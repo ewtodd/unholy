@@ -253,3 +253,14 @@ summation order differs), the indexer weights and the grouped wo_a (fp8 x 128x12
 to bf16 in LDS, exact). Dispatch in forward_ref (`UNHOLY_REF_DENSE=1` keeps the references).
 Layer 2 vs oracle unchanged (prefill rel 4.56e-3 vs 4.48e-3); resident EXL3 model: KL 2.64e-2,
 prefill 1024 tokens 8.0 -> 6.67 s, decode 0.47 -> 0.24 s/token.
+
+## 2026-10-11 — WMMA sparse attention
+
+`src/kernels/attn_wmma.hip` (gfx12): one 256-thread block per query computes all 64 heads (MQA: one
+KV row set for all heads, loaded once). Wave (hg, dh) holds heads 16hg.. and dims 256dh.. : Q slice as
+bf16 WMMA A fragments in registers, output slice in 16 accumulators; keys 16 at a time staged in LDS
+key-major (Q K^T) and dim-major (P V); partner waves sum partial scores through LDS; per-head online
+softmax with bf16 P, sink in the denominator. Softmax blocks are 16 keys instead of the reference's
+64 (bf16 rounding of P against a different running max: noise-level). Layers 2/3 vs oracle:
+4.62e-3 / 7.79e-3 (reference attention 4.56e-3 / 7.67e-3). Resident EXL3 model: KL 2.59e-2, prefill
+1024 tokens 6.67 -> 3.06 s (~335 tok/s), decode 0.23 s/token.

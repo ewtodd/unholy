@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "kernels/attn_wmma.hpp"
 #include "kernels/exl3_moe.hpp"
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/ref.hpp"
@@ -309,6 +310,17 @@ void dense_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16
   else k::gemm_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
 }
 
+// Attention dispatch: WMMA kernel on gfx12 unless UNHOLY_REF_ATTN=1.
+void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sink, bf16* o, int T, int H, int D,
+               float scale, hipStream_t st) {
+  static const bool fast = [] {
+    const char* v = std::getenv("UNHOLY_REF_ATTN");
+    return !v || std::string(v) == "0";
+  }();
+  if (fast && on_gfx12()) k::sparse_attn_wmma(q, pos, kv, sink, o, T, H, D, scale, st);
+  else k::sparse_attn(q, pos, kv, sink, o, T, H, D, scale, st);
+}
+
 // UNHOLY_DUMP=dir: raw intermediates of batches whose first chunk starts at position 0, named like
 // the oracle's captures (tools/ref/oracle/run.py --capture-layer), for tools/ref/compare_dump.py.
 void dump(int layer, const BatchDesc& b, const char* name, const void* dptr, size_t bytes, hipStream_t st) {
@@ -473,7 +485,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       akv.comp_idx = idx;
       akv.ncomp = kk;
     }
-    k::sparse_attn(q + size_t(ch.t0) * H * HD, cpos, akv, w.sink.p<float>(), o + size_t(ch.t0) * H * HD, ch.n, H, HD,
+    attention(q + size_t(ch.t0) * H * HD, cpos, akv, w.sink.p<float>(), o + size_t(ch.t0) * H * HD, ch.n, H, HD,
                    scale, st);
     k::window_update(kv + size_t(ch.t0) * HD, window, ch.s0, ch.n, HD, st);
   }
