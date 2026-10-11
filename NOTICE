@@ -7,3 +7,9 @@ Third-party code is credited here as it is taken, with its license. Sources the 
 (no code copied yet): gufo (MIT), antirez ds4.c (MIT), exllamav3 (MIT), Strata (MIT),
 llama.cpp / ggml and the llama-halo-hybrid ds4-hybrid branch (MIT), vLLM and sglang
 (Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0).
+
+third_party/gufo/json.hpp — from gufo (https://github.com/gufo-org/gufo), MIT License,
+Copyright (c) 2026 gufo contributors (third_party/gufo/LICENSE).
+
+src/model/exl3.* — the EXL3 format (trellis layout, codebooks, tensor-core permutation) follows
+exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License, Copyright (c) 2025 Turboderp.

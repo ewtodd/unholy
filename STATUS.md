@@ -27,5 +27,6 @@ nix develop -c ./build/unholy-probe --json probe.json
 
 - [x] flake + CMake (TheRock 10.1 SDK, fat gfx1201/gfx1151)
 - [x] `unholy-probe`: PCIe paths, verified transfers, signalling latency (DECISIONS 2026-10-11)
-- [ ] weight loader: native safetensors (fp8 block-scaled, MXFP4, bf16) + EXL3 trellis tensors
+- [x] checkpoint reader + CPU reference decoders: native (MXFP4, fp8 block-scaled) and EXL3 (bit-exact vs exllamav3)
+- [ ] device weight loader (placement-driven upload)
 - [ ] memory planner dry-run against the probe JSON (4 x 512k slots, hot/cold expert split)

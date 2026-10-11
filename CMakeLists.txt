@@ -24,15 +24,21 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 # therock-sdk-nix's clang wrapper appends its link flags to compile-only invocations too.
 add_compile_options(-Wno-unused-command-line-argument)
 
-# Host-only pieces (no device code): sysfs topology, JSON output.
+# Host-only pieces (no device code): sysfs topology, checkpoints, CPU references.
 add_library(unholy_host STATIC
   src/hw/pci.cpp
+  src/model/safetensors.cpp
+  src/model/exl3.cpp
+  src/model/native.cpp
 )
-target_include_directories(unholy_host PUBLIC src)
+target_include_directories(unholy_host PUBLIC src third_party)
+
+add_executable(unholy-ckpt tools/ckpt/main.cpp)
+target_link_libraries(unholy-ckpt PRIVATE unholy_host)
 
 # unholy-probe: topology, verified transports, signalling latency.
 add_executable(unholy-probe tools/probe/probe.hip)
 set_source_files_properties(tools/probe/probe.hip PROPERTIES LANGUAGE HIP)
 target_link_libraries(unholy-probe PRIVATE unholy_host hip::host)
 
-install(TARGETS unholy-probe RUNTIME DESTINATION bin)
+install(TARGETS unholy-probe unholy-ckpt RUNTIME DESTINATION bin)

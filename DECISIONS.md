@@ -88,3 +88,27 @@ The decode critical path has 43 card<->APU hops per token: at 2.5 us that is ~0.
 at 12 us ~0.5 ms. The APU hop is not the decode bottleneck as long as the host stays off the
 path (host sync would be ~2 ms/token). The two stream-level numbers include host enqueue cost
 and are upper bounds.
+
+## 2026-10-11 — EXL3 decoded exactly; first weight-space error numbers
+
+`src/model/exl3.cpp` decodes EXL3 linears on the CPU (format notes in `exl3.hpp`): tail-biting
+16-bit trellis windows over an MSB-first bitstream of little-endian uint32 words, the `mul1`
+codebook (`x * 0x83DCD12D`, byte sum + 0x6400 as fp16, `fma(h, 1/147.7, -10.39)`), the
+tensor-core tile permutation, and W = diag(suh) H128 W_inner H128 diag(svh). Checked against
+exllamav3's own `get_inner_weight_tensor()` (built from source on son-of-anton against the vLLM
+stack's ROCm torch, `tools/ref/build_exllamav3.sh`): **0 mismatches** over 21M weights
+(experts.0.w1 / experts.17.w2 at K=3, attn.wq_a at K=5); dense weights within exllamav3's per-step
+fp16 rounding (rel 4.1e-4).
+
+Weight-space error of the turboderp 3.04 bpw checkpoint against the native weights
+(`unholy-ckpt compare`):
+
+| tensor | K | rel L2 | cosine |
+|---|---|---|---|
+| routed experts w1/w2/w3 (layers 0, 20, 42) vs MXFP4 | 3 | 0.144-0.159 | 0.9874-0.9897 |
+| shared expert w1 vs fp8 | 5 | 0.038 | 0.9993 |
+| attention wq_a / wq_b / wkv / wo_b vs fp8 | 5 | 0.038-0.041 | 0.9992-0.9993 |
+
+The native MXFP4 experts are the trained weights (QAT), so ~15% expert weight error is pure loss.
+Output KL decides, but this already argues for (a) native fp8 attention (lossless, and the fast
+path on gfx1201) and (b) measuring MXFP4-hot / EXL3-cold mixes and a 4 bpw EXL3 tier.
