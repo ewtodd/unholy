@@ -112,3 +112,30 @@ Weight-space error of the turboderp 3.04 bpw checkpoint against the native weigh
 The native MXFP4 experts are the trained weights (QAT), so ~15% expert weight error is pure loss.
 Output KL decides, but this already argues for (a) native fp8 attention (lossless, and the fast
 path on gfx1201) and (b) measuring MXFP4-hot / EXL3-cold mixes and a 4 bpw EXL3 tier.
+
+## 2026-10-11 — the oracle: DeepSeek's own model.py, layer-streamed
+
+`tools/ref/oracle/run.py` runs the checkpoint's own `inference/model.py` (MIT, shipped in
+`/scratch/dsv4-ve/inference`) **unmodified** on one R9700 through the vLLM stack's ROCm torch,
+one `Block` at a time (build, load weights, push every position through, free), teacher-forced:
+the prompt as one prefill at `start_pos` 0, then the continuation one token at a time, which
+exercises the decode-path state (window ring, compressor `kv_state`/`score_state`, indexer).
+`tools/ref/oracle/kernel.py` replaces the tilelang kernels with torch code that keeps their
+arithmetic: power-of-two scales by the same ceil(log2) bit rule, amax floors, fp32 per-block
+(128 fp8 / 32 fp4) partial sums scaled then accumulated, 64-key online-softmax blocks with bf16
+probabilities, the sink added last, the 20-iteration Sinkhorn.
+
+Validation: on `ids_code32768.bin[:1024]` the oracle's next-token argmax is **2606** (logit
+33.141) and the following argmaxes are `[223, 18, 11, 4054, ...]` — the same five tokens
+dsv4-engine and gufo (antirez's quant) agreed on. A full 43-layer run (1024 prefill + 8 decode)
+takes ~2.5 min and dumps every layer's HC residual and the full logits.
+
+What reading the reference changed in the design (DESIGN.md updated):
+- the checkpoint's `mtp.*` layers are a **DSpark** block drafter (block 5, target layers
+  40-42, markov head rank 256, confidence head), not classic MTP;
+- the reference is QAT'd at fp8 activations (128-blocks) for every fp8/fp4 linear, fp8-simulated
+  KV (64-blocks, nope dims only) and fp4-simulated indexer q/k after a 128-point Hadamard — so
+  storing KV as fp8 and indexer keys as fp4 loses nothing against the reference (~1.8 GB per
+  512k slot instead of 3.6 GB);
+- `wo_a` is dequantized to bf16 and run as a bf16 grouped einsum; compressor `wkv`/`wgate`, the
+  router and the LM head run in fp32.

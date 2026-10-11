@@ -51,7 +51,7 @@ Memory, 4 slots x 512k:
 |---|---|---|
 | routed experts, EXL3 3.04 bpw | ~105 GB (+2.4 GB per MTP layer) | hot on cards, cold on APU |
 | dense (attention fp8, shared experts, compressors, indexer, HC, router) + head | ~8 GB | cards |
-| compressed KV + indexer keys, bf16 | 3.6 GB per 512k slot -> 14.4 GB | cards |
+| compressed KV (fp8 nope + bf16 rope + e8m0 scales) + indexer keys (fp4) | ~1.8 GB per 512k slot -> ~7.4 GB (bf16 would be 3.6 GB per slot) | cards |
 | sliding-window rings + compressor carries | ~6 MB per sequence | cards |
 | activation scratch (8k-token chunks, tiled indexer) | ~3 GB per card | cards |
 
@@ -178,9 +178,9 @@ unit test against it. The hot set:
 
 ### Speculative decoding
 
-Proposer interface with three implementations, chosen by measured acceptance x cost per
-workload: the checkpoint's **MTP** layers (native, up to 3 drafts), **DSpark** (DeepSeek's
-block drafter, used by gufo/ds4), and **prompt lookup** (n-gram copy; Strata gates it by
+Proposer interface, chosen by measured acceptance x cost per workload: **DSpark** — the
+checkpoint's `mtp.*` layers are a 3-stage DSpark block drafter (block 5, conditioned on target
+layers 40-42, Markov head + confidence head for adaptive block length) — and **prompt lookup** (n-gram copy; Strata gates it by
 measured payoff). Verification is exact (greedy match or standard rejection sampling), so
 output quality is the target model's.
 

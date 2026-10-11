@@ -1,0 +1,166 @@
+"""DSV4 oracle: DeepSeek's own inference/model.py, layer-streamed on one GPU, teacher-forced.
+
+    PYTHONPATH=tools/ref/oracle:/scratch/dsv4-ve/inference $REF_PY tools/ref/oracle/run.py \
+        --ckpt /scratch/dsv4-ve --ids ids.bin --prompt 1024 --decode 8 --out DIR
+
+The 168 GB checkpoint does not fit one card, so the model is run one Block at a time: build the
+block, load its weights, push every position through it (the prompt as one prefill at start_pos 0,
+then the teacher-forced continuation one token at a time, which exercises the decode-path caches),
+free it, next layer. The model code itself is unmodified; kernel.py in this directory replaces the
+tilelang kernels (see its docstring).
+
+Outputs in --out: meta.json, h_LLL.bin (bf16 [S, 4, 4096] after layer LLL, for --dump-layers),
+logits.bin (f32 [S, vocab]).
+"""
+import argparse
+import json
+import os
+import struct
+import sys
+import time
+import types
+
+import numpy as np
+import torch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8m0fnu, "BF16": torch.bfloat16,
+    "F16": torch.float16, "F32": torch.float32, "I64": torch.int64, "I32": torch.int32,
+    "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8,
+}
+
+
+class Ckpt:
+    """Raw sharded-safetensors reader (avoids depending on the safetensors package's fp8/e8m0 support)."""
+
+    def __init__(self, d):
+        with open(os.path.join(d, "model.safetensors.index.json")) as f:
+            wm = json.load(f)["weight_map"]
+        self.maps, self.index = {}, {}
+        for fn in sorted(set(wm.values())):
+            path = os.path.join(d, fn)
+            with open(path, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                hdr = json.loads(fh.read(n))
+            self.maps[fn] = np.memmap(path, dtype=np.uint8, mode="r")
+            for k, v in hdr.items():
+                if k != "__metadata__":
+                    b, e = v["data_offsets"]
+                    self.index[k] = (fn, 8 + n + b, 8 + n + e, v["dtype"], v["shape"])
+
+    def get(self, name):
+        fn, b, e, dt, shape = self.index[name]
+        raw = torch.from_numpy(np.array(self.maps[fn][b:e]))
+        return raw.view(_DTYPES[dt]).reshape(shape)
+
+
+def load_params(module, prefix, ck, dev):
+    for pname, p in module.named_parameters():
+        full = prefix + pname
+        if pname.endswith("wo_a.weight"):
+            # inference/convert.py: wo_a is dequantized to bf16 (the model runs it as a bf16 einsum).
+            w = ck.get(full).to(dev)
+            s = ck.get(full[: -len("weight")] + "scale").to(dev)
+            wd = (w.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128)).float() * s[:, None, :, None].float())
+            p.data.copy_(wd.flatten(2, 3).flatten(0, 1).to(p.dtype))
+            continue
+        t = ck.get(full)
+        if p.dtype == torch.float4_e2m1fn_x2:
+            p.data.view(torch.uint8).copy_(t.view(torch.uint8).to(dev))
+        else:
+            p.data.copy_(t.to(dev).to(p.dtype))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default="/scratch/dsv4-ve")
+    ap.add_argument("--ids", required=True, help="uint32 token ids")
+    ap.add_argument("--prompt", type=int, required=True)
+    ap.add_argument("--decode", type=int, default=0)
+    ap.add_argument("--layers", type=int, default=None, help="run only the first N layers (no logits)")
+    ap.add_argument("--dump-layers", default="all", help="'all', 'none' or comma list")
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    sys.path.insert(0, HERE)
+    sys.path.insert(1, os.path.join(args.ckpt, "inference"))
+    import model as M
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_default_dtype(torch.bfloat16)
+    dev = torch.device("cuda", 0)
+    torch.set_default_device(dev)
+
+    with open(os.path.join(args.ckpt, "inference", "config.json")) as f:
+        cfg = json.load(f)
+    ids = np.fromfile(args.ids, dtype=np.uint32)[: args.prompt + args.decode].astype(np.int64)
+    S, P = len(ids), args.prompt
+    margs = M.ModelArgs(**cfg, max_batch_size=1, max_seq_len=((S + 127) // 128) * 128)
+    # Normally set by Transformer.__init__.
+    M.world_size, M.rank = 1, 0
+    M.default_dtype = torch.float8_e4m3fn
+    M.scale_fmt = "ue8m0"
+    M.scale_dtype = torch.float8_e8m0fnu
+
+    n_layers = args.layers if args.layers is not None else margs.n_layers
+    if args.dump_layers == "all":
+        dump = set(range(n_layers))
+    elif args.dump_layers == "none":
+        dump = set()
+    else:
+        dump = {int(x) for x in args.dump_layers.split(",")}
+    os.makedirs(args.out, exist_ok=True)
+    ck = Ckpt(args.ckpt)
+
+    input_ids = torch.tensor(ids, dtype=torch.int64, device=dev).unsqueeze(0)
+    with torch.inference_mode():
+        emb = ck.get("embed.weight").to(dev)
+        h = emb[input_ids].unsqueeze(2).repeat(1, 1, margs.hc_mult, 1)  # [1, S, hc, D] bf16
+        del emb
+        for L in range(n_layers):
+            t0 = time.time()
+            block = M.Block(L, margs)
+            load_params(block, f"layers.{L}.", ck, dev)
+            t1 = time.time()
+            outs = [block(h[:, :P], 0, input_ids[:, :P])]
+            for t in range(P, S):
+                outs.append(block(h[:, t:t + 1], t, input_ids[:, t:t + 1]))
+            h = torch.cat(outs, 1)
+            torch.cuda.synchronize()
+            if L in dump:
+                h[0].contiguous().view(torch.uint16).cpu().numpy().tofile(os.path.join(args.out, f"h_{L:03d}.bin"))
+            print(f"layer {L:2d}: load {t1 - t0:5.1f} s  run {time.time() - t1:6.1f} s  "
+                  f"|h| {h.float().norm().item():.4e}", flush=True)
+            del block, outs
+            torch.cuda.empty_cache()
+
+        logits_info = None
+        if n_layers == margs.n_layers:
+            ns = types.SimpleNamespace(norm_eps=margs.norm_eps, hc_eps=margs.hc_eps)
+            hc_fn = ck.get("hc_head_fn").to(dev)
+            hc_scale = ck.get("hc_head_scale").to(dev)
+            hc_base = ck.get("hc_head_base").to(dev)
+            x = M.Block.hc_head(ns, h, hc_fn, hc_scale, hc_base)
+            norm = M.RMSNorm(margs.dim, margs.norm_eps)
+            norm.weight.data.copy_(ck.get("norm.weight").to(dev).float())
+            head = M.ParallelHead(margs.vocab_size, margs.dim, margs.norm_eps, margs.hc_eps)
+            head.weight.data.copy_(ck.get("head.weight").to(dev).float())
+            logits = head(norm(x), full_logits=True)[0]  # [S, V] f32
+            logits.cpu().numpy().tofile(os.path.join(args.out, "logits.bin"))
+            top = logits.argmax(-1).cpu().tolist()
+            logits_info = {"argmax_last_prompt": top[P - 1], "argmax": top,
+                           "max_logit_last_prompt": logits[P - 1].max().item()}
+            print(f"argmax after prompt: {top[P - 1]} (logit {logits[P - 1].max().item():.3f}); "
+                  f"teacher-forced argmax: {top[P - 1:]}", flush=True)
+
+    meta = {"ckpt": args.ckpt, "S": S, "prompt": P, "decode": S - P, "ids": ids.tolist(),
+            "layers": n_layers, "dumped": sorted(dump), "logits": logits_info}
+    with open(os.path.join(args.out, "meta.json"), "w") as f:
+        json.dump(meta, f)
+
+
+if __name__ == "__main__":
+    main()
