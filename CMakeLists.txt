@@ -66,3 +66,15 @@ install(TARGETS unholy-ref-run RUNTIME DESTINATION bin)
 
 add_executable(unholy-batch-test tools/batch_test/main.hip)
 target_link_libraries(unholy-batch-test PRIVATE unholy_ref)
+
+# Engine: placement, resident multi-device model.
+add_library(unholy_engine STATIC
+  src/engine/plan.cpp
+  src/engine/resident.hip
+)
+set_source_files_properties(src/engine/plan.cpp PROPERTIES LANGUAGE HIP)
+target_include_directories(unholy_engine PUBLIC src third_party)
+target_link_libraries(unholy_engine PUBLIC unholy_ref)
+
+add_executable(unholy-resident-test tools/resident_test/main.hip)
+target_link_libraries(unholy-resident-test PRIVATE unholy_engine)

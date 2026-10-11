@@ -20,6 +20,7 @@
 
 #include "gufo/json.hpp"
 #include "model/safetensors.hpp"
+#include "rt/arena.hpp"
 #include "rt/hip.hpp"
 
 namespace unholy::model {
@@ -45,16 +46,18 @@ struct Dsv4Config {
 // `yarn` = the compressed-layer family (compress_rope_theta + YaRN); otherwise rope_theta, no YaRN.
 std::vector<float> rope_table(const Dsv4Config& c, int max_pos, bool yarn);
 
-// A device copy of one checkpoint tensor (raw bytes, optional dtype conversion).
+// A device copy of one checkpoint tensor (raw bytes, optional dtype conversion): owns its buffer, or
+// points into an Arena that outlives it.
 struct DevTensor {
   rt::DeviceBuffer buf;
+  void* ptr = nullptr;
   DType dtype = DType::Unknown;
   std::vector<int64_t> shape;
   template <typename T>
   T* p() const {
-    return buf.as<T>();
+    return static_cast<T*>(ptr);
   }
-  explicit operator bool() const { return buf.data() != nullptr; }
+  explicit operator bool() const { return ptr != nullptr; }
 };
 
 struct Fp8Linear {  // e4m3 [out, in] + e8m0 [ceil(out/128), in/128]
@@ -93,15 +96,25 @@ struct LayerWeights {
   std::vector<Fp4Linear> w1, w2, w3;     // routed experts
   bool exl3_experts = false;              // routed experts in EXL3 instead (x1, x2, x3)
   std::vector<Exl3Weights> x1, x2, x3;
+  bool has_expert(int e) const {
+    return exl3_experts ? bool(x1[size_t(e)].trellis) : bool(w1[size_t(e)].w);
+  }
   Fp8Linear sw1, sw2, sw3;               // shared expert
 };
 
 class Uploader;
-// Loads one layer's weights to `dev` (coalesced O_DIRECT reads; pass an Uploader to reuse its
-// pinned staging across layers).
-// `exl3`: take the routed experts from this EXL3 checkpoint instead of the native MXFP4 ones.
+struct LoadOptions {
+  Uploader* up = nullptr;                          // reuse pinned staging across layers
+  const Checkpoint* exl3 = nullptr;                // routed experts from this EXL3 checkpoint
+  Uploader* exl3_up = nullptr;
+  bool dense = true;                               // attention, norms, router, shared expert
+  const std::vector<uint8_t>* experts = nullptr;  // [E]: 1 = load this routed expert (null: all)
+  rt::Arena* arena = nullptr;                      // allocate weights from here (null: one hipMalloc each)
+};
+// Loads one layer's weights to `dev` with coalesced O_DIRECT reads. Expert vectors always have
+// n_experts entries; experts not loaded here are empty (has_expert() false).
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
-                        Uploader* up = nullptr, const Checkpoint* exl3 = nullptr, Uploader* exl3_up = nullptr);
+                        const LoadOptions& opt = {});
 
 struct RopeTables {
   rt::DeviceBuffer plain, yarn;  // float2 [max_pos][rope_dim/2]

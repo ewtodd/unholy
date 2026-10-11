@@ -132,15 +132,25 @@ struct LoadCtx {
   const Checkpoint& ck;
   int dev;
   std::vector<Uploader::Item> items;
+  rt::Arena* arena = nullptr;
 };
+
+void allocate(LoadCtx& lc, DevTensor& d, size_t bytes) {
+  if (lc.arena) {
+    d.ptr = lc.arena->alloc(bytes);
+  } else {
+    d.buf = rt::DeviceBuffer(lc.dev, bytes);
+    d.ptr = d.buf.data();
+  }
+}
 
 DevTensor upload(LoadCtx& lc, const std::string& name) {
   const TensorInfo& t = lc.ck.at(name);
   DevTensor d;
   d.dtype = t.dtype;
   d.shape = t.shape;
-  d.buf = rt::DeviceBuffer(lc.dev, t.nbytes);
-  lc.items.push_back({&t, d.buf.data()});
+  allocate(lc, d, t.nbytes);
+  lc.items.push_back({&t, d.ptr});
   return d;
 }
 
@@ -153,9 +163,9 @@ DevTensor upload_i64_as_i32(LoadCtx& lc, const std::string& name) {
   DevTensor d;
   d.dtype = DType::I32;
   d.shape = t.shape;
-  d.buf = rt::DeviceBuffer(lc.dev, host.size() * 4);
   rt::DeviceGuard g(lc.dev);
-  UH_CHECK(hipMemcpy(d.buf.data(), host.data(), host.size() * 4, hipMemcpyHostToDevice));
+  allocate(lc, d, host.size() * 4);
+  UH_CHECK(hipMemcpy(d.ptr, host.data(), host.size() * 4, hipMemcpyHostToDevice));
   return d;
 }
 
@@ -209,74 +219,83 @@ CompressorWeights compressor(LoadCtx& lc, const std::string& prefix, int ratio, 
 }  // namespace
 
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
-                        Uploader* up, const Checkpoint* exl3, Uploader* exl3_up) {
+                        const LoadOptions& opt) {
   const std::string p = "layers." + std::to_string(layer) + ".";
-  LoadCtx lc{ck, dev, {}};
+  LoadCtx lc{ck, dev, {}, opt.arena};
   LayerWeights w;
   w.layer = layer;
   w.ratio = c.ratio(layer);
   w.hash = layer < c.n_hash_layers;
-  w.hc_attn_fn = upload(lc, p + "hc_attn_fn");
-  w.hc_attn_base = upload(lc, p + "hc_attn_base");
-  w.hc_attn_scale = upload(lc, p + "hc_attn_scale");
-  w.hc_ffn_fn = upload(lc, p + "hc_ffn_fn");
-  w.hc_ffn_base = upload(lc, p + "hc_ffn_base");
-  w.hc_ffn_scale = upload(lc, p + "hc_ffn_scale");
-  w.attn_norm = upload(lc, p + "attn_norm.weight");
-  w.ffn_norm = upload(lc, p + "ffn_norm.weight");
-  w.sink = upload(lc, p + "attn.attn_sink");
-  w.q_norm = upload(lc, p + "attn.q_norm.weight");
-  w.kv_norm = upload(lc, p + "attn.kv_norm.weight");
-  w.wq_a = fp8(lc, p + "attn.wq_a");
-  w.wq_b = fp8(lc, p + "attn.wq_b");
-  w.wkv = fp8(lc, p + "attn.wkv");
-  w.wo_a = fp8(lc, p + "attn.wo_a");
-  w.wo_b = fp8(lc, p + "attn.wo_b");
-  if (w.ratio) w.comp = compressor(lc, p + "attn.compressor", w.ratio, c.head_dim, false);
-  if (w.ratio == 4) {
-    w.has_indexer = true;
-    w.idx_wq_b = fp8(lc, p + "attn.indexer.wq_b");
-    w.idx_wproj = upload(lc, p + "attn.indexer.weights_proj.weight");
-    w.idx_comp = compressor(lc, p + "attn.indexer.compressor", 4, c.idx_dim, true);
+  w.has_indexer = w.ratio == 4;
+  if (opt.dense) {
+    w.hc_attn_fn = upload(lc, p + "hc_attn_fn");
+    w.hc_attn_base = upload(lc, p + "hc_attn_base");
+    w.hc_attn_scale = upload(lc, p + "hc_attn_scale");
+    w.hc_ffn_fn = upload(lc, p + "hc_ffn_fn");
+    w.hc_ffn_base = upload(lc, p + "hc_ffn_base");
+    w.hc_ffn_scale = upload(lc, p + "hc_ffn_scale");
+    w.attn_norm = upload(lc, p + "attn_norm.weight");
+    w.ffn_norm = upload(lc, p + "ffn_norm.weight");
+    w.sink = upload(lc, p + "attn.attn_sink");
+    w.q_norm = upload(lc, p + "attn.q_norm.weight");
+    w.kv_norm = upload(lc, p + "attn.kv_norm.weight");
+    w.wq_a = fp8(lc, p + "attn.wq_a");
+    w.wq_b = fp8(lc, p + "attn.wq_b");
+    w.wkv = fp8(lc, p + "attn.wkv");
+    w.wo_a = fp8(lc, p + "attn.wo_a");
+    w.wo_b = fp8(lc, p + "attn.wo_b");
+    if (w.ratio) w.comp = compressor(lc, p + "attn.compressor", w.ratio, c.head_dim, false);
+    if (w.has_indexer) {
+      w.idx_wq_b = fp8(lc, p + "attn.indexer.wq_b");
+      w.idx_wproj = upload(lc, p + "attn.indexer.weights_proj.weight");
+      w.idx_comp = compressor(lc, p + "attn.indexer.compressor", 4, c.idx_dim, true);
+    }
+    w.gate_w = upload(lc, p + "ffn.gate.weight");
+    w.gate_bias = upload(lc, p + "ffn.gate.bias");
+    if (w.hash) w.tid2eid = upload_i64_as_i32(lc, p + "ffn.gate.tid2eid");
+    w.sw1 = fp8(lc, p + "ffn.shared_experts.w1");
+    w.sw2 = fp8(lc, p + "ffn.shared_experts.w2");
+    w.sw3 = fp8(lc, p + "ffn.shared_experts.w3");
   }
-  w.gate_w = upload(lc, p + "ffn.gate.weight");
-  w.gate_bias = upload(lc, p + "ffn.gate.bias");
-  if (w.hash) w.tid2eid = upload_i64_as_i32(lc, p + "ffn.gate.tid2eid");
-  LoadCtx lx{exl3 ? *exl3 : ck, dev, {}};
-  w.exl3_experts = exl3 != nullptr;
+  LoadCtx lx{opt.exl3 ? *opt.exl3 : ck, dev, {}, opt.arena};
+  w.exl3_experts = opt.exl3 != nullptr;
+  const size_t E = size_t(c.n_experts);
+  if (w.exl3_experts) {
+    w.x1.resize(E);
+    w.x2.resize(E);
+    w.x3.resize(E);
+  } else {
+    w.w1.resize(E);
+    w.w2.resize(E);
+    w.w3.resize(E);
+  }
   for (int e = 0; e < c.n_experts; ++e) {
+    if (opt.experts && !(*opt.experts)[size_t(e)]) continue;
     const std::string ep = p + "ffn.experts." + std::to_string(e) + ".";
-    if (exl3) {
-      w.x1.push_back(exl3_linear(lx, ep + "w1"));
-      w.x2.push_back(exl3_linear(lx, ep + "w2"));
-      w.x3.push_back(exl3_linear(lx, ep + "w3"));
+    if (w.exl3_experts) {
+      w.x1[size_t(e)] = exl3_linear(lx, ep + "w1");
+      w.x2[size_t(e)] = exl3_linear(lx, ep + "w2");
+      w.x3[size_t(e)] = exl3_linear(lx, ep + "w3");
     } else {
-      w.w1.push_back(fp4(lc, ep + "w1"));
-      w.w2.push_back(fp4(lc, ep + "w2"));
-      w.w3.push_back(fp4(lc, ep + "w3"));
+      w.w1[size_t(e)] = fp4(lc, ep + "w1");
+      w.w2[size_t(e)] = fp4(lc, ep + "w2");
+      w.w3[size_t(e)] = fp4(lc, ep + "w3");
     }
   }
-  w.sw1 = fp8(lc, p + "ffn.shared_experts.w1");
-  w.sw2 = fp8(lc, p + "ffn.shared_experts.w2");
-  w.sw3 = fp8(lc, p + "ffn.shared_experts.w3");
 
   rt::DeviceGuard g(dev);
-  std::unique_ptr<Uploader> own;
-  if (!up) {
-    own = std::make_unique<Uploader>(ck);
-    up = own.get();
-  }
-  up->upload_many(std::move(lc.items), st);
-  up->sync();
-  if (exl3) {
-    std::unique_ptr<Uploader> own_x;
-    if (!exl3_up) {
-      own_x = std::make_unique<Uploader>(*exl3);
-      exl3_up = own_x.get();
+  auto run = [&](const Checkpoint& src, Uploader* up, std::vector<Uploader::Item>& items) {
+    if (items.empty()) return;
+    std::unique_ptr<Uploader> own;
+    if (!up) {
+      own = std::make_unique<Uploader>(src);
+      up = own.get();
     }
-    exl3_up->upload_many(std::move(lx.items), st);
-    exl3_up->sync();
-  }
+    up->upload_many(std::move(items), st);
+    up->sync();
+  };
+  run(ck, opt.up, lc.items);
+  if (opt.exl3) run(*opt.exl3, opt.exl3_up, lx.items);
   return w;
 }
 

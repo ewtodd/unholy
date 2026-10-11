@@ -200,3 +200,24 @@ aligned to the 4/128 compression blocks) gives bit-identical output to one 1024-
 `unholy-batch-test` runs three sequences (600/523/333 tokens) interleaved in mixed batches (chunks of
 1/37/128/211 tokens, shuffled slots, shuffled physical pages) and every element matches the solo runs
 on layers 0 (window), 2 (CSA) and 3 (HCA).
+
+## 2026-10-11 — the model resident across both cards and the APU
+
+`src/engine/plan.cpp` sizes everything from the checkpoint and the real allocation functions
+(`dense_layer_bytes`, `expert_bytes`, `layer_cache_bytes`, `scratch_bytes`, `hipMemGetInfo`): layers
+split to balance dense + cache bytes (0-21 / 22-42), each card's remaining VRAM filled greedily with
+that card's most-routed experts (usage from `data/expert_profile_dsv4engine_code32k.txt`, dsv4-engine's
+32k-token code calibration), every other expert on the APU. With EXL3 3.04 experts, 1 slot x 2k:
+card 0 2907 hot experts (27.5 GB), card 1 2861 (27.1 GB), APU 49.6 GB cold, **95% of routing predicted
+on the cards**.
+
+`src/engine/resident.hip`: per-card weights/caches/scratch, the APU's experts behind
+`RemoteExperts` (inputs and outputs in pinned host memory: the APU reads and writes it zero-copy, the
+cards DMA), residual handoff card 0 -> card 1 through pinned memory, head on card 1. Weights come from
+per-device arenas (256 MiB slabs): one hipMalloc per tensor rounded each 3 MiB trellis up to 4 MiB and
+ran the cards out of memory. The uploader's events are recreated when the caller switches devices.
+
+`unholy-resident-test` (load 37.7 s; code prompt, 1024 prefill + 8 teacher-forced decode steps):
+**all 133,416,960 logits bit-identical to the single-card streaming run**, KL vs the oracle 2.667e-2
+(the EXL3 number). Reference-kernel speed, the baseline the fast path replaces: prefill 1024 tokens
+27.5 s (37 tok/s), decode ~1.0 s/token.

@@ -89,7 +89,9 @@ int main(int argc, char** argv) {
     hipStream_t st;
     UH_CHECK(hipStreamCreate(&st));
     const auto t0 = std::chrono::steady_clock::now();
-    const auto w = model::load_layer(*ck, c, layer, dev, st, nullptr, xck.get());
+    model::LoadOptions lo;
+    lo.exl3 = xck.get();
+    const auto w = model::load_layer(*ck, c, layer, dev, st, lo);
     const auto t1 = std::chrono::steady_clock::now();
     const int max_seq = (S + 255) / 256 * 256;
     const model::CacheGeometry geo{1, max_seq / model::kPageTokens, max_seq / model::kPageTokens};

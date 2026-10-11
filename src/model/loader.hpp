@@ -49,6 +49,8 @@ class Uploader {
   uint8_t* staging_[2] = {nullptr, nullptr};
   hipEvent_t done_[2] = {nullptr, nullptr};
   bool pending_[2] = {false, false};
+  int event_dev_ = -1;  // events belong to one device; recreated when the caller switches device
+  void ensure_events();
   int slot_ = 0;
   uint64_t bytes_ = 0;
 };

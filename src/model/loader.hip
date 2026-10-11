@@ -28,7 +28,6 @@ Uploader::Uploader(const Checkpoint& ck, size_t chunk_bytes) : ck_(ck), chunk_(c
   for (int i = 0; i < 2; ++i) {
     // hipHostMalloc is page-aligned; one alignment unit of slack covers the aligned superset.
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&staging_[i]), chunk_ + 2 * kAlign, hipHostMallocPortable));
-    UH_CHECK(hipEventCreateWithFlags(&done_[i], hipEventDisableTiming));
   }
 }
 
@@ -76,7 +75,20 @@ const uint8_t* Uploader::read_range(int file, uint64_t off, uint64_t len, uint8_
   return buf;
 }
 
+void Uploader::ensure_events() {
+  int dev = 0;
+  UH_CHECK(hipGetDevice(&dev));
+  if (dev == event_dev_) return;
+  sync();
+  for (int i = 0; i < 2; ++i) {
+    if (done_[i]) UH_CHECK(hipEventDestroy(done_[i]));
+    UH_CHECK(hipEventCreateWithFlags(&done_[i], hipEventDisableTiming));
+  }
+  event_dev_ = dev;
+}
+
 void Uploader::upload(const TensorInfo& t, void* dst, hipStream_t st) {
+  ensure_events();
   for (uint64_t pos = 0; pos < t.nbytes; pos += chunk_) {
     const uint64_t len = std::min<uint64_t>(chunk_, t.nbytes - pos);
     const int s = slot_;
@@ -91,6 +103,7 @@ void Uploader::upload(const TensorInfo& t, void* dst, hipStream_t st) {
 }
 
 void Uploader::upload_many(std::vector<Item> items, hipStream_t st) {
+  ensure_events();
   std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
     return a.t->file != b.t->file ? a.t->file < b.t->file : a.t->offset < b.t->offset;
   });

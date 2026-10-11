@@ -104,7 +104,11 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     for (int L = 0; L < c.n_layers; ++L) {
       const auto tl = std::chrono::steady_clock::now();
-      auto w = model::load_layer(*ck, c, L, dev, st, &up, xck.get(), xup.get());
+      model::LoadOptions lo;
+      lo.up = &up;
+      lo.exl3 = xck.get();
+      lo.exl3_up = xup.get();
+      auto w = model::load_layer(*ck, c, L, dev, st, lo);
       auto cache = model::make_layer_cache(c, w, geo, dev, st);
       auto run = [&](int s0, int n) {
         model::BatchDesc b;

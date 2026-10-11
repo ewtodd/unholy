@@ -55,7 +55,7 @@ namespace {
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
   kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
-  kY2F, kNumBufs
+  kY2F, kPairIn, kNumBufs
 };
 
 template <typename T>
@@ -65,7 +65,8 @@ T* B(const Scratch& s, Buf b) {
 
 }  // namespace
 
-Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) {
+namespace {
+std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_seq) {
   const size_t N = size_t(max_tokens);
   const size_t rows = N / 4 + 2;
   const size_t keys = size_t(max_seq / 4 + 1);
@@ -108,12 +109,98 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   sz[kEIdx] = N * K * 4;
   sz[kEWt] = N * K * 4;
   sz[kY2F] = N * c.dim * 4;
+  sz[kPairIn] = N * K * c.dim * 2;
+  return sz;
+}
+}  // namespace
+
+size_t expert_scratch_bytes(const Dsv4Config& c, int rows) {
+  const size_t R = size_t(std::max(rows, 1)), W = size_t(std::max(c.dim, c.moe_inter));
+  return R * W + R * W / 32 + 3 * R * c.moe_inter * 2 + 2 * R * W * 4;
+}
+
+size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq) {
+  size_t total = expert_scratch_bytes(c, max_tokens);
+  for (size_t b : scratch_sizes(c, max_tokens, max_seq)) total += std::max<size_t>(b, 256);
+  return total;
+}
+
+size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const CacheGeometry& g) {
+  size_t b = size_t(g.max_slots) * c.window * c.head_dim * 2;
+  if (ratio) {
+    const size_t width = size_t(ratio == 4 ? 2 : 1) * c.head_dim, ring = size_t(ratio == 4 ? 8 : ratio);
+    b += 2 * size_t(g.max_slots) * ring * width * 4;
+    b += size_t(g.num_pages) * (kPageTokens / ratio) * c.head_dim * 2;
+  }
+  if (indexer) {
+    b += 2 * size_t(g.max_slots) * 8 * (2 * c.idx_dim) * 4;
+    b += size_t(g.num_pages) * (kPageTokens / 4) * c.idx_dim * 2;
+  }
+  return b;
+}
+
+Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) {
+  const std::vector<size_t> sz = scratch_sizes(c, max_tokens, max_seq);
   Scratch s;
   s.max_tokens = max_tokens;
-  s.max_keys = int(keys);
+  s.max_keys = max_seq / 4 + 1;
   for (size_t i = 0; i < kNumBufs; ++i) s.bufs.emplace_back(dev, std::max<size_t>(sz[i], 256));
+  s.expert = make_expert_scratch(c, dev, max_tokens);
   return s;
 }
+
+ExpertScratch make_expert_scratch(const Dsv4Config& c, int dev, int rows) {
+  const size_t R = size_t(std::max(rows, 1)), W = size_t(std::max(c.dim, c.moe_inter));
+  ExpertScratch s;
+  s.rows = rows;
+  s.qb = rt::DeviceBuffer(dev, R * W);
+  s.qs = rt::DeviceBuffer(dev, R * W / 32);
+  s.h1 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
+  s.h3 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
+  s.hh = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
+  s.xf = rt::DeviceBuffer(dev, R * W * 4);
+  s.y2 = rt::DeviceBuffer(dev, R * W * 4);
+  return s;
+}
+
+void expert_forward(const Dsv4Config& c, const LayerWeights& w, int e, uint16_t* in, const float* rw, int cnt,
+                    uint16_t* out, const ExpertScratch& s, hipStream_t st) {
+  const int D = c.dim, I = c.moe_inter;
+  if (cnt > s.rows) throw std::runtime_error("expert_forward: more rows than scratch");
+  bf16* h1 = s.h1.as<bf16>();
+  bf16* h3 = s.h3.as<bf16>();
+  bf16* hh = s.hh.as<bf16>();
+  if (w.exl3_experts) {
+    // EXL3 weights on the fp8-quantized activations the experts were trained with (A8 fake quant).
+    float* xf = s.xf.as<float>();
+    float* y2 = s.y2.as<float>();
+    auto lin = [&](const Exl3Weights& xw, const bf16* x, int in_dim, bf16* y, int out_dim) {
+      k::exl3_in(x, in_dim, xw.suh.p<uint16_t>(), xf, cnt, in_dim, st);
+      k::gemm_exl3_inner(xf, xw.trellis.p<uint16_t>(), xw.bits, y2, cnt, out_dim, in_dim, st);
+      k::exl3_out(y2, xw.svh.p<uint16_t>(), y, out_dim, cnt, out_dim, st);
+    };
+    k::fake_quant_fp8(in, D, cnt, D, 128, st);
+    lin(w.x1[size_t(e)], in, D, h1, I);
+    lin(w.x3[size_t(e)], in, D, h3, I);
+    k::swiglu(h1, h3, rw, hh, cnt, I, c.swiglu_limit, st);
+    k::fake_quant_fp8(hh, I, cnt, I, 128, st);
+    lin(w.x2[size_t(e)], hh, I, out, D);
+  } else {
+    uint8_t* qb = s.qb.as<uint8_t>();
+    uint8_t* qs = s.qs.as<uint8_t>();
+    k::act_quant_fp8(in, D, qb, qs, cnt, D, 128, st);
+    k::gemm_a8w4(qb, qs, w.w1[size_t(e)].w.p<uint8_t>(), w.w1[size_t(e)].s.p<uint8_t>(), h1, I, cnt, I, D, st);
+    k::gemm_a8w4(qb, qs, w.w3[size_t(e)].w.p<uint8_t>(), w.w3[size_t(e)].s.p<uint8_t>(), h3, I, cnt, I, D, st);
+    k::swiglu(h1, h3, rw, hh, cnt, I, c.swiglu_limit, st);
+    k::act_quant_fp8(hh, I, qb, qs, cnt, I, 128, st);
+    k::gemm_a8w4(qb, qs, w.w2[size_t(e)].w.p<uint8_t>(), w.w2[size_t(e)].s.p<uint8_t>(), out, D, cnt, D, I, st);
+  }
+}
+
+namespace {
+std::vector<std::vector<uint64_t>>* g_expert_hist = nullptr;
+}
+void set_expert_histogram(std::vector<std::vector<uint64_t>>* hist) { g_expert_hist = hist; }
 
 // ---------------------------------------------------------------------------------------------------
 // Forward
@@ -304,7 +391,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
 }
 
 void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
-              hipStream_t st) {
+              hipStream_t st, RemoteExperts* remote) {
   const int D = c.dim, I = c.moe_inter, E = c.n_experts, K = c.n_active, T = b.T, L = w.layer;
   bf16* y = B<bf16>(scr, kY);
   bf16* f = B<bf16>(scr, kA);
@@ -341,6 +428,12 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   UH_CHECK(hipStreamSynchronize(st));
   std::vector<int> count(size_t(E), 0), off(size_t(E) + 1, 0);
   for (int32_t e : hsel) ++count[size_t(e)];
+  if (g_expert_hist) {
+    if (g_expert_hist->size() <= size_t(L)) g_expert_hist->resize(size_t(L) + 1);
+    auto& hl = (*g_expert_hist)[size_t(L)];
+    hl.resize(size_t(E), 0);
+    for (int e = 0; e < E; ++e) hl[size_t(e)] += uint64_t(count[size_t(e)]);
+  }
   for (int e = 0; e < E; ++e) off[size_t(e) + 1] = off[size_t(e)] + count[size_t(e)];
   std::vector<int32_t> eidx(size_t(T) * K), pidx(size_t(T) * K);
   std::vector<float> ewt(size_t(T) * K);
@@ -365,41 +458,40 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   UH_CHECK(hipMemcpyAsync(dpidx, pidx.data(), pidx.size() * 4, hipMemcpyHostToDevice, st));
 
   bf16* pair_out = B<bf16>(scr, kPairOut);
-  bf16* g = B<bf16>(scr, kG);
+  bf16* pair_in = B<bf16>(scr, kPairIn);
+  const int P = T * K;
+  k::gather_rows(f, deidx, pair_in, P, D, st);
+  // Experts this device does not hold: ship every pair's input once (the remote side only reads the
+  // rows of its jobs); local experts are queued meanwhile and overlap the remote computation.
+  std::vector<RemoteExperts::Job> jobs;
+  for (int e = 0; e < E; ++e)
+    if (count[size_t(e)] && !w.has_expert(e)) jobs.push_back({e, off[size_t(e)], count[size_t(e)]});
+  hipEvent_t shipped = nullptr;
+  if (!jobs.empty()) {
+    if (!remote) throw std::runtime_error("moe: experts missing on this device and no remote backend");
+    if (size_t(P) > remote->capacity_rows) throw std::runtime_error("moe: remote staging too small");
+    UH_CHECK(hipMemcpyAsync(remote->in_host, pair_in, size_t(P) * D * 2, hipMemcpyDeviceToHost, st));
+    std::copy(ewt.begin(), ewt.end(), remote->w_host);
+    UH_CHECK(hipEventCreateWithFlags(&shipped, hipEventDisableTiming));
+    UH_CHECK(hipEventRecord(shipped, st));
+  }
+  for (int e = 0; e < E; ++e) {
+    const int cnt = count[size_t(e)];
+    if (!cnt || !w.has_expert(e)) continue;
+    const size_t o = size_t(off[size_t(e)]);
+    expert_forward(c, w, e, pair_in + o * D, dewt + o, cnt, pair_out + o * D, scr.expert, st);
+  }
+  if (!jobs.empty()) {
+    UH_CHECK(hipEventSynchronize(shipped));
+    UH_CHECK(hipEventDestroy(shipped));
+    remote->run(L, jobs);
+    for (const auto& j : jobs)
+      UH_CHECK(hipMemcpyAsync(pair_out + size_t(j.row0) * D, remote->out_host + size_t(j.row0) * D,
+                              size_t(j.cnt) * D * 2, hipMemcpyHostToDevice, st));
+  }
   bf16* h1 = B<bf16>(scr, kH1);
   bf16* h3 = B<bf16>(scr, kH3);
   bf16* hh = B<bf16>(scr, kHH);
-  for (int e = 0; e < E; ++e) {
-    const int cnt = count[size_t(e)];
-    if (!cnt) continue;
-    const int32_t* rows = deidx + off[size_t(e)];
-    const float* rw = dewt + off[size_t(e)];
-    bf16* oe = pair_out + size_t(off[size_t(e)]) * D;
-    k::gather_rows(f, rows, g, cnt, D, st);
-    if (w.exl3_experts) {
-      // EXL3 weights on the fp8-quantized activations the experts were trained with (A8 fake quant).
-      float* xf = B<float>(scr, kAF);
-      float* y2 = B<float>(scr, kY2F);
-      auto lin = [&](const Exl3Weights& xw, const bf16* in, int in_dim, bf16* out, int out_dim) {
-        k::exl3_in(in, in_dim, xw.suh.p<uint16_t>(), xf, cnt, in_dim, st);
-        k::gemm_exl3_inner(xf, xw.trellis.p<uint16_t>(), xw.bits, y2, cnt, out_dim, in_dim, st);
-        k::exl3_out(y2, xw.svh.p<uint16_t>(), out, out_dim, cnt, out_dim, st);
-      };
-      k::fake_quant_fp8(g, D, cnt, D, 128, st);
-      lin(w.x1[size_t(e)], g, D, h1, I);
-      lin(w.x3[size_t(e)], g, D, h3, I);
-      k::swiglu(h1, h3, rw, hh, cnt, I, c.swiglu_limit, st);
-      k::fake_quant_fp8(hh, I, cnt, I, 128, st);
-      lin(w.x2[size_t(e)], hh, I, oe, D);
-    } else {
-      k::act_quant_fp8(g, D, qb, qs, cnt, D, 128, st);
-      k::gemm_a8w4(qb, qs, w.w1[size_t(e)].w.p<uint8_t>(), w.w1[size_t(e)].s.p<uint8_t>(), h1, I, cnt, I, D, st);
-      k::gemm_a8w4(qb, qs, w.w3[size_t(e)].w.p<uint8_t>(), w.w3[size_t(e)].s.p<uint8_t>(), h3, I, cnt, I, D, st);
-      k::swiglu(h1, h3, rw, hh, cnt, I, c.swiglu_limit, st);
-      k::act_quant_fp8(hh, I, qb, qs, cnt, I, 128, st);
-      k::gemm_a8w4(qb, qs, w.w2[size_t(e)].w.p<uint8_t>(), w.w2[size_t(e)].s.p<uint8_t>(), oe, D, cnt, D, I, st);
-    }
-  }
   // Shared expert (fp8 weights, no routing weight).
   bf16* shared = B<bf16>(scr, kShared);
   k::act_quant_fp8(f, D, qb, qs, T, D, 128, st);
@@ -419,14 +511,14 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
 }  // namespace
 
 void layer_forward(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
-                   const RopeTables& rope, uint16_t* x, const BatchDesc& b, hipStream_t st) {
+                   const RopeTables& rope, uint16_t* x, const BatchDesc& b, hipStream_t st, RemoteExperts* remote) {
   if (b.T > scr.max_tokens) throw std::runtime_error("layer_forward: batch larger than scratch");
   for (const auto& ch : b.chunks) {
     if ((ch.s0 + ch.n) / 4 > scr.max_keys) throw std::runtime_error("layer_forward: context larger than scratch");
     if (ch.slot < 0 || ch.slot >= cache.slots) throw std::runtime_error("layer_forward: bad slot");
   }
   attention_half(c, w, cache, scr, rope, x, b, st);
-  moe_half(c, w, scr, x, b, st);
+  moe_half(c, w, scr, x, b, st, remote);
 }
 
 }  // namespace unholy::model
