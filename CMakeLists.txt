@@ -41,4 +41,23 @@ add_executable(unholy-probe tools/probe/probe.hip)
 set_source_files_properties(tools/probe/probe.hip PROPERTIES LANGUAGE HIP)
 target_link_libraries(unholy-probe PRIVATE unholy_host hip::host)
 
-install(TARGETS unholy-probe unholy-ckpt RUNTIME DESTINATION bin)
+# Reference kernels + the DSV4 reference model path.
+add_library(unholy_ref STATIC
+  src/kernels/ref_gemm.hip
+  src/kernels/ref_elem.hip
+  src/kernels/ref_attn.hip
+  src/kernels/ref_moe.hip
+  src/model/dsv4.hip
+  src/model/loader.hip
+)
+target_include_directories(unholy_ref PUBLIC src third_party)
+target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)
+
+add_executable(unholy-layer-test tools/layer_test/main.hip)
+target_link_libraries(unholy-layer-test PRIVATE unholy_ref)
+
+install(TARGETS unholy-probe unholy-ckpt unholy-layer-test RUNTIME DESTINATION bin)
+
+add_executable(unholy-ref-run tools/ref_run/main.hip)
+target_link_libraries(unholy-ref-run PRIVATE unholy_ref)
+install(TARGETS unholy-ref-run RUNTIME DESTINATION bin)

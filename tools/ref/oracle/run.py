@@ -73,6 +73,67 @@ def load_params(module, prefix, ck, dev):
             p.data.copy_(t.to(dev).to(p.dtype))
 
 
+def install_capture(block, d):
+    """Save the prefill-call intermediates of one block (first call only) as raw files: bf16 as
+    uint16, fp32/int as is. Names match the engine's UNHOLY_DUMP files."""
+    os.makedirs(d, exist_ok=True)
+    seen = set()
+
+    def save(name, t):
+        if name in seen:
+            return
+        seen.add(name)
+        t = t.detach().contiguous()
+        if t.dtype == torch.bfloat16:
+            t = t.view(torch.uint16)
+        t.cpu().numpy().tofile(os.path.join(d, name + ".bin"))
+
+    orig_pre = block.hc_pre
+    calls = {"n": 0}
+
+    def hc_pre(x, fn, scale, base):
+        y, post, comb = orig_pre(x, fn, scale, base)
+        tag = "attn" if calls["n"] % 2 == 0 else "ffn"
+        calls["n"] += 1
+        save(f"hcpre_{tag}_y", y[0]); save(f"hcpre_{tag}_post", post[0]); save(f"hcpre_{tag}_comb", comb[0])
+        return y, post, comb
+    block.hc_pre = hc_pre
+
+    # The attention kernel's exact inputs and output (first call = the prefill).
+    import model as M
+    orig_attn = M.sparse_attn
+
+    def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+        o = orig_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+        save("sa_q", q[0]); save("sa_kv", kv[0]); save("sa_idx", topk_idxs[0]); save("sa_o", o[0])
+        return o
+    M.sparse_attn = sparse_attn
+
+    def hook(name, inputs_idx=None):
+        def f(mod, inp, out):
+            if inputs_idx is not None:
+                save(name + "_in", inp[inputs_idx][0])
+            if isinstance(out, tuple):
+                for i, o in enumerate(out):
+                    if torch.is_tensor(o):
+                        save(f"{name}_out{i}", o[0] if o.dim() > 2 else o)
+            elif torch.is_tensor(out):
+                save(name + "_out", out[0] if out.dim() > 2 else out)
+        return f
+    block.attn.register_forward_hook(hook("attn", 0))
+    block.ffn.register_forward_hook(hook("ffn", 0))
+    block.ffn.gate.register_forward_hook(hook("gate"))
+    block.ffn.shared_experts.register_forward_hook(hook("shared"))
+    block.attn.wq_a.register_forward_hook(hook("wq_a"))
+    block.attn.wq_b.register_forward_hook(hook("wq_b"))
+    block.attn.wkv.register_forward_hook(hook("wkv"))
+    block.attn.wo_b.register_forward_hook(hook("wo_b", 0))
+    if getattr(block.attn, "compressor", None) is not None:
+        block.attn.compressor.register_forward_hook(hook("comp"))
+    if getattr(block.attn, "indexer", None) is not None:
+        block.attn.indexer.register_forward_hook(hook("indexer"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="/scratch/dsv4-ve")
@@ -82,6 +143,7 @@ def main():
     ap.add_argument("--layers", type=int, default=None, help="run only the first N layers (no logits)")
     ap.add_argument("--dump-layers", default="all", help="'all', 'none' or comma list")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--capture-layer", type=int, default=-1, help="save intermediates of this layer's prefill")
     args = ap.parse_args()
 
     sys.path.insert(0, HERE)
@@ -124,6 +186,8 @@ def main():
             t0 = time.time()
             block = M.Block(L, margs)
             load_params(block, f"layers.{L}.", ck, dev)
+            if L == args.capture_layer:
+                install_capture(block, os.path.join(args.out, f"cap_{L:03d}"))
             t1 = time.time()
             outs = [block(h[:, :P], 0, input_ids[:, :P])]
             for t in range(P, S):

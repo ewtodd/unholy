@@ -139,3 +139,27 @@ What reading the reference changed in the design (DESIGN.md updated):
   512k slot instead of 3.6 GB);
 - `wo_a` is dequantized to bf16 and run as a bf16 grouped einsum; compressor `wkv`/`wgate`, the
   router and the LM head run in fp32.
+
+## 2026-10-11 — the reference path is correct (KL at the noise floor)
+
+`src/model/dsv4.hip` + `src/kernels/ref_*.hip`: the whole forward in our own C++/HIP, following
+model.py's rounding points, generalised to chunked prefill (window ring, compressor projection rings,
+paged compressed rows, page tables). `unholy-ref-run` streams all 43 layers on one R9700 (1024-token
+prefill + 8 teacher-forced decode steps, 63 s including loading) and compares logits with the oracle:
+
+| comparison (1032 positions, code prompt) | mean KL | median KL | p99 | top-1 agree |
+|---|---|---|---|---|
+| oracle vs oracle with GEMM K-blocks summed in reverse (`ORACLE_PERTURB=1`) | 9.9e-3 | 1.1e-3 | 8.8e-2 | 96.2% |
+| oracle vs unholy reference path | 9.6e-3 | 1.0e-3 | 9.9e-2 | 95.7% |
+
+Every argmax after the prompt matches (2606, 223, 18, 11, 4054, 223, 18, 4658, 1313). The engine is
+as close to the oracle as the oracle is to itself under an equally valid fp32 summation order: the
+fp8-activation QAT design amplifies 1-ulp differences (see the per-layer bisection in STATUS.md), so
+this ~1e-2 mean KL / ~96% top-1 is the floor for any re-implementation, and the reference for judging
+the fast path and the quantization study is "within the noise floor", not "bit-identical".
+
+Loading: mmap + hipMemcpy from pageable memory faulted the 168 GB checkpoint in a page at a time once
+it no longer fit the page cache (20+ min per pass). `src/model/loader.hip`: O_DIRECT reads of
+4 KiB-aligned ranges straight into pinned staging buffers, double-buffered against async H2D copies,
+a layer's ~1500 tensors sorted by offset and coalesced into chunk-sized reads: 0.64 s per 3.6 GB layer
+(~5.6 GB/s), ~30 s for the whole checkpoint.

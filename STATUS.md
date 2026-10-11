@@ -30,3 +30,28 @@ nix develop -c ./build/unholy-probe --json probe.json
 - [x] checkpoint reader + CPU reference decoders: native (MXFP4, fp8 block-scaled) and EXL3 (bit-exact vs exllamav3)
 - [ ] device weight loader (placement-driven upload)
 - [ ] memory planner dry-run against the probe JSON (4 x 512k slots, hot/cold expert split)
+
+## Milestone 2 (correct forward)
+
+- [x] oracle: DeepSeek's model.py layer-streamed on one R9700 (`tools/ref/oracle`), 2606/223/18/11/4054
+- [x] reference kernels (`src/kernels/ref_*.hip`) and the reference layer forward (`src/model/dsv4.hip`):
+      reference rounding points, chunked prefill, window ring + compressor rings + paged compressed rows
+- [x] per-layer comparison against the oracle (`unholy-layer-test`) and intermediate dumps
+      (`UNHOLY_DUMP`, `tools/ref/compare_dump.py`)
+- [x] full-model logits vs oracle (`unholy-ref-run`): mean KL 9.6e-3, top-1 95.7% vs the oracle's own
+      noise floor 9.9e-3 / 96.2% (DECISIONS 2026-10-11) — correct
+- [ ] DSpark (the checkpoint's `mtp.*` block drafter) on the reference path
+
+### Reference path vs oracle, per layer (1024 prefill + 8 decode, code prompt)
+
+| layer | type | prefill rel L2 | decode rel L2 | bit-identical |
+|---|---|---|---|---|
+| 0 | window, hash-routed | 1.1e-2 | 1.3e-2 | 73% |
+| 2 | CSA, hash-routed | 4.5e-3 | 3.1e-3 | 59% |
+| 3 | HCA | 7.7e-3 | 5.2e-3 | 44% |
+
+Bisected on layer 0 (`compare_dump.py`): projections 99.9% bit-identical; the attention kernel on the
+oracle's exact inputs 98.5% (rel 4e-4); the wo_a einsum turns the 1.5% one-ulp differences into 12%
+(K = 4096 sums); every fp8 activation quantization then amplifies ~3x (an e4m3 step is 12.5%, so a
+0.4% input change flips some roundings): wo_b 3e-3, MoE input 3.8e-3, MoE output 1.2e-2. Inherent to
+re-implementing a QAT'd fp8-activation model with a different fp32 summation order; judged end to end.

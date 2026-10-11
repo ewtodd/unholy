@@ -13,7 +13,13 @@ function reproduces the reference kernel's arithmetic, not just its math:
 
 Only the fp32 summation order inside a block differs from the tensor-core kernels.
 """
+import os
+
 import torch
+
+# ORACLE_PERTURB=1: sum the GEMM K-blocks in reverse order. Equally valid arithmetic; the KL between a
+# perturbed and an unperturbed run is the noise floor any re-implementation is judged against.
+_PERTURB = os.environ.get("ORACLE_PERTURB", "0") == "1"
 
 F32 = torch.float32
 BF16 = torch.bfloat16
@@ -82,7 +88,7 @@ def fp8_gemm(a, a_s, b, b_s, scale_dtype=F32):
     sa = a_s.reshape(M, -1).float()
     sb = b_s.float().repeat_interleave(128, dim=0)[:N]  # [N, K/128]
     C = torch.zeros(M, N, dtype=F32, device=a.device)
-    for k in range(K // 128):
+    for k in (reversed(range(K // 128)) if _PERTURB else range(K // 128)):
         part = A[:, k * 128:(k + 1) * 128] @ B[:, k * 128:(k + 1) * 128].T
         C += part * (sa[:, k:k + 1] * sb[:, k][None, :])
     return C.to(torch.get_default_dtype()).view(*a.shape[:-1], N)
@@ -107,7 +113,8 @@ def fp4_gemm(a, a_s, b, b_s, scale_dtype=F32):
     sa = a_s.reshape(M, -1).float().repeat_interleave(4, dim=1)  # [M, K/32]
     sb = b_s.float()  # [N, K/32]
     part = torch.einsum("mbk,nbk->mnb", A, B)  # fp32 per-32 partial sums
-    C = (part * sa[:, None, :] * sb[None, :, :]).sum(-1)
+    scaled = part * sa[:, None, :] * sb[None, :, :]
+    C = scaled.flip(-1).sum(-1) if _PERTURB else scaled.sum(-1)
     return C.to(torch.get_default_dtype()).view(*a.shape[:-1], N)
 
 
