@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -45,7 +46,7 @@ rt::DeviceBuffer upload(model::Uploader& up, const model::Checkpoint& ck, const 
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string ckpt = "/scratch/dsv4-ve", oracle, out_path;
+  std::string ckpt = "/scratch/dsv4-ve", oracle, exl3_dir, out_path;
   int chunk = 0, dev = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -54,6 +55,7 @@ int main(int argc, char** argv) {
     else if (a == "--oracle") oracle = next();
     else if (a == "--chunk") chunk = std::stoi(next());
     else if (a == "--device") dev = std::stoi(next());
+    else if (a == "--exl3") exl3_dir = next();
     else if (a == "--out") out_path = next();
     else {
       std::fprintf(stderr, "usage: %s --oracle DIR [--ckpt DIR] [--chunk C] [--device D] [--out F]\n", argv[0]);
@@ -62,6 +64,8 @@ int main(int argc, char** argv) {
   }
   try {
     auto ck = model::Checkpoint::open(ckpt);
+    std::unique_ptr<model::Checkpoint> xck;
+    if (!exl3_dir.empty()) xck = model::Checkpoint::open(exl3_dir);
     const auto c = model::Dsv4Config::from_hf(ck->config());
     const auto meta = gufo::json::parse(read_text(oracle + "/meta.json"));
     const int S = int(meta.member_size("S")), P = int(meta.member_size("prompt"));
@@ -74,6 +78,8 @@ int main(int argc, char** argv) {
     hipStream_t st;
     UH_CHECK(hipStreamCreate(&st));
     model::Uploader up(*ck);
+    std::unique_ptr<model::Uploader> xup;
+    if (xck) xup = std::make_unique<model::Uploader>(*xck);
     const int max_seq = (S + 255) / 256 * 256;
     auto scr = model::make_scratch(c, dev, std::max(chunk, 1), max_seq);
     auto rope = model::make_rope_tables(c, dev, max_seq + 128);
@@ -92,7 +98,7 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     for (int L = 0; L < c.n_layers; ++L) {
       const auto tl = std::chrono::steady_clock::now();
-      auto w = model::load_layer(*ck, c, L, dev, st, &up);
+      auto w = model::load_layer(*ck, c, L, dev, st, &up, xck.get(), xup.get());
       auto state = model::make_layer_state(c, w, dev, max_seq, st);
       auto run = [&](int s0, int n) {
         model::layer_forward(c, w, state, scr, rope, x.as<uint16_t>() + size_t(s0) * row, dids.as<int32_t>() + s0,

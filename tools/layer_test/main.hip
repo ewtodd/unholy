@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,7 +56,7 @@ struct Stats {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string ckpt = "/scratch/dsv4-ve", oracle;
+  std::string ckpt = "/scratch/dsv4-ve", oracle, exl3_dir;
   int layer = 0, chunk = 0, dev = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -65,6 +66,7 @@ int main(int argc, char** argv) {
     else if (a == "--layer") layer = std::stoi(next());
     else if (a == "--chunk") chunk = std::stoi(next());
     else if (a == "--device") dev = std::stoi(next());
+    else if (a == "--exl3") exl3_dir = next();
     else {
       std::fprintf(stderr, "usage: %s --oracle DIR --layer L [--ckpt DIR] [--chunk C] [--device D]\n", argv[0]);
       return 2;
@@ -72,6 +74,8 @@ int main(int argc, char** argv) {
   }
   try {
     auto ck = model::Checkpoint::open(ckpt);
+    std::unique_ptr<model::Checkpoint> xck;
+    if (!exl3_dir.empty()) xck = model::Checkpoint::open(exl3_dir);
     const Dsv4Config c = Dsv4Config::from_hf(ck->config());
     const auto meta = gufo::json::parse(read_text(oracle + "/meta.json"));
     const int S = int(meta.member_size("S")), P = int(meta.member_size("prompt"));
@@ -84,7 +88,7 @@ int main(int argc, char** argv) {
     hipStream_t st;
     UH_CHECK(hipStreamCreate(&st));
     const auto t0 = std::chrono::steady_clock::now();
-    const auto w = model::load_layer(*ck, c, layer, dev, st);
+    const auto w = model::load_layer(*ck, c, layer, dev, st, nullptr, xck.get());
     const auto t1 = std::chrono::steady_clock::now();
     const int max_seq = (S + 255) / 256 * 256;
     auto state = model::make_layer_state(c, w, dev, max_seq, st);

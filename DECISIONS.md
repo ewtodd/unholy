@@ -163,3 +163,23 @@ it no longer fit the page cache (20+ min per pass). `src/model/loader.hip`: O_DI
 4 KiB-aligned ranges straight into pinned staging buffers, double-buffered against async H2D copies,
 a layer's ~1500 tensors sorted by offset and coalesced into chunk-sized reads: 0.64 s per 3.6 GB layer
 (~5.6 GB/s), ~30 s for the whole checkpoint.
+
+## 2026-10-11 — first quant number: EXL3 3.04 experts
+
+`src/kernels/ref_exl3.hip`: reference EXL3 linear (H(H(x*suh) W_inner)*svh in fp32, W_inner decoded
+from the trellis in the GEMM loader); `load_layer(..., exl3=...)` takes the routed experts from the
+EXL3 checkpoint, everything else native (fp8 attention/shared experts). The expert inputs keep the
+fp8 fake quantization the experts were trained with (A8), so only the weights change.
+
+`unholy-ref-run --exl3 /scratch/models/dsv4-ve-exl3-3.04bpw` vs the native-MXFP4 oracle, code prompt,
+1032 positions:
+
+| | mean KL | median KL | p99 | top-1 agree |
+|---|---|---|---|---|
+| noise floor (oracle vs reordered oracle) | 9.9e-3 | 1.1e-3 | 8.8e-2 | 96.2% |
+| native experts (reference path) | 9.6e-3 | 1.0e-3 | 9.9e-2 | 95.7% |
+| **EXL3 3.04 experts** | **2.7e-2** | 3.4e-3 | 3.1e-1 | 92.7% |
+
+All 9 post-prompt argmaxes still match. 3-bit experts cost ~1.7e-2 nats over the floor on this
+prompt. One prompt type only; the quant study needs a mixed eval set (prose, chat, math, code, long
+context) and per-expert mixes (MXFP4 for the most-used / most-sensitive experts).

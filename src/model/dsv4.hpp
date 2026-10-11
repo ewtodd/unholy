@@ -65,6 +65,10 @@ struct Fp4Linear {  // packed e2m1 [out, in/2] + e8m0 [out, in/32]
   DevTensor w, s;
   int out = 0, in = 0;
 };
+struct Exl3Weights {  // EXL3 linear (trellis I16, suh/svh F16), mul1 codebook
+  DevTensor trellis, suh, svh;
+  int in = 0, out = 0, bits = 0;
+};
 struct CompressorWeights {
   DevTensor wkv, wgate, ape, norm;  // bf16 [coff*d, dim], bf16, f32 [ratio, coff*d], bf16 [d]
   int ratio = 0, d = 0;
@@ -87,14 +91,17 @@ struct LayerWeights {
   std::optional<CompressorWeights> idx_comp;
   DevTensor gate_w, gate_bias, tid2eid;  // bf16 [E, dim], f32 [E], int32 [vocab, K]
   std::vector<Fp4Linear> w1, w2, w3;     // routed experts
+  bool exl3_experts = false;              // routed experts in EXL3 instead (x1, x2, x3)
+  std::vector<Exl3Weights> x1, x2, x3;
   Fp8Linear sw1, sw2, sw3;               // shared expert
 };
 
 class Uploader;
 // Loads one layer's weights to `dev` (coalesced O_DIRECT reads; pass an Uploader to reuse its
 // pinned staging across layers).
+// `exl3`: take the routed experts from this EXL3 checkpoint instead of the native MXFP4 ones.
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
-                        Uploader* up = nullptr);
+                        Uploader* up = nullptr, const Checkpoint* exl3 = nullptr, Uploader* exl3_up = nullptr);
 
 // Per-sequence, per-layer state. Compressed rows are addressed through page tables (identity for
 // now) so the kernels already work on paged pools.

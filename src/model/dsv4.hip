@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "kernels/ref.hpp"
+#include "model/exl3.hpp"
 #include "model/loader.hpp"
 
 namespace unholy::model {
@@ -178,6 +179,19 @@ Fp4Linear fp4(LoadCtx& lc, const std::string& prefix) {
   return l;
 }
 
+Exl3Weights exl3_linear(LoadCtx& lc, const std::string& prefix) {
+  const auto info = find_exl3_linear(lc.ck, prefix);  // validates shapes and the mul1 marker
+  if (!info || info->cb != Exl3Codebook::Mul1) throw std::runtime_error(prefix + ": not an EXL3 mul1 linear");
+  Exl3Weights x;
+  x.trellis = upload(lc, prefix + ".trellis");
+  x.suh = upload(lc, prefix + ".suh");
+  x.svh = upload(lc, prefix + ".svh");
+  x.in = info->in_features;
+  x.out = info->out_features;
+  x.bits = info->K;
+  return x;
+}
+
 CompressorWeights compressor(LoadCtx& lc, const std::string& prefix, int ratio, int d, bool rotate) {
   CompressorWeights cw;
   cw.wkv = upload(lc, prefix + ".wkv.weight");
@@ -195,7 +209,7 @@ CompressorWeights compressor(LoadCtx& lc, const std::string& prefix, int ratio, 
 }  // namespace
 
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
-                        Uploader* up) {
+                        Uploader* up, const Checkpoint* exl3, Uploader* exl3_up) {
   const std::string p = "layers." + std::to_string(layer) + ".";
   LoadCtx lc{ck, dev, {}};
   LayerWeights w;
@@ -228,11 +242,19 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
   w.gate_w = upload(lc, p + "ffn.gate.weight");
   w.gate_bias = upload(lc, p + "ffn.gate.bias");
   if (w.hash) w.tid2eid = upload_i64_as_i32(lc, p + "ffn.gate.tid2eid");
+  LoadCtx lx{exl3 ? *exl3 : ck, dev, {}};
+  w.exl3_experts = exl3 != nullptr;
   for (int e = 0; e < c.n_experts; ++e) {
     const std::string ep = p + "ffn.experts." + std::to_string(e) + ".";
-    w.w1.push_back(fp4(lc, ep + "w1"));
-    w.w2.push_back(fp4(lc, ep + "w2"));
-    w.w3.push_back(fp4(lc, ep + "w3"));
+    if (exl3) {
+      w.x1.push_back(exl3_linear(lx, ep + "w1"));
+      w.x2.push_back(exl3_linear(lx, ep + "w2"));
+      w.x3.push_back(exl3_linear(lx, ep + "w3"));
+    } else {
+      w.w1.push_back(fp4(lc, ep + "w1"));
+      w.w2.push_back(fp4(lc, ep + "w2"));
+      w.w3.push_back(fp4(lc, ep + "w3"));
+    }
   }
   w.sw1 = fp8(lc, p + "ffn.shared_experts.w1");
   w.sw2 = fp8(lc, p + "ffn.shared_experts.w2");
@@ -246,6 +268,15 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
   }
   up->upload_many(std::move(lc.items), st);
   up->sync();
+  if (exl3) {
+    std::unique_ptr<Uploader> own_x;
+    if (!exl3_up) {
+      own_x = std::make_unique<Uploader>(*exl3);
+      exl3_up = own_x.get();
+    }
+    exl3_up->upload_many(std::move(lx.items), st);
+    exl3_up->sync();
+  }
   return w;
 }
 
@@ -286,7 +317,7 @@ namespace {
 
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
-  kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kOE, kEIdx, kEWt, kNumBufs
+  kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kOE, kEIdx, kEWt, kY2F, kNumBufs
 };
 
 }  // namespace
@@ -330,6 +361,7 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   sz[kOE] = N * c.dim * 2;
   sz[kEIdx] = N * c.n_active * 4;
   sz[kEWt] = N * c.n_active * 4;
+  sz[kY2F] = N * c.dim * 4;
   Scratch s;
   s.max_tokens = max_tokens;
   s.max_keys = int(keys);
@@ -571,12 +603,29 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
     if (!cnt) continue;
     const int32_t* rows = deidx + off[size_t(e)];
     k::gather_rows(f, rows, g, cnt, D, st);
-    k::act_quant_fp8(g, D, qb, qs, cnt, D, 128, st);
-    k::gemm_a8w4(qb, qs, w.w1[size_t(e)].w.p<uint8_t>(), w.w1[size_t(e)].s.p<uint8_t>(), h1, I, cnt, I, D, st);
-    k::gemm_a8w4(qb, qs, w.w3[size_t(e)].w.p<uint8_t>(), w.w3[size_t(e)].s.p<uint8_t>(), h3, I, cnt, I, D, st);
-    k::swiglu(h1, h3, dewt + off[size_t(e)], hh, cnt, I, c.swiglu_limit, st);
-    k::act_quant_fp8(hh, I, qb, qs, cnt, I, 128, st);
-    k::gemm_a8w4(qb, qs, w.w2[size_t(e)].w.p<uint8_t>(), w.w2[size_t(e)].s.p<uint8_t>(), oe, D, cnt, D, I, st);
+    if (w.exl3_experts) {
+      // EXL3 weights on the fp8-quantized activations the experts were trained with (A8 fake quant).
+      float* xf = B<float>(scr, kAF);
+      float* y2 = B<float>(scr, kY2F);
+      auto lin = [&](const Exl3Weights& xw, const bf16* in, int in_dim, bf16* out, int out_dim) {
+        k::exl3_in(in, in_dim, xw.suh.p<uint16_t>(), xf, cnt, in_dim, st);
+        k::gemm_exl3_inner(xf, xw.trellis.p<uint16_t>(), xw.bits, y2, cnt, out_dim, in_dim, st);
+        k::exl3_out(y2, xw.svh.p<uint16_t>(), out, out_dim, cnt, out_dim, st);
+      };
+      k::fake_quant_fp8(g, D, cnt, D, 128, st);
+      lin(w.x1[size_t(e)], g, D, h1, I);
+      lin(w.x3[size_t(e)], g, D, h3, I);
+      k::swiglu(h1, h3, dewt + off[size_t(e)], hh, cnt, I, c.swiglu_limit, st);
+      k::fake_quant_fp8(hh, I, cnt, I, 128, st);
+      lin(w.x2[size_t(e)], hh, I, oe, D);
+    } else {
+      k::act_quant_fp8(g, D, qb, qs, cnt, D, 128, st);
+      k::gemm_a8w4(qb, qs, w.w1[size_t(e)].w.p<uint8_t>(), w.w1[size_t(e)].s.p<uint8_t>(), h1, I, cnt, I, D, st);
+      k::gemm_a8w4(qb, qs, w.w3[size_t(e)].w.p<uint8_t>(), w.w3[size_t(e)].s.p<uint8_t>(), h3, I, cnt, I, D, st);
+      k::swiglu(h1, h3, dewt + off[size_t(e)], hh, cnt, I, c.swiglu_limit, st);
+      k::act_quant_fp8(hh, I, qb, qs, cnt, I, 128, st);
+      k::gemm_a8w4(qb, qs, w.w2[size_t(e)].w.p<uint8_t>(), w.w2[size_t(e)].s.p<uint8_t>(), oe, D, cnt, D, I, st);
+    }
     k::scatter_add(oe, rows, yf, cnt, D, st);
   }
   // Shared expert (fp8 weights, no routing weight).

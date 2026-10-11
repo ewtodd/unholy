@@ -123,6 +123,14 @@ void swiglu(const bf16* gate, const bf16* up, const float* w, bf16* h, int rows,
 void scatter_add(const bf16* src, const int32_t* rows_idx, float* y, int n, int dim, hipStream_t st);
 void gather_rows(const bf16* src, const int32_t* rows_idx, bf16* dst, int n, int dim, hipStream_t st);
 void add_bf16_to_f32(const bf16* x, float* y, size_t n, hipStream_t st);
+
+// ---- EXL3 (reference) ------------------------------------------------------------------------------
+// xh [M, K] fp32 = H128(x * suh) per 128-block (suh fp16 [K]).
+void exl3_in(const bf16* x, int ldx, const uint16_t* suh, float* xh, int M, int K, hipStream_t st);
+// c [M, N] fp32 = xh @ W_inner, W_inner decoded from the trellis (I16 [K/16, N/16, 16*bits], mul1 codebook).
+void gemm_exl3_inner(const float* a, const uint16_t* trellis, int bits, float* c, int M, int N, int K, hipStream_t st);
+// out [M, N] bf16 = H128(y) * svh.
+void exl3_out(const float* y, const uint16_t* svh, bf16* out, int ldo, int M, int N, hipStream_t st);
 // x = bf16(x * c) (a bf16 tensor times a Python scalar in torch).
 void scale_bf16(bf16* x, float c, size_t n, hipStream_t st);
 
