@@ -1,0 +1,9 @@
+unholy
+Copyright 2026 Ethan Todd
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+Third-party code is credited here as it is taken, with its license. Sources the design draws on
+(no code copied yet): gufo (MIT), antirez ds4.c (MIT), exllamav3 (MIT), Strata (MIT),
+llama.cpp / ggml and the llama-halo-hybrid ds4-hybrid branch (MIT), vLLM and sglang
+(Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0).

@@ -1,0 +1,48 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791594108,
+        "narHash": "sha256-XK4KceonkwD8LuMAt/vNrz982mXJM5jeHAxMwsUXXAQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "6510408d147d8c5e6d76043e899e9251756f6a75",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "therock-sdk": "therock-sdk"
+      }
+    },
+    "therock-sdk": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791475071,
+        "narHash": "sha256-bJlR/zOcncvylCrzcX3krFa3T1Cby4kmA7d7nNVx/Wk=",
+        "owner": "ewtodd",
+        "repo": "therock-sdk-nix",
+        "rev": "b11e0906c272f12f15c51933daa33c1627401001",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ewtodd",
+        "repo": "therock-sdk-nix",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
