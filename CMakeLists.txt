@@ -52,6 +52,7 @@ add_library(unholy_ref STATIC
   src/model/loader.hip
   src/kernels/ref_exl3.hip
   src/kernels/exl3_moe.hip
+  src/kernels/gemm_wmma.hip
 )
 target_include_directories(unholy_ref PUBLIC src third_party)
 target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)

@@ -242,3 +242,14 @@ Results: one layer (3, HCA) vs the oracle is identical to the reference EXL3 pat
 (prefill rel 3.592e-2 both; the difference is the fp16 rounding of the transformed input); resident
 model, code prompt: KL 2.52e-2 (reference EXL3 path 2.67e-2), prefill 1024 tokens 27.5 -> 8.0 s,
 decode 1.0 -> 0.47 s/token, load 38 -> 22 s.
+
+## 2026-10-11 — WMMA dense GEMMs
+
+`src/kernels/gemm_wmma.hip`: fp8 x fp8 WMMA (gfx12) for every W8A8 linear, with the reference's
+structure kept exactly (each 128-wide K block accumulates in a raw WMMA accumulator, folded into the
+output with sa[m][kb] * sw[n/128][kb] at the block end); bf16 WMMA (gfx11 + gfx12) for the fp32
+linears whose inputs are bf16-valued (compressor projections, router, head: products exact, only
+summation order differs), the indexer weights and the grouped wo_a (fp8 x 128x128 scale dequantized
+to bf16 in LDS, exact). Dispatch in forward_ref (`UNHOLY_REF_DENSE=1` keeps the references).
+Layer 2 vs oracle unchanged (prefill rel 4.56e-3 vs 4.48e-3); resident EXL3 model: KL 2.64e-2,
+prefill 1024 tokens 8.0 -> 6.67 s, decode 0.47 -> 0.24 s/token.

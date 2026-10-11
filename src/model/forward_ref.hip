@@ -8,6 +8,7 @@
 #include <string>
 
 #include "kernels/exl3_moe.hpp"
+#include "kernels/gemm_wmma.hpp"
 #include "kernels/ref.hpp"
 
 namespace unholy::model {
@@ -267,6 +268,47 @@ void set_expert_histogram(std::vector<std::vector<uint64_t>>* hist) { g_expert_h
 
 namespace {
 
+// Dense dispatch: WMMA kernels unless UNHOLY_REF_DENSE=1 (fp8 WMMA needs gfx12).
+bool fast_dense() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_REF_DENSE");
+    return !v || std::string(v) == "0";
+  }();
+  return on;
+}
+bool on_gfx12() {
+  static int arch[64] = {};
+  int dev = 0;
+  UH_CHECK(hipGetDevice(&dev));
+  if (!arch[dev]) {
+    hipDeviceProp_t p{};
+    UH_CHECK(hipGetDeviceProperties(&p, dev));
+    arch[dev] = std::string(p.gcnArchName).rfind("gfx12", 0) == 0 ? 2 : 1;
+  }
+  return arch[dev] == 2;
+}
+void dense_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
+                int N, int K, hipStream_t st) {
+  if (fast_dense() && on_gfx12()) k::gemm_w8a8_wmma(a, sa, w, sw, c, ldc, M, N, K, st);
+  else k::gemm_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
+}
+// The reference's fp32 linears on x.float() of a bf16 tensor: bf16 WMMA on the bf16 source is exact in
+// the products; the reference kernel takes the fp32 copy.
+void dense_f32(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w, float* c, int ldc, int M, int N,
+               int K, hipStream_t st) {
+  if (fast_dense()) k::gemm_bf16_f32out_wmma(a_bf16, lda, w, c, ldc, M, N, K, st);
+  else k::gemm_f32(a_f32, lda, w, c, ldc, M, N, K, st);
+}
+void dense_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
+  if (fast_dense()) k::gemm_bf16_wmma(a, lda, w, c, ldc, M, N, K, st);
+  else k::gemm_bf16(a, lda, w, c, ldc, M, N, K, st);
+}
+void dense_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16* c, int M, int G, int R, int K,
+                        hipStream_t st) {
+  if (fast_dense()) k::gemm_grouped_fp8w_wmma(a, w, sw, c, M, G, R, K, st);
+  else k::gemm_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
+}
+
 // UNHOLY_DUMP=dir: raw intermediates of batches whose first chunk starts at position 0, named like
 // the oracle's captures (tools/ref/oracle/run.py --capture-layer), for tools/ref/compare_dump.py.
 void dump(int layer, const BatchDesc& b, const char* name, const void* dptr, size_t bytes, hipStream_t st) {
@@ -326,8 +368,8 @@ void compressor_proj(const Dsv4Config& c, const CompressorWeights& cw, const Scr
   const int width = cw.width();
   float* pk = B<float>(scr, kPK);
   float* ps = B<float>(scr, kPS);
-  k::gemm_f32(B<float>(scr, kAF), c.dim, cw.wkv.p<bf16>(), pk, width, b.T, width, c.dim, st);
-  k::gemm_f32(B<float>(scr, kAF), c.dim, cw.wgate.p<bf16>(), ps, width, b.T, width, c.dim, st);
+  dense_f32(B<bf16>(scr, kA), B<float>(scr, kAF), c.dim, cw.wkv.p<bf16>(), pk, width, b.T, width, c.dim, st);
+  dense_f32(B<bf16>(scr, kA), B<float>(scr, kAF), c.dim, cw.wgate.p<bf16>(), ps, width, b.T, width, c.dim, st);
   for (const auto& ch : b.chunks) k::add_ape(ps + size_t(ch.t0) * width, cw.ape.p<float>(), ch.s0, ch.n, cw.ratio, width, st);
 }
 
@@ -357,13 +399,13 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   bf16* q = B<bf16>(scr, kQ);
   bf16* kv = B<bf16>(scr, kKV);
   k::act_quant_fp8(a, D, qb, qs, T, D, 128, st);
-  k::gemm_w8a8(qb, qs, w.wq_a.w.p<uint8_t>(), w.wq_a.s.p<uint8_t>(), qa, c.q_lora, T, c.q_lora, D, st);
+  dense_w8a8(qb, qs, w.wq_a.w.p<uint8_t>(), w.wq_a.s.p<uint8_t>(), qa, c.q_lora, T, c.q_lora, D, st);
   dump(L, b, "wq_a_out", qa, size_t(T) * c.q_lora * 2, st);
-  k::gemm_w8a8(qb, qs, w.wkv.w.p<uint8_t>(), w.wkv.s.p<uint8_t>(), kv, HD, T, HD, D, st);
+  dense_w8a8(qb, qs, w.wkv.w.p<uint8_t>(), w.wkv.s.p<uint8_t>(), kv, HD, T, HD, D, st);
   dump(L, b, "wkv_out", kv, size_t(T) * HD * 2, st);
   k::rmsnorm(qa, c.q_lora, w.q_norm.p<bf16>(), qr, c.q_lora, T, c.q_lora, c.norm_eps, st);
   k::act_quant_fp8(qr, c.q_lora, qb, qs, T, c.q_lora, 128, st);
-  k::gemm_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
+  dense_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
   dump(L, b, "wq_b_out", q, size_t(T) * H * HD * 2, st);
   k::head_rms_bf16(q, T, H, HD, c.norm_eps, st);
   k::rope(q, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, false, st);
@@ -377,12 +419,12 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   const int IH = c.idx_heads, ID = c.idx_dim;
   if (w.ratio) k::cast_bf16_f32(a, B<float>(scr, kAF), size_t(T) * D, st);
   if (w.has_indexer) {
-    k::gemm_w8a8(qb, qs, w.idx_wq_b.w.p<uint8_t>(), w.idx_wq_b.s.p<uint8_t>(), qi, IH * ID, T, IH * ID, c.q_lora,
+    dense_w8a8(qb, qs, w.idx_wq_b.w.p<uint8_t>(), w.idx_wq_b.s.p<uint8_t>(), qi, IH * ID, T, IH * ID, c.q_lora,
                  st);
     k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
     k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
     k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
-    k::gemm_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
+    dense_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
     // weights_proj(x) * (softmax_scale * n_heads^-0.5): the Python double, applied as fp32.
     const double wscale = (1.0 / std::sqrt(double(ID))) * (1.0 / std::sqrt(double(IH)));
     k::scale_bf16(wi, float(wscale), size_t(T) * IH, st);
@@ -442,10 +484,10 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   bf16* oa = B<bf16>(scr, kOA);
   bf16* ao = B<bf16>(scr, kAO);
   const int G = c.o_groups, R = c.o_lora, GK = H * HD / G;
-  k::gemm_grouped_fp8w(o, w.wo_a.w.p<uint8_t>(), w.wo_a.s.p<uint8_t>(), oa, T, G, R, GK, st);
+  dense_grouped_fp8w(o, w.wo_a.w.p<uint8_t>(), w.wo_a.s.p<uint8_t>(), oa, T, G, R, GK, st);
   dump(L, b, "wo_b_in", oa, size_t(T) * G * R * 2, st);
   k::act_quant_fp8(oa, G * R, qb, qs, T, G * R, 128, st);
-  k::gemm_w8a8(qb, qs, w.wo_b.w.p<uint8_t>(), w.wo_b.s.p<uint8_t>(), ao, D, T, D, G * R, st);
+  dense_w8a8(qb, qs, w.wo_b.w.p<uint8_t>(), w.wo_b.s.p<uint8_t>(), ao, D, T, D, G * R, st);
   dump(L, b, "attn_out", ao, size_t(T) * D * 2, st);
   k::hc_post(ao, x, post, comb, x, T, c.hc_mult, D, st);
 }
@@ -473,7 +515,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   int32_t* sel = B<int32_t>(scr, kSel);
   float* wt = B<float>(scr, kWt);
   k::cast_bf16_f32(f, af, size_t(T) * D, st);
-  k::gemm_f32(af, D, w.gate_w.p<bf16>(), lg, E, T, E, D, st);
+  dense_f32(f, af, D, w.gate_w.p<bf16>(), lg, E, T, E, D, st);
   k::route(lg, w.gate_bias.p<float>(), w.hash ? w.tid2eid.p<int32_t>() : nullptr, b.ids, sel, wt, T, E, K,
            c.route_scale, st);
   dump(L, b, "gate_out0", wt, size_t(T) * K * 4, st);
@@ -572,11 +614,11 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   // Shared expert (fp8 weights, no routing weight).
   bf16* shared = B<bf16>(scr, kShared);
   k::act_quant_fp8(f, D, qb, qs, T, D, 128, st);
-  k::gemm_w8a8(qb, qs, w.sw1.w.p<uint8_t>(), w.sw1.s.p<uint8_t>(), h1, I, T, I, D, st);
-  k::gemm_w8a8(qb, qs, w.sw3.w.p<uint8_t>(), w.sw3.s.p<uint8_t>(), h3, I, T, I, D, st);
+  dense_w8a8(qb, qs, w.sw1.w.p<uint8_t>(), w.sw1.s.p<uint8_t>(), h1, I, T, I, D, st);
+  dense_w8a8(qb, qs, w.sw3.w.p<uint8_t>(), w.sw3.s.p<uint8_t>(), h3, I, T, I, D, st);
   k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
   k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
-  k::gemm_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
+  dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
   dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
   bf16* fo = B<bf16>(scr, kAO);
   k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
