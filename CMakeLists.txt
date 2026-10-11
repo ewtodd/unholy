@@ -51,6 +51,7 @@ add_library(unholy_ref STATIC
   src/model/forward_ref.hip
   src/model/loader.hip
   src/kernels/ref_exl3.hip
+  src/kernels/exl3_moe.hip
 )
 target_include_directories(unholy_ref PUBLIC src third_party)
 target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)

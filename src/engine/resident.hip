@@ -23,11 +23,14 @@ ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&in_host), capacity_rows * c.dim * 2, flags));
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&out_host), capacity_rows * c.dim * 2, flags));
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&w_host), capacity_rows * 4, flags));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&e_host), capacity_rows * 4, flags));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&e_dev_), e_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&in_dev_), in_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&out_dev_), out_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&w_dev_), w_host, 0));
   // Each job is one expert: at most every token of a step.
   scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));
+  xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows));
   layers_.resize(size_t(c.n_layers));
 }
 
@@ -37,6 +40,7 @@ ApuExperts::~ApuExperts() {
   if (in_host) (void)hipHostFree(in_host);
   if (out_host) (void)hipHostFree(out_host);
   if (w_host) (void)hipHostFree(w_host);
+  if (e_host) (void)hipHostFree(e_host);
 }
 
 void ApuExperts::add_layer(model::LayerWeights w) {
@@ -47,6 +51,18 @@ void ApuExperts::add_layer(model::LayerWeights w) {
 void ApuExperts::run(int layer, const std::vector<Job>& jobs) {
   const auto& w = *layers_.at(size_t(layer));
   rt::DeviceGuard g(dev_);
+  if (w.exl3_experts && model::exl3_fast_enabled()) {
+    std::vector<std::array<int, 3>> runs;
+    int P = 0;
+    for (const auto& j : jobs) {
+      if (!w.has_expert(j.expert)) throw std::runtime_error("ApuExperts: expert not resident on the APU");
+      runs.push_back({j.expert, j.row0, j.cnt});
+      P = std::max(P, j.row0 + j.cnt);
+    }
+    model::exl3_moe_forward(c_, w, in_dev_, w_dev_, e_dev_, model::exl3_tiles(runs), P, xscratch_, out_dev_, st_);
+    UH_CHECK(hipStreamSynchronize(st_));
+    return;
+  }
   for (const auto& j : jobs) {
     if (!w.has_expert(j.expert)) throw std::runtime_error("ApuExperts: expert not resident on the APU");
     const size_t o = size_t(j.row0);

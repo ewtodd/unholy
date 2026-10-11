@@ -32,6 +32,8 @@ class ApuExperts final : public model::RemoteExperts {
   hipStream_t st_ = nullptr;
   std::vector<std::unique_ptr<model::LayerWeights>> layers_;  // [layer]
   model::ExpertScratch scratch_;
+  model::Exl3MoeScratch xscratch_;
+  int32_t* e_dev_ = nullptr;
   uint16_t* in_dev_ = nullptr;
   float* w_dev_ = nullptr;
   uint16_t* out_dev_ = nullptr;

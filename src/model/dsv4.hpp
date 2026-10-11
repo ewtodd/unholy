@@ -96,6 +96,13 @@ struct LayerWeights {
   std::vector<Fp4Linear> w1, w2, w3;     // routed experts
   bool exl3_experts = false;              // routed experts in EXL3 instead (x1, x2, x3)
   std::vector<Exl3Weights> x1, x2, x3;
+  // Fast EXL3 path: device pointer tables [w1, w3, w2] x [trellis, suh, svh] x E (null where the
+  // expert is not on this device), and each matrix's bit width (uniform over resident experts).
+  rt::DeviceBuffer exl3_tab;
+  int exl3_bits[3] = {0, 0, 0};
+  const uint16_t* const* exl3_ptrs(int m, int f, int n_experts) const {
+    return exl3_tab.as<const uint16_t* const>() + size_t(m * 3 + f) * n_experts;
+  }
   bool has_expert(int e) const {
     return exl3_experts ? bool(x1[size_t(e)].trellis) : bool(w1[size_t(e)].w);
   }

@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
+#include "kernels/exl3_moe.hpp"
 #include "kernels/ref.hpp"
 
 namespace unholy::model {
@@ -119,8 +121,13 @@ size_t expert_scratch_bytes(const Dsv4Config& c, int rows) {
   return R * W + R * W / 32 + 3 * R * c.moe_inter * 2 + 2 * R * W * 4;
 }
 
+size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows) {
+  const size_t R = size_t(std::max(rows, 1));
+  return R * c.dim * 4 + R * c.moe_inter * 6 + R * 4 + size_t(rows / 64 + c.n_experts + 1) * 12;
+}
+
 size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq) {
-  size_t total = expert_scratch_bytes(c, max_tokens);
+  size_t total = expert_scratch_bytes(c, max_tokens) + exl3_moe_scratch_bytes(c, max_tokens * c.n_active);
   for (size_t b : scratch_sizes(c, max_tokens, max_seq)) total += std::max<size_t>(b, 256);
   return total;
 }
@@ -146,6 +153,7 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   s.max_keys = max_seq / 4 + 1;
   for (size_t i = 0; i < kNumBufs; ++i) s.bufs.emplace_back(dev, std::max<size_t>(sz[i], 256));
   s.expert = make_expert_scratch(c, dev, max_tokens);
+  s.exl3 = make_exl3_moe_scratch(c, dev, max_tokens * c.n_active);
   return s;
 }
 
@@ -195,6 +203,58 @@ void expert_forward(const Dsv4Config& c, const LayerWeights& w, int e, uint16_t*
     k::act_quant_fp8(hh, I, qb, qs, cnt, I, 128, st);
     k::gemm_a8w4(qb, qs, w.w2[size_t(e)].w.p<uint8_t>(), w.w2[size_t(e)].s.p<uint8_t>(), out, D, cnt, D, I, st);
   }
+}
+
+Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows) {
+  const size_t R = size_t(std::max(rows, 1));
+  Exl3MoeScratch s;
+  s.rows = rows;
+  s.max_tiles = rows / 64 + c.n_experts + 1;
+  s.xh1 = rt::DeviceBuffer(dev, R * c.dim * 2);
+  s.xh3 = rt::DeviceBuffer(dev, R * c.dim * 2);
+  s.h1 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
+  s.h3 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
+  s.xh2 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
+  s.tiles = rt::DeviceBuffer(dev, size_t(s.max_tiles) * sizeof(kernels::Exl3Tile));
+  s.row_expert = rt::DeviceBuffer(dev, R * 4);
+  return s;
+}
+
+bool exl3_fast_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_REF_EXL3");
+    return !v || std::string(v) == "0";
+  }();
+  return on;
+}
+
+std::vector<kernels::Exl3Tile> exl3_tiles(const std::vector<std::array<int, 3>>& runs) {
+  std::vector<kernels::Exl3Tile> t;
+  for (const auto& r : runs)
+    for (int i = 0; i < r[2]; i += 64) t.push_back({r[0], r[1] + i, std::min(64, r[2] - i)});
+  return t;
+}
+
+void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
+                      const int32_t* row_expert, const std::vector<kernels::Exl3Tile>& tiles, int P,
+                      const Exl3MoeScratch& s, uint16_t* out, hipStream_t st) {
+  if (tiles.empty()) return;
+  if (int(tiles.size()) > s.max_tiles || P > s.rows) throw std::runtime_error("exl3_moe_forward: scratch too small");
+  const int D = c.dim, I = c.moe_inter, E = c.n_experts;
+  auto* dt = s.tiles.as<kernels::Exl3Tile>();
+  UH_CHECK(hipMemcpyAsync(dt, tiles.data(), tiles.size() * sizeof(kernels::Exl3Tile), hipMemcpyHostToDevice, st));
+  const int nt = int(tiles.size());
+  uint16_t* xh1 = s.xh1.as<uint16_t>();
+  uint16_t* xh3 = s.xh3.as<uint16_t>();
+  uint16_t* xh2 = s.xh2.as<uint16_t>();
+  bf16* h1 = s.h1.as<bf16>();
+  bf16* h3 = s.h3.as<bf16>();
+  k::exl3_xform_in(in, D, row_expert, w.exl3_ptrs(0, 1, E), xh1, P, D, true, st);
+  k::exl3_xform_in(in, D, row_expert, w.exl3_ptrs(1, 1, E), xh3, P, D, true, st);
+  k::exl3_grouped_gemm(xh1, D, dt, nt, w.exl3_ptrs(0, 0, E), w.exl3_ptrs(0, 2, E), w.exl3_bits[0], h1, I, I, st);
+  k::exl3_grouped_gemm(xh3, D, dt, nt, w.exl3_ptrs(1, 0, E), w.exl3_ptrs(1, 2, E), w.exl3_bits[1], h3, I, I, st);
+  k::exl3_swiglu_xform(h1, h3, rw, row_expert, w.exl3_ptrs(2, 1, E), xh2, P, I, c.swiglu_limit, st);
+  k::exl3_grouped_gemm(xh2, I, dt, nt, w.exl3_ptrs(2, 0, E), w.exl3_ptrs(2, 2, E), w.exl3_bits[2], out, D, D, st);
 }
 
 namespace {
@@ -461,6 +521,14 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   bf16* pair_in = B<bf16>(scr, kPairIn);
   const int P = T * K;
   k::gather_rows(f, deidx, pair_in, P, D, st);
+  const bool fast = w.exl3_experts && exl3_fast_enabled();
+  std::vector<int32_t> row_expert;
+  if (fast) {
+    row_expert.resize(size_t(P));
+    for (int e = 0; e < E; ++e)
+      for (int p = off[size_t(e)]; p < off[size_t(e) + 1]; ++p) row_expert[size_t(p)] = e;
+    UH_CHECK(hipMemcpyAsync(scr.exl3.row_expert.data(), row_expert.data(), size_t(P) * 4, hipMemcpyHostToDevice, st));
+  }
   // Experts this device does not hold: ship every pair's input once (the remote side only reads the
   // rows of its jobs); local experts are queued meanwhile and overlap the remote computation.
   std::vector<RemoteExperts::Job> jobs;
@@ -472,14 +540,23 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
     if (size_t(P) > remote->capacity_rows) throw std::runtime_error("moe: remote staging too small");
     UH_CHECK(hipMemcpyAsync(remote->in_host, pair_in, size_t(P) * D * 2, hipMemcpyDeviceToHost, st));
     std::copy(ewt.begin(), ewt.end(), remote->w_host);
+    if (fast) std::copy(row_expert.begin(), row_expert.end(), remote->e_host);
     UH_CHECK(hipEventCreateWithFlags(&shipped, hipEventDisableTiming));
     UH_CHECK(hipEventRecord(shipped, st));
   }
-  for (int e = 0; e < E; ++e) {
-    const int cnt = count[size_t(e)];
-    if (!cnt || !w.has_expert(e)) continue;
-    const size_t o = size_t(off[size_t(e)]);
-    expert_forward(c, w, e, pair_in + o * D, dewt + o, cnt, pair_out + o * D, scr.expert, st);
+  if (fast) {
+    std::vector<std::array<int, 3>> runs;
+    for (int e = 0; e < E; ++e)
+      if (count[size_t(e)] && w.has_expert(e)) runs.push_back({e, off[size_t(e)], count[size_t(e)]});
+    exl3_moe_forward(c, w, pair_in, dewt, scr.exl3.row_expert.as<int32_t>(), exl3_tiles(runs), P, scr.exl3, pair_out,
+                     st);
+  } else {
+    for (int e = 0; e < E; ++e) {
+      const int cnt = count[size_t(e)];
+      if (!cnt || !w.has_expert(e)) continue;
+      const size_t o = size_t(off[size_t(e)]);
+      expert_forward(c, w, e, pair_in + o * D, dewt + o, cnt, pair_out + o * D, scr.expert, st);
+    }
   }
   if (!jobs.empty()) {
     UH_CHECK(hipEventSynchronize(shipped));

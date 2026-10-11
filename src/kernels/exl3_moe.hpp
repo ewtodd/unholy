@@ -1,0 +1,28 @@
+// EXL3 grouped MoE kernels (fast path; reference: kernels/ref_exl3.hip). fp16 storage is uint16_t.
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+#include <cstdint>
+
+namespace unholy::kernels {
+
+using bf16 = uint16_t;
+
+// A run of up to 64 pair rows of one expert.
+struct Exl3Tile {
+  int expert, row0, rows;
+};
+
+// xh[r] = fp16(H128(fq(x[r]) * suh[e_r]) / sqrt(128)); fq = fp8 128-block fake quant if enabled.
+void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint16_t* const* suh_tab, uint16_t* xh,
+                   int P, int K, bool fake_quant, hipStream_t st);
+// xh[r] = fp16(H128(fq(bf16(silu(min(g,lim)) * clamp(u,±lim) * w[r])) * suh[e_r]) / sqrt(128)).
+void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
+                       const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st);
+// out[r] = bf16(H128(xh[r] @ W_inner[e]) * svh[e] / sqrt(128)) for the rows of each tile.
+void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
+                       const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
+                       int ldo, int N, hipStream_t st);
+
+}  // namespace unholy::kernels

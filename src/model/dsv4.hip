@@ -296,6 +296,24 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
   };
   run(ck, opt.up, lc.items);
   if (opt.exl3) run(*opt.exl3, opt.exl3_up, lx.items);
+  if (w.exl3_experts) {
+    // Pointer tables for the grouped kernels.
+    std::vector<const void*> tab(9 * E, nullptr);
+    for (size_t e = 0; e < E; ++e) {
+      const Exl3Weights* m3[3] = {&w.x1[e], &w.x3[e], &w.x2[e]};
+      for (int m = 0; m < 3; ++m) {
+        if (!m3[m]->trellis) continue;
+        if (w.exl3_bits[m] && w.exl3_bits[m] != m3[m]->bits)
+          throw std::runtime_error(p + ": mixed EXL3 bit widths in one projection");
+        w.exl3_bits[m] = m3[m]->bits;
+        tab[size_t(m * 3 + 0) * E + e] = m3[m]->trellis.ptr;
+        tab[size_t(m * 3 + 1) * E + e] = m3[m]->suh.ptr;
+        tab[size_t(m * 3 + 2) * E + e] = m3[m]->svh.ptr;
+      }
+    }
+    w.exl3_tab = rt::DeviceBuffer(dev, tab.size() * sizeof(void*));
+    UH_CHECK(hipMemcpy(w.exl3_tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
+  }
   return w;
 }
 

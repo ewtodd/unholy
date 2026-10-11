@@ -10,6 +10,13 @@ namespace unholy::dev {
 
 using bf16 = uint16_t;
 
+// Arch families for the WMMA paths (each fat-binary pass defines its own target macro).
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define UH_GFX12 1
+#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
+#define UH_GFX11 1
+#endif
+
 __device__ __forceinline__ float bf16_to_f32(bf16 v) { return __uint_as_float(uint32_t(v) << 16); }
 
 // Round-to-nearest-even (NaN preserved as quiet NaN).

@@ -221,3 +221,24 @@ ran the cards out of memory. The uploader's events are recreated when the caller
 **all 133,416,960 logits bit-identical to the single-card streaming run**, KL vs the oracle 2.667e-2
 (the EXL3 number). Reference-kernel speed, the baseline the fast path replaces: prefill 1024 tokens
 27.5 s (37 tok/s), decode ~1.0 s/token.
+
+## 2026-10-11 — grouped EXL3 MoE kernels (fast path, first piece)
+
+The reference profile (rocprofv3, resident run): 41.3 of 50.8 GPU-seconds (81%) in the reference
+EXL3 GEMM (per-element trellis decode, 35664 launches), sparse_attn 3.7 s, W8A8 GEMMs 2.8 s.
+
+`src/kernels/exl3_moe.hip`, one launch per projection for every resident expert of a layer:
+`exl3_xform_in` (A8 fake quant + suh + 128-point Hadamard -> fp16, per (row, 128-segment)),
+`exl3_grouped_gemm` (tile list of <= 64 rows of one expert x 128 columns; the K-slab's trellis words
+into LDS, decoded to fp16 [n][k], fp16 WMMA with fp32 accumulators, gfx12 and gfx11 fragment
+layouts; epilogue: output Hadamard over the 128 columns in LDS * svh -> bf16), `exl3_swiglu_xform`
+(clamped SwiGLU * routing weight, bf16 round, A8 fake quant, w2's suh + Hadamard -> fp16). Pointer
+tables per layer and device ([w1, w3, w2] x [trellis, suh, svh] x E, null where the expert lives
+elsewhere) are built at load; the same kernels run on the APU (gfx1151) for the cold experts.
+Not adopted: exllamav3's own fused MoE (its RDNA kernels are excellent but bound to its Python tier
+orchestration); its decode math and the tensor-core permutation are what these follow.
+
+Results: one layer (3, HCA) vs the oracle is identical to the reference EXL3 path to 3-4 digits
+(prefill rel 3.592e-2 both; the difference is the fp16 rounding of the transformed input); resident
+model, code prompt: KL 2.52e-2 (reference EXL3 path 2.67e-2), prefill 1024 tokens 27.5 -> 8.0 s,
+decode 1.0 -> 0.47 s/token, load 38 -> 22 s.

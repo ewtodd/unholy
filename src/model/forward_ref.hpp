@@ -13,9 +13,11 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
+#include "kernels/exl3_moe.hpp"
 #include "model/dsv4.hpp"
 
 namespace unholy::model {
@@ -58,11 +60,29 @@ struct ExpertScratch {
 };
 ExpertScratch make_expert_scratch(const Dsv4Config& c, int dev, int rows);
 
+// Scratch for the grouped EXL3 path over up to `rows` pair rows.
+struct Exl3MoeScratch {
+  rt::DeviceBuffer xh1, xh3, h1, h3, xh2, tiles, row_expert;
+  int rows = 0, max_tiles = 0;
+};
+Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows);
+
+// The routed experts of `w` that are resident here, for the given tiles (runs of <= 64 pair rows of one
+// expert), over pair rows in[P, dim] with routing weights rw[P] and row_expert[P] (device-visible).
+// out rows of the tiles are written; other rows are untouched. Disabled by UNHOLY_REF_EXL3=1.
+bool exl3_fast_enabled();
+void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
+                      const int32_t* row_expert, const std::vector<kernels::Exl3Tile>& tiles, int P,
+                      const Exl3MoeScratch& s, uint16_t* out, hipStream_t st);
+// Tiles of <= 64 rows for each (expert, row0, cnt) run.
+std::vector<kernels::Exl3Tile> exl3_tiles(const std::vector<std::array<int, 3>>& runs);
+
 // Scratch for batches of up to max_tokens tokens whose sequences are at most max_seq long.
 struct Scratch {
   int max_tokens = 0, max_keys = 0;
   std::vector<rt::DeviceBuffer> bufs;
   ExpertScratch expert;
+  Exl3MoeScratch exl3;
   void* get(size_t i) const { return bufs.at(i).data(); }
 };
 Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq);
@@ -90,6 +110,7 @@ class RemoteExperts {
   uint16_t* in_host = nullptr;
   float* w_host = nullptr;
   uint16_t* out_host = nullptr;
+  int32_t* e_host = nullptr;  // expert of each pair row
   size_t capacity_rows = 0;
 };
 
