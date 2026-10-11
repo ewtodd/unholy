@@ -48,6 +48,7 @@ add_library(unholy_ref STATIC
   src/kernels/ref_attn.hip
   src/kernels/ref_moe.hip
   src/model/dsv4.hip
+  src/model/forward_ref.hip
   src/model/loader.hip
   src/kernels/ref_exl3.hip
 )
@@ -62,3 +63,6 @@ install(TARGETS unholy-probe unholy-ckpt unholy-layer-test RUNTIME DESTINATION b
 add_executable(unholy-ref-run tools/ref_run/main.hip)
 target_link_libraries(unholy-ref-run PRIVATE unholy_ref)
 install(TARGETS unholy-ref-run RUNTIME DESTINATION bin)
+
+add_executable(unholy-batch-test tools/batch_test/main.hip)
+target_link_libraries(unholy-batch-test PRIVATE unholy_ref)

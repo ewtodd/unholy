@@ -82,6 +82,17 @@ __global__ void gather_rows_kernel(const bf16* src, const int32_t* rows_idx, bf1
   dst[gid] = src[size_t(rows_idx[r]) * dim + c];
 }
 
+__global__ void moe_combine_kernel(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int K,
+                                   int dim) {
+  const int t = blockIdx.x;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int j = 0; j < K; ++j) acc += bf16_to_f32(pair_out[size_t(pidx[size_t(t) * K + j]) * dim + d]);
+    acc += bf16_to_f32(shared[size_t(t) * dim + d]);
+    out[size_t(t) * dim + d] = f32_to_bf16(acc);
+  }
+}
+
 }  // namespace
 
 void route(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
@@ -102,6 +113,12 @@ void scatter_add(const bf16* src, const int32_t* rows_idx, float* y, int n, int 
 void gather_rows(const bf16* src, const int32_t* rows_idx, bf16* dst, int n, int dim, hipStream_t st) {
   if (n <= 0) return;
   gather_rows_kernel<<<cdiv(size_t(n) * dim, 256), 256, 0, st>>>(src, rows_idx, dst, n, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
+                 hipStream_t st) {
+  moe_combine_kernel<<<T, 256, 0, st>>>(pair_out, pidx, shared, out, K, dim);
   UH_CHECK_LAUNCH();
 }
 

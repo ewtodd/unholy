@@ -122,6 +122,10 @@ void swiglu(const bf16* gate, const bf16* up, const float* w, bf16* h, int rows,
 // y[rows_idx[r]] += src[r] (fp32 += bf16), r in order.
 void scatter_add(const bf16* src, const int32_t* rows_idx, float* y, int n, int dim, hipStream_t st);
 void gather_rows(const bf16* src, const int32_t* rows_idx, bf16* dst, int n, int dim, hipStream_t st);
+// out[t] = bf16(sum_j pair_out[pidx[t][j]] (j ascending) + shared[t]), fp32 accumulation: the
+// reference's y = 0; y[idx] += expert_e(...) for e ascending; y += shared.
+void moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
+                 hipStream_t st);
 void add_bf16_to_f32(const bf16* x, float* y, size_t n, hipStream_t st);
 
 // ---- EXL3 (reference) ------------------------------------------------------------------------------

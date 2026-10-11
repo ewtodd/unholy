@@ -103,38 +103,10 @@ class Uploader;
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
                         Uploader* up = nullptr, const Checkpoint* exl3 = nullptr, Uploader* exl3_up = nullptr);
 
-// Per-sequence, per-layer state. Compressed rows are addressed through page tables (identity for
-// now) so the kernels already work on paged pools.
-struct LayerState {
-  int layer = 0;
-  rt::DeviceBuffer window;                    // bf16 [128][head_dim]
-  rt::DeviceBuffer comp_ring_kv, comp_ring_sc;  // f32 [ring][width]
-  rt::DeviceBuffer idx_ring_kv, idx_ring_sc;
-  rt::DeviceBuffer comp_pool, idx_pool;  // bf16 rows
-  rt::DeviceBuffer page_table;           // int32, identity
-  int rows_per_page = 64;
-  int max_rows = 0;
-};
-LayerState make_layer_state(const Dsv4Config& c, const LayerWeights& w, int dev, int max_seq, hipStream_t st);
-
-// Reusable scratch for chunks of up to max_tokens tokens.
-struct Scratch {
-  int max_tokens = 0, max_keys = 0;
-  std::vector<rt::DeviceBuffer> bufs;
-  void* get(size_t i) const { return bufs.at(i).data(); }
-};
-Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq);
-
 struct RopeTables {
   rt::DeviceBuffer plain, yarn;  // float2 [max_pos][rope_dim/2]
   int max_pos = 0;
 };
 RopeTables make_rope_tables(const Dsv4Config& c, int dev, int max_pos);
-
-// One layer over chunk positions [s0, s0 + n) of a sequence. x: residual [n, hc, dim] bf16, updated
-// in place. ids/pos: device int32 [n].
-void layer_forward(const Dsv4Config& c, const LayerWeights& w, LayerState& s, const Scratch& scr,
-                   const RopeTables& rope, uint16_t* x, const int32_t* ids, const int32_t* pos, int s0, int n,
-                   hipStream_t st);
 
 }  // namespace unholy::model

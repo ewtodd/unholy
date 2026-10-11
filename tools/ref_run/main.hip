@@ -18,6 +18,7 @@
 #include "gufo/json.hpp"
 #include "kernels/ref.hpp"
 #include "model/dsv4.hpp"
+#include "model/forward_ref.hpp"
 #include "model/loader.hpp"
 #include "model/safetensors.hpp"
 #include "rt/hip.hpp"
@@ -83,6 +84,11 @@ int main(int argc, char** argv) {
     const int max_seq = (S + 255) / 256 * 256;
     auto scr = model::make_scratch(c, dev, std::max(chunk, 1), max_seq);
     auto rope = model::make_rope_tables(c, dev, max_seq + 128);
+    const model::CacheGeometry geo{1, max_seq / model::kPageTokens, max_seq / model::kPageTokens};
+    std::vector<int32_t> table(static_cast<size_t>(geo.max_pages_per_seq));
+    for (size_t i = 0; i < table.size(); ++i) table[i] = int32_t(i);
+    rt::DeviceBuffer bt(dev, table.size() * 4);
+    UH_CHECK(hipMemcpy(bt.data(), table.data(), table.size() * 4, hipMemcpyHostToDevice));
     rt::DeviceBuffer x(dev, size_t(S) * row * 2);
     rt::DeviceBuffer dids(dev, size_t(S) * 4), dpos(dev, size_t(S) * 4);
     std::vector<int32_t> pos(static_cast<size_t>(S));
@@ -99,10 +105,16 @@ int main(int argc, char** argv) {
     for (int L = 0; L < c.n_layers; ++L) {
       const auto tl = std::chrono::steady_clock::now();
       auto w = model::load_layer(*ck, c, L, dev, st, &up, xck.get(), xup.get());
-      auto state = model::make_layer_state(c, w, dev, max_seq, st);
+      auto cache = model::make_layer_cache(c, w, geo, dev, st);
       auto run = [&](int s0, int n) {
-        model::layer_forward(c, w, state, scr, rope, x.as<uint16_t>() + size_t(s0) * row, dids.as<int32_t>() + s0,
-                             dpos.as<int32_t>() + s0, s0, n, st);
+        model::BatchDesc b;
+        b.chunks = {{0, s0, n, 0}};
+        b.T = n;
+        b.ids = dids.as<int32_t>() + s0;
+        b.pos = dpos.as<int32_t>() + s0;
+        b.block_tables = bt.as<int32_t>();
+        b.max_pages_per_seq = geo.max_pages_per_seq;
+        model::layer_forward(c, w, cache, scr, rope, x.as<uint16_t>() + size_t(s0) * row, b, st);
       };
       for (int s0 = 0; s0 < P; s0 += chunk) run(s0, std::min(chunk, P - s0));
       for (int t = P; t < S; ++t) run(t, 1);

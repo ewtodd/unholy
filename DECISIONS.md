@@ -183,3 +183,20 @@ fp8 fake quantization the experts were trained with (A8), so only the weights ch
 All 9 post-prompt argmaxes still match. 3-bit experts cost ~1.7e-2 nats over the floor on this
 prompt. One prompt type only; the quant study needs a mixed eval set (prose, chat, math, code, long
 context) and per-expert mixes (MXFP4 for the most-used / most-sensitive experts).
+
+## 2026-10-11 — batched, paged forward; chunk- and batch-invariant
+
+`src/model/forward_ref.{hpp,hip}` replaces the single-sequence forward: a batch is a list of chunks
+(slot, s0, n, t0); HC mixing, norms, projections, wo_a/wo_b and the MoE run over all T tokens,
+compressors / indexer / attention / window ring per chunk. Compressed rows (CSA 64, HCA 2, indexer 64
+rows per 256-token page) live in per-layer pools addressed through one block table per slot (physical
+page ids shared by all layers on a device, so pages are allocated once per position range). Window
+rings and compressor rings are per-slot arrays. The MoE writes every (token, expert) pair to its own
+output row and `moe_combine` sums each token's pairs in ascending expert order, so hot and cold
+experts can later run on different devices without changing the reference accumulation order.
+
+Checks: the oracle comparison is unchanged to every printed digit; prefill in 300-token chunks (not
+aligned to the 4/128 compression blocks) gives bit-identical output to one 1024-token chunk;
+`unholy-batch-test` runs three sequences (600/523/333 tokens) interleaved in mixed batches (chunks of
+1/37/128/211 tokens, shuffled slots, shuffled physical pages) and every element matches the solo runs
+on layers 0 (window), 2 (CSA) and 3 (HCA).
