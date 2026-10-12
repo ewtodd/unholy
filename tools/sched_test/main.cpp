@@ -5,7 +5,10 @@
 // one-hot "logits" from a hash of the whole sequence read back through the block table. Greedy outputs
 // must then equal a standalone simulation of each request, whatever the batching, chunking,
 // preemption and slot/page reuse were — any aliasing of pages between live sequences or a lost
-// chunk changes the hash.
+// chunk changes the hash. With prefix caching on, half the requests extend an earlier prompt (or prompt
+// and reply), and the fake keeps per-slot state (a running hash of the slot's tokens) that snapshots
+// save and restore: a restore that does not match the pages it continues over, or a chunk that does
+// not continue the restored state, fails.
 //
 //   unholy-sched-test [--requests N] [--seed S]
 #include <cstdio>
@@ -23,9 +26,11 @@ namespace {
 
 constexpr int kVocab = 512, kEos = 1;
 
+constexpr uint64_t kFnvBasis = 1469598103934665603ull;
+uint64_t fnv_step(uint64_t h, int32_t t) { return (h ^ uint64_t(uint32_t(t))) * 1099511628211ull; }
 uint64_t fnv(const int32_t* t, size_t n) {
-  uint64_t h = 1469598103934665603ull;
-  for (size_t i = 0; i < n; ++i) h = (h ^ uint64_t(uint32_t(t[i]))) * 1099511628211ull;
+  uint64_t h = kFnvBasis;
+  for (size_t i = 0; i < n; ++i) h = fnv_step(h, t[i]);
   return h;
 }
 int32_t next_token(const std::vector<int32_t>& seq) {
@@ -36,9 +41,11 @@ int32_t next_token(const std::vector<int32_t>& seq) {
 
 class FakeModel final : public StepModel {
  public:
-  FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens, int inflight)
+  FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens, int inflight, int snapshots)
       : inflight_(inflight), slots_(slots), ppseq_(pages_per_seq), pages_(pages), page_(page_tokens), max_tokens_(max_tokens),
-        store_(size_t(pages) * page_tokens, -1), len_(size_t(slots), 0) {}
+        snapshots_(snapshots), store_(size_t(pages) * page_tokens, -1), len_(size_t(slots), 0),
+        state_(size_t(slots), kFnvBasis), snaps_(size_t(snapshots)) {}
+  int num_snapshots() const override { return snapshots_; }
   int vocab() const override { return kVocab; }
   int max_tokens() const override { return max_tokens_; }
   int max_logit_rows() const override { return 64; }
@@ -72,6 +79,16 @@ class FakeModel final : public StepModel {
     int t = 0;
     std::vector<bool> seen(size_t(slots_), false);
     std::vector<int> chunk_of_row(in.ids.size());
+    for (const StateOp& r : in.restore) {
+      const Snap& sn = snaps_.at(size_t(r.snapshot));
+      if (!sn.valid) throw std::runtime_error("fake: restore of an unsaved snapshot");
+      state_[size_t(r.slot)] = sn.state;
+      len_[size_t(r.slot)] = sn.len;
+      uint64_t h = kFnvBasis;  // the pages the slot continues over must hold what the state saw
+      for (int p = 0; p < sn.len; ++p) h = fnv_step(h, at(r.slot, p));
+      if (h != sn.state) throw std::runtime_error("fake: restored state does not match the slot's pages");
+      ++restores;
+    }
     for (size_t ci = 0; ci < in.chunks.size(); ++ci) {
       const Chunk& c = in.chunks[ci];
       if (c.t0 != t || c.n <= 0 || seen[size_t(c.slot)]) throw std::runtime_error("fake: chunk layout");
@@ -85,6 +102,8 @@ class FakeModel final : public StepModel {
         at(c.slot, p) = in.ids[size_t(t + k)];
         chunk_of_row[size_t(t + k)] = int(ci);
       }
+      if (c.s0 == 0) state_[size_t(c.slot)] = kFnvBasis;
+      for (int k = 0; k < c.n; ++k) state_[size_t(c.slot)] = fnv_step(state_[size_t(c.slot)], in.ids[size_t(t + k)]);
       len_[size_t(c.slot)] = c.s0 + c.n;
       t += c.n;
       max_batch = std::max(max_batch, t);
@@ -95,10 +114,16 @@ class FakeModel final : public StepModel {
       if (in.logit_rows[r] != c.t0 + c.n - 1) throw std::runtime_error("fake: logit row is not a chunk end");
       std::vector<int32_t> seq(size_t(c.s0 + c.n));
       for (int p = 0; p < c.s0 + c.n; ++p) seq[size_t(p)] = at(c.slot, p);
+      if (fnv(seq.data(), seq.size()) != state_[size_t(c.slot)]) throw std::runtime_error("fake: slot state is stale");
       logits[r * kVocab + size_t(next_token(seq))] = 10.0f;
     }
+    for (const StateOp& sv : in.save) {
+      if (len_[size_t(sv.slot)] % page_ != 0) throw std::runtime_error("fake: save off a page boundary");
+      snaps_.at(size_t(sv.snapshot)) = {state_[size_t(sv.slot)], len_[size_t(sv.slot)], true};
+      ++saves;
+    }
   }
-  int steps = 0, max_batch = 0, max_seen = 0;
+  int steps = 0, max_batch = 0, max_seen = 0, restores = 0, saves = 0;
 
  private:
   int32_t& at(int slot, int p) {
@@ -111,9 +136,16 @@ class FakeModel final : public StepModel {
   int inflight_;
   std::deque<std::pair<uint64_t, std::vector<float>>> pending_;
   uint64_t next_ = 1;
-  int slots_, ppseq_, pages_, page_, max_tokens_;
+  int slots_, ppseq_, pages_, page_, max_tokens_, snapshots_;
   std::vector<int32_t> store_, tables_;
   std::vector<int> len_;
+  struct Snap {
+    uint64_t state = 0;
+    int len = 0;
+    bool valid = false;
+  };
+  std::vector<uint64_t> state_;
+  std::vector<Snap> snaps_;
 };
 
 struct Result {
@@ -155,10 +187,11 @@ int main(int argc, char** argv) {
   // Configurations: (slots, pages per seq, pool pages, page tokens, step tokens, batch budget).
   const int configs[][6] = {{8, 64, 512, 16, 256, 256}, {4, 32, 40, 16, 128, 100}, {16, 16, 60, 8, 64, 64},
                             {2, 128, 30, 32, 512, 512}, {32, 20, 200, 16, 96, 96}};
+  for (const int snaps : {0, 6, 64})
   for (const int depth : {1, 2})
   for (const auto& cfgv : configs) {
     std::mt19937_64 rng(seed);
-    FakeModel model(cfgv[0], cfgv[1], cfgv[2], cfgv[3], cfgv[4], depth);
+    FakeModel model(cfgv[0], cfgv[1], cfgv[2], cfgv[3], cfgv[4], depth, snaps);
     EngineConfig ec;
     ec.max_batch_tokens = cfgv[5];
     Engine eng(model, ec, false);
@@ -169,8 +202,28 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> rid;
     auto submit = [&]() {
       GenRequest r;
-      const int len = 1 + int(rng() % uint64_t(std::min(max_ctx - 1, 700)));
-      for (int i = 0; i < len; ++i) r.prompt.push_back(int32_t(2 + rng() % (kVocab - 2)));
+      const int cap = std::min(max_ctx - 1, 700);
+      if (snaps > 0 && !spec.empty() && rng() % 2 == 0) {
+        // Extend an earlier request: its prompt, or its prompt and reply (a following chat turn), whole or
+        // cut somewhere past the middle, plus new tokens.
+        const auto& base = spec[spec.size() - 1 - rng() % std::min<size_t>(spec.size(), 8)];  // a recent one
+        std::vector<int32_t> prefix = base.first;
+        if (rng() % 2 == 0) {
+          FinishReason why;
+          const auto reply = reference(base.first, base.second, max_ctx, why);
+          prefix.insert(prefix.end(), reply.begin(), reply.end());
+        }
+        prefix.resize(std::min(prefix.size(), size_t(cap) - 1));
+        if (rng() % 2 == 0) prefix.resize(prefix.size() / 2 + rng() % (prefix.size() / 2 + 1));
+        r.prompt = prefix;
+        const int extra = 1 + int(rng() % 40);
+        for (int i = 0; i < extra && int(r.prompt.size()) < cap; ++i)
+          r.prompt.push_back(int32_t(2 + rng() % (kVocab - 2)));
+        if (r.prompt.empty()) r.prompt.push_back(2);
+      } else {
+        const int len = 1 + int(rng() % uint64_t(cap));
+        for (int i = 0; i < len; ++i) r.prompt.push_back(int32_t(2 + rng() % (kVocab - 2)));
+      }
       r.max_tokens = rng() % 4 == 0 ? 0 : 1 + int(rng() % 200);
       r.sampling.temperature = 0.0f;
       spec.emplace_back(r.prompt, r.max_tokens);
@@ -238,11 +291,17 @@ int main(int argc, char** argv) {
       }
     }
     const auto st = eng.stats();
-    std::printf("depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, %d errors; "
-                "%d steps, max batch %d, %llu preemptions, free pages %d/%d\n",
-                depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors, model.steps,
-                model.max_batch,
-                (unsigned long long)st.preemptions, st.free_pages, st.total_pages);
+    std::printf("snaps %d depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, "
+                "%d errors; %d steps, max batch %d, %llu preemptions, free pages %d/%d; cached %llu of %llu prompt "
+                "tokens, %d restores, %d saves\n",
+                snaps, depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors,
+                model.steps, model.max_batch, (unsigned long long)st.preemptions, st.free_pages, st.total_pages,
+                (unsigned long long)st.cached_tokens, (unsigned long long)st.prompt_tokens, model.restores,
+                model.saves);
+    if (snaps > 0 && st.cached_tokens == 0) {
+      std::printf("  the prefix cache was never used\n");
+      ++failures;
+    }
     if (st.free_pages != st.total_pages) {
       std::printf("  page leak\n");
       ++failures;

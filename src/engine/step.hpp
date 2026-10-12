@@ -20,10 +20,19 @@ struct Chunk {
   int slot = 0, s0 = 0, n = 0, t0 = 0;
 };
 
+// Prefix reuse: a snapshot holds a slot's unpaged state (window ring, compressor rings) as it was at a
+// page boundary. `restore` loads one into a slot before the step's chunks run (the slot then continues
+// its sequence at the snapshot's position, over pages it shares with the sequence that saved it);
+// `save` copies a slot's state into one after them.
+struct StateOp {
+  int slot = 0, snapshot = 0;
+};
+
 struct StepInput {
   std::vector<Chunk> chunks;
   std::vector<int32_t> ids, pos;     // [T]
   std::vector<int32_t> logit_rows;   // batch rows whose logits are wanted
+  std::vector<StateOp> restore, save;
 };
 
 class StepModel {
@@ -37,6 +46,7 @@ class StepModel {
   virtual int num_pages() const = 0;          // physical pages
   virtual int page_tokens() const = 0;
   virtual int max_inflight() const { return 1; }
+  virtual int num_snapshots() const { return 0; }  // 0: no prefix reuse
   // Block tables [max_slots][max_pages_per_seq] of physical page ids, for steps submitted from now on.
   virtual void set_block_tables(const std::vector<int32_t>& tables) = 0;
   virtual uint64_t submit(const StepInput& in) = 0;

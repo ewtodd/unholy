@@ -173,11 +173,14 @@ Params parse_params(const Value& req, bool chat, int default_max_tokens) {
   return p;
 }
 
-Value usage_json(int prompt, int completion) {
+Value usage_json(int prompt, int completion, int cached) {
   Value u = Value::object();
   u.set("prompt_tokens", Value(prompt));
   u.set("completion_tokens", Value(completion));
   u.set("total_tokens", Value(prompt + completion));
+  Value details = Value::object();
+  details.set("cached_tokens", Value(cached));
+  u.set("prompt_tokens_details", std::move(details));
   return u;
 }
 
@@ -336,7 +339,7 @@ struct OpenAIServer::Impl {
         "text/event-stream",
         [this, job, ch, st, rid](size_t, httplib::DataSink& sink) {
           const auto write = [&](const std::string& s) { return sink.write(s.data(), s.size()); };
-          int n_calls = 0, prompt_tokens = int(job->prompt.size()), completion = 0;
+          int n_calls = 0, prompt_tokens = int(job->prompt.size()), completion = 0, cached = 0;
           bool sent_role = false;
           const auto send_delta = [&](const text::ParsedDelta& d, const std::string& raw, const Value* lp) {
             Value choice = Value::object();
@@ -422,6 +425,7 @@ struct OpenAIServer::Impl {
               }
               continue;
             }
+            cached = std::max(cached, o.cached_tokens);
             completion = std::max(completion, o.completion_tokens);
             text::ParsedDelta d;
             std::string raw;
@@ -457,7 +461,7 @@ struct OpenAIServer::Impl {
             if (job->p.include_usage) {
               Value u = chunk_base(*job);
               u.set("choices", Value::array());
-              u.set("usage", usage_json(prompt_tokens, completion));
+              u.set("usage", usage_json(prompt_tokens, completion, cached));
               write(sse(u));
             }
           }
@@ -478,7 +482,7 @@ struct OpenAIServer::Impl {
     std::vector<engine::Sampled> samples;
     engine::FinishReason reason = engine::FinishReason::None;
     std::string error;
-    int completion = 0;
+    int completion = 0, cached = 0;
     for (;;) {
       engine::GenOutput o;
       if (!ch->pop(o, std::chrono::milliseconds(500))) {
@@ -488,6 +492,7 @@ struct OpenAIServer::Impl {
         }
         continue;
       }
+      cached = std::max(cached, o.cached_tokens);
       completion = std::max(completion, o.completion_tokens);
       if (job->p.logprobs) samples.insert(samples.end(), o.samples.begin(), o.samples.end());
       st->push(o.tokens, raw, all);
@@ -559,7 +564,7 @@ struct OpenAIServer::Impl {
     Value choices = Value::array();
     choices.push_back(std::move(choice));
     body.set("choices", std::move(choices));
-    body.set("usage", usage_json(int(job->prompt.size()), completion));
+    body.set("usage", usage_json(int(job->prompt.size()), completion, cached));
     send_json(res, body);
   }
 
@@ -671,16 +676,18 @@ struct OpenAIServer::Impl {
                }));
     svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
       const auto s = eng.stats();
-      char buf[1024];
+      char buf[2048];
       std::snprintf(buf, sizeof(buf),
                     "unholy_steps_total %llu\nunholy_prefill_tokens_total %llu\nunholy_decode_tokens_total %llu\n"
                     "unholy_preemptions_total %llu\nunholy_busy_seconds_total %.3f\nunholy_running %d\n"
                     "unholy_waiting %d\nunholy_free_pages %d\nunholy_total_pages %d\nunholy_http_requests_total %llu\n"
-                    "unholy_http_errors_total %llu\n",
+                    "unholy_http_errors_total %llu\nunholy_prompt_tokens_total %llu\nunholy_cached_prompt_tokens_total %llu\n"
+                    "unholy_cached_pages %d\nunholy_cached_snapshots %d\n",
                     (unsigned long long)s.steps, (unsigned long long)s.prefill_tokens,
                     (unsigned long long)s.decode_tokens, (unsigned long long)s.preemptions, s.busy_seconds, s.running,
                     s.waiting, s.free_pages, s.total_pages, (unsigned long long)requests.load(),
-                    (unsigned long long)errors.load());
+                    (unsigned long long)errors.load(), (unsigned long long)s.prompt_tokens,
+                    (unsigned long long)s.cached_tokens, s.cached_pages, s.snapshots);
       res.set_content(buf, "text/plain; version=0.0.4");
     });
   }

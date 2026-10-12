@@ -8,6 +8,15 @@
 // pool runs dry the most recently admitted request is preempted (its cache dropped, recomputed later
 // from prompt + generated tokens, as vLLM's recompute preemption).
 //
+// Prefix caching (when the model keeps snapshots): every full page is named by a hash chained over the
+// tokens up to its end, and a finished request's pages stay in the pool, unreferenced, until they are
+// needed (least recently used first, the tail of a sequence before its head). DSV4 also keeps unpaged
+// per-slot state (the attention window, compressor rings), so a prefix is reusable only up to a page
+// boundary where that state was saved: prefill chunks that end on a page boundary save it (every
+// chunk up to 64k tokens, then sparser), the last full page of the prompt always does, and decoding
+// saves at every page it completes (each superseding the last). A new request takes the deepest
+// boundary its tokens match, restores the snapshot into its slot and computes the rest.
+//
 // Token-level stops (EOS, stop token ids, max_tokens, the context limit) are decided here; text-level
 // stop strings belong to the frontend, which aborts the request when it sees one.
 #pragma once
@@ -17,10 +26,12 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/sampler.hpp"
@@ -48,6 +59,7 @@ struct GenOutput {
   int32_t stop_token = -1;  // the token that stopped it (not included in `tokens` when it is EOS)
   std::string error;
   int prompt_tokens = 0, completion_tokens = 0;
+  int cached_tokens = 0;  // prompt tokens served from the prefix cache
 };
 
 struct EngineConfig {
@@ -56,11 +68,14 @@ struct EngineConfig {
   int eos_id = 1;
   int max_context = 0;          // positions per sequence; 0 = the block table's reach
   uint64_t seed = 0;            // base for requests without a seed
+  bool prefix_cache = true;      // when the model keeps snapshots
 };
 
 struct EngineStats {
   uint64_t steps = 0, prefill_tokens = 0, decode_tokens = 0, preemptions = 0;
-  int running = 0, waiting = 0, free_pages = 0, total_pages = 0;
+  uint64_t prompt_tokens = 0, cached_tokens = 0;  // admitted prompt tokens, those served from the cache
+  int running = 0, waiting = 0, free_pages = 0, total_pages = 0;  // free: unused or cached-unreferenced
+  int cached_pages = 0, snapshots = 0;
   double busy_seconds = 0;
 };
 
@@ -89,6 +104,17 @@ class Engine {
   void loop();
   void intake();
   bool alloc_pages(Seq& s, int upto);  // pages for positions [0, upto)
+  int available_pages() const { return int(free_pages_.size() + evictable_.size()); }
+  int32_t take_page();
+  void write_table(const Seq& s);
+  void hash_pages(Seq& s, int npages);
+  void match_prefix(Seq& s);
+  void register_pages(Seq& s);
+  int take_snapshot();
+  void put_snapshot(int id);
+  void commit_snapshot(Seq& s, int id, int end);
+  void clear_cache();
+  bool save_at(const Seq& s, int end, bool decode) const;
   void release(Seq& s);
   void preempt(Seq& s);
   void finish(Seq& s, FinishReason r, const std::string& err = "");
@@ -102,6 +128,8 @@ class Engine {
       int n;
       bool logits;
       int row;  // logit row, -1 if none
+      int restore = -1, save = -1;  // snapshots loaded before / saved after the chunk
+      int end = 0;                  // the chunk's end position
     };
     uint64_t ticket = 0;
     std::vector<Item> items;
@@ -123,6 +151,28 @@ class Engine {
   std::vector<std::unique_ptr<Seq>> running_;  // admission order
   std::deque<InFlight> inflight_;              // submitted steps, oldest first
   std::vector<int32_t> free_pages_, free_slots_;
+  // Prefix cache. A page is free (in free_pages_), referenced by running sequences, or cached and
+  // unreferenced (in evictable_, oldest first). Snapshots likewise (free_snaps_, snap_lru_).
+  struct PageInfo {
+    uint64_t hash = 0;
+    int refs = 0;
+    bool cached = false;
+    std::list<int32_t>::iterator lru;
+  };
+  struct SnapInfo {
+    uint64_t hash = 0;
+    int refs = 0;
+    bool cached = false;
+    std::list<int>::iterator lru;
+  };
+  bool cache_on_ = false;
+  std::vector<PageInfo> page_info_;
+  std::list<int32_t> evictable_;
+  std::unordered_map<uint64_t, int32_t> page_by_hash_;
+  std::vector<SnapInfo> snap_info_;
+  std::vector<int> free_snaps_;
+  std::list<int> snap_lru_;
+  std::unordered_map<uint64_t, int> snap_by_hash_;
   std::vector<int32_t> tables_;
   bool tables_dirty_ = true;
   std::vector<float> logits_;

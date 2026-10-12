@@ -33,6 +33,17 @@ struct Engine::Seq {
   int inflight = 0;             // submitted steps that include this sequence and have not completed
   bool awaiting_logits = false; // one of them samples its next token
   bool abort_pending = false;   // aborted while in flight: finished when the last such step completes
+  bool admitted_once = false;
+  // Prefix cache.
+  std::vector<uint64_t> hashes;  // chained hash of each full page of `tokens`, computed as needed
+  int registered = 0;            // leading pages entered in the cache (or found there)
+  int done_pos = 0;              // positions whose steps have completed
+  int restore = -1;              // snapshot to load into the slot with the next chunk
+  int cut = 0;                   // the prompt's last page boundary: a prefill chunk ends there to save state
+  int last_save = 0;             // position of the last state save
+  int rolling = -1;              // the snapshot decoding saved last, superseded by the next
+  uint64_t rolling_hash = 0;
+  int cached = 0;                // prompt tokens served from the cache at the first admission
 
   Seq(uint64_t id_, GenRequest r, Sink s, uint64_t seed)
       : id(id_), req(std::move(r)), sink(std::move(s)), sampler(req.sampling, seed) {}
@@ -47,6 +58,12 @@ Engine::Engine(StepModel& model, EngineConfig cfg, bool start) : model_(model), 
   if (cfg_.max_context > 0) max_context_ = std::min(max_context_, cfg_.max_context);
   cfg_.max_batch_tokens = std::min(cfg_.max_batch_tokens > 0 ? cfg_.max_batch_tokens : model_.max_tokens(),
                                    model_.max_tokens());
+  cache_on_ = cfg_.prefix_cache && model_.num_snapshots() > 0;
+  page_info_.resize(size_t(model_.num_pages()));
+  if (cache_on_) {
+    snap_info_.resize(size_t(model_.num_snapshots()));
+    for (int s = model_.num_snapshots() - 1; s >= 0; --s) free_snaps_.push_back(s);
+  }
   slots_ = model_.max_slots();
   if (cfg_.max_running > 0) slots_ = std::min(slots_, cfg_.max_running);
   for (int s = slots_ - 1; s >= 0; --s) free_slots_.push_back(s);
@@ -112,11 +129,140 @@ void Engine::finish(Seq& s, FinishReason r, const std::string& err) {
 }
 
 void Engine::release(Seq& s) {
-  for (const int32_t p : s.pages) free_pages_.push_back(p);
+  // Tail first: a sequence's last pages become evictable before its first ones.
+  for (auto it = s.pages.rbegin(); it != s.pages.rend(); ++it) {
+    PageInfo& pi = page_info_[size_t(*it)];
+    if (--pi.refs > 0) continue;
+    if (pi.cached) pi.lru = evictable_.insert(evictable_.end(), *it);
+    else free_pages_.push_back(*it);
+  }
   s.pages.clear();
+  if (s.restore >= 0) put_snapshot(s.restore);
+  s.restore = -1;
   if (s.slot >= 0) free_slots_.push_back(s.slot);
   s.slot = -1;
-  s.computed = 0;
+  s.computed = s.done_pos = s.registered = s.cut = s.last_save = 0;
+  s.rolling = -1;
+}
+
+int32_t Engine::take_page() {
+  int32_t p;
+  if (!free_pages_.empty()) {
+    p = free_pages_.back();
+    free_pages_.pop_back();
+  } else {
+    p = evictable_.front();
+    evictable_.pop_front();
+    PageInfo& pi = page_info_[size_t(p)];
+    page_by_hash_.erase(pi.hash);
+    pi.cached = false;
+  }
+  page_info_[size_t(p)].refs = 1;
+  return p;
+}
+
+void Engine::write_table(const Seq& s) {
+  const size_t w = size_t(model_.max_pages_per_seq());
+  std::copy(s.pages.begin(), s.pages.end(), tables_.begin() + ptrdiff_t(size_t(s.slot) * w));
+  tables_dirty_ = true;
+}
+
+namespace {
+uint64_t mix64(uint64_t x) {  // splitmix64 finalizer
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31);
+}
+}  // namespace
+
+void Engine::hash_pages(Seq& s, int npages) {
+  while (int(s.hashes.size()) < npages) {
+    const size_t i = s.hashes.size();
+    uint64_t h = i ? s.hashes.back() : 0x243f6a8885a308d3ull;
+    for (int k = 0; k < page_tokens_; ++k)
+      h = mix64(h + 0x9e3779b97f4a7c15ull + uint32_t(s.tokens[i * size_t(page_tokens_) + size_t(k)]));
+    s.hashes.push_back(h);
+  }
+}
+
+// The deepest page boundary (short of the last token, which must be computed for its logits) whose
+// pages are all cached and whose state was saved: take the pages and the snapshot.
+void Engine::match_prefix(Seq& s) {
+  const int limit = (int(s.tokens.size()) - 1) / page_tokens_;
+  if (!cache_on_ || limit <= 0) return;
+  hash_pages(s, limit);
+  int best = 0, snap = -1;
+  for (int i = 0; i < limit; ++i) {
+    if (!page_by_hash_.count(s.hashes[size_t(i)])) break;
+    if (const auto it = snap_by_hash_.find(s.hashes[size_t(i)]); it != snap_by_hash_.end()) {
+      best = i + 1;
+      snap = it->second;
+    }
+  }
+  if (best == 0) return;
+  for (int i = 0; i < best; ++i) {
+    const int32_t p = page_by_hash_.at(s.hashes[size_t(i)]);
+    PageInfo& pi = page_info_[size_t(p)];
+    if (pi.refs++ == 0) evictable_.erase(pi.lru);
+    s.pages.push_back(p);
+  }
+  SnapInfo& si = snap_info_[size_t(snap)];
+  if (si.refs++ == 0) snap_lru_.erase(si.lru);
+  s.restore = snap;
+  s.computed = s.done_pos = s.last_save = best * page_tokens_;
+  s.registered = best;
+}
+
+// Enters the sequence's completed full pages into the cache (a page whose hash is already there stays
+// private to the sequence and is freed with it).
+void Engine::register_pages(Seq& s) {
+  const int full = std::min(s.done_pos / page_tokens_, int(s.pages.size()));
+  if (full <= s.registered) return;
+  hash_pages(s, full);
+  for (int i = s.registered; i < full; ++i) {
+    const int32_t p = s.pages[size_t(i)];
+    PageInfo& pi = page_info_[size_t(p)];
+    if (!pi.cached && page_by_hash_.emplace(s.hashes[size_t(i)], p).second) {
+      pi.hash = s.hashes[size_t(i)];
+      pi.cached = true;
+    }
+  }
+  s.registered = full;
+}
+
+int Engine::take_snapshot() {
+  int id;
+  if (!free_snaps_.empty()) {
+    id = free_snaps_.back();
+    free_snaps_.pop_back();
+  } else if (!snap_lru_.empty()) {
+    id = snap_lru_.front();
+    snap_lru_.pop_front();
+    snap_by_hash_.erase(snap_info_[size_t(id)].hash);
+    snap_info_[size_t(id)].cached = false;
+  } else {
+    return -1;
+  }
+  snap_info_[size_t(id)].refs = 1;
+  return id;
+}
+
+void Engine::put_snapshot(int id) {
+  SnapInfo& si = snap_info_[size_t(id)];
+  if (--si.refs > 0) return;
+  if (si.cached) si.lru = snap_lru_.insert(snap_lru_.end(), id);
+  else free_snaps_.push_back(id);
+}
+
+// Whether a chunk ending at `end` saves the slot's state: on page boundaries, at the prompt's last one,
+// at every one decoding completes, and every 16 pages of prefill up to 256 pages (64 to 1024, then 256;
+// with 256-token pages: every 4k tokens up to 64k, 16k up to 256k, then 64k).
+bool Engine::save_at(const Seq& s, int end, bool decode) const {
+  if (end % page_tokens_ != 0) return false;
+  if (decode || end == s.cut) return true;
+  const int pages = end / page_tokens_;
+  const int stride = page_tokens_ * (pages <= 256 ? 16 : pages <= 1024 ? 64 : 256);
+  return end - s.last_save >= stride;
 }
 
 void Engine::preempt(Seq& s) {
@@ -130,14 +276,9 @@ void Engine::preempt(Seq& s) {
 bool Engine::alloc_pages(Seq& s, int upto) {
   const size_t need = size_t((upto + page_tokens_ - 1) / page_tokens_);
   if (need <= s.pages.size()) return true;
-  if (need - s.pages.size() > free_pages_.size()) return false;
-  while (s.pages.size() < need) {
-    s.pages.push_back(free_pages_.back());
-    free_pages_.pop_back();
-  }
-  const size_t w = size_t(model_.max_pages_per_seq());
-  std::copy(s.pages.begin(), s.pages.end(), tables_.begin() + ptrdiff_t(size_t(s.slot) * w));
-  tables_dirty_ = true;
+  if (need - s.pages.size() > size_t(available_pages())) return false;
+  while (s.pages.size() < need) s.pages.push_back(take_page());
+  write_table(s);
   return true;
 }
 
@@ -182,16 +323,35 @@ bool Engine::iterate() {
   const auto t_start = std::chrono::steady_clock::now();
   const int budget0 = cfg_.max_batch_tokens;
 
-  // Admission: a free slot, pages for the request's first chunk, and a page of headroom for every
-  // running sequence (so decoders crossing a page boundary do not immediately preempt the newcomer).
+  // Admission: a free slot, pages for the request's first chunk (after any cached prefix), and a page of
+  // headroom for every running sequence (so decoders crossing a page boundary do not immediately
+  // preempt the newcomer).
   while (!waiting_.empty() && !free_slots_.empty()) {
     Seq& s = *waiting_.front();
-    const int first = std::min(int(s.tokens.size()), budget0);
-    const size_t need = size_t((first + page_tokens_ - 1) / page_tokens_) + running_.size();
-    if (need > free_pages_.size()) break;
+    match_prefix(s);
+    const int first = std::min(int(s.tokens.size()) - s.computed, budget0);
+    const int need =
+        (s.computed + first + page_tokens_ - 1) / page_tokens_ - int(s.pages.size()) + int(running_.size());
+    if (need > available_pages()) {
+      release(s);  // gives the matched prefix back
+      break;
+    }
     s.slot = free_slots_.back();
     free_slots_.pop_back();
+    write_table(s);
     s.admitted = ++admit_counter_;
+    if (cache_on_) {
+      s.cut = (int(s.tokens.size()) - 1) / page_tokens_ * page_tokens_;
+      if (s.cut <= s.computed) s.cut = 0;
+    }
+    if (!s.admitted_once) {
+      s.admitted_once = true;
+      s.cached = s.computed;
+      s.out.cached_tokens = s.cached;
+      std::lock_guard lk(stats_mu_);
+      stats_.prompt_tokens += uint64_t(s.n_prompt);
+      stats_.cached_tokens += uint64_t(s.cached);
+    }
     running_.push_back(std::move(waiting_.front()));
     waiting_.pop_front();
   }
@@ -215,7 +375,9 @@ bool Engine::iterate() {
   stats_.busy_seconds += dt;
   stats_.running = int(running_.size());
   stats_.waiting = int(waiting_.size());
-  stats_.free_pages = int(free_pages_.size());
+  stats_.free_pages = available_pages();
+  stats_.cached_pages = int(page_by_hash_.size());
+  stats_.snapshots = int(snap_by_hash_.size());
   return submitted || completed;
 }
 
@@ -233,10 +395,11 @@ bool Engine::submit_step(int budget0) {
         if (s.awaiting_logits || s.abort_pending || s.done) continue;
         const int remaining = int(s.tokens.size()) - s.computed;
         if (remaining <= 0 || (remaining == 1) != (pass == 0) || budget == 0) continue;
-        const int n = std::min(remaining, budget);
+        int n = std::min(remaining, budget);
+        if (s.cut > s.computed && s.computed + n > s.cut) n = s.cut - s.computed;
         const bool logits = n == remaining;
         if (logits && logit_rows == 0) continue;
-        plan.push_back({&s, n, logits, -1});
+        plan.push_back({&s, n, logits, -1, -1, -1, s.computed + n});
         budget -= n;
         logit_rows -= logits;
       }
@@ -248,7 +411,7 @@ bool Engine::submit_step(int budget0) {
       const size_t want = size_t((it.s->computed + it.n + page_tokens_ - 1) / page_tokens_);
       need += want > it.s->pages.size() ? want - it.s->pages.size() : 0;
     }
-    if (need <= free_pages_.size()) break;
+    if (need <= size_t(available_pages())) break;
     // Preempt the most recently admitted request with nothing in flight and plan again; if every
     // candidate is in flight, let those steps complete first.
     auto victim = running_.end();
@@ -275,6 +438,19 @@ bool Engine::submit_step(int budget0) {
     Seq& s = *it.s;
     if (!alloc_pages(s, s.computed + it.n)) throw std::logic_error("engine: page accounting");
     const int t0 = int(in.ids.size());
+    if (s.restore >= 0) {
+      in.restore.push_back({s.slot, s.restore});
+      it.restore = s.restore;
+      s.restore = -1;
+    }
+    if (cache_on_ && save_at(s, it.end, it.n == 1)) {
+      it.save = take_snapshot();
+      if (it.save >= 0) {
+        in.save.push_back({s.slot, it.save});
+        s.last_save = it.end;
+      }
+    }
+    if (it.end == s.cut) s.cut = 0;
     in.chunks.push_back({s.slot, s.computed, it.n, t0});
     for (int k = 0; k < it.n; ++k) {
       in.ids.push_back(s.tokens[size_t(s.computed + k)]);
@@ -320,6 +496,12 @@ void Engine::complete_step() {
   for (const auto& it : f.items) {
     Seq& s = *it.s;
     --s.inflight;
+    if (it.restore >= 0) put_snapshot(it.restore);
+    if (cache_on_) {
+      s.done_pos = std::max(s.done_pos, it.end);
+      register_pages(s);
+      if (it.save >= 0) commit_snapshot(s, it.save, it.end);
+    }
     (it.n == 1 && it.logits ? decode : prefill) += it.n;
     if (!it.logits) continue;
     s.awaiting_logits = false;
@@ -357,6 +539,7 @@ void Engine::complete_step() {
       s->sink(std::move(s->out));
       s->out = GenOutput{};
       s->out.prompt_tokens = s->n_prompt;
+      s->out.cached_tokens = s->cached;
     }
   }
   running_.erase(std::remove_if(running_.begin(), running_.end(),
@@ -376,6 +559,49 @@ void Engine::fail_all(const std::string& why) {
     finish(*s, FinishReason::Error, why);
   }
   running_.clear();
+  clear_cache();
+}
+
+// Forgets every cached page and snapshot (after a failed step the device contents are unknown).
+void Engine::clear_cache() {
+  for (const int32_t p : evictable_) {
+    page_info_[size_t(p)].cached = false;
+    free_pages_.push_back(p);
+  }
+  evictable_.clear();
+  for (auto& pi : page_info_) pi.cached = false;
+  page_by_hash_.clear();
+  snap_by_hash_.clear();
+  snap_lru_.clear();
+  free_snaps_.clear();
+  for (size_t i = snap_info_.size(); i-- > 0;) {
+    snap_info_[i] = SnapInfo{};
+    free_snaps_.push_back(int(i));
+  }
+}
+
+// A state save completed: the snapshot names the boundary `end` of the sequence's tokens. Decoding saves
+// at every page it completes; the save it supersedes is moved to the front of the eviction order.
+void Engine::commit_snapshot(Seq& s, int id, int end) {
+  hash_pages(s, end / page_tokens_);
+  const uint64_t h = s.hashes[size_t(end / page_tokens_ - 1)];
+  SnapInfo& si = snap_info_[size_t(id)];
+  if (snap_by_hash_.emplace(h, id).second) {
+    si.hash = h;
+    si.cached = true;
+  }
+  put_snapshot(id);
+  if (!si.cached || end <= s.n_prompt) return;
+  if (s.rolling >= 0 && s.rolling != id) {
+    const auto f = snap_by_hash_.find(s.rolling_hash);
+    SnapInfo& old = snap_info_[size_t(s.rolling)];
+    if (f != snap_by_hash_.end() && f->second == s.rolling && old.refs == 0) {
+      snap_lru_.erase(old.lru);
+      old.lru = snap_lru_.insert(snap_lru_.begin(), s.rolling);
+    }
+  }
+  s.rolling = id;
+  s.rolling_hash = h;
 }
 
 void Engine::loop() {

@@ -11,6 +11,11 @@
 // runs dry the newest request is preempted and recomputed later. Default pool: 2 x --max-model-len.
 // (--max-slots, --max-seq and --num-pages are the older names of the same three settings.)
 //
+// Prefix caching keeps finished requests' pages in the pool until they are needed and --prefix-snapshots
+// (default 128, ~7 MB of pinned host memory each; 0 turns prefix caching off) slot-state snapshots at
+// page boundaries, so a request that repeats an earlier one's prefix (the next turn of a chat, a shared
+// system prompt) starts from the deepest matching boundary instead of position 0.
+//
 // --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
 // planner (src/engine/plan.hpp) for the requested cache geometry.
@@ -42,7 +47,7 @@ int usage() {
                "usage: unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]\n"
                "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
-               "                    [--max-tokens-default N] [--card-margin-gb G]\n");
+               "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n");
   return 2;
 }
 
@@ -51,6 +56,7 @@ int serve(int argc, char** argv, bool plan_only) {
   server::ServerConfig scfg;
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
   long long kv_tokens = 0;
+  int prefix_snapshots = 128;
   double card_margin_gb = 3.0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -68,6 +74,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--max-num-seqs" || a == "--max-slots") max_slots = std::stoi(v);
     else if (a == "--max-model-len" || a == "--max-seq") max_seq = std::stoi(v);
     else if (a == "--kv-tokens") kv_tokens = std::stoll(v);
+    else if (a == "--prefix-snapshots") prefix_snapshots = std::stoi(v);
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
@@ -127,7 +134,8 @@ int serve(int argc, char** argv, bool plan_only) {
   std::fflush(stdout);
 
   const auto t0 = std::chrono::steady_clock::now();
-  engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows);
+  engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows,
+                              prefix_snapshots);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, max_slots);

@@ -127,9 +127,9 @@ rt::DeviceBuffer upload_tensor(model::Uploader& up, const model::Checkpoint& ck,
 
 ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense,
                              const model::Checkpoint* exl3, const Plan& plan, const model::CacheGeometry& geo,
-                             int max_tokens, int max_seq, int max_logit_rows)
+                             int max_tokens, int max_seq, int max_logit_rows, int snapshots)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
-      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens) {
+      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), snapshots_(snapshots) {
   model::Uploader up(dense);
   std::unique_ptr<model::Uploader> xup;
   if (exl3) xup = std::make_unique<model::Uploader>(*exl3);
@@ -281,9 +281,49 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
                    static_cast<void*>(f.x_host + size_t(max_tokens) * c.hc_mult * c.dim), static_cast<void*>(f.logits_host),
                    static_cast<void*>(f.ids_host), static_cast<void*>(f.tables_host));
   }
+  if (snapshots_ > 0) {
+    for (int k = 0; k < 2; ++k) {
+      size_t off = 0;
+      const auto add = [&](const rt::DeviceBuffer& b, size_t per_slot) {
+        snap_segs_[k].push_back({static_cast<uint8_t*>(const_cast<void*>(b.data())), per_slot, off});
+        off += per_slot;
+      };
+      for (const model::LayerCache& lc : card_[k].cache) {
+        add(lc.window_rows, size_t(c.window) * c.head_dim * 2);
+        if (lc.ratio == 4) {
+          add(lc.ring_kv, size_t(lc.ring) * lc.width * 4);
+          add(lc.ring_sc, size_t(lc.ring) * lc.width * 4);
+        }
+        if (lc.indexer) {
+          add(lc.iring_kv, size_t(lc.iring) * lc.iwidth * 4);
+          add(lc.iring_sc, size_t(lc.iring) * lc.iwidth * 4);
+        }
+      }
+      snap_bytes_[k] = off;
+      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&snap_host_[k]), off * size_t(snapshots_),
+                             hipHostMallocPortable | hipHostMallocMapped));
+    }
+  }
+}
+
+// Restores (before the step's layers) or saves (after them) slot states on card k's stream.
+void ResidentModel::state_copies(int k, const std::vector<StateOp>& ops, bool save) {
+  Card& cd = card_[k];
+  for (const StateOp& op : ops) {
+    if (op.snapshot < 0 || op.snapshot >= snapshots_ || op.slot < 0 || op.slot >= geo_.max_slots)
+      throw std::runtime_error("step: bad state op");
+    uint8_t* snap = snap_host_[k] + size_t(op.snapshot) * snap_bytes_[k];
+    for (const SnapSeg& s : snap_segs_[k]) {
+      uint8_t* slot = s.dev + size_t(op.slot) * s.bytes;
+      if (save) k::copy_kernel(snap + s.off, slot, s.bytes, cd.st);
+      else k::copy_kernel(slot, snap + s.off, s.bytes, cd.st);
+    }
+  }
 }
 
 ResidentModel::~ResidentModel() {
+  for (uint8_t* p : snap_host_)
+    if (p) (void)hipHostFree(p);
   for (auto& cd : card_)
     if (cd.st) {
       rt::DeviceGuard g(cd.dev);
@@ -399,6 +439,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     b.ids = cd.ids.as<int32_t>();
     b.pos = cd.pos.as<int32_t>();
     b.block_tables = cd.tables.as<int32_t>();
+    state_copies(k, in.restore, false);
     for (size_t i = 0; i < cd.layers.size(); ++i)
       model::layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, cd.x.as<uint16_t>(), b, cd.st,
                            chan_[k].get());
@@ -408,6 +449,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
       k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.handoff, cd.st));
     }
+    state_copies(k, in.save, true);
     if (timing) t_enq[k] = std::chrono::steady_clock::now();
   }
   // Head on card 1 for the requested rows.

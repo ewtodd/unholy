@@ -57,10 +57,11 @@ class ApuExperts final : public model::RemoteExperts {
 
 class ResidentModel final : public StepModel {
  public:
-  // max_logit_rows: rows of logits one step can return (0: max_tokens).
+  // max_logit_rows: rows of logits one step can return (0: max_tokens). snapshots: slot-state snapshots
+  // kept for prefix reuse, in pinned host memory (~7 MB each); 0 disables prefix reuse.
   ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense, const model::Checkpoint* exl3,
                 const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq,
-                int max_logit_rows = 0);
+                int max_logit_rows = 0, int snapshots = 0);
   ~ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -70,6 +71,7 @@ class ResidentModel final : public StepModel {
   int max_pages_per_seq() const override { return geo_.max_pages_per_seq; }
   int num_pages() const override { return geo_.num_pages; }
   int page_tokens() const override { return model::kPageTokens; }
+  int num_snapshots() const override { return snapshots_; }
   // Block tables [max_slots][max_pages_per_seq] (host), uploaded to both cards.
   void set_block_tables(const std::vector<int32_t>& tables) override;
   // Two steps in flight: card 0 runs step k + 1 while card 1 finishes step k (UNHOLY_INFLIGHT=1: one).
@@ -118,6 +120,18 @@ class ResidentModel final : public StepModel {
     bool busy = false;
   };
   Flight flight_[2];
+  // Slot-state snapshots: per card, the slot slices of each layer's window rows and (ratio-4 layers)
+  // compressor and indexer rings, packed per snapshot in pinned host memory. The ratio-128 rings are
+  // left out: at a page boundary (a multiple of 128) they hold no position a later block reads.
+  struct SnapSeg {
+    uint8_t* dev;       // the buffer; a slot's slice at dev + slot * bytes
+    size_t bytes, off;  // per slot; offset in the snapshot
+  };
+  int snapshots_ = 0;
+  std::vector<SnapSeg> snap_segs_[2];
+  size_t snap_bytes_[2] = {0, 0};
+  uint8_t* snap_host_[2] = {nullptr, nullptr};
+  void state_copies(int k, const std::vector<StateOp>& ops, bool save);
   // Diagnostics (UNHOLY_CHECK_PTRS): the cards' per-layer weight pointers as loaded, verified per step.
   std::vector<std::vector<const void*>> ptr_snapshot_;
   kernels::HcCanaryLog* canary_ = nullptr;  // UNHOLY_CANARY (host-mapped)
