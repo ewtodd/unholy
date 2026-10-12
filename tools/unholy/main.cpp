@@ -67,7 +67,7 @@ int serve(int argc, char** argv, bool plan_only) {
   int spec_drafts = 0;
   bool vision = true;
   float spec_min_conf = 0.5f;
-  double card_margin_gb = 3.0;
+  double card_margin_gb = 2.0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -130,8 +130,9 @@ int serve(int argc, char** argv, bool plan_only) {
   pin.vision = vision;
   // A verify chunk wants logits for its token and every draft.
   pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
-  // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). With
-  // 1.5 GB the cards ended up ~300 MB from full and the driver faulted on weight pages.
+  // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). 2 GB: the
+  // faults once blamed on headroom were c7 under the 230 W power cap (DECISIONS 2026-10-12); 2 GB moves
+  // ~2 GB of experts off the APU, which three 512k requests + DSpark + the vision tower need.
   pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
   if (plan_only) {
     std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "

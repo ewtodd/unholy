@@ -574,3 +574,34 @@ logits rel L2 1-4%; the scheduler test with a fake drafter (25% wrong tokens) gi
 to non-speculative greedy in every configuration (with prefix caching, preemption, aborts); on DSV4
 greedy outputs with and without speculation are identical. 4 drafts, single stream, short context:
 code 19.9 -> 35.1 tok/s, prose 18.9 -> 23.0 (52% of drafts accepted, 3.1 tokens per verify step).
+
+## 2026-10-12 — vision
+
+The checkpoint is DeepSeek-V4-Flash-Vision-Exp: a 32-layer ViT (1024 wide, 16 heads, 2-D rope,
+bidirectional), an Aligner (3 x 3 unfold, linear, GELU, linear) and image tokens (vocab + type) laid out
+by build_image_block in an "N-layout" that puts each 2 x 2 patch square into one 4-token compression
+block. Image tokens embed as the aligner rows (or learned start / pad / newline / end rows), route with
+gate.bias_vl (by score on the hash layers too), and see their whole image span both ways in the
+sliding-window attention (512 window entries); compressed attention stays causal.
+
+- Preprocessing on the CPU, bit-exact with the reference: libjpeg-turbo with PIL's decoder settings,
+  libpng (16-bit grey clipped to 255 as PIL's convert does), libwebp, Pillow's bicubic resampler ported
+  (fixed point, two passes), load_image's sizing / pad / normalisation. 60 synthetic + 2 example images:
+  identical bf16 patches and blocks; 12 multi-image prompts expand to identical ids; 4134 random
+  conversations with image blocks encode identically (text_test / chat_compare.py, vision_compare.py).
+- The ViT runs on the APU (1.2 GB with scratch): bf16 WMMA GEMMs with the reference's rounding points,
+  a flash-style attention. Against the reference block rows: rel L2 2.2e-2 mean — the same as the
+  reference's own CPU vs GPU difference (2.24e-2, worst rows 0.2-0.3; the ViT is that sensitive).
+  Encode: 870 ms on the APU, 409 ms on an R9700, for a 42 x 61 patch grid.
+- End to end (oracle run.py --vl-request, teacher-forced on our output): identical 329- and 119-token
+  prompts; our greedy tokens are the reference's argmax at 3/3 and 40/41 positions, median |logprob
+  difference| 0.010; the one difference (the first word) also flips between two reference runs whose
+  only difference is where the ViT ran.
+- The engine keeps an image block whole in one chunk, keys page hashes on the image's hash (identical
+  type ids otherwise), never resumes a cached prefix inside a block (its tokens see the whole block), and
+  refuses blocks that cannot fit a step.
+
+Memory: three 512k requests + DSpark + the vision tower did not fit (a pinned allocation failed at load).
+The card margin goes 3 -> 2 GB (the faults it was raised for were the power cap) and son-of-anton keeps
+64 prefix snapshots: loads with ~2 GB more experts on the cards (53.3% of routing vs 51.6%); GSM8K at
+concurrency 4 (warm cache): 44.5 tok/s aggregate, 97.9%.

@@ -36,6 +36,7 @@ def main():
     args = SimpleNamespace(**cfg)
     torch.set_default_dtype(torch.bfloat16)
     dev = torch.device(a.device)
+    torch.set_default_device(dev)  # vision.py builds its rope tables on the default device
 
     wm = json.load(open(os.path.join(a.ckpt, "model.safetensors.index.json")))["weight_map"]
     hdrs = {}

@@ -22,7 +22,7 @@
 using namespace unholy;
 
 int main(int argc, char** argv) {
-  std::string model_dir = "/scratch/dsv4-ve", image, ref;
+  std::string model_dir = "/scratch/dsv4-ve", image, ref, out_path;
   int dev = 0, reps = 3;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
     else if (a == "--ref") ref = v;
     else if (a == "--dev") dev = std::stoi(v);
     else if (a == "--reps") reps = std::stoi(v);
+    else if (a == "--out") out_path = v;
   }
   try {
     auto ck = model::Checkpoint::open(model_dir);
@@ -59,6 +60,10 @@ int main(int argc, char** argv) {
     }
     std::vector<uint16_t> got(n * c.dim);
     UH_CHECK(hipMemcpy(got.data(), out.data(), got.size() * 2, hipMemcpyDeviceToHost));
+    if (!out_path.empty()) {
+      std::ofstream of(out_path, std::ios::binary);
+      of.write(reinterpret_cast<const char*>(got.data()), std::streamsize(got.size() * 2));
+    }
     std::printf("grid %dx%d -> %dx%d, block %zu rows, encode %.1f ms\n", p.n_vit_h, p.n_vit_w, p.n_llm_h, p.n_llm_w, n, ms);
     if (!ref.empty()) {
       std::ifstream rf(ref, std::ios::binary);

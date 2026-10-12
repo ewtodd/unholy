@@ -140,7 +140,8 @@ def main():
     ap.add_argument("--ids", help="uint32 token ids (or --vl-request)")
     ap.add_argument("--vl-request", help="JSON {messages, thinking_mode?}: a prompt with images (data URLs or paths)")
     ap.add_argument("--decode-ids", default="", help="with --vl-request: comma list of teacher-forced continuation ids")
-    ap.add_argument("--prompt", type=int, required=True)
+    ap.add_argument("--vision-device", default="", help="run the ViT / Aligner there (e.g. cpu) to see their noise")
+    ap.add_argument("--prompt", type=int, default=0, help="prompt length within --ids (--vl-request: computed)")
     ap.add_argument("--decode", type=int, default=0)
     ap.add_argument("--layers", type=int, default=None, help="run only the first N layers (no logits)")
     ap.add_argument("--dump-layers", default="all", help="'all', 'none' or comma list")
@@ -211,14 +212,17 @@ def main():
         if images:
             # merge_image_embeddings with the reference ViT / Aligner, then the prompt's visibility.
             import vision as V
-            ViT, Aligner = V.ViT(margs).to(dev), V.Aligner(margs).to(dev)
+            vdev = torch.device(args.vision_device) if args.vision_device else dev
+            ViT, Aligner = V.ViT(margs).to(vdev), V.Aligner(margs).to(vdev)
             for mod, prefix in ((ViT, "vision."), (Aligner, "aligner.")):
                 for pname, prm in mod.named_parameters():
-                    prm.data.copy_(ck.get(prefix + pname).to(dev).to(prm.dtype))
+                    prm.data.copy_(ck.get(prefix + pname).to(vdev).to(prm.dtype))
             params = torch.stack([ck.get(nm).to(dev) for nm in ("image_start", "image_pad", "image_pad",
                                                                  "image_newline", "image_end")])
             for img in images:
-                emb_i = Aligner(ViT(img.patches.to(dev), img.n_vit_h, img.n_vit_w), img.n_vit_h, img.n_vit_w)[img.perm.to(dev)]
+                with torch.device(vdev):
+                    emb_i = Aligner(ViT(img.patches.to(vdev), img.n_vit_h, img.n_vit_w), img.n_vit_h, img.n_vit_w)
+                emb_i = emb_i.to(dev)[img.perm.to(dev)]
                 blk = params[img.types.to(dev)].clone()
                 blk[img.types.to(dev) == ip.IMAGE] = emb_i
                 h[0, img.start:img.start + blk.size(0)] = blk

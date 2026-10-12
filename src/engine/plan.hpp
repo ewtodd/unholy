@@ -41,7 +41,7 @@ struct PlanInput {
   model::CacheGeometry geo;
   int max_tokens = 0, max_seq = 0;
   int max_logit_rows = 0;  // rows of logits a step returns (0: max_tokens)
-  size_t card_margin = size_t(3) << 30;  // runtime, fragmentation, HIP's own allocations (unholy serve --card-margin-gb)
+  size_t card_margin = size_t(2) << 30;  // runtime, fragmentation, HIP's own allocations (unholy serve --card-margin-gb)
   size_t apu_margin = size_t(4) << 30;
   bool dspark = false;  // the DSpark drafter: dense parts and windows on card 1, routed experts on the APU
   bool vision = false;  // the vision tower on the APU
