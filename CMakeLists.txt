@@ -98,9 +98,11 @@ add_library(unholy_ref STATIC
   src/kernels/indexer.hip
   src/kernels/mx_moe.hip
   src/kernels/dspark.hip
+  src/kernels/vision.hip
+  src/model/vision.hip
 )
 target_include_directories(unholy_ref PUBLIC src third_party)
-target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)
+target_link_libraries(unholy_ref PUBLIC unholy_host unholy_vision hip::host)
 
 add_executable(unholy-layer-test tools/layer_test/main.hip)
 target_link_libraries(unholy-layer-test PRIVATE unholy_ref)
@@ -129,7 +131,7 @@ target_link_libraries(unholy-resident-test PRIVATE unholy_engine)
 # The server: OpenAI-compatible HTTP frontend + the `unholy` binary.
 add_library(unholy_server STATIC src/server/openai.cpp)
 target_include_directories(unholy_server PUBLIC src)
-target_link_libraries(unholy_server PUBLIC unholy_text unholy_sched PkgConfig::HTTPLIB)
+target_link_libraries(unholy_server PUBLIC unholy_text unholy_sched unholy_vision PkgConfig::HTTPLIB)
 
 add_executable(unholy tools/unholy/main.cpp)
 set_source_files_properties(tools/unholy/main.cpp PROPERTIES LANGUAGE HIP)
@@ -151,6 +153,8 @@ target_link_libraries(unholy-exl3-gemm-test PRIVATE unholy_ref)
 add_executable(unholy-curve tools/bench/curve.hip)
 target_link_libraries(unholy-curve PRIVATE unholy_engine)
 
+add_executable(unholy-vit-test tools/kernel_test/vision.hip)
+target_link_libraries(unholy-vit-test PRIVATE unholy_ref)
 add_executable(unholy-dspark-test tools/kernel_test/dspark.hip)
 target_link_libraries(unholy-dspark-test PRIVATE unholy_ref)
 add_executable(unholy-mx-test tools/kernel_test/mx_moe.hip)

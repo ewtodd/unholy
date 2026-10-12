@@ -42,8 +42,18 @@ namespace unholy::engine {
 enum class FinishReason { None, Stop, Length, Abort, Error };
 const char* finish_reason_name(FinishReason r);
 
+// An image of the prompt: its token block [start, start + len) (ids vocab + type), the span whose tokens
+// see each other ([span_start, span_end]: IMAGE_START .. IMAGE_END), a hash of the image (prefix caching
+// keys on it) and the block's embedding rows [len][dim] bf16 from the vision tower.
+struct GenImage {
+  int start = 0, len = 0, span_start = 0, span_end = 0;
+  uint64_t hash = 0;
+  std::shared_ptr<const std::vector<uint16_t>> rows;
+};
+
 struct GenRequest {
   std::vector<int32_t> prompt;
+  std::vector<GenImage> images;  // in position order
   SamplingParams sampling;
   int max_tokens = 0;  // completion tokens; <= 0: until the context limit
   std::vector<int32_t> stop_token_ids;
@@ -95,6 +105,8 @@ class Engine {
   uint64_t submit(GenRequest req, Sink sink);
   void abort(uint64_t id);
   EngineStats stats() const;
+  // Diagnostics (tests): one line per running request (positions, flags, drafts, images).
+  std::string debug_state() const;
   int max_context() const { return max_context_; }
 
   // Runs one scheduling iteration on the calling thread (tests drive the engine this way when it is
@@ -110,6 +122,7 @@ class Engine {
   int available_pages() const { return int(free_pages_.size() + evictable_.size()); }
   int32_t take_page();
   void write_table(const Seq& s);
+  uint64_t token_key(const Seq& s, int p) const;
   void hash_pages(Seq& s, int npages);
   void match_prefix(Seq& s);
   void register_pages(Seq& s);

@@ -235,11 +235,12 @@ __global__ void hc_post_kernel(const bf16* x, const bf16* res, const float* post
   }
 }
 
-__global__ void embed_hc_kernel(const int32_t* ids, const bf16* table, bf16* out, int dim, int hc) {
+__global__ void embed_hc_kernel(const int32_t* ids, const bf16* table, bf16* out, int dim, int hc, int vocab) {
   const int t = blockIdx.x;
-  const bf16* src = table + size_t(ids[t]) * dim;
+  const bool image = vocab > 0 && ids[t] >= vocab;  // zero (ParallelEmbedding's mask); image rows come later
+  const bf16* src = table + size_t(image ? 0 : ids[t]) * dim;
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-    const bf16 v = src[d];
+    const bf16 v = image ? bf16(0) : src[d];
     for (int h = 0; h < hc; ++h) out[(size_t(t) * hc + h) * dim + d] = v;
   }
 }
@@ -326,8 +327,8 @@ void hc_head(const bf16* x, const float* fn, const float* scale, const float* ba
   hc_mix_kernel<true><<<T, 256, 0, st>>>(x, fn, scale, base, y, nullptr, nullptr, hc, dim, 0, norm_eps, hc_eps);
   UH_CHECK_LAUNCH();
 }
-void embed_hc(const int32_t* ids, const bf16* table, bf16* out, int T, int dim, int hc, hipStream_t st) {
-  embed_hc_kernel<<<T, 256, 0, st>>>(ids, table, out, dim, hc);
+void embed_hc(const int32_t* ids, const bf16* table, bf16* out, int T, int dim, int hc, hipStream_t st, int vocab) {
+  embed_hc_kernel<<<T, 256, 0, st>>>(ids, table, out, dim, hc, vocab);
   UH_CHECK_LAUNCH();
 }
 void cast_bf16_f32(const bf16* x, float* y, size_t n, hipStream_t st) {
@@ -361,6 +362,26 @@ void copy_kernel(void* dst, const void* src, size_t bytes, hipStream_t st) {
   const int blocks = int(std::min<size_t>((n + 255) / 256, 1024));
   if (v16) copy16_kernel<<<blocks, 256, 0, st>>>(static_cast<uint4*>(dst), static_cast<const uint4*>(src), n);
   else copy1_kernel<<<blocks, 256, 0, st>>>(static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src), n);
+  UH_CHECK_LAUNCH();
+}
+
+}  // namespace unholy::kernels
+
+namespace unholy::kernels {
+
+namespace {
+__global__ void put_rows_hc_kernel(const bf16* rows, bf16* x, int t0, int dim, int hc) {
+  const int i = blockIdx.x;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const bf16 v = rows[size_t(i) * dim + d];
+    for (int h = 0; h < hc; ++h) x[(size_t(t0 + i) * hc + h) * dim + d] = v;
+  }
+}
+}  // namespace
+
+void put_rows_hc(const bf16* rows, int n, bf16* x, int t0, int dim, int hc, hipStream_t st) {
+  if (n <= 0) return;
+  put_rows_hc_kernel<<<n, 256, 0, st>>>(rows, x, t0, dim, hc);
   UH_CHECK_LAUNCH();
 }
 

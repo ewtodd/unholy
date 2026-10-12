@@ -270,7 +270,10 @@ __global__ void sparse_attn_kernel(const bf16* q, const int32_t* pos, AttnKv kv,
   const bool dspark = kv.dspark_slots >= 0;
   const int visible = kv.ratio && !dspark ? (p_t + 1) / kv.ratio : 0;
   const int ncomp = kv.ratio == 0 || dspark ? 0 : (kv.ncomp > 0 ? kv.ncomp : visible);
-  const int total = dspark ? kv.dspark_slots + kv.dspark_chunk : 128 + ncomp;
+  // Window: positions [lo, hi] from lo up in W entries (W = 512 with image spans, 128 without).
+  const int W = kv.vis ? 512 : 128;
+  const int lo = kv.vis ? kv.vis[2 * t] : max(0, p_t - 127), hi = kv.vis ? kv.vis[2 * t + 1] : p_t;
+  const int total = dspark ? kv.dspark_slots + kv.dspark_chunk : W + ncomp;
   if (threadIdx.x == 0) {
     m_run = -INFINITY;
     l_run = 0.0f;
@@ -285,12 +288,12 @@ __global__ void sparse_attn_kernel(const bf16* q, const int32_t* pos, AttnKv kv,
       if (dspark) {
         if (e < kv.dspark_slots) r = kv.ring + size_t(e) * D;
         else if (e < total) r = kv.chunk_kv + size_t(e - kv.dspark_slots) * D;
-      } else if (e < 128) {
-        // Ascending positions from max(0, p - 127), unused slots at the end (reference order).
-        const int wp = max(0, p_t - 127) + e;
-        if (wp <= p_t) r = wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;
+      } else if (e < W) {
+        // Ascending positions from lo, unused slots at the end (reference order).
+        const int wp = lo + e;
+        if (wp <= hi) r = wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;
       } else if (e < total) {
-        const int ci = e - 128;
+        const int ci = e - W;
         const int row = kv.ncomp > 0 ? kv.comp_idx[size_t(t) * kv.ncomp + ci] : ci;
         if (row >= 0 && row < visible) r = paged_row(kv.comp, row);
       }

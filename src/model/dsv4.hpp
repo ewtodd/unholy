@@ -37,6 +37,10 @@ struct Dsv4Config {
   std::vector<int> compress_ratios;  // n_layers + n_mtp entries
   int n_mtp = 0, dspark_block = 0, dspark_noise_token = 0, dspark_markov_rank = 0;
   std::vector<int> dspark_target_layers;
+  // Vision tower (0 layers: none).
+  int vision_layers = 0, vision_dim = 0, vision_heads = 0, vision_inter = 0, vision_patch = 0, vision_downsample = 0;
+  int vision_max_tokens = 0, vision_min_pixels = 0, vision_max_wh_ratio = 0;
+  double vision_rope_theta = 0;
 
   static Dsv4Config from_hf(const gufo::json::Value& cfg);
   int ratio(int layer) const { return compress_ratios.at(size_t(layer)); }
@@ -94,6 +98,7 @@ struct LayerWeights {
   DevTensor idx_wproj;  // bf16 [idx_heads, dim]
   std::optional<CompressorWeights> idx_comp;
   DevTensor gate_w, gate_bias, tid2eid;  // bf16 [E, dim], f32 [E], int32 [vocab, K]
+  DevTensor gate_bias_vl;               // f32 [E]: image tokens' selection bias (Vision-Exp checkpoints)
   std::vector<Fp4Linear> w1, w2, w3;     // routed experts
   bool exl3_experts = false;              // routed experts in EXL3 instead (x1, x2, x3)
   std::vector<Exl3Weights> x1, x2, x3;
@@ -145,6 +150,20 @@ struct DSparkWeights {
 // Loads the stages (routed experts per opt.experts, like load_layer) and the drafter tensors to `dev`.
 DSparkWeights load_dspark(const Checkpoint& ck, const Dsv4Config& c, int dev, hipStream_t st,
                           const LoadOptions& opt);
+
+// DSV4's vision tower (Vision-Exp checkpoints; inference/vision.py): ViT patch embedding, blocks, final
+// norm, and the Aligner, plus the learned rows of the image block's non-image tokens. bf16 throughout.
+struct VisionWeights {
+  struct Block {
+    DevTensor norm1, wqkv_w, wqkv_b, wo_w, wo_b, norm2, w1, w2;
+  };
+  rt::DeviceBuffer patch_w;  // [vision_dim][kpad]: the patch embedding with K zero-padded to a multiple of 32
+  int kpad = 0;
+  DevTensor patch_b, norm, al_w1, al_b1, al_w2, al_b2;
+  std::vector<Block> blocks;
+  rt::DeviceBuffer params;  // [5][dim] by token type: start, pad, pad (an image slot's default), newline, end
+};
+VisionWeights load_vision(const Checkpoint& ck, const Dsv4Config& c, int dev, hipStream_t st);
 
 struct RopeTables {
   rt::DeviceBuffer plain, yarn;  // float2 [max_pos][rope_dim/2]

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "engine/engine.hpp"
+#include "vision/image.hpp"
 #include "text/tokenizer.hpp"
 
 namespace unholy::server {
@@ -25,6 +26,11 @@ struct ServerConfig {
   std::string api_key;  // empty: no auth
   int threads = 64;     // concurrent HTTP requests (each stream holds one)
   int default_max_tokens = 0;  // when a request gives none; 0 = until the context limit
+  // Images in chat messages: the vision tower (encode one image's block rows; null: images are refused),
+  // the placeholder token, the model's vocabulary size (image tokens are vocab + type) and preprocessing.
+  std::function<void(const vision::Patches&, const vision::ImageBlock&, std::vector<uint16_t>&)> encode_image;
+  int32_t image_token = -1, vocab = 0;
+  vision::VisionConfig vision;
   // Extra plain-text endpoints (path -> handler), e.g. the routing histogram.
   std::vector<std::pair<std::string, std::function<std::string()>>> extra_get, extra_post;
 };

@@ -595,6 +595,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
     akv.ring = window;
     akv.s0 = ch.s0;
     akv.ratio = w.ratio;
+    if (b.vis) akv.vis = b.vis + size_t(ch.t0) * 2;
     if (w.ratio) akv.comp = paged(cache.comp, b, ch.slot, kPageTokens / w.ratio, HD);
     if (w.has_indexer) {
       const int nkeys = (ch.s0 + ch.n) / 4;
@@ -722,7 +723,8 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   k::cast_bf16_f32(f, af, size_t(T) * D, st);
   dense_f32(f, af, D, w.gate_w.p<bf16>(), lg, E, T, E, D, st);
   (fast_dense() ? k::route_fast : k::route)(lg, w.gate_bias.p<float>(), w.hash ? w.tid2eid.p<int32_t>() : nullptr, b.ids,
-                                           sel, wt, T, E, K, c.route_scale, st);
+                                           sel, wt, T, E, K, c.route_scale, st,
+                                           w.gate_bias_vl ? w.gate_bias_vl.p<float>() : nullptr, c.vocab);
   dump(L, b, "gate_out0", wt, size_t(T) * K * 4, st);
   dump(L, b, "gate_out1", sel, size_t(T) * K * 4, st);
 

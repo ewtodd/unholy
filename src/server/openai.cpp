@@ -296,6 +296,7 @@ struct OpenAIServer::Impl {
     bool chat = false, thinking = false;
     Value tools;
     std::vector<int32_t> prompt;
+    std::vector<engine::GenImage> images;
     std::string prompt_text;  // completions echo
     Params p;
     std::string id;
@@ -306,6 +307,7 @@ struct OpenAIServer::Impl {
     auto ch = std::make_shared<Channel>();
     engine::GenRequest gen = job->p.gen;
     gen.prompt = job->prompt;
+    gen.images = job->images;
     const int ctx = eng.max_context();
     if (int(gen.prompt.size()) >= ctx)
       throw HttpError(400, "this model's maximum context length is " + std::to_string(ctx) +
@@ -590,6 +592,28 @@ struct OpenAIServer::Impl {
     const text::RenderedChat r = text::render_request(body);
     job->thinking = r.thinking;
     job->prompt = tok.encode(r.prompt);
+    if (!r.images.empty()) {
+      if (!cfg.encode_image) throw HttpError(400, "this server has no vision tower; images are not supported");
+      std::vector<vision::ImageInput> imgs;
+      try {
+        imgs = vision::expand_images(job->prompt, cfg.image_token, cfg.vocab, r.images, cfg.vision);
+      } catch (const vision::ImageError& e) {
+        throw HttpError(400, std::string("image: ") + e.what());
+      }
+      for (const auto& im : imgs) {
+        auto rows = std::make_shared<std::vector<uint16_t>>();
+        cfg.encode_image(im.patches, im.block, *rows);
+        engine::GenImage g;
+        g.start = im.start;
+        g.len = int(im.block.types.size());
+        const auto st = std::find(im.block.types.begin(), im.block.types.end(), int32_t(vision::kImageStart));
+        g.span_start = im.start + int(st - im.block.types.begin());
+        g.span_end = im.start + g.len - 1;  // the block ends with kImageEnd
+        g.hash = im.hash;
+        g.rows = std::move(rows);
+        job->images.push_back(std::move(g));
+      }
+    }
     job->id = "chatcmpl-" + random_hex(32);
     job->created = unix_now();
     run_job(job, req, res);

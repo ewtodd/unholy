@@ -5,18 +5,30 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
 #include "kernels/dspark.hpp"
+#include "model/vision.hpp"
 #include "kernels/hc_fast.hpp"
 #include "kernels/ref.hpp"
 #include "model/loader.hpp"
 #include "rt/hip.hpp"
 
 namespace unholy::engine {
+
+// The vision tower on the APU: weights, scratch, its stream, the output rows, one image at a time.
+struct ResidentModel::Vision {
+  model::VisionWeights w;
+  model::VisionScratch s;
+  rt::DeviceBuffer out;
+  hipStream_t st = nullptr;
+  int dev = 0;
+  std::mutex mu;
+};
 
 namespace k = unholy::kernels;
 
@@ -129,7 +141,8 @@ rt::DeviceBuffer upload_tensor(model::Uploader& up, const model::Checkpoint& ck,
 
 ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense,
                              const model::Checkpoint* exl3, const Plan& plan, const model::CacheGeometry& geo,
-                             int max_tokens, int max_seq, int max_logit_rows, int snapshots, bool dspark)
+                             int max_tokens, int max_seq, int max_logit_rows, int snapshots, bool dspark,
+                             bool vision)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
       max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), snapshots_(snapshots),
       dspark_(dspark) {
@@ -162,6 +175,7 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     cd.ids = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
     cd.pos = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
     cd.tables = rt::DeviceBuffer(cd.dev, size_t(geo.max_slots) * geo.max_pages_per_seq * 4);
+    cd.vis = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 2 * 4);
   }
   for (int L = 0; L < c.n_layers; ++L) {
     Card& cd = card_[plan.layer_card[size_t(L)]];
@@ -225,6 +239,15 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
         pr("cache.window", k, cd.cache[i].window_rows.data(), cd.cache[i].window_rows.size());
       }
     }
+  }
+  if (vision && c.vision_layers > 0) {
+    vision_ = std::make_unique<Vision>();
+    vision_->dev = plan.apu;
+    rt::DeviceGuard g(plan.apu);
+    UH_CHECK(hipStreamCreateWithFlags(&vision_->st, hipStreamNonBlocking));
+    vision_->w = model::load_vision(dense, c, plan.apu, vision_->st);
+    vision_->s = model::make_vision_scratch(c, plan.apu);
+    vision_->out = rt::DeviceBuffer(plan.apu, size_t(c.vision_max_tokens + 16) * c.dim * 2);
   }
   const auto pin_host = [](auto** p, size_t bytes) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), bytes, hipHostMallocPortable | hipHostMallocMapped));
@@ -305,6 +328,8 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     pinned(&f.logits_host, size_t(max_logit_rows_) * c.vocab * 4);
     pinned(&f.ids_host, size_t(max_tokens) * 3 * 4);
     pinned(&f.tables_host, size_t(geo.max_slots) * geo.max_pages_per_seq * 4);
+    pinned(&f.vis_host, size_t(max_tokens) * 2 * 4);
+    pinned(&f.img_host, size_t(max_tokens) * c.dim * 2);
     {
       rt::DeviceGuard g(card_[0].dev);
       UH_CHECK(hipEventCreateWithFlags(&f.handoff, hipEventDisableTiming));
@@ -399,6 +424,18 @@ void ResidentModel::state_copies(int k, const std::vector<StateOp>& ops, bool sa
   }
 }
 
+void ResidentModel::encode_image(const vision::Patches& p, const vision::ImageBlock& block, std::vector<uint16_t>& rows) {
+  if (!vision_) throw std::runtime_error("no vision tower loaded");
+  std::lock_guard lk(vision_->mu);
+  rt::DeviceGuard g(vision_->dev);
+  const size_t n = block.types.size();
+  if (n * size_t(c_.dim) * 2 > vision_->out.size()) throw std::runtime_error("image block too long");
+  model::vision_encode(c_, vision_->w, vision_->s, p, block, vision_->out.as<uint16_t>(), vision_->st);
+  rows.resize(n * size_t(c_.dim));
+  UH_CHECK(hipMemcpyAsync(rows.data(), vision_->out.data(), rows.size() * 2, hipMemcpyDeviceToHost, vision_->st));
+  UH_CHECK(hipStreamSynchronize(vision_->st));
+}
+
 // Verify-chunk ring backups (before the layers) and restores of rejected positions, on card k.
 void ResidentModel::ring_ops(int k, hipStream_t st, const std::vector<RingBackup>* backup,
                              const std::vector<RingRestore>* restore) {
@@ -474,6 +511,10 @@ void ResidentModel::draft(const std::vector<RingRestore>& restore, const std::ve
 }
 
 ResidentModel::~ResidentModel() {
+  if (vision_ && vision_->st) {
+    rt::DeviceGuard g(vision_->dev);
+    (void)hipStreamDestroy(vision_->st);
+  }
   if (dst_) {
     rt::DeviceGuard g(card_[1].dev);
     (void)hipStreamDestroy(dst_);
@@ -490,7 +531,7 @@ ResidentModel::~ResidentModel() {
     }
   for (Flight& f : flight_) {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.ids_host),
-                    static_cast<void*>(f.tables_host)})
+                    static_cast<void*>(f.tables_host), static_cast<void*>(f.vis_host), static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
     for (hipEvent_t e : {f.handoff, f.consumed, f.done})
       if (e) (void)hipEventDestroy(e);
@@ -572,6 +613,33 @@ uint64_t ResidentModel::submit(const StepInput& in) {
   const bool tables = tables_dirty_;
   if (tables) std::memcpy(f.tables_host, tables_.data(), tables_.size() * 4);
   tables_dirty_ = false;
+  // Image spans: every row's window range (model.py get_image_visible / get_window_topk_idxs_visible);
+  // image rows into this flight's pinned buffer.
+  const bool vis = !in.image_spans.empty();
+  if (vis) {
+    const int max_img = std::max(c_.vision_max_tokens, 1);
+    for (const Chunk& ch : in.chunks)
+      for (int i = 0; i < ch.n; ++i) {
+        const int p = ch.s0 + i;
+        int lo = std::max(0, p - (c_.window - 1)), hi = p;
+        for (const ImageSpan& sp : in.image_spans)
+          if (sp.slot == ch.slot && p >= sp.start && p <= sp.end) {
+            const int left = std::min(p - sp.start, max_img - 1), right = std::min(sp.end - p, max_img);
+            lo = std::max(0, p - (c_.window - 1) - std::max(0, left - (c_.window - 1)));
+            hi = p + right;
+          }
+        f.vis_host[2 * (ch.t0 + i)] = lo;
+        f.vis_host[2 * (ch.t0 + i) + 1] = hi;
+      }
+  }
+  {
+    size_t off = 0;
+    for (const ImageRows& im : in.image_rows) {
+      if (im.t0 < 0 || im.t0 + im.n > T) throw std::runtime_error("step: image rows outside the batch");
+      std::memcpy(f.img_host + off, im.rows, size_t(im.n) * c_.dim * 2);
+      off += size_t(im.n) * c_.dim;
+    }
+  }
   for (int k = 0; k < 2; ++k) {
     Card& cd = card_[k];
     rt::DeviceGuard g(cd.dev);
@@ -579,6 +647,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     k::copy_kernel(cd.ids.data(), f.ids_host, size_t(T) * 4, cd.st);
     k::copy_kernel(cd.pos.data(), f.ids_host + max_tokens_, size_t(T) * 4, cd.st);
     if (tables) k::copy_kernel(cd.tables.data(), f.tables_host, tables_.size() * 4, cd.st);
+    if (vis) k::copy_kernel(cd.vis.data(), f.vis_host, size_t(T) * 2 * 4, cd.st);
   }
   // DSpark: the rows whose target hidden states feed the drafter's main-KV (each chunk's last <= 128).
   int ncap = 0;
@@ -605,7 +674,14 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     Card& cd = card_[k];
     rt::DeviceGuard g(cd.dev);
     if (k == 0) {
-      k::embed_hc(cd.ids.as<int32_t>(), embed_.as<uint16_t>(), cd.x.as<uint16_t>(), T, c_.dim, c_.hc_mult, cd.st);
+      k::embed_hc(cd.ids.as<int32_t>(), embed_.as<uint16_t>(), cd.x.as<uint16_t>(), T, c_.dim, c_.hc_mult, cd.st,
+                  c_.vocab);
+      // Image blocks: their rows (staged in this flight's pinned buffer) over the zero embeddings.
+      size_t off = 0;
+      for (const ImageRows& im : in.image_rows) {
+        k::put_rows_hc(f.img_host + off, im.n, cd.x.as<uint16_t>(), im.t0, c_.dim, c_.hc_mult, cd.st);
+        off += size_t(im.n) * c_.dim;
+      }
     } else {  // residual from card 0 through this flight's pinned buffer, ordered by events
       UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));
       k::copy_kernel(cd.x.data(), f.x_host, size_t(T) * row * 2, cd.st);
@@ -614,6 +690,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     b.ids = cd.ids.as<int32_t>();
     b.pos = cd.pos.as<int32_t>();
     b.block_tables = cd.tables.as<int32_t>();
+    b.vis = in.image_spans.empty() ? nullptr : cd.vis.as<int32_t>();
     state_copies(k, in.restore, false);
     if (!in.backup.empty()) ring_ops(k, cd.st, &in.backup, nullptr);
     const int nt = int(c_.dspark_target_layers.size());

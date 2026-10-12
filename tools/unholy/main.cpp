@@ -65,6 +65,7 @@ int serve(int argc, char** argv, bool plan_only) {
   long long kv_tokens = 0;
   int prefix_snapshots = 128;
   int spec_drafts = 0;
+  bool vision = true;
   float spec_min_conf = 0.5f;
   double card_margin_gb = 3.0;
   for (int i = 2; i < argc; ++i) {
@@ -85,6 +86,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--kv-tokens") kv_tokens = std::stoll(v);
     else if (a == "--prefix-snapshots") prefix_snapshots = std::stoi(v);
     else if (a == "--spec-drafts") spec_drafts = std::stoi(v);
+    else if (a == "--vision") vision = v != "0" && v != "off" && v != "false";
     else if (a == "--spec-min-conf") spec_min_conf = std::stof(v);
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
@@ -124,6 +126,8 @@ int serve(int argc, char** argv, bool plan_only) {
   pin.max_tokens = max_batch;
   pin.max_seq = max_seq;
   pin.dspark = spec_drafts > 0;
+  vision = vision && c.vision_layers > 0;
+  pin.vision = vision;
   // A verify chunk wants logits for its token and every draft.
   pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
   // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). With
@@ -148,7 +152,7 @@ int serve(int argc, char** argv, bool plan_only) {
 
   const auto t0 = std::chrono::steady_clock::now();
   engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows,
-                              prefix_snapshots, spec_drafts > 0);
+                              prefix_snapshots, spec_drafts > 0, vision);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, max_slots);
@@ -161,6 +165,16 @@ int serve(int argc, char** argv, bool plan_only) {
   ecfg.spec_min_conf = spec_min_conf;
   ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
   engine::Engine eng(model, ecfg);
+  if (model.has_vision()) {
+    scfg.encode_image = [&model](const vision::Patches& p, const vision::ImageBlock& b, std::vector<uint16_t>& rows) {
+      model.encode_image(p, b, rows);
+    };
+    scfg.image_token = tok.token_id("<｜deepseek_image｜>");
+    scfg.vocab = c.vocab;
+    scfg.vision = vision::VisionConfig{c.vision_patch, c.vision_downsample, c.vision_max_tokens, c.vision_min_pixels,
+                                       c.vision_max_wh_ratio};
+    if (scfg.image_token < 0) throw std::runtime_error("the tokenizer has no image placeholder token");
+  }
   // Routing histogram of the traffic served so far, in the --profile format (for re-planning).
   scfg.extra_get.emplace_back("/unholy/routing_profile",
                               [&model] { return engine::format_usage_profile(model.routing_histogram()); });

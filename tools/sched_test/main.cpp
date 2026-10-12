@@ -166,13 +166,24 @@ class FakeModel final : public StepModel {
       if (fnv(seq.data(), seq.size()) != row_state[size_t(row)]) throw std::runtime_error("fake: slot state is stale");
       logits[r * kVocab + size_t(next_token(seq))] = 10.0f;
     }
+    for (const ImageRows& im : in.image_rows) {  // whole blocks, inside one chunk
+      bool inside = false;
+      for (const Chunk& c : in.chunks) inside |= im.t0 >= c.t0 && im.t0 + im.n <= c.t0 + c.n;
+      if (!inside || !im.rows) throw std::runtime_error("fake: image rows across chunks");
+      ++image_blocks;
+    }
+    for (const ImageSpan& sp : in.image_spans) {
+      bool inside = false;
+      for (const Chunk& c : in.chunks) inside |= c.slot == sp.slot && sp.start >= c.s0 && sp.end < c.s0 + c.n;
+      if (!inside) throw std::runtime_error("fake: image span across chunks");
+    }
     for (const StateOp& sv : in.save) {
       if (len_[size_t(sv.slot)] % page_ != 0) throw std::runtime_error("fake: save off a page boundary");
       snaps_.at(size_t(sv.snapshot)) = {state_[size_t(sv.slot)], len_[size_t(sv.slot)], true};
       ++saves;
     }
   }
-  int steps = 0, max_batch = 0, max_seen = 0, restores = 0, saves = 0, rollbacks = 0, drafts = 0;
+  int steps = 0, max_batch = 0, max_seen = 0, restores = 0, saves = 0, rollbacks = 0, drafts = 0, image_blocks = 0;
 
  private:
   int32_t& at(int slot, int p) {
@@ -254,6 +265,8 @@ int main(int argc, char** argv) {
     const int max_ctx = eng.max_context();
     std::vector<std::unique_ptr<Result>> res;
     std::vector<std::pair<std::vector<int32_t>, int>> spec;
+    std::vector<std::vector<GenImage>> spec_images;
+    const int max_image = std::min(40, cfgv[5] - cfgv[0] - 1);  // fits a step even with every slot decoding
     std::vector<uint64_t> rid;
     auto submit = [&]() {
       GenRequest r;
@@ -261,7 +274,8 @@ int main(int argc, char** argv) {
       if (snaps > 0 && !spec.empty() && rng() % 2 == 0) {
         // Extend an earlier request: its prompt, or its prompt and reply (a following chat turn), whole or
         // cut somewhere past the middle, plus new tokens.
-        const auto& base = spec[spec.size() - 1 - rng() % std::min<size_t>(spec.size(), 8)];  // a recent one
+        const size_t bi = spec.size() - 1 - rng() % std::min<size_t>(spec.size(), 8);  // a recent one
+        const auto& base = spec[bi];
         std::vector<int32_t> prefix = base.first;
         if (rng() % 2 == 0) {
           FinishReason why;
@@ -270,6 +284,10 @@ int main(int argc, char** argv) {
         }
         prefix.resize(std::min(prefix.size(), size_t(cap) - 1));
         if (rng() % 2 == 0) prefix.resize(prefix.size() / 2 + rng() % (prefix.size() / 2 + 1));
+        for (const GenImage& im : spec_images[bi]) {  // the base's images that the prefix keeps whole
+          if (int(prefix.size()) > im.start && int(prefix.size()) < im.start + im.len) prefix.resize(size_t(im.start));
+          if (im.start + im.len <= int(prefix.size())) r.images.push_back(im);
+        }
         r.prompt = prefix;
         const int extra = 1 + int(rng() % 40);
         for (int i = 0; i < extra && int(r.prompt.size()) < cap; ++i)
@@ -278,10 +296,23 @@ int main(int argc, char** argv) {
       } else {
         const int len = 1 + int(rng() % uint64_t(cap));
         for (int i = 0; i < len; ++i) r.prompt.push_back(int32_t(2 + rng() % (kVocab - 2)));
+        // A third of the fresh prompts carry an image block (ids past the vocabulary, as the real ones).
+        if (max_image >= 8 && len > max_image + 2 && rng() % 3 == 0) {
+          GenImage im;
+          im.len = 8 + int(rng() % uint64_t(max_image - 7));
+          im.start = int(rng() % uint64_t(len - im.len));
+          im.span_start = im.start + 1;
+          im.span_end = im.start + im.len - 1;
+          im.hash = rng();
+          im.rows = std::make_shared<std::vector<uint16_t>>(size_t(im.len), 0);
+          for (int i = 0; i < im.len; ++i) r.prompt[size_t(im.start + i)] = int32_t(kVocab + i % 5);
+          r.images.push_back(im);
+        }
       }
       r.max_tokens = rng() % 4 == 0 ? 0 : 1 + int(rng() % 200);
       r.sampling.temperature = 0.0f;
       spec.emplace_back(r.prompt, r.max_tokens);
+      spec_images.push_back(r.images);
       res.push_back(std::make_unique<Result>());
       Result* out = res.back().get();
       rid.push_back(eng.submit(std::move(r), [out](GenOutput&& o) {
@@ -297,13 +328,20 @@ int main(int argc, char** argv) {
       ++submitted;
     };
     try {
+      int idle = 0;
       while (submitted < n_req || eng.stats().running + eng.stats().waiting > 0 || submitted == 0) {
+        if (++idle > 200000) {
+          const auto s = eng.stats();
+          throw std::runtime_error("stuck: " + std::to_string(s.running) + " running, " + std::to_string(s.waiting) +
+                                   " waiting, " + std::to_string(s.free_pages) + " free pages, steps " +
+                                   std::to_string(s.steps) + "\n" + eng.debug_state());
+        }
         const int burst = submitted < n_req ? int(rng() % 4) : 0;
         for (int b = 0; b < burst && submitted < n_req; ++b) submit();
         if (rng() % 50 == 0 && !rid.empty()) {
           eng.abort(rid[rng() % rid.size()]);
         }
-        eng.iterate();
+        if (eng.iterate()) idle = 0;
         if (submitted >= n_req && eng.stats().running + eng.stats().waiting == 0) {
           eng.iterate();  // drain aborts and intake
           if (eng.stats().running + eng.stats().waiting == 0) break;
@@ -348,12 +386,12 @@ int main(int argc, char** argv) {
     const auto st = eng.stats();
     std::printf("spec %d snaps %d depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, "
                 "%d errors; %d steps, max batch %d, %llu preemptions, free pages %d/%d; cached %llu of %llu prompt "
-                "tokens, %d restores, %d saves; drafts %d, verified %llu of %llu drafted, %d rollbacks\n",
+                "tokens, %d restores, %d saves; drafts %d, verified %llu of %llu drafted, %d rollbacks; %d image blocks\n",
                 nspec, snaps, depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors,
                 model.steps, model.max_batch, (unsigned long long)st.preemptions, st.free_pages, st.total_pages,
                 (unsigned long long)st.cached_tokens, (unsigned long long)st.prompt_tokens, model.restores,
                 model.saves, model.drafts, (unsigned long long)st.spec_accepted, (unsigned long long)st.spec_drafted,
-                model.rollbacks);
+                model.rollbacks, model.image_blocks);
     if (nspec > 0 && (st.spec_accepted == 0 || model.rollbacks == 0)) {
       std::printf("  speculative decoding never accepted or never rolled back\n");
       ++failures;

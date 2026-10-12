@@ -45,7 +45,9 @@ __global__ __launch_bounds__(NT) void sparse_attn_wmma_kernel(const bf16* __rest
   const int p_t = pos[t];
   const int visible = kv.ratio ? (p_t + 1) / kv.ratio : 0;
   const int ncomp = kv.ratio == 0 ? 0 : (kv.ncomp > 0 ? kv.ncomp : visible);
-  const int total = 128 + ncomp;
+  const int W = kv.vis ? 512 : 128;  // window entries: positions [lo, hi] from lo up (image spans: 512)
+  const int lo = kv.vis ? kv.vis[2 * t] : max(0, p_t - 127), hi = kv.vis ? kv.vis[2 * t + 1] : p_t;
+  const int total = W + ncomp;
 
   // Q fragments: head hg*16 + lane%16, dims dh*256 + ks*16 + (lane/16)*8 .. +7.
   bf16x8_t qf[16];
@@ -68,11 +70,11 @@ __global__ __launch_bounds__(NT) void sparse_attn_wmma_kernel(const bf16* __rest
     if (tid < KB) {
       const int e = e0 + tid;
       const bf16* r = nullptr;
-      if (e < 128) {
-        const int wp = max(0, p_t - 127) + e;
-        if (wp <= p_t) r = wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;
+      if (e < W) {
+        const int wp = lo + e;
+        if (wp <= hi) r = wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;
       } else if (e < total) {
-        const int ci = e - 128;
+        const int ci = e - W;
         const int row = kv.ncomp > 0 ? kv.comp_idx[size_t(t) * kv.ncomp + ci] : ci;
         if (row >= 0 && row < visible) r = paged_row(kv.comp, row);
       }

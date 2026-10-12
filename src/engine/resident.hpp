@@ -16,6 +16,7 @@
 #include "engine/step.hpp"
 #include "model/dsv4.hpp"
 #include "model/forward_ref.hpp"
+#include "vision/image.hpp"
 
 namespace unholy::kernels {
 struct HcCanaryLog;
@@ -62,7 +63,7 @@ class ResidentModel final : public StepModel {
   // kept for prefix reuse, in pinned host memory (~7 MB each); 0 disables prefix reuse.
   ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense, const model::Checkpoint* exl3,
                 const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq,
-                int max_logit_rows = 0, int snapshots = 0, bool dspark = false);
+                int max_logit_rows = 0, int snapshots = 0, bool dspark = false, bool vision = false);
   ~ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -73,6 +74,10 @@ class ResidentModel final : public StepModel {
   int num_pages() const override { return geo_.num_pages; }
   int page_tokens() const override { return model::kPageTokens; }
   int num_snapshots() const override { return snapshots_; }
+  // The vision tower (on the APU, loaded when the checkpoint has one): the embedding rows of one image's
+  // block, [block len][dim] bf16. Thread-safe; runs alongside the steps.
+  bool has_vision() const { return vision_ != nullptr; }
+  void encode_image(const vision::Patches& p, const vision::ImageBlock& block, std::vector<uint16_t>& rows);
   // DSpark (dspark = true): verify chunks of up to 1 + dspark_block tokens, drafts on card 1.
   int draft_block() const override { return dspark_ ? c_.dspark_block : 0; }
   int max_verify() const override { return dspark_ ? c_.dspark_block + 1 : 0; }
@@ -101,7 +106,7 @@ class ResidentModel final : public StepModel {
     std::vector<model::LayerCache> cache;
     model::Scratch scratch;
     model::RopeTables rope;
-    rt::DeviceBuffer x, ids, pos, tables;
+    rt::DeviceBuffer x, ids, pos, tables, vis;  // vis: [max_tokens][2] image-span windows
   };
   const model::Dsv4Config& c_;
   Plan plan_;
@@ -118,6 +123,8 @@ class ResidentModel final : public StepModel {
     float* logits_host = nullptr; // [max_logit_rows][vocab]
     int32_t* ids_host = nullptr;  // [max_tokens] ids, then positions, then logit rows
     int32_t* tables_host = nullptr;
+    int32_t* vis_host = nullptr;    // [max_tokens][2]
+    uint16_t* img_host = nullptr;   // image rows of the step [max_tokens][dim]
     hipEvent_t handoff = nullptr;   // card 0: x_host written
     hipEvent_t consumed = nullptr;  // card 1: x_host read
     hipEvent_t done = nullptr;      // card 1: logits_host written
@@ -143,6 +150,8 @@ class ResidentModel final : public StepModel {
   // layer table, own channel). Every step records the HC means of the target layers for the last <= 128
   // rows of each chunk (cap_*) and writes the stages' main-KV of them; verify chunks back up the rings
   // they overwrite (ring_* per card: descriptors and [slot][1 + block][pos_bytes] backups).
+  struct Vision;  // weights, scratch, stream, lock
+  std::unique_ptr<Vision> vision_;
   bool dspark_ = false;
   model::DSparkWeights dw_;
   std::vector<model::LayerCache> dcache_;

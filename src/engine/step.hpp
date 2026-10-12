@@ -45,12 +45,25 @@ struct DraftReq {
   int32_t token = 0;
 };
 
+// Images: an image block's embedding rows replace its tokens' embeddings (rows [n][dim] bf16 in host memory
+// that outlives the step, for batch rows [t0, t0 + n)); within a span [start, end] (IMAGE_START ..
+// IMAGE_END positions of the slot's sequence) tokens see each other both ways. A step holds whole blocks.
+struct ImageRows {
+  int t0 = 0, n = 0;
+  const uint16_t* rows = nullptr;
+};
+struct ImageSpan {
+  int slot = 0, start = 0, end = 0;
+};
+
 struct StepInput {
   std::vector<Chunk> chunks;
   std::vector<int32_t> ids, pos;     // [T]
   std::vector<int32_t> logit_rows;   // batch rows whose logits are wanted
   std::vector<StateOp> restore, save;
   std::vector<RingBackup> backup;
+  std::vector<ImageRows> image_rows;
+  std::vector<ImageSpan> image_spans;
 };
 
 class StepModel {

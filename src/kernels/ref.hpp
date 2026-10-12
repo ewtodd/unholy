@@ -47,7 +47,10 @@ void gemm_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16*
 // ---- elementwise / norms / rope / Hyper-Connections ---------------------------------------------
 void cast_bf16_f32(const bf16* x, float* y, size_t n, hipStream_t st);
 // out[t][h][:] = table[ids[t]][:] for h < hc.
-void embed_hc(const int32_t* ids, const bf16* table, bf16* out, int T, int dim, int hc, hipStream_t st);
+// Ids >= vocab (> 0) embed as zeros (image tokens; their rows are written afterwards by put_rows_hc).
+void embed_hc(const int32_t* ids, const bf16* table, bf16* out, int T, int dim, int hc, hipStream_t st, int vocab = 0);
+// x[t0 + i][h][:] = rows[i][:] for every HC copy h (i < n): image-block rows into the residual.
+void put_rows_hc(const bf16* rows, int n, bf16* x, int t0, int dim, int hc, hipStream_t st);
 // RMSNorm with weight: y = bf16(w * (x * rsqrt(mean(x^2) + eps))). y may alias x.
 void rmsnorm(const bf16* x, int ldx, const bf16* w, bf16* y, int ldy, int rows, int dim, float eps, hipStream_t st);
 // Per-head RMS normalisation without weight, in torch bf16 semantics (q path).
@@ -117,6 +120,10 @@ struct AttnKv {
   // DSpark stage attention (dspark_slots >= 0): every query sees ring slots [0, dspark_slots) in slot
   // order, then chunk_kv rows [0, dspark_chunk) (the draft block, both directions); no positions.
   int dspark_slots = -1, dspark_chunk = 0;
+  // Image spans (model.py get_window_topk_idxs_visible): vis [n][2] per query of the call, the window
+  // positions [lo, hi] it sees (the whole image, both ways, plus its 128-window); window entries are then
+  // the positions from lo up, 512 of them (128 + 384) before the compressed rows. Null: [p - 127, p].
+  const int32_t* vis = nullptr;
 };
 void sparse_attn(const bf16* q, const int32_t* pos, AttnKv kv, const float* sink, bf16* o, int T, int H, int D,
                  float scale, hipStream_t st);
@@ -126,11 +133,14 @@ void window_update(const bf16* chunk_kv, bf16* ring, int s0, int n, int D, hipSt
 // ---- MoE -------------------------------------------------------------------------------------------
 // Router: logits fp32 [T, E] -> sel [T, K] (int32), weights [T, K] fp32. sqrtsoftplus scores, bias for
 // selection (hash layers: experts from tid2eid[ids]), weights normalised and scaled.
+// Image tokens (ids >= vocab, when bias_vl is given) select with bias_vl, by score on hash layers too.
 void route(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
-           float* weights, int T, int E, int K, float route_scale, hipStream_t st);
+           float* weights, int T, int E, int K, float route_scale, hipStream_t st, const float* bias_vl = nullptr,
+           int vocab = 0);
 // Same routing, one block per token (parallel scores and argmax rounds).
 void route_fast(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
-                float* weights, int T, int E, int K, float route_scale, hipStream_t st);
+                float* weights, int T, int E, int K, float route_scale, hipStream_t st, const float* bias_vl = nullptr,
+                int vocab = 0);
 // SwiGLU with clamp: h = bf16(silu(min(g, lim)) * clamp(u, -lim, lim) * (w ? w[row] : 1)).
 void swiglu(const bf16* gate, const bf16* up, const float* w, bf16* h, int rows, int dim, float limit,
             hipStream_t st);

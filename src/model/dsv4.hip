@@ -71,6 +71,18 @@ Dsv4Config Dsv4Config::from_hf(const gufo::json::Value& j) {
   c.dspark_noise_token = int(j.member_double("dspark_noise_token_id"));
   c.dspark_markov_rank = int(j.member_double("dspark_markov_rank"));
   c.dspark_target_layers = ints("dspark_target_layer_ids");
+  if (j.find("vision_n_layers")) {  // the vision tower (Vision-Exp checkpoints)
+    c.vision_layers = int(num("vision_n_layers"));
+    c.vision_dim = int(num("vision_dim"));
+    c.vision_heads = int(num("vision_n_heads"));
+    c.vision_inter = int(num("vision_inter_dim"));
+    c.vision_patch = int(num("vision_patch_size"));
+    c.vision_rope_theta = num("vision_rope_theta");
+    c.vision_downsample = int(num("vision_downsample_ratio"));
+    c.vision_max_tokens = int(num("vision_max_n_token"));
+    c.vision_min_pixels = int(num("vision_min_pixels"));
+    c.vision_max_wh_ratio = int(num("vision_max_wh_ratio"));
+  }
   if (int(c.compress_ratios.size()) < c.n_layers) throw std::runtime_error("config: compress_ratios too short");
   return c;
 }
@@ -253,6 +265,7 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
     }
     w.gate_w = upload(lc, p + "ffn.gate.weight");
     w.gate_bias = upload(lc, p + "ffn.gate.bias");
+    if (ck.find(p + "ffn.gate.bias_vl")) w.gate_bias_vl = upload(lc, p + "ffn.gate.bias_vl");
     if (w.hash) w.tid2eid = upload_i64_as_i32(lc, p + "ffn.gate.tid2eid");
     w.sw1 = fp8(lc, p + "ffn.shared_experts.w1");
     w.sw2 = fp8(lc, p + "ffn.shared_experts.w2");
@@ -384,6 +397,57 @@ DSparkWeights load_dspark(const Checkpoint& ck, const Dsv4Config& c, int dev, hi
   u->upload_many(std::move(lc.items), st);
   u->sync();
   return d;
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+VisionWeights load_vision(const Checkpoint& ck, const Dsv4Config& c, int dev, hipStream_t st) {
+  if (c.vision_layers <= 0) throw std::runtime_error("load_vision: the checkpoint has no vision tower");
+  LoadCtx lc{ck, dev, {}, nullptr};
+  VisionWeights v;
+  v.patch_b = upload(lc, "vision.patch_embed.proj.bias");
+  v.norm = upload(lc, "vision.norm.weight");
+  v.al_w1 = upload(lc, "aligner.w1.weight");
+  v.al_b1 = upload(lc, "aligner.w1.bias");
+  v.al_w2 = upload(lc, "aligner.w2.weight");
+  v.al_b2 = upload(lc, "aligner.w2.bias");
+  for (int i = 0; i < c.vision_layers; ++i) {
+    const std::string p = "vision.blocks." + std::to_string(i) + ".";
+    VisionWeights::Block b;
+    b.norm1 = upload(lc, p + "norm1.weight");
+    b.wqkv_w = upload(lc, p + "attn.wqkv.weight");
+    b.wqkv_b = upload(lc, p + "attn.wqkv.bias");
+    b.wo_w = upload(lc, p + "attn.wo.weight");
+    b.wo_b = upload(lc, p + "attn.wo.bias");
+    b.norm2 = upload(lc, p + "norm2.weight");
+    b.w1 = upload(lc, p + "mlp.w1.weight");
+    b.w2 = upload(lc, p + "mlp.w2.weight");
+    v.blocks.push_back(std::move(b));
+  }
+  rt::DeviceGuard g(dev);
+  Uploader up(ck);
+  up.upload_many(std::move(lc.items), st);
+  up.sync();
+  // Patch embedding [dim][3 p p] -> K padded to a multiple of 32 (the WMMA GEMM's step), zeros after.
+  const auto& pw = ck.at("vision.patch_embed.proj.weight");
+  const int K = int(pw.shape[1]);
+  v.kpad = (K + 31) / 32 * 32;
+  const auto src = ck.as<uint16_t>(pw);
+  std::vector<uint16_t> padded(size_t(c.vision_dim) * v.kpad, 0);
+  for (int r = 0; r < c.vision_dim; ++r) std::copy_n(&src[size_t(r) * K], K, &padded[size_t(r) * v.kpad]);
+  v.patch_w = rt::DeviceBuffer(dev, padded.size() * 2);
+  UH_CHECK(hipMemcpy(v.patch_w.data(), padded.data(), padded.size() * 2, hipMemcpyHostToDevice));
+  std::vector<uint16_t> params(size_t(5) * c.dim);
+  const char* names[5] = {"image_start", "image_pad", "image_pad", "image_newline", "image_end"};
+  for (int t = 0; t < 5; ++t) {
+    const auto row = ck.as<uint16_t>(ck.at(names[t]));
+    std::copy_n(row.data(), c.dim, &params[size_t(t) * c.dim]);
+  }
+  v.params = rt::DeviceBuffer(dev, params.size() * 2);
+  UH_CHECK(hipMemcpy(v.params.data(), params.data(), params.size() * 2, hipMemcpyHostToDevice));
+  return v;
 }
 
 }  // namespace unholy::model

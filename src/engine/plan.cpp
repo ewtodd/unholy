@@ -146,6 +146,11 @@ Plan make_plan(const PlanInput& in) {
   }
   pl.dense[0] += embed;
   pl.dense[1] += head;
+  if (in.vision && c.vision_layers > 0) {
+    for (const auto& t : in.dense->tensors())
+      if (t.name.rfind("vision.", 0) == 0 || t.name.rfind("aligner.", 0) == 0) pl.vision_apu += t.nbytes;
+    pl.vision_apu += size_t(256) << 20;  // scratch for the largest image, the output rows
+  }
   if (in.dspark) {
     pl.dspark_card = dspark_dense_bytes(*in.dense) + dspark_work_bytes(c, in.geo);
     pl.dspark_apu = dspark_expert_bytes(*in.dense);
@@ -199,7 +204,7 @@ Plan make_plan(const PlanInput& in) {
       if (!pl.on_card[size_t(cd.layer)][size_t(cd.expert)]) pl.apu_experts += cd.bytes;
   pl.routed_on_cards = mass_cards / mass_total;
   pl.apu_free = info(pl.apu).free_bytes;
-  if (pl.apu_experts + pl.dspark_apu + in.apu_margin > pl.apu_free)
+  if (pl.apu_experts + pl.dspark_apu + pl.vision_apu + in.apu_margin > pl.apu_free)
     throw std::runtime_error("plan: the APU cannot hold the cold experts" +
                              std::string(in.dspark ? " and the drafter's" : ""));
   return pl;
@@ -230,6 +235,10 @@ std::string Plan::summary() const {
   std::snprintf(buf, sizeof buf, "apu (dev %d): cold experts %.2f GB of %.2f GB free; predicted routing on cards %.1f%%\n",
                 apu, gb(apu_experts), gb(apu_free), 100.0 * routed_on_cards);
   s << buf;
+  if (vision_apu > 0) {
+    std::snprintf(buf, sizeof buf, "vision tower: %.2f GB on the APU\n", gb(vision_apu));
+    s << buf;
+  }
   if (dspark_apu > 0) {
     std::snprintf(buf, sizeof buf, "dspark drafter: %.2f GB on card 1 (in its dense), %.2f GB of experts on the APU\n",
                   gb(dspark_card), gb(dspark_apu));

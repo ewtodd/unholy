@@ -54,6 +54,9 @@ struct BatchDesc {
   const int32_t* pos = nullptr;           // device [T]
   const int32_t* block_tables = nullptr;  // device [max_slots][max_pages_per_seq]
   int max_pages_per_seq = 0;
+  // Image tokens: device [T][2] window position range (lo, hi) per row, or null (every row's window is
+  // its last 128 positions). See k::AttnKv::vis.
+  const int32_t* vis = nullptr;
 };
 
 // Scratch for computing one routed expert over up to `rows` tokens (any device).

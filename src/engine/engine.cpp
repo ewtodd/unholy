@@ -181,12 +181,20 @@ uint64_t mix64(uint64_t x) {  // splitmix64 finalizer
 }
 }  // namespace
 
+// What a page hash takes for position p: the token, or for an image block's positions the image's hash
+// and the offset in the block (every image block's ids are the same few type ids).
+uint64_t Engine::token_key(const Seq& s, int p) const {
+  for (const GenImage& im : s.req.images)
+    if (p >= im.start && p < im.start + im.len) return mix64(im.hash + uint64_t(p - im.start));
+  return uint32_t(s.tokens[size_t(p)]);
+}
+
 void Engine::hash_pages(Seq& s, int npages) {
   while (int(s.hashes.size()) < npages) {
     const size_t i = s.hashes.size();
     uint64_t h = i ? s.hashes.back() : 0x243f6a8885a308d3ull;
     for (int k = 0; k < page_tokens_; ++k)
-      h = mix64(h + 0x9e3779b97f4a7c15ull + uint32_t(s.tokens[i * size_t(page_tokens_) + size_t(k)]));
+      h = mix64(h + 0x9e3779b97f4a7c15ull + token_key(s, int(i) * page_tokens_ + k));
     s.hashes.push_back(h);
   }
 }
@@ -200,6 +208,11 @@ void Engine::match_prefix(Seq& s) {
   int best = 0, snap = -1;
   for (int i = 0; i < limit; ++i) {
     if (!page_by_hash_.count(s.hashes[size_t(i)])) break;
+    // Never resume inside an image block: its tokens see the whole block.
+    const int boundary = (i + 1) * page_tokens_;
+    bool inside = false;
+    for (const GenImage& im : s.req.images) inside |= boundary > im.start && boundary < im.start + im.len;
+    if (inside) continue;
     if (const auto it = snap_by_hash_.find(s.hashes[size_t(i)]); it != snap_by_hash_.end()) {
       best = i + 1;
       snap = it->second;
@@ -302,6 +315,10 @@ void Engine::intake() {
       finish(*s, FinishReason::Error,
              "prompt of " + std::to_string(s->n_prompt) + " tokens does not fit the context of " +
                  std::to_string(max_context_));
+    else if (std::any_of(s->req.images.begin(), s->req.images.end(), [&](const GenImage& im) {
+               return im.len > cfg_.max_batch_tokens - slots_ || im.start < 0 || im.start + im.len > s->n_prompt || !im.rows;
+             }))
+      finish(*s, FinishReason::Error, "an image block does not fit one step (or lies outside the prompt)");
     else waiting_.push_back(std::move(s));
   }
   for (const uint64_t id : aborts) {
@@ -348,6 +365,8 @@ bool Engine::iterate() {
     s.admitted = ++admit_counter_;
     if (cache_on_) {
       s.cut = (int(s.tokens.size()) - 1) / page_tokens_ * page_tokens_;
+      for (const GenImage& im : s.req.images)  // not inside an image block
+        if (s.cut > im.start && s.cut < im.start + im.len) s.cut = im.start / page_tokens_ * page_tokens_;
       if (s.cut <= s.computed) s.cut = 0;
     }
     if (!s.admitted_once) {
@@ -361,24 +380,25 @@ bool Engine::iterate() {
     running_.push_back(std::move(waiting_.front()));
     waiting_.pop_front();
   }
+  bool submitted = false, completed = false;
   if (running_.empty() && inflight_.empty()) {
     if (!waiting_.empty()) {
       // Nothing runs and the head does not fit an empty pool: it never will.
       finish(*waiting_.front(), FinishReason::Error, "request does not fit the page pool");
       waiting_.pop_front();
-      return true;
+      completed = true;
     }
-    return false;
+  } else {
+    submitted = int(inflight_.size()) < model_.max_inflight() && submit_step(budget0);
+    if (!inflight_.empty() && (int(inflight_.size()) >= model_.max_inflight() || !submitted)) {
+      complete_step();
+      completed = true;
+    }
   }
-  const bool submitted = int(inflight_.size()) < model_.max_inflight() && submit_step(budget0);
-  bool completed = false;
-  if (!inflight_.empty() && (int(inflight_.size()) >= model_.max_inflight() || !submitted)) {
-    complete_step();
-    completed = true;
-  }
+  // Counts refreshed on every path (an abort during intake can empty the running set).
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
   std::lock_guard lk(stats_mu_);
-  stats_.busy_seconds += dt;
+  if (submitted || completed) stats_.busy_seconds += dt;
   stats_.running = int(running_.size());
   stats_.waiting = int(waiting_.size());
   stats_.free_pages = available_pages();
@@ -403,6 +423,15 @@ bool Engine::submit_step(int budget0) {
         if (remaining <= 0 || (remaining == 1) != (pass == 0) || budget == 0) continue;
         int n = std::min(remaining, budget);
         if (s.cut > s.computed && s.computed + n > s.cut) n = s.cut - s.computed;
+        // An image block goes into one chunk whole: stop before it, or take all of it when the step
+        // has room, else wait for a step that does.
+        for (const GenImage& im : s.req.images) {
+          const int a = im.start, e = im.start + im.len;
+          if (n <= 0 || s.computed >= e || s.computed + n <= a || s.computed + n >= e) continue;
+          if (a > s.computed) n = a - s.computed;
+          else n = e - s.computed <= budget ? e - s.computed : 0;
+        }
+        if (n <= 0) continue;
         const bool logits = n == remaining;
         if (logits && logit_rows == 0) continue;
         // Decoding with drafts: verify as many as the step, the context and max_tokens allow.
@@ -467,6 +496,11 @@ bool Engine::submit_step(int budget0) {
     }
     if (it.end == s.cut) s.cut = 0;
     in.chunks.push_back({s.slot, s.computed, it.n, t0});
+    for (const GenImage& im : s.req.images)  // blocks lie wholly inside chunks (planning above)
+      if (im.start >= s.computed && im.start + im.len <= s.computed + it.n) {
+        in.image_rows.push_back({t0 + im.start - s.computed, im.len, im.rows->data()});
+        in.image_spans.push_back({s.slot, im.span_start, im.span_end});
+      }
     const int fed = it.n - it.ndraft;  // tokens of the sequence; the rest are drafts
     for (int k = 0; k < it.n; ++k) {
       in.ids.push_back(k < fed ? s.tokens[size_t(s.computed + k)] : s.drafts[size_t(k - fed)]);
@@ -690,6 +724,25 @@ void Engine::loop() {
     }
     iterate();
   }
+}
+
+}  // namespace unholy::engine
+
+namespace unholy::engine {
+
+std::string Engine::debug_state() const {
+  std::string out;
+  for (const auto& s : running_) {
+    out += "seq " + std::to_string(s->id) + ": tokens " + std::to_string(s->tokens.size()) + " prompt " +
+           std::to_string(s->n_prompt) + " computed " + std::to_string(s->computed) + " inflight " +
+           std::to_string(s->inflight) + " awaiting " + std::to_string(s->awaiting_logits) + " done " +
+           std::to_string(s->done) + " abort " + std::to_string(s->abort_pending) + " drafts " +
+           std::to_string(s->drafts.size()) + " cut " + std::to_string(s->cut) + " pages " +
+           std::to_string(s->pages.size()) + " images";
+    for (const auto& im : s->req.images) out += " [" + std::to_string(im.start) + "," + std::to_string(im.start + im.len) + ")";
+    out += "\n";
+  }
+  return out;
 }
 
 }  // namespace unholy::engine

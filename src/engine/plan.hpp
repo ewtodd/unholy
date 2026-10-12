@@ -44,6 +44,7 @@ struct PlanInput {
   size_t card_margin = size_t(3) << 30;  // runtime, fragmentation, HIP's own allocations (unholy serve --card-margin-gb)
   size_t apu_margin = size_t(4) << 30;
   bool dspark = false;  // the DSpark drafter: dense parts and windows on card 1, routed experts on the APU
+  bool vision = false;  // the vision tower on the APU
 };
 
 struct Plan {
@@ -53,7 +54,8 @@ struct Plan {
   std::vector<std::vector<uint8_t>> on_card;  // [layer][expert] 1 = on the layer's card
   size_t dense[2] = {0, 0}, cache[2] = {0, 0}, scratch[2] = {0, 0}, experts[2] = {0, 0}, budget[2] = {0, 0};
   size_t apu_experts = 0, apu_free = 0;
-  size_t dspark_card = 0, dspark_apu = 0;  // the drafter's bytes on card 1 / the APU
+  size_t dspark_card = 0, dspark_apu = 0;
+  size_t vision_apu = 0;  // vision tower weights + scratch  // the drafter's bytes on card 1 / the APU
   double routed_on_cards = 0;  // predicted share of routing served by card-resident experts
   std::string summary() const;
 };

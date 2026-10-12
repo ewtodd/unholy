@@ -12,10 +12,15 @@ namespace {
 inline int cdiv(size_t a, int b) { return int((a + b - 1) / b); }
 
 // One thread per token (E <= 256, K <= 8).
-__global__ void route_kernel(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids,
-                             int32_t* sel, float* weights, int T, int E, int K, float route_scale) {
+__global__ void route_kernel(const float* logits, const float* bias0, const int32_t* tid2eid0, const int32_t* ids,
+                             int32_t* sel, float* weights, int T, int E, int K, float route_scale,
+                             const float* bias_vl, int vocab) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T) return;
+  // Image tokens (ids >= vocab) select with bias_vl, by score even on hash layers (model.py Gate).
+  const bool image = bias_vl && ids[t] >= vocab;
+  const float* bias = image ? bias_vl : bias0;
+  const int32_t* tid2eid = image ? nullptr : tid2eid0;
   const float* lg = logits + size_t(t) * E;
   auto score = [&](int e) {
     const float x = lg[e];
@@ -96,9 +101,13 @@ __global__ void moe_combine_kernel(const bf16* pair_out, const int32_t* pidx, co
 
 // Fast router: one 256-thread block per token, thread e scores expert e; K rounds of a block argmax
 // (ties -> lower expert id, as the reference scan).
-__global__ __launch_bounds__(256) void route_block_kernel(const float* logits, const float* bias,
-                                                          const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
-                                                          float* weights, int E, int K, float route_scale) {
+__global__ __launch_bounds__(256) void route_block_kernel(const float* logits, const float* bias0,
+                                                          const int32_t* tid2eid0, const int32_t* ids, int32_t* sel,
+                                                          float* weights, int E, int K, float route_scale,
+                                                          const float* bias_vl, int vocab) {
+  const bool image = bias_vl && ids[blockIdx.x] >= vocab;
+  const float* bias = image ? bias_vl : bias0;
+  const int32_t* tid2eid = image ? nullptr : tid2eid0;
   __shared__ float s_score[256];
   __shared__ float wv[8];
   __shared__ int wi[8];
@@ -161,9 +170,10 @@ __global__ __launch_bounds__(256) void route_block_kernel(const float* logits, c
 }  // namespace
 
 void route(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
-           float* weights, int T, int E, int K, float route_scale, hipStream_t st) {
+           float* weights, int T, int E, int K, float route_scale, hipStream_t st, const float* bias_vl, int vocab) {
   if (K > 8) throw std::runtime_error("route: K > 8");
-  route_kernel<<<cdiv(T, 64), 64, 0, st>>>(logits, bias, tid2eid, ids, sel, weights, T, E, K, route_scale);
+  route_kernel<<<cdiv(T, 64), 64, 0, st>>>(logits, bias, tid2eid, ids, sel, weights, T, E, K, route_scale, bias_vl,
+                                            vocab);
   UH_CHECK_LAUNCH();
 }
 void swiglu(const bf16* gate, const bf16* up, const float* w, bf16* h, int rows, int dim, float limit, hipStream_t st) {
@@ -188,9 +198,10 @@ void moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, 
 }
 
 void route_fast(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
-                float* weights, int T, int E, int K, float route_scale, hipStream_t st) {
+                float* weights, int T, int E, int K, float route_scale, hipStream_t st, const float* bias_vl,
+                int vocab) {
   if (E > 256 || K > 8) throw std::runtime_error("route_fast: E > 256 or K > 8");
-  route_block_kernel<<<T, 256, 0, st>>>(logits, bias, tid2eid, ids, sel, weights, E, K, route_scale);
+  route_block_kernel<<<T, 256, 0, st>>>(logits, bias, tid2eid, ids, sel, weights, E, K, route_scale, bias_vl, vocab);
   UH_CHECK_LAUNCH();
 }
 
