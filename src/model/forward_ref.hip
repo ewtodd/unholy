@@ -10,6 +10,7 @@
 #include "kernels/attn_wmma.hpp"
 #include "kernels/exl3_moe.hpp"
 #include "kernels/gemm_wmma.hpp"
+#include "kernels/gemv.hpp"
 #include "kernels/hc_fast.hpp"
 #include "kernels/ref.hpp"
 
@@ -60,7 +61,7 @@ namespace {
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
   kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
-  kY2F, kPairIn, kNumBufs
+  kY2F, kPairIn, kHcPart, kNumBufs
 };
 
 template <typename T>
@@ -115,6 +116,7 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kEWt] = N * K * 4;
   sz[kY2F] = N * c.dim * 4;
   sz[kPairIn] = N * K * c.dim * 2;
+  sz[kHcPart] = size_t(32) * 32 * 25 * 4;
   return sz;
 }
 }  // namespace
@@ -227,6 +229,7 @@ Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows) {
   s.xh2 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
   s.tiles = rt::DeviceBuffer(dev, size_t(s.max_tiles) * sizeof(kernels::Exl3Tile));
   s.row_expert = rt::DeviceBuffer(dev, R * 4);
+  s.yp = rt::DeviceBuffer(dev, R * size_t(std::max(c.dim, c.moe_inter)) * 4);
   return s;
 }
 
@@ -279,6 +282,17 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
   bf16* h3 = s.h3.as<bf16>();
   k::exl3_xform_in(in, D, row_expert, w.exl3_ptrs(0, 1, E), xh1, P, D, true, st);
   k::exl3_xform_in(in, D, row_expert, w.exl3_ptrs(1, 1, E), xh3, P, D, true, st);
+  if (P / c.n_active <= 8) {  // <= 8 tokens: every expert has <= 8 rows -> GEMV kernels
+    float* yp = s.yp.as<float>();
+    k::exl3_grouped_gemv(xh1, D, tiles, max_tiles, w.exl3_ptrs(0, 0, E), w.exl3_ptrs(0, 2, E), w.exl3_bits[0], yp, h1,
+                         I, I, st, ntiles_dev);
+    k::exl3_grouped_gemv(xh3, D, tiles, max_tiles, w.exl3_ptrs(1, 0, E), w.exl3_ptrs(1, 2, E), w.exl3_bits[1], yp, h3,
+                         I, I, st, ntiles_dev);
+    k::exl3_swiglu_xform(h1, h3, rw, row_expert, w.exl3_ptrs(2, 1, E), xh2, P, I, c.swiglu_limit, st);
+    k::exl3_grouped_gemv(xh2, I, tiles, max_tiles, w.exl3_ptrs(2, 0, E), w.exl3_ptrs(2, 2, E), w.exl3_bits[2], yp, out,
+                         D, D, st, ntiles_dev);
+    return;
+  }
   k::exl3_grouped_gemm(xh1, D, tiles, max_tiles, w.exl3_ptrs(0, 0, E), w.exl3_ptrs(0, 2, E), w.exl3_bits[0], h1, I, I,
                        st, ntiles_dev);
   k::exl3_grouped_gemm(xh3, D, tiles, max_tiles, w.exl3_ptrs(1, 0, E), w.exl3_ptrs(1, 2, E), w.exl3_bits[1], h3, I, I,
@@ -319,23 +333,27 @@ bool on_gfx12() {
 }
 void dense_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                 int N, int K, hipStream_t st) {
-  if (fast_dense() && on_gfx12()) k::gemm_w8a8_wmma(a, sa, w, sw, c, ldc, M, N, K, st);
+  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
+  else if (fast_dense() && on_gfx12()) k::gemm_w8a8_wmma(a, sa, w, sw, c, ldc, M, N, K, st);
   else k::gemm_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
 }
 // The reference's fp32 linears on x.float() of a bf16 tensor: bf16 WMMA on the bf16 source is exact in
 // the products; the reference kernel takes the fp32 copy.
 void dense_f32(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w, float* c, int ldc, int M, int N,
                int K, hipStream_t st) {
-  if (fast_dense()) k::gemm_bf16_f32out_wmma(a_bf16, lda, w, c, ldc, M, N, K, st);
+  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_bf16_f32out(a_bf16, lda, w, c, ldc, M, N, K, st);
+  else if (fast_dense()) k::gemm_bf16_f32out_wmma(a_bf16, lda, w, c, ldc, M, N, K, st);
   else k::gemm_f32(a_f32, lda, w, c, ldc, M, N, K, st);
 }
 void dense_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
-  if (fast_dense()) k::gemm_bf16_wmma(a, lda, w, c, ldc, M, N, K, st);
+  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_bf16(a, lda, w, c, ldc, M, N, K, st);
+  else if (fast_dense()) k::gemm_bf16_wmma(a, lda, w, c, ldc, M, N, K, st);
   else k::gemm_bf16(a, lda, w, c, ldc, M, N, K, st);
 }
 void dense_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16* c, int M, int G, int R, int K,
                         hipStream_t st) {
-  if (fast_dense()) k::gemm_grouped_fp8w_wmma(a, w, sw, c, M, G, R, K, st);
+  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
+  else if (fast_dense()) k::gemm_grouped_fp8w_wmma(a, w, sw, c, M, G, R, K, st);
   else k::gemm_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
 }
 
@@ -352,12 +370,14 @@ void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sin
 
 // Hyper-Connection pre-mix dispatch: token-tiled kernel unless UNHOLY_REF_HC=1.
 void hc_pre(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post, float* comb,
-            int T, int hc, int dim, int iters, float norm_eps, float hc_eps, hipStream_t st) {
+            float* part, int T, int hc, int dim, int iters, float norm_eps, float hc_eps, hipStream_t st) {
   static const bool fast = [] {
     const char* v = std::getenv("UNHOLY_REF_HC");
     return !v || std::string(v) == "0";
   }();
-  if (fast) k::hc_pre_tiled(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
+  if (fast && T <= k::kHcSmallMaxTokens)
+    k::hc_pre_small(x, fn, scale, base, y, post, comb, part, T, hc, dim, iters, norm_eps, hc_eps, st);
+  else if (fast) k::hc_pre_tiled(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
   else k::hc_pre(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
 }
 
@@ -434,7 +454,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   uint8_t* qb = B<uint8_t>(scr, kQBuf);
   uint8_t* qs = B<uint8_t>(scr, kQSc);
 
-  hc_pre(x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), y, post, comb, T,
+  hc_pre(x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), y, post, comb, B<float>(scr, kHcPart), T,
             c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
   dump(L, b, "hcpre_attn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_attn_post", post, size_t(T) * c.hc_mult * 4, st);
@@ -594,7 +614,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   float* comb = B<float>(scr, kComb);
   uint8_t* qb = B<uint8_t>(scr, kQBuf);
   uint8_t* qs = B<uint8_t>(scr, kQSc);
-  hc_pre(x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), y, post, comb, T,
+  hc_pre(x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), y, post, comb, B<float>(scr, kHcPart), T,
             c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
   dump(L, b, "hcpre_ffn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_ffn_post", post, size_t(T) * c.hc_mult * 4, st);
@@ -609,8 +629,8 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   float* wt = B<float>(scr, kWt);
   k::cast_bf16_f32(f, af, size_t(T) * D, st);
   dense_f32(f, af, D, w.gate_w.p<bf16>(), lg, E, T, E, D, st);
-  k::route(lg, w.gate_bias.p<float>(), w.hash ? w.tid2eid.p<int32_t>() : nullptr, b.ids, sel, wt, T, E, K,
-           c.route_scale, st);
+  (fast_dense() ? k::route_fast : k::route)(lg, w.gate_bias.p<float>(), w.hash ? w.tid2eid.p<int32_t>() : nullptr, b.ids,
+                                           sel, wt, T, E, K, c.route_scale, st);
   dump(L, b, "gate_out0", wt, size_t(T) * K * 4, st);
   dump(L, b, "gate_out1", sel, size_t(T) * K * 4, st);
 

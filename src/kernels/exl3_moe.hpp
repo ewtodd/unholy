@@ -26,4 +26,10 @@ void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int nti
                        const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
                        int ldo, int N, hipStream_t st, const int* ntiles_dev = nullptr);
 
+// Decode variant for tiles of <= 8 rows (batches of <= 8 tokens): K split across waves, each lane
+// decoding 8 trellis steps of a tile in registers; y' (fp32 [P, N]) then the output transform.
+void exl3_grouped_gemv(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* trellis_tab,
+                       const uint16_t* const* svh_tab, int bits, float* yp, bf16* out, int ldo, int N, hipStream_t st,
+                       const int* ntiles_dev = nullptr);
+
 }  // namespace unholy::kernels

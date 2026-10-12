@@ -113,6 +113,102 @@ __global__ __launch_bounds__(NT) void hc_pre_tiled_kernel(const bf16* __restrict
   }
 }
 
+
+// Small T: grid (T, 32 K-splits) partial sums, then one block per token for Sinkhorn and the mix.
+constexpr int SPLITS = 32;
+
+__global__ __launch_bounds__(NT) void hc_partial_kernel(const bf16* __restrict__ x, const float* __restrict__ fn,
+                                                        float* __restrict__ part, int width) {
+  __shared__ float red[MIX + 1][8];
+  const int t = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int ks = width / SPLITS, k0 = sp * ks;
+  const bf16* xr = x + size_t(t) * width;
+  float acc[MIX + 1];
+#pragma unroll
+  for (int j = 0; j <= MIX; ++j) acc[j] = 0.0f;
+  for (int k = k0 + tid; k < k0 + ks; k += NT) {
+    const float v = bf16_to_f32(xr[k]);
+    acc[MIX] += v * v;
+#pragma unroll
+    for (int j = 0; j < MIX; ++j) acc[j] = fmaf(v, fn[size_t(j) * width + k], acc[j]);
+  }
+#pragma unroll
+  for (int j = 0; j <= MIX; ++j) {
+    const float v = warp_sum(acc[j]);
+    if (lane == 0) red[j][wave] = v;
+  }
+  __syncthreads();
+  if (tid <= MIX) {
+    float v = 0.0f;
+    for (int w = 0; w < 8; ++w) v += red[tid][w];
+    part[(size_t(t) * SPLITS + sp) * (MIX + 1) + tid] = v;
+  }
+}
+
+__global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ x, const float* __restrict__ part,
+                                                       const float* __restrict__ scale, const float* __restrict__ base,
+                                                       bf16* __restrict__ y, float* __restrict__ post_out,
+                                                       float* __restrict__ comb_out, int hc, int dim, int iters,
+                                                       float norm_eps, float hc_eps) {
+  __shared__ float m[MIX + 1];
+  __shared__ float pre[4];
+  const int t = blockIdx.x, tid = threadIdx.x, width = hc * dim;
+  if (tid <= MIX) {
+    float v = 0.0f;
+    for (int sp = 0; sp < SPLITS; ++sp) v += part[(size_t(t) * SPLITS + sp) * (MIX + 1) + tid];
+    m[tid] = v;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    const float rs = rsqrtf(m[MIX] / float(width) + norm_eps);
+    float mx[MIX];
+    for (int j = 0; j < MIX; ++j) mx[j] = m[j] * rs;
+    float post[4], comb[4][4];
+    for (int j = 0; j < hc; ++j) pre[j] = 1.0f / (1.0f + expf(-(mx[j] * scale[0] + base[j]))) + hc_eps;
+    for (int j = 0; j < hc; ++j) post[j] = 2.0f / (1.0f + expf(-(mx[hc + j] * scale[1] + base[hc + j])));
+    for (int j = 0; j < hc; ++j) {
+      float mm = -INFINITY;
+      for (int k = 0; k < hc; ++k) {
+        comb[j][k] = mx[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k];
+        mm = fmaxf(mm, comb[j][k]);
+      }
+      float sum = 0.0f;
+      for (int k = 0; k < hc; ++k) {
+        comb[j][k] = expf(comb[j][k] - mm);
+        sum += comb[j][k];
+      }
+      for (int k = 0; k < hc; ++k) comb[j][k] = comb[j][k] / sum + hc_eps;
+    }
+    auto col_norm = [&]() {
+      for (int k = 0; k < hc; ++k) {
+        float cs = 0.0f;
+        for (int j = 0; j < hc; ++j) cs += comb[j][k];
+        for (int j = 0; j < hc; ++j) comb[j][k] = comb[j][k] / (cs + hc_eps);
+      }
+    };
+    col_norm();
+    for (int it = 0; it < iters - 1; ++it) {
+      for (int j = 0; j < hc; ++j) {
+        float rsum = 0.0f;
+        for (int k = 0; k < hc; ++k) rsum += comb[j][k];
+        for (int k = 0; k < hc; ++k) comb[j][k] = comb[j][k] / (rsum + hc_eps);
+      }
+      col_norm();
+    }
+    for (int j = 0; j < hc; ++j) {
+      post_out[size_t(t) * hc + j] = post[j];
+      for (int k = 0; k < hc; ++k) comb_out[(size_t(t) * hc + j) * hc + k] = comb[j][k];
+    }
+  }
+  __syncthreads();
+  const bf16* xt = x + size_t(t) * width;
+  for (int d = tid; d < dim; d += NT) {
+    float v = 0.0f;
+    for (int h = 0; h < hc; ++h) v += pre[h] * bf16_to_f32(xt[size_t(h) * dim + d]);
+    y[size_t(t) * dim + d] = f32_to_bf16(v);
+  }
+}
+
 }  // namespace
 
 void hc_pre_tiled(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
@@ -120,6 +216,16 @@ void hc_pre_tiled(const bf16* x, const float* fn, const float* scale, const floa
   if (hc != 4 || (hc * dim) % KC) throw std::runtime_error("hc_pre_tiled: unsupported shape");
   hc_pre_tiled_kernel<<<(T + TB - 1) / TB, NT, 0, st>>>(x, fn, scale, base, y, post, comb, T, hc, dim, iters,
                                                          norm_eps, hc_eps);
+  UH_CHECK_LAUNCH();
+}
+
+void hc_pre_small(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
+                  float* comb, float* part, int T, int hc, int dim, int iters, float norm_eps, float hc_eps,
+                  hipStream_t st) {
+  if (hc != 4 || (hc * dim) % (SPLITS * NT)) throw std::runtime_error("hc_pre_small: unsupported shape");
+  hc_partial_kernel<<<dim3(T, SPLITS), NT, 0, st>>>(x, fn, part, hc * dim);
+  UH_CHECK_LAUNCH();
+  hc_finish_kernel<<<T, NT, 0, st>>>(x, part, scale, base, y, post, comb, hc, dim, iters, norm_eps, hc_eps);
   UH_CHECK_LAUNCH();
 }
 

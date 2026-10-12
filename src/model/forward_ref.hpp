@@ -65,7 +65,7 @@ ExpertScratch make_expert_scratch(const Dsv4Config& c, int dev, int rows);
 
 // Scratch for the grouped EXL3 path over up to `rows` pair rows.
 struct Exl3MoeScratch {
-  rt::DeviceBuffer xh1, xh3, h1, h3, xh2, tiles, row_expert;
+  rt::DeviceBuffer xh1, xh3, h1, h3, xh2, tiles, row_expert, yp;
   int rows = 0, max_tiles = 0;
 };
 Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows);

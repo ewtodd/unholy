@@ -290,3 +290,20 @@ EXL3 fast path now has no host synchronization in a layer.
 
 Single EXL3 layer on one card, 1024 prefill: 162 -> 75 ms; resident model: KL 2.438e-2 (same),
 prefill 1024 tokens 2.68 -> 2.44 s, decode 0.24 -> 0.20 s/token (~4.4 ms per layer per token).
+
+## 2026-10-11 — small-M (decode) kernels
+
+The decode trace of one layer (T = 1, 49 launches, 4.4 ms) showed prefill-shaped kernels: the tiled
+HC pre-mix ran one block over K = 16384 (575 us x2), the router one thread with a serial top-6
+(543 us), the EXL3 GEMM 64-row tiles holding one row (333 us per projection), the WMMA GEMMs
+4-block grids for small N. Added (`src/kernels/gemv.hip`, `hc_fast.hip`, `ref_moe.hip`,
+`exl3_moe.hip`), selected by shape:
+- skinny GEMMs for M <= 8: W8A8 (each 16-wide chunk's exact sum scaled by its 128-block scale
+  product), bf16 -> bf16 / fp32, grouped fp8-weight wo_a; wave per column, lanes over K;
+- HC pre-mix for T <= 32: 32-way split-K partial sums, then Sinkhorn + mix per token;
+- router: a block per token, parallel scores, K argmax rounds (ties -> lower id, as the reference);
+- EXL3 GEMV for batches of <= 8 tokens: block per (tile, 16-column block), K over 8 waves, each lane
+  decoding its 8 trellis steps of a tile in registers (rows {r0, r0+1, r0+8, r0+9} x columns
+  {c0, c0+8}), then the output Hadamard * svh per row.
+Decode error vs the oracle unchanged (layer 3: 3.612e-2); per-layer decode 4.4 -> ~1.7 ms;
+resident model decode 0.20 s -> 79 ms/token (12.7 tok/s raw), KL 2.438e-2.

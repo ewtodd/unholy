@@ -263,3 +263,127 @@ void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int nti
 }
 
 }  // namespace unholy::kernels
+
+// ---------------------------------------------------------------------------------------------------
+// Decode path: tiles with <= 8 rows (any batch of <= 8 tokens).
+namespace unholy::kernels {
+
+namespace {
+
+constexpr int GV_ROWS = 8, GV_KC = 512, GV_NT = 256;
+
+// 16 bits ending at bit `end` of the circular stream (`w` = the tile's NW words).
+template <int BITS>
+__device__ __forceinline__ uint32_t window_end(const uint32_t* w, int end) {
+  constexpr int LEN = 256 * BITS, NW = 8 * BITS;
+  const int start = (end - 16 + LEN) % LEN;
+  const int w0 = start >> 5, b0 = start & 31;
+  const uint64_t two = (uint64_t(w[w0]) << 32) | w[(w0 + 1) % NW];
+  return uint32_t(two >> (48 - b0)) & 0xffffu;
+}
+
+// One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows.
+template <int BITS>
+__global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __restrict__ xh, int K,
+                                                          const Exl3Tile* __restrict__ tiles,
+                                                          const uint16_t* const* __restrict__ trellis_tab,
+                                                          float* __restrict__ yp, int N, const int* ntiles_dev) {
+  constexpr int NW = 8 * BITS;
+  if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
+  const Exl3Tile tile = tiles[blockIdx.y];
+  const int nb = blockIdx.x, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const int M = tile.rows;
+  __shared__ _Float16 sX[GV_ROWS][GV_KC];
+  __shared__ uint32_t sW[8][NW];  // one tile's words per wave
+  __shared__ float sRed[8][GV_ROWS][16];
+  const uint32_t* trellis = reinterpret_cast<const uint32_t*>(trellis_tab[tile.expert]);
+  const int tiles_n = N / 16;
+  // This lane's 8 trellis steps cover rows {r0, r0+1, r0+8, r0+9} x columns {c0, c0+8}.
+  const int r0 = (lane & 3) * 2, c0 = lane >> 2;
+  float acc[GV_ROWS][2];
+#pragma unroll
+  for (int m = 0; m < GV_ROWS; ++m) acc[m][0] = acc[m][1] = 0.0f;
+
+  for (int kc = 0; kc < K; kc += GV_KC) {
+    for (int i = tid; i < M * GV_KC; i += GV_NT) {
+      const int m = i / GV_KC, k = i % GV_KC;
+      reinterpret_cast<uint16_t*>(sX[m])[k] = xh[size_t(tile.row0 + m) * K + kc + k];
+    }
+    __syncthreads();
+    // GV_KC / 16 = 32 k-tiles in this chunk; wave w takes w, w + 8, ...
+    for (int kt = wave; kt < GV_KC / 16; kt += 8) {
+      const size_t ti = size_t((kc / 16) + kt) * tiles_n + nb;
+      for (int i = lane; i < NW; i += 32) sW[wave][i] = trellis[ti * NW + i];
+      __builtin_amdgcn_wave_barrier();
+      float wv[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) wv[j] = float(decode_mul1(window_end<BITS>(sW[wave], (lane * 8 + j + 1) * BITS)));
+      __builtin_amdgcn_wave_barrier();
+      const int kb = kt * 16;
+      for (int m = 0; m < M; ++m) {
+        const float x0 = float(sX[m][kb + r0]), x1 = float(sX[m][kb + r0 + 1]);
+        const float x8 = float(sX[m][kb + r0 + 8]), x9 = float(sX[m][kb + r0 + 9]);
+        // j: 0 (r0,c0) 1 (r0+1,c0) 2 (r0+8,c0) 3 (r0+9,c0) 4..7 the same rows at c0+8
+        acc[m][0] += wv[0] * x0 + wv[1] * x1 + wv[2] * x8 + wv[3] * x9;
+        acc[m][1] += wv[4] * x0 + wv[5] * x1 + wv[6] * x8 + wv[7] * x9;
+      }
+    }
+    __syncthreads();
+  }
+  // Lanes 4c0..4c0+3 share columns c0 and c0+8.
+  for (int m = 0; m < M; ++m)
+    for (int h = 0; h < 2; ++h) {
+      float v = acc[m][h];
+      v += __shfl_xor(v, 1, 32);
+      v += __shfl_xor(v, 2, 32);
+      if ((lane & 3) == 0) sRed[wave][m][c0 + 8 * h] = v;
+    }
+  __syncthreads();
+  for (int i = tid; i < M * 16; i += GV_NT) {
+    const int m = i / 16, cc = i % 16;
+    float v = 0.0f;
+    for (int w8 = 0; w8 < 8; ++w8) v += sRed[w8][m][cc];
+    yp[size_t(tile.row0 + m) * N + nb * 16 + cc] = v;
+  }
+}
+
+// out[row] = bf16(H128(y'[row]) * svh[e] / sqrt(128)) for the tiles' rows; block per (segment, tile row).
+__global__ __launch_bounds__(128) void exl3_out_rows_kernel(const float* yp, const Exl3Tile* tiles,
+                                                            const uint16_t* const* svh_tab, bf16* out, int ldo, int N,
+                                                            const int* ntiles_dev) {
+  const int ti = blockIdx.y / GV_ROWS, m = blockIdx.y % GV_ROWS;
+  if (ntiles_dev && ti >= *ntiles_dev) return;
+  const Exl3Tile tile = tiles[ti];
+  if (m >= tile.rows) return;
+  __shared__ float b[128];
+  const int seg = blockIdx.x, i = threadIdx.x, row = tile.row0 + m;
+  b[i] = yp[size_t(row) * N + seg * 128 + i];
+  __syncthreads();
+  fwht128_lds(b, i);
+  const uint16_t* svh = svh_tab[tile.expert];
+  out[size_t(row) * ldo + seg * 128 + i] =
+      f32_to_bf16(b[i] * 0.08838834764831845f * __half2float(__ushort_as_half(svh[seg * 128 + i])));
+}
+
+}  // namespace
+
+void exl3_grouped_gemv(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* trellis_tab,
+                       const uint16_t* const* svh_tab, int bits, float* yp, bf16* out, int ldo, int N, hipStream_t st,
+                       const int* ntiles_dev) {
+  if (ntiles <= 0) return;
+  if (K % GV_KC || N % 128) throw std::runtime_error("exl3_grouped_gemv: K % 512 or N % 128");
+  const dim3 grid(N / 16, ntiles);
+  switch (bits) {
+    case 2: exl3_gemv_kernel<2><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
+    case 3: exl3_gemv_kernel<3><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
+    case 4: exl3_gemv_kernel<4><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
+    case 5: exl3_gemv_kernel<5><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
+    case 6: exl3_gemv_kernel<6><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
+    default: throw std::runtime_error("exl3_grouped_gemv: unsupported bit width");
+  }
+  UH_CHECK_LAUNCH();
+  exl3_out_rows_kernel<<<dim3(N / 128, ntiles * GV_ROWS), 128, 0, st>>>(yp, tiles, svh_tab, out, ldo, N, ntiles_dev);
+  UH_CHECK_LAUNCH();
+}
+
+}  // namespace unholy::kernels

@@ -116,6 +116,9 @@ void window_update(const bf16* chunk_kv, bf16* ring, int s0, int n, int D, hipSt
 // selection (hash layers: experts from tid2eid[ids]), weights normalised and scaled.
 void route(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
            float* weights, int T, int E, int K, float route_scale, hipStream_t st);
+// Same routing, one block per token (parallel scores and argmax rounds).
+void route_fast(const float* logits, const float* bias, const int32_t* tid2eid, const int32_t* ids, int32_t* sel,
+                float* weights, int T, int E, int K, float route_scale, hipStream_t st);
 // SwiGLU with clamp: h = bf16(silu(min(g, lim)) * clamp(u, -lim, lim) * (w ? w[row] : 1)).
 void swiglu(const bf16* gate, const bf16* up, const float* w, bf16* h, int rows, int dim, float limit,
             hipStream_t st);
