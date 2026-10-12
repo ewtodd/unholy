@@ -28,7 +28,7 @@ nix develop -c ./build/unholy-probe --json probe.json
 - [x] flake + CMake (TheRock 10.1 SDK, fat gfx1201/gfx1151)
 - [x] `unholy-probe`: PCIe paths, verified transfers, signalling latency (DECISIONS 2026-10-11)
 - [x] checkpoint reader + CPU reference decoders: native (MXFP4, fp8 block-scaled) and EXL3 (bit-exact vs exllamav3)
-- [ ] device weight loader (placement-driven upload)
+- [x] device weight loader (O_DIRECT coalesced uploads into per-device arenas; full resident load ~21 s)
 - [ ] memory planner dry-run against the probe JSON (4 x 512k slots, hot/cold expert split)
 
 ## Milestone 2 (correct forward)
@@ -41,6 +41,18 @@ nix develop -c ./build/unholy-probe --json probe.json
 - [x] full-model logits vs oracle (`unholy-ref-run`): mean KL 9.6e-3, top-1 95.7% vs the oracle's own
       noise floor 9.9e-3 / 96.2% (DECISIONS 2026-10-11) — correct
 - [ ] DSpark (the checkpoint's `mtp.*` block drafter) on the reference path
+
+## Milestone 3 (serving)
+
+- [x] tokenizer (`src/text/tokenizer.cpp`, PCRE2): identical to HF `tokenizers` on 91k adversarial +
+      real strings except code points assigned after HF's Oniguruma tables; decode identical;
+      5.3M tok/s (`tools/ref/tok_compare.py`)
+- [x] chat format + streaming output parser (`src/text/chat.cpp`): byte-identical to
+      `encoding_dsv4.py` (golden 4/4, 20k random conversations), request path identical to vLLM's
+      `apply_chat_template` (text and ids), parser identical to the reference at any chunking
+      (`tools/ref/chat_compare.py`)
+- [ ] scheduler + paged cache manager (continuous batching, chunked prefill, slots)
+- [ ] OpenAI-compatible HTTP server (SSE), `unholy` CLI, NixOS module
 
 ### Reference path vs oracle, per layer (1024 prefill + 8 decode, code prompt)
 

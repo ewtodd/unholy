@@ -6,6 +6,8 @@
   cmake,
   ninja,
   patchelf,
+  pkg-config,
+  pcre2,
   rocmSdk,
   rocmSdkCc,
   gpuTargets,
@@ -29,7 +31,10 @@ stdenv.mkDerivation {
     cmake
     ninja
     patchelf
+    pkg-config
   ];
+
+  buildInputs = [ pcre2 ];
 
   cmakeFlags = [
     (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
@@ -48,7 +53,7 @@ stdenv.mkDerivation {
   # Linked by the SDK clang, not nix's ld wrapper: add the SDK and our own lib dir to the runpath.
   postFixup = ''
     for f in $out/bin/*; do
-      [ -L "$f" ] || patchelf --add-rpath ${rocmSdk}/lib:$out/lib "$f"
+      [ -L "$f" ] || patchelf --add-rpath ${rocmSdk}/lib:${lib.getLib pcre2}/lib:$out/lib "$f"
     done
   '';
 

@@ -312,3 +312,34 @@ for the worst-case tile count (257) and launched ~50k empty blocks per call (now
 pair-row count), the HC finish ran Sinkhorn out of scratch memory (runtime-indexed arrays; now
 compile-time hc = 4, registers), and the LM head used the 64-row WMMA tile at M = 1 (now the GEMV;
 1.06 GB of bf16 head per token is its floor). Decode 79 -> 58 ms/token (~17 tok/s raw), KL unchanged.
+
+## 2026-10-11 — serving text layer: tokenizer, chat format, output parser
+
+Own implementations rather than embedding Python or the Rust `tokenizers` crate: the server is one
+C++ binary.
+- JSON (`src/text/json.cpp`): ordered, numbers kept as their source text, `dump_py()` = Python's
+  `json.dumps(ensure_ascii=False)` (", "/": " separators, ints as ints, floats as `repr`). The chat
+  format embeds tool schemas and arguments through `json.dumps`, so this has to be exact.
+- Tokenizer (`src/text/tokenizer.cpp`): HF's pipeline for this tokenizer.json — added tokens cut out
+  first (special + non-normalized in one leftmost-longest pass, normalized ones in a second), the three
+  Isolated Split regexes each applied to the pieces of the previous one, byte-level alphabet, BPE by
+  merge rank with HF's queue order. PCRE2 (UTF+UCP, JIT) stands in for Oniguruma; the one semantic
+  difference found is `\s`: PCRE2's includes U+180E, Oniguruma's is the White_Space property, so
+  `\s`/`\S` are rewritten to the explicit set at load. Against HF on 91k strings (adversarial
+  whitespace/digits/CJK/emoji/special-token fragments + real source files): identical except 2 strings
+  containing code points newly assigned in Unicode 17 (PCRE2 10.48 has newer tables than HF's
+  Oniguruma; not worth emulating). Decode (incl. a streaming detokenizer holding back incomplete UTF-8)
+  identical on 6k sequences. 5.3M tok/s vs HF's 0.76M on the same 3 MB text (a 512k prompt in ~0.1 s).
+- Chat format (`src/text/chat.cpp`): a port of the checkpoint's `encoding_dsv4.py` text path, plus
+  vLLM's two deliberate changes: a system message that is last or followed by an assistant turn opens
+  a generation turn, and object-valued tool-call arguments render as parameters. Request semantics as
+  vLLM's DSV4 tokenizer wrapper: tools become a leading system message, thinking defaults on,
+  `reasoning_effort` defaults to high when thinking (none -> chat mode; low/minimal/medium -> low).
+  Golden files 4/4, 20k randomized conversations byte-identical to the reference (cases with the two
+  deliberate differences filtered), 400 OpenAI requests identical to vLLM's `apply_chat_template` in
+  text and token ids.
+- Output parser: vLLM's DSV4 state machine (reasoning until `</think>`, content, DSML tool blocks
+  anywhere, arguments via `_dsml_arg_converter` + wrapper unwrapping), streaming with held-back
+  partial terminals; the "\n\n" before a tool block is dropped from content as the reference does.
+  Identical to `parse_message_from_completion_text` on 24k reference-rendered completions fed in
+  chunks of 1..13 bytes and whole.

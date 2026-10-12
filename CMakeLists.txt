@@ -19,6 +19,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(hip REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 # therock-sdk-nix's clang wrapper appends its link flags to compile-only invocations too.
@@ -40,6 +42,18 @@ target_link_libraries(unholy-ckpt PRIVATE unholy_host)
 add_executable(unholy-probe tools/probe/probe.hip)
 set_source_files_properties(tools/probe/probe.hip PROPERTIES LANGUAGE HIP)
 target_link_libraries(unholy-probe PRIVATE unholy_host hip::host)
+
+# Serving text layer: JSON, tokenizer (PCRE2 pre-tokenizer), DSV4 chat format. No device code.
+add_library(unholy_text STATIC
+  src/text/json.cpp
+  src/text/tokenizer.cpp
+  src/text/chat.cpp
+)
+target_include_directories(unholy_text PUBLIC src)
+target_link_libraries(unholy_text PUBLIC PkgConfig::PCRE2)
+
+add_executable(unholy-text-test tools/text_test/main.cpp)
+target_link_libraries(unholy-text-test PRIVATE unholy_text)
 
 # Reference kernels + the DSV4 reference model path.
 add_library(unholy_ref STATIC
