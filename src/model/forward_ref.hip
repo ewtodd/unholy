@@ -657,11 +657,11 @@ void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
     if (!remote || !remote->can_enqueue()) throw std::runtime_error("moe: remote experts need an enqueue backend");
     if (size_t(P) > remote->capacity_rows || ds.max_tiles > remote->max_tiles)
       throw std::runtime_error("moe: remote staging too small");
-    UH_CHECK(hipMemcpyAsync(remote->plan_host, plan, sizeof(k::MoePlan), hipMemcpyDeviceToHost, st));
-    UH_CHECK(hipMemcpyAsync(remote->tiles_host, rtl, size_t(ds.max_tiles) * sizeof(k::Exl3Tile), hipMemcpyDeviceToHost,
-                            st));
-    UH_CHECK(hipMemcpyAsync(remote->e_host, row_expert, size_t(P) * 4, hipMemcpyDeviceToHost, st));
-    UH_CHECK(hipMemcpyAsync(remote->w_host, ewt, size_t(P) * 4, hipMemcpyDeviceToHost, st));
+    // A kernel, not async copies: the copies were not reliably ordered after the previous layer's
+    // stream wait on the remote side's done flag (DECISIONS 2026-10-12), so they could overwrite the
+    // staging the remote side was still reading.
+    k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host, remote->e_host,
+                    P, st);
     k::copy_remote_rows(pair_in, remote->in_host, plan, D, P, st);
     static const bool stats = std::getenv("UNHOLY_MOE_STATS") != nullptr;
     if (stats) {  // diagnostics only: synchronizes the stream

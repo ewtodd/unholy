@@ -1,4 +1,6 @@
 // Reference elementwise kernels: quantization, norms, rotary, Hadamard, Hyper-Connections.
+#include <algorithm>
+
 #include "kernels/dev.hip.hpp"
 #include "kernels/ref.hpp"
 #include "rt/hip.hpp"
@@ -263,6 +265,17 @@ __global__ void add_bf16_to_f32_kernel(const bf16* x, float* y, size_t n) {
     y[i] += bf16_to_f32(x[i]);
 }
 
+__global__ void copy16_kernel(uint4* dst, const uint4* src, size_t n) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    dst[i] = src[i];
+  __threadfence_system();
+}
+__global__ void copy1_kernel(uint8_t* dst, const uint8_t* src, size_t n) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    dst[i] = src[i];
+  __threadfence_system();
+}
+
 }  // namespace
 
 void act_quant_fp8(const bf16* x, int ldx, uint8_t* q, uint8_t* s, int rows, int cols, int block, hipStream_t st) {
@@ -338,6 +351,16 @@ void scale_bf16(bf16* x, float c, size_t n, hipStream_t st) {
 void positions(int32_t* out, int n, int start, int step, hipStream_t st) {
   if (n <= 0) return;
   positions_kernel<<<(n + 255) / 256, 256, 0, st>>>(out, n, start, step);
+  UH_CHECK_LAUNCH();
+}
+
+void copy_kernel(void* dst, const void* src, size_t bytes, hipStream_t st) {
+  if (bytes == 0) return;
+  const bool v16 = (reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src) | bytes) % 16 == 0;
+  const size_t n = v16 ? bytes / 16 : bytes;
+  const int blocks = int(std::min<size_t>((n + 255) / 256, 1024));
+  if (v16) copy16_kernel<<<blocks, 256, 0, st>>>(static_cast<uint4*>(dst), static_cast<const uint4*>(src), n);
+  else copy1_kernel<<<blocks, 256, 0, st>>>(static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src), n);
   UH_CHECK_LAUNCH();
 }
 

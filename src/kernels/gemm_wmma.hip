@@ -129,19 +129,23 @@ __global__ __launch_bounds__(NT) void bf16_kernel(const bf16* __restrict__ A, in
     }
     for (int idx = tid; idx < BN * 4; idx += NT) {  // W: 128 x 32, 8 per item
       const int r = idx >> 2, c = (idx & 3) * 8;
-      uint16_t vals[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      // Kept in registers (a local array here was spilled to scratch).
+      uint4 vals = {0, 0, 0, 0};
       if (n0 + r < N) {
         const size_t row = wrow0 + n0 + r;
         if constexpr (kFp8W) {
           const uint8_t* wp = static_cast<const uint8_t*>(Wv) + row * K + k0 + c;
           const float s = e8m0_to_f32(sw[(row / 128) * (K / 128) + (k0 + c) / 128]);
-          for (int j = 0; j < 8; ++j) vals[j] = f32_to_bf16(e4m3_to_f32(wp[j]) * s);
+          const auto pair = [&](int j) {
+            return uint32_t(f32_to_bf16(e4m3_to_f32(wp[j]) * s)) |
+                   (uint32_t(f32_to_bf16(e4m3_to_f32(wp[j + 1]) * s)) << 16);
+          };
+          vals = uint4{pair(0), pair(2), pair(4), pair(6)};
         } else {
-          *reinterpret_cast<uint4*>(vals) =
-              *reinterpret_cast<const uint4*>(static_cast<const bf16*>(Wv) + row * K + k0 + c);
+          vals = *reinterpret_cast<const uint4*>(static_cast<const bf16*>(Wv) + row * K + k0 + c);
         }
       }
-      *reinterpret_cast<uint4*>(&sW[r * STR + c]) = *reinterpret_cast<uint4*>(vals);
+      *reinterpret_cast<uint4*>(&sW[r * STR + c]) = vals;
     }
     __syncthreads();
 #pragma unroll

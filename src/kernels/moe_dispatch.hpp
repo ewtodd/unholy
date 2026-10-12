@@ -26,6 +26,10 @@ void moe_scatter(const int32_t* sel, const float* wt, int T, int K, const int32_
                  float* ewt, int32_t* row_expert, int32_t* pidx, hipStream_t st);
 // Rows [remote0, P) (and their weights / experts) between two buffers with the same row indexing,
 // e.g. device pair rows -> pinned host staging; grids sized for max_rows.
+// The remote side's per-layer inputs (plan, remote tiles, rows' routing weights and experts) into its
+// staging, by a kernel: stream-ordered with the flag packets around it.
+void stage_remote(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt, const int32_t* row_expert,
+                  MoePlan* plan_dst, Exl3Tile* tiles_dst, float* w_dst, int32_t* e_dst, int max_rows, hipStream_t st);
 void copy_remote_rows(const uint16_t* src, uint16_t* dst, const MoePlan* plan, int dim, int max_rows, hipStream_t st);
 void copy_remote_meta(const float* ewt, const int32_t* row_expert, float* w_dst, int32_t* e_dst, const MoePlan* plan,
                       int max_rows, hipStream_t st);

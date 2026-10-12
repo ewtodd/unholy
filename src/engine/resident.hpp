@@ -114,6 +114,10 @@ class ResidentModel final : public StepModel {
     bool busy = false;
   };
   Flight flight_[2];
+  // Diagnostics (UNHOLY_CHECK_PTRS): the cards' per-layer weight pointers as loaded, verified per step.
+  std::vector<std::vector<const void*>> ptr_snapshot_;
+  uint64_t steps_ = 0;
+  std::vector<const void*> layer_ptrs(int k) const;
   uint64_t next_ticket_ = 1;
   int inflight_ = 2;
   std::vector<int32_t> tables_;

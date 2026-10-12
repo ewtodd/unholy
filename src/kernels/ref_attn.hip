@@ -37,24 +37,33 @@ __global__ void compress_rows_kernel(const float* pkv, const float* psc, const f
       sc = rsc[size_t(p % ring) * width + ch];
     }
   };
-  constexpr int kMax = 128;
-  float kv[kMax], sc[kMax];
-  int m = 0;
-  if (overlap) {
-    for (int r = 0; r < ratio; ++r, ++m) fetch((i - 1) * ratio + r, c, kv[m], sc[m]);
-    for (int r = 0; r < ratio; ++r, ++m) fetch(i * ratio + r, d + c, kv[m], sc[m]);
-  } else {
-    for (int r = 0; r < ratio; ++r, ++m) fetch(i * ratio + r, c, kv[m], sc[m]);
-  }
+  // Entry e of the softmax window (overlap: the previous block's first half, then this block's second
+  // half). Three passes re-fetching from L2 instead of up to 2 x 128 locals, which spilled to scratch;
+  // the same operations in the same order.
+  const int m = overlap ? 2 * ratio : ratio;
+  const auto at = [&](int e, float& kv, float& sc) {
+    if (overlap && e < ratio) fetch((i - 1) * ratio + e, c, kv, sc);
+    else if (overlap) fetch(i * ratio + (e - ratio), d + c, kv, sc);
+    else fetch(i * ratio + e, c, kv, sc);
+  };
   float mx = -INFINITY;
-  for (int e = 0; e < m; ++e) mx = fmaxf(mx, sc[e]);
+  for (int e = 0; e < m; ++e) {
+    float kv, sc;
+    at(e, kv, sc);
+    mx = fmaxf(mx, sc);
+  }
   float sum = 0.0f;
   for (int e = 0; e < m; ++e) {
-    sc[e] = expf(sc[e] - mx);
-    sum += sc[e];
+    float kv, sc;
+    at(e, kv, sc);
+    sum += expf(sc - mx);
   }
   float acc = 0.0f;
-  for (int e = 0; e < m; ++e) acc += kv[e] * (sc[e] / sum);
+  for (int e = 0; e < m; ++e) {
+    float kv, sc;
+    at(e, kv, sc);
+    acc += kv * (expf(sc - mx) / sum);
+  }
   out[size_t(i - row0) * d + c] = acc;
 }
 

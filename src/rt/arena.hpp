@@ -30,6 +30,7 @@ class Arena {
     return r;
   }
   int device() const { return dev_; }
+  const std::vector<DeviceBuffer>& slabs() const { return slabs_; }
 
  private:
   int dev_;

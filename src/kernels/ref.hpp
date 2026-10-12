@@ -81,6 +81,10 @@ void add_ape(float* score, const float* ape, int s0, int n, int ratio, int width
 void ring_update(const float* proj_kv, const float* proj_score, float* ring_kv, float* ring_score, int s0, int n,
                  int ring, int width, hipStream_t st);
 void cast_f32_bf16(const float* x, bf16* y, size_t n, hipStream_t st);
+// Byte copy by a kernel on the stream's device (16-byte vectors where src/dst/n allow). For staging
+// through pinned host memory: the device pulls from it or pushes into it with ordinary loads and stores,
+// ordered with the stream's kernels and event/flag packets like any kernel (no copy engine).
+void copy_kernel(void* dst, const void* src, size_t bytes, hipStream_t st);
 
 // Paged row access: row r of a sequence lives at pool + (table[r / rows_per_page] * rows_per_page +
 // r % rows_per_page) * row_stride (elements).

@@ -58,46 +58,63 @@ __global__ __launch_bounds__(NT) void hc_pre_tiled_kernel(const bf16* __restrict
     for (int j = 0; j < MIX; ++j) sMix[tt][j] = acc[j] * rs;
   }
   __syncthreads();
-  // Sinkhorn per token (one thread each), same op order as the reference kernel.
+  // Sinkhorn per token (one thread each), same op order as the reference kernel. hc is 4 (checked by
+  // the launcher) and a compile-time constant here, so the arrays stay in registers (runtime-indexed
+  // they were spilled to scratch).
   if (tid < TB && blockIdx.x * TB + tid < T) {
+    constexpr int HC = 4;
     const float* m = sMix[tid];
-    float pre[4], post[4], comb[4][4];
-    for (int j = 0; j < hc; ++j) pre[j] = 1.0f / (1.0f + expf(-(m[j] * scale[0] + base[j]))) + hc_eps;
-    for (int j = 0; j < hc; ++j) post[j] = 2.0f / (1.0f + expf(-(m[hc + j] * scale[1] + base[hc + j])));
-    for (int j = 0; j < hc; ++j) {
+    float pre[HC], post[HC], comb[HC][HC];
+#pragma unroll
+    for (int j = 0; j < HC; ++j) pre[j] = 1.0f / (1.0f + expf(-(m[j] * scale[0] + base[j]))) + hc_eps;
+#pragma unroll
+    for (int j = 0; j < HC; ++j) post[j] = 2.0f / (1.0f + expf(-(m[HC + j] * scale[1] + base[HC + j])));
+#pragma unroll
+    for (int j = 0; j < HC; ++j) {
       float mx = -INFINITY;
-      for (int k = 0; k < hc; ++k) {
-        comb[j][k] = m[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k];
+#pragma unroll
+      for (int k = 0; k < HC; ++k) {
+        comb[j][k] = m[2 * HC + j * HC + k] * scale[2] + base[2 * HC + j * HC + k];
         mx = fmaxf(mx, comb[j][k]);
       }
       float sum = 0.0f;
-      for (int k = 0; k < hc; ++k) {
+#pragma unroll
+      for (int k = 0; k < HC; ++k) {
         comb[j][k] = expf(comb[j][k] - mx);
         sum += comb[j][k];
       }
-      for (int k = 0; k < hc; ++k) comb[j][k] = comb[j][k] / sum + hc_eps;
+#pragma unroll
+      for (int k = 0; k < HC; ++k) comb[j][k] = comb[j][k] / sum + hc_eps;
     }
     auto col_norm = [&]() {
-      for (int k = 0; k < hc; ++k) {
+#pragma unroll
+      for (int k = 0; k < HC; ++k) {
         float cs = 0.0f;
-        for (int j = 0; j < hc; ++j) cs += comb[j][k];
-        for (int j = 0; j < hc; ++j) comb[j][k] = comb[j][k] / (cs + hc_eps);
+#pragma unroll
+        for (int j = 0; j < HC; ++j) cs += comb[j][k];
+#pragma unroll
+        for (int j = 0; j < HC; ++j) comb[j][k] = comb[j][k] / (cs + hc_eps);
       }
     };
     col_norm();
     for (int it = 0; it < iters - 1; ++it) {
-      for (int j = 0; j < hc; ++j) {
+#pragma unroll
+      for (int j = 0; j < HC; ++j) {
         float rsum = 0.0f;
-        for (int k = 0; k < hc; ++k) rsum += comb[j][k];
-        for (int k = 0; k < hc; ++k) comb[j][k] = comb[j][k] / (rsum + hc_eps);
+#pragma unroll
+        for (int k = 0; k < HC; ++k) rsum += comb[j][k];
+#pragma unroll
+        for (int k = 0; k < HC; ++k) comb[j][k] = comb[j][k] / (rsum + hc_eps);
       }
       col_norm();
     }
     const int tok = blockIdx.x * TB + tid;
-    for (int j = 0; j < hc; ++j) {
+#pragma unroll
+    for (int j = 0; j < HC; ++j) {
       sPre[tid][j] = pre[j];
-      post_out[size_t(tok) * hc + j] = post[j];
-      for (int k = 0; k < hc; ++k) comb_out[(size_t(tok) * hc + j) * hc + k] = comb[j][k];
+      post_out[size_t(tok) * HC + j] = post[j];
+#pragma unroll
+      for (int k = 0; k < HC; ++k) comb_out[(size_t(tok) * HC + j) * HC + k] = comb[j][k];
     }
   }
   __syncthreads();

@@ -468,3 +468,29 @@ GEMV 383 GB/s; APU: GEMV 212 GB/s (near its bandwidth). Native load (167.8 GB, w
 Native (lossless, 59.7% of routing on the cards at 1 x 512k) decodes slightly faster than EXL3 3.04
 bpw (71.9%) — MXFP4 dequantization is far cheaper than trellis decoding — and prefills 3-15% slower
 (more APU work). Both hold the >= 500 tok/s prefill target at 512k depth.
+
+## 2026-10-12 — GPU memory fault serving native experts: investigation
+
+Symptom: with native MXFP4 experts the server faults (HSA_STATUS_ERROR_MEMORY_FAULT, amdgpu "[gfxhub]
+page fault ... PERMISSION_FAULTS 0x3, client TCP") after 2-25 sequential chat requests; every later
+request then fails. 9 of 9 runs. With EXL3 experts: 0 faults (3 runs of 48 requests).
+Always physical card c7 (logical card 1), always the first kernel of card 1's part of a new prefill
+(hc_pre_tiled), always an address that is a card-1 weight with bit 44 cleared — attributed exactly:
+inside layer 25's hc_attn_fn at +0xb000, the tensor that kernel reads first (UNHOLY_DEBUG_TENSORS).
+Ruled out, each by a run:
+- our host pointers (UNHOLY_CHECK_PTRS: unchanged), out-of-bounds indexing (the access is in-bounds
+  on a live allocation), kernel scratch (removed from all kernels: hc_pre_tiled's runtime-indexed
+  Sinkhorn arrays, compress_rows' 2 x 128 locals, a staging array in the bf16 WMMA GEMM — numerics
+  unchanged, KL 2.445e-2), pipelining (UNHOLY_INFLIGHT=1 faults), kernarg placement
+  (HIP_FORCE_DEV_KERNARG=0 faults), VRAM headroom (3 GB margin faults; `--card-margin-gb`, default
+  now 3), memory pressure / reclaim (vmstat reclaim and swap counters and PSI unchanged during a
+  faulting run; EXL3 under 46 GB of stress-ng pressure: clean), idle power states (card kept busy by
+  a second process: faults), async copies (all per-step staging now by kernels pulling from /
+  pushing to pinned memory, the per-layer APU metadata by one kernel: faults), VRAM cells (pattern
+  test, 6 passes x 33.6 GB on both cards: 0 bit errors), PCIe (no AER errors).
+- Any kernel or copy serialization (AMD_SERIALIZE_KERNEL / AMD_SERIALIZE_COPY) hides it.
+- Swapping the cards' roles (HIP_VISIBLE_DEVICES=1,0,2: c3 runs layers 22-42 + head, c7 layers 0-21):
+  0 faults in 48 requests (concurrency sweep on that order running for confirmation).
+Working hypothesis: a timing-dependent hardware/firmware-level problem on c7's path in the card-1
+role (one bit of a kernel-argument pointer, bit 44, arrives cleared). Kept from the investigation:
+no kernel uses scratch, staging by kernels, `stage_remote`, `--card-margin-gb`, the debug dumps.

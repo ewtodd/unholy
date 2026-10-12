@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
@@ -197,9 +198,26 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     logits_ = rt::DeviceBuffer(cd.dev, size_t(max_logit_rows_) * c.vocab * 4);
     rows_idx_ = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
   }
+  if (std::getenv("UNHOLY_DEBUG_ADDRS")) {  // diagnostics: buffer ranges, to attribute GPU faults
+    const auto pr = [](const char* what, int k, const void* p, size_t n) {
+      std::fprintf(stderr, "addr %-14s card %d  %p .. %p\n", what, k, p, static_cast<const char*>(p) + n);
+    };
+    for (int k = 0; k < 2; ++k) {
+      const Card& cd = card_[k];
+      pr("x", k, cd.x.data(), cd.x.size());
+      pr("ids", k, cd.ids.data(), cd.ids.size());
+      pr("tables", k, cd.tables.data(), cd.tables.size());
+      for (size_t i = 0; i < cd.scratch.bufs.size(); ++i) pr("scratch", k, cd.scratch.bufs[i].data(), cd.scratch.bufs[i].size());
+      for (size_t i = 0; i < cd.cache.size(); ++i) {
+        pr("cache.comp", k, cd.cache[i].comp.data(), cd.cache[i].comp.size());
+        pr("cache.idx", k, cd.cache[i].idx.data(), cd.cache[i].idx.size());
+        pr("cache.window", k, cd.cache[i].window_rows.data(), cd.cache[i].window_rows.size());
+      }
+    }
+  }
   for (Flight& f : flight_) {
     const auto pinned = [](auto** p, size_t bytes) {
-      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), bytes, hipHostMallocPortable));
+      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), bytes, hipHostMallocPortable | hipHostMallocMapped));
     };
     pinned(&f.x_host, size_t(max_tokens) * c.hc_mult * c.dim * 2);
     pinned(&f.logits_host, size_t(max_logit_rows_) * c.vocab * 4);
@@ -212,6 +230,50 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventCreateWithFlags(&f.consumed, hipEventDisableTiming));
     UH_CHECK(hipEventCreateWithFlags(&f.done, hipEventDisableTiming));
+    if (const char* path = std::getenv("UNHOLY_DEBUG_TENSORS"); path && &f == &flight_[0]) {
+      // Every per-layer tensor of both cards: "card layer name begin end" (attributing GPU faults).
+      if (FILE* out = std::fopen(path, "w")) {
+        const auto put = [&](int k, int L, const std::string& name, const model::DevTensor& t, size_t bytes) {
+          if (t.ptr) std::fprintf(out, "%d %d %s %p %p\n", k, L, name.c_str(), t.ptr, static_cast<char*>(t.ptr) + bytes);
+        };
+        for (int k = 0; k < 2; ++k)
+          for (const auto& w : card_[k].w) {
+            const int L = w.layer;
+            put(k, L, "hc_attn_fn", w.hc_attn_fn, size_t(24) * c.hc_mult * c.dim * 4);
+            put(k, L, "hc_ffn_fn", w.hc_ffn_fn, size_t(24) * c.hc_mult * c.dim * 4);
+            for (size_t e = 0; e < w.w1.size(); ++e)
+              for (const auto& [nm, l] : {std::pair<const char*, const model::Fp4Linear*>{"w1", &w.w1[e]}, {"w2", &w.w2[e]},
+                                          {"w3", &w.w3[e]}}) {
+                put(k, L, std::string(nm) + "." + std::to_string(e) + ".w", l->w, size_t(l->out) * l->in / 2);
+                put(k, L, std::string(nm) + "." + std::to_string(e) + ".s", l->s, size_t(l->out) * (l->in / 32));
+              }
+            for (const auto& [nm, l] : {std::pair<const char*, const model::Fp8Linear*>{"wq_a", &w.wq_a}, {"wq_b", &w.wq_b},
+                                        {"wkv", &w.wkv}, {"wo_a", &w.wo_a}, {"wo_b", &w.wo_b}, {"sw1", &w.sw1},
+                                        {"sw2", &w.sw2}, {"sw3", &w.sw3}})
+              put(k, L, nm, l->w, size_t(l->out) * l->in);
+          }
+        std::fclose(out);
+      }
+    }
+    if (std::getenv("UNHOLY_DEBUG_ADDRS") && &f == &flight_[0]) {
+      const auto span = [](const char* what, const rt::Arena& a) {
+        for (const auto& sl : a.slabs())
+          std::fprintf(stderr, "addr %-14s card %d  %p .. %p\n", what, a.device(), sl.data(),
+                       static_cast<const char*>(sl.data()) + sl.size());
+      };
+      span("arena", *card_arena_[0]);
+      span("arena", *card_arena_[1]);
+      span("apu_arena", *apu_arena_);
+      for (int k = 0; k < 2; ++k)
+        std::fprintf(stderr, "addr chan %d in %p out %p w %p e %p plan %p tiles %p\n", k,
+                     static_cast<void*>(chan_[k]->in_host), static_cast<void*>(chan_[k]->out_host),
+                     static_cast<void*>(chan_[k]->w_host), static_cast<void*>(chan_[k]->e_host),
+                     static_cast<void*>(chan_[k]->plan_host), static_cast<void*>(chan_[k]->tiles_host));
+    }
+    if (std::getenv("UNHOLY_DEBUG_ADDRS"))
+      std::fprintf(stderr, "addr flight x_host %p .. %p, logits %p, ids %p, tables %p\n", static_cast<void*>(f.x_host),
+                   static_cast<void*>(f.x_host + size_t(max_tokens) * c.hc_mult * c.dim), static_cast<void*>(f.logits_host),
+                   static_cast<void*>(f.ids_host), static_cast<void*>(f.tables_host));
   }
 }
 
@@ -256,7 +318,38 @@ void ResidentModel::set_block_tables(const std::vector<int32_t>& tables) {
   tables_dirty_ = true;
 }
 
+std::vector<const void*> ResidentModel::layer_ptrs(int k) const {
+  std::vector<const void*> v;
+  for (const auto& w : card_[k].w) {
+    for (const auto* t : {&w.hc_attn_fn, &w.hc_attn_base, &w.hc_attn_scale, &w.hc_ffn_fn, &w.hc_ffn_base,
+                          &w.hc_ffn_scale, &w.attn_norm, &w.ffn_norm, &w.sink, &w.q_norm, &w.kv_norm, &w.gate_w,
+                          &w.gate_bias})
+      v.push_back(t->ptr);
+    for (const auto* l : {&w.wq_a, &w.wq_b, &w.wkv, &w.wo_a, &w.wo_b, &w.sw1, &w.sw2, &w.sw3}) {
+      v.push_back(l->w.ptr);
+      v.push_back(l->s.ptr);
+    }
+    v.push_back(w.exl3_tab.data());
+  }
+  return v;
+}
+
 uint64_t ResidentModel::submit(const StepInput& in) {
+  static const bool check_ptrs = std::getenv("UNHOLY_CHECK_PTRS") != nullptr;
+  if (check_ptrs) {
+    if (ptr_snapshot_.empty())
+      for (int k = 0; k < 2; ++k) ptr_snapshot_.push_back(layer_ptrs(k));
+    for (int k = 0; k < 2; ++k) {
+      const auto now = layer_ptrs(k);
+      for (size_t i = 0; i < now.size(); ++i)
+        if (now[i] != ptr_snapshot_[size_t(k)][i]) {
+          std::fprintf(stderr, "CHECK_PTRS: step %llu card %d slot %zu changed %p -> %p\n",
+                       static_cast<unsigned long long>(steps_), k, i, ptr_snapshot_[size_t(k)][i], now[i]);
+          std::abort();
+        }
+    }
+  }
+  ++steps_;
   static const bool timing = std::getenv("UNHOLY_STEP_TIMING") != nullptr;
   const auto t_begin = std::chrono::steady_clock::now();
   const int T = int(in.ids.size()), R = int(in.logit_rows.size());
@@ -277,10 +370,10 @@ uint64_t ResidentModel::submit(const StepInput& in) {
   for (int k = 0; k < 2; ++k) {
     Card& cd = card_[k];
     rt::DeviceGuard g(cd.dev);
-    UH_CHECK(hipMemcpyAsync(cd.ids.data(), f.ids_host, size_t(T) * 4, hipMemcpyHostToDevice, cd.st));
-    UH_CHECK(hipMemcpyAsync(cd.pos.data(), f.ids_host + max_tokens_, size_t(T) * 4, hipMemcpyHostToDevice, cd.st));
-    if (tables)
-      UH_CHECK(hipMemcpyAsync(cd.tables.data(), f.tables_host, tables_.size() * 4, hipMemcpyHostToDevice, cd.st));
+    // Staging moves by kernels pulling from / pushing to pinned host memory (DECISIONS 2026-10-12).
+    k::copy_kernel(cd.ids.data(), f.ids_host, size_t(T) * 4, cd.st);
+    k::copy_kernel(cd.pos.data(), f.ids_host + max_tokens_, size_t(T) * 4, cd.st);
+    if (tables) k::copy_kernel(cd.tables.data(), f.tables_host, tables_.size() * 4, cd.st);
   }
   model::BatchDesc b;
   for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0});
@@ -294,7 +387,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
       k::embed_hc(cd.ids.as<int32_t>(), embed_.as<uint16_t>(), cd.x.as<uint16_t>(), T, c_.dim, c_.hc_mult, cd.st);
     } else {  // residual from card 0 through this flight's pinned buffer, ordered by events
       UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));
-      UH_CHECK(hipMemcpyAsync(cd.x.data(), f.x_host, size_t(T) * row * 2, hipMemcpyHostToDevice, cd.st));
+      k::copy_kernel(cd.x.data(), f.x_host, size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.consumed, cd.st));
     }
     b.ids = cd.ids.as<int32_t>();
@@ -306,7 +399,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     if (k == 0) {
       // The flight's buffer may still be read by card 1 for the step two tickets back.
       UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));
-      UH_CHECK(hipMemcpyAsync(f.x_host, cd.x.data(), size_t(T) * row * 2, hipMemcpyDeviceToHost, cd.st));
+      k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.handoff, cd.st));
     }
     if (timing) t_enq[k] = std::chrono::steady_clock::now();
@@ -315,8 +408,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
   Card& cd = card_[1];
   rt::DeviceGuard g(cd.dev);
   if (R > 0) {
-    UH_CHECK(hipMemcpyAsync(rows_idx_.data(), f.ids_host + 2 * max_tokens_, size_t(R) * 4, hipMemcpyHostToDevice,
-                            cd.st));
+    k::copy_kernel(rows_idx_.data(), f.ids_host + 2 * max_tokens_, size_t(R) * 4, cd.st);
     k::gather_rows(cd.x.as<uint16_t>(), rows_idx_.as<int32_t>(), hrows_.as<uint16_t>(), R, int(row), cd.st);
     k::hc_head(hrows_.as<uint16_t>(), hc_fn_.as<float>(), hc_scale_.as<float>(), hc_base_.as<float>(),
                hb_.as<uint16_t>(), R, c_.hc_mult, c_.dim, c_.norm_eps, c_.hc_eps, cd.st);
@@ -329,7 +421,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     else
       k::gemm_bf16_f32out_wmma(hb_.as<uint16_t>(), c_.dim, head_.as<uint16_t>(), logits_.as<float>(), c_.vocab, R,
                                c_.vocab, c_.dim, cd.st);
-    UH_CHECK(hipMemcpyAsync(f.logits_host, logits_.data(), size_t(R) * c_.vocab * 4, hipMemcpyDeviceToHost, cd.st));
+    k::copy_kernel(f.logits_host, logits_.data(), size_t(R) * c_.vocab * 4, cd.st);
   }
   UH_CHECK(hipEventRecord(f.done, cd.st));
   if (timing)

@@ -36,7 +36,7 @@ int usage() {
                "usage: unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]\n"
                "                    [--served-model-name NAME] [--max-slots N] [--max-seq N] [--num-pages N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
-               "                    [--max-tokens-default N]\n");
+               "                    [--max-tokens-default N] [--card-margin-gb G]\n");
   return 2;
 }
 
@@ -44,6 +44,7 @@ int serve(int argc, char** argv, bool plan_only) {
   std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_dsv4engine_code32k.txt";
   server::ServerConfig scfg;
   int max_slots = 4, max_seq = 65536, num_pages = 0, max_batch = 2048;
+  double card_margin_gb = 3.0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -61,6 +62,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--max-seq") max_seq = std::stoi(v);
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
+    else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
     else return usage();
   }
   if (model_dir.empty()) return usage();
@@ -95,6 +97,9 @@ int serve(int argc, char** argv, bool plan_only) {
   pin.max_tokens = max_batch;
   pin.max_seq = max_seq;
   pin.max_logit_rows = std::max(max_slots, 8);
+  // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). With
+  // 1.5 GB the cards ended up ~300 MB from full and the driver faulted on weight pages.
+  pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
   if (plan_only) {
     std::printf("geometry: %d slots x %d tokens, %d pages; step %d tokens; experts %s\n", max_slots, max_seq,
                 geo.num_pages, max_batch, xck ? "EXL3" : "native (MXFP4)");

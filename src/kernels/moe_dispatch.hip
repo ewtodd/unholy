@@ -8,6 +8,8 @@
 //
 // The row order inside an expert's block depends on atomic arrival order; every expert kernel is
 // row-independent and the combine follows pidx (ascending expert per token), so results do not.
+#include <algorithm>
+
 #include "kernels/dev.hip.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "rt/hip.hpp"
@@ -101,7 +103,31 @@ __global__ void copy_remote_meta_kernel(const float* ewt, const int32_t* row_exp
   __threadfence_system();
 }
 
+// Everything the remote side needs for one layer, written by one kernel (so it is ordered with the
+// stream's flag packets like any kernel): the plan, the remote tiles, and the routing weight and expert
+// of the remote rows [remote0, P).
+__global__ void stage_remote_kernel(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt,
+                                    const int32_t* row_expert, MoePlan* plan_dst, Exl3Tile* tiles_dst, float* w_dst,
+                                    int32_t* e_dst) {
+  const MoePlan p = *plan;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x, n = gridDim.x * blockDim.x;
+  if (tid == 0) *plan_dst = p;
+  for (int i = tid; i < p.n_remote_tiles; i += n) tiles_dst[i] = rtiles[i];
+  for (int i = p.remote0 + tid; i < p.P; i += n) {
+    w_dst[i] = ewt[i];
+    e_dst[i] = row_expert[i];
+  }
+  __threadfence_system();
+}
+
 }  // namespace
+
+void stage_remote(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt, const int32_t* row_expert,
+                  MoePlan* plan_dst, Exl3Tile* tiles_dst, float* w_dst, int32_t* e_dst, int max_rows, hipStream_t st) {
+  stage_remote_kernel<<<std::max(1, std::min((max_rows + 255) / 256, 64)), 256, 0, st>>>(plan, rtiles, ewt, row_expert,
+                                                                                       plan_dst, tiles_dst, w_dst, e_dst);
+  UH_CHECK_LAUNCH();
+}
 
 void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st, uint32_t* hist) {
   UH_CHECK(hipMemsetAsync(count, 0, size_t(E) * 4, st));
