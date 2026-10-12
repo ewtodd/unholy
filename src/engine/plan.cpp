@@ -85,6 +85,29 @@ size_t dense_layer_bytes(const model::Checkpoint& ck, int layer) {
   return b;
 }
 
+size_t dspark_dense_bytes(const model::Checkpoint& ck) {
+  size_t b = 0;
+  for (const auto& t : ck.tensors())
+    if (t.name.compare(0, 4, "mtp.") == 0 && t.name.find(".ffn.experts.") == std::string::npos) b += t.nbytes;
+  return b;
+}
+
+size_t dspark_expert_bytes(const model::Checkpoint& ck) {
+  size_t b = 0;
+  for (const auto& t : ck.tensors())
+    if (t.name.compare(0, 4, "mtp.") == 0 && t.name.find(".ffn.experts.") != std::string::npos) b += t.nbytes;
+  return b;
+}
+
+size_t dspark_work_bytes(const model::Dsv4Config& c, const model::CacheGeometry& g) {
+  const size_t rows = size_t(g.max_slots) * c.dspark_block;  // draft rows
+  size_t b = size_t(c.n_mtp) * g.max_slots * c.window * c.head_dim * 2;               // stage windows
+  b += size_t(g.max_slots) * 128 * c.dspark_target_layers.size() * c.dim * 2;       // main-hidden capture
+  b += model::scratch_bytes(c, int(rows), 4096) + rows * size_t(c.vocab) * 4;      // draft scratch, logits
+  b += rows * c.hc_mult * c.dim * 2 + (size_t(64) << 20);                            // block, backups
+  return b;
+}
+
 Plan make_plan(const PlanInput& in) {
   const auto& c = *in.cfg;
   const auto devs = query_devices();
@@ -123,6 +146,11 @@ Plan make_plan(const PlanInput& in) {
   }
   pl.dense[0] += embed;
   pl.dense[1] += head;
+  if (in.dspark) {
+    pl.dspark_card = dspark_dense_bytes(*in.dense) + dspark_work_bytes(c, in.geo);
+    pl.dspark_apu = dspark_expert_bytes(*in.dense);
+    pl.dense[1] += pl.dspark_card;
+  }
   for (int k = 0; k < 2; ++k) {
     // Scratch, plus a logits buffer on the head card.
     pl.scratch[k] = model::scratch_bytes(c, in.max_tokens, in.max_seq) +
@@ -171,7 +199,9 @@ Plan make_plan(const PlanInput& in) {
       if (!pl.on_card[size_t(cd.layer)][size_t(cd.expert)]) pl.apu_experts += cd.bytes;
   pl.routed_on_cards = mass_cards / mass_total;
   pl.apu_free = info(pl.apu).free_bytes;
-  if (pl.apu_experts + in.apu_margin > pl.apu_free) throw std::runtime_error("plan: the APU cannot hold the cold experts");
+  if (pl.apu_experts + pl.dspark_apu + in.apu_margin > pl.apu_free)
+    throw std::runtime_error("plan: the APU cannot hold the cold experts" +
+                             std::string(in.dspark ? " and the drafter's" : ""));
   return pl;
 }
 
@@ -200,6 +230,11 @@ std::string Plan::summary() const {
   std::snprintf(buf, sizeof buf, "apu (dev %d): cold experts %.2f GB of %.2f GB free; predicted routing on cards %.1f%%\n",
                 apu, gb(apu_experts), gb(apu_free), 100.0 * routed_on_cards);
   s << buf;
+  if (dspark_apu > 0) {
+    std::snprintf(buf, sizeof buf, "dspark drafter: %.2f GB on card 1 (in its dense), %.2f GB of experts on the APU\n",
+                  gb(dspark_card), gb(dspark_apu));
+    s << buf;
+  }
   return s.str();
 }
 

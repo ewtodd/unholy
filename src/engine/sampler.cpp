@@ -23,8 +23,15 @@ void Sampler::accept(int32_t token) {
 
 void Sampler::reset_output() { out_counts_.clear(); }
 
-Sampled Sampler::sample(const float* logits, int V) {
+Sampled Sampler::sample(const float* logits, int V) { return sample_impl(logits, V, -1, nullptr); }
+
+Sampled Sampler::verify(const float* logits, int V, int32_t draft, bool& accepted) {
+  return sample_impl(logits, V, draft, &accepted);
+}
+
+Sampled Sampler::sample_impl(const float* logits, int V, int32_t draft, bool* accepted) {
   Sampled s;
+  if (accepted) *accepted = false;
   const float* l = logits;
   if (penalties_) {
     work_.assign(logits, logits + V);
@@ -46,6 +53,7 @@ Sampled Sampler::sample(const float* logits, int V) {
 
   if (p_.temperature < 1e-5f || p_.top_k == 1) {
     s.token = int32_t(std::max_element(l, l + V) - l);  // first maximum
+    if (accepted) *accepted = s.token == draft;
   } else {
     const double T = p_.temperature;
     const float m = *std::max_element(l, l + V);
@@ -82,16 +90,29 @@ Sampled Sampler::sample(const float* logits, int V) {
         want = std::min(cand_.size(), want * 16);
       }
     }
-    double total = 0.0;
-    for (size_t i = 0; i < keep; ++i) total += std::exp((double(cand_[i].first) - m) / T);
-    double u = std::uniform_real_distribution<double>(0.0, total)(rng_);
-    s.token = cand_[keep - 1].second;
+    double total = 0.0, pd = 0.0;
     for (size_t i = 0; i < keep; ++i) {
-      u -= std::exp((double(cand_[i].first) - m) / T);
-      if (u < 0.0) {
+      const double w = std::exp((double(cand_[i].first) - m) / T);
+      total += w;
+      if (cand_[i].second == draft) pd = w;
+    }
+    bool take_draft = false;
+    if (accepted && pd > 0.0)  // accept with probability p(draft)
+      take_draft = std::uniform_real_distribution<double>(0.0, total)(rng_) < pd;
+    if (take_draft) {
+      s.token = draft;
+      *accepted = true;
+    } else {
+      // Rejected (or no draft): draw from the distribution without the draft.
+      double u = std::uniform_real_distribution<double>(0.0, total - pd)(rng_);
+      s.token = -1;
+      for (size_t i = 0; i < keep; ++i) {
+        if (accepted && cand_[i].second == draft) continue;
         s.token = cand_[i].second;
-        break;
+        u -= std::exp((double(cand_[i].first) - m) / T);
+        if (u < 0.0) break;
       }
+      if (s.token < 0) s.token = cand_[0].second;
     }
   }
 

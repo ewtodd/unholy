@@ -59,7 +59,12 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
 - [x] OpenAI-compatible server (`src/server/openai.cpp`, cpp-httplib): chat + completions with SSE,
       tool calls, reasoning (`reasoning` and `reasoning_content`), stop strings, logprobs, usage,
       /tokenize, /detokenize, /metrics; `unholy serve` (`tools/unholy/main.cpp`)
-- [ ] NixOS module / service
+- [x] NixOS module / service (/etc/nixos modules/services/unholy: native experts, 2M-token pool, 1M per
+      request; polkit lets son-of-anton stop/start it for development)
+- [x] prefix caching (page hashes + slot-state snapshots; logprobs identical to uncached), vLLM-style
+      KV flags, cached_tokens in usage
+- [x] GPU fault: c7 under the 230 W power cap (DECISIONS 2026-10-12); clean at 300 W
+- [ ] disk tier for the prefix cache
 - [ ] decode scaling: batch 4 gives 29.7 tok/s aggregate (7.8/stream) vs 16.4 at batch 1
 - [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s
 - [x] routing profile from our own traffic (`data/expert_profile_unholy_mixed.txt`, default for runs)

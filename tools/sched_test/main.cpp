@@ -41,11 +41,47 @@ int32_t next_token(const std::vector<int32_t>& seq) {
 
 class FakeModel final : public StepModel {
  public:
-  FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens, int inflight, int snapshots)
+  FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens, int inflight, int snapshots,
+            int draft_block)
       : inflight_(inflight), slots_(slots), ppseq_(pages_per_seq), pages_(pages), page_(page_tokens), max_tokens_(max_tokens),
-        snapshots_(snapshots), store_(size_t(pages) * page_tokens, -1), len_(size_t(slots), 0),
-        state_(size_t(slots), kFnvBasis), snaps_(size_t(snapshots)) {}
+        snapshots_(snapshots), draft_block_(draft_block), store_(size_t(pages) * page_tokens, -1),
+        len_(size_t(slots), 0), state_(size_t(slots), kFnvBasis), snaps_(size_t(snapshots)), backup_(size_t(slots)) {}
   int num_snapshots() const override { return snapshots_; }
+  int draft_block() const override { return draft_block_; }
+  int max_verify() const override { return draft_block_ ? draft_block_ + 1 : 0; }
+  // Restores truncate the slot back to the accepted prefix (they must match the last backup); drafts
+  // are the true continuation with a quarter of the tokens wrong (deterministically), so verification
+  // accepts some and rejects others.
+  void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs, std::vector<int32_t>& tokens,
+             std::vector<float>& conf) override {
+    for (const RingRestore& r : restore) {
+      Backup& b = backup_.at(size_t(r.slot));
+      if (b.n == 0 || r.s0 != b.s0 || r.to != b.s0 + b.n || r.from <= r.s0 || r.from >= r.to)
+        throw std::runtime_error("fake: restore does not match the slot's backup");
+      len_[size_t(r.slot)] = r.from;
+      uint64_t h = kFnvBasis;
+      for (int p = 0; p < r.from; ++p) h = fnv_step(h, at(r.slot, p));
+      state_[size_t(r.slot)] = h;
+      b.n = 0;
+      ++rollbacks;
+    }
+    tokens.clear();
+    conf.clear();
+    for (const DraftReq& q : reqs) {
+      if (len_[size_t(q.slot)] != q.start + 1) throw std::runtime_error("fake: draft from a state that is not the sequence's");
+      std::vector<int32_t> seq(size_t(q.start + 1));
+      for (int p = 0; p <= q.start; ++p) seq[size_t(p)] = at(q.slot, p);
+      seq.push_back(q.token);
+      for (int i = 0; i < draft_block_; ++i) {
+        const uint64_t h = fnv(seq.data(), seq.size());
+        const int32_t t = (h >> 17) % 4 == 0 ? int32_t(2 + (h >> 29) % (kVocab - 2)) : next_token(seq);
+        tokens.push_back(t);
+        conf.push_back(1.0f);
+        seq.push_back(t);
+      }
+      ++drafts;
+    }
+  }
   int vocab() const override { return kVocab; }
   int max_tokens() const override { return max_tokens_; }
   int max_logit_rows() const override { return 64; }
@@ -89,6 +125,12 @@ class FakeModel final : public StepModel {
       if (h != sn.state) throw std::runtime_error("fake: restored state does not match the slot's pages");
       ++restores;
     }
+    std::vector<uint64_t> row_state(in.ids.size());
+    std::vector<bool> verify(size_t(slots_), false);
+    for (const RingBackup& b : in.backup) {
+      verify[size_t(b.slot)] = true;
+      backup_[size_t(b.slot)] = {b.s0, b.n};
+    }
     for (size_t ci = 0; ci < in.chunks.size(); ++ci) {
       const Chunk& c = in.chunks[ci];
       if (c.t0 != t || c.n <= 0 || seen[size_t(c.slot)]) throw std::runtime_error("fake: chunk layout");
@@ -103,7 +145,12 @@ class FakeModel final : public StepModel {
         chunk_of_row[size_t(t + k)] = int(ci);
       }
       if (c.s0 == 0) state_[size_t(c.slot)] = kFnvBasis;
-      for (int k = 0; k < c.n; ++k) state_[size_t(c.slot)] = fnv_step(state_[size_t(c.slot)], in.ids[size_t(t + k)]);
+      for (int k = 0; k < c.n; ++k) {
+        state_[size_t(c.slot)] = fnv_step(state_[size_t(c.slot)], in.ids[size_t(t + k)]);
+        row_state[size_t(t + k)] = state_[size_t(c.slot)];
+      }
+      for (const RingBackup& b : in.backup)
+        if (b.slot == c.slot && (b.s0 != c.s0 || b.n != c.n)) throw std::runtime_error("fake: backup is not the chunk");
       len_[size_t(c.slot)] = c.s0 + c.n;
       t += c.n;
       max_batch = std::max(max_batch, t);
@@ -111,10 +158,12 @@ class FakeModel final : public StepModel {
     logits.assign(in.logit_rows.size() * kVocab, -10.0f);
     for (size_t r = 0; r < in.logit_rows.size(); ++r) {
       const Chunk& c = in.chunks[size_t(chunk_of_row[size_t(in.logit_rows[r])])];
-      if (in.logit_rows[r] != c.t0 + c.n - 1) throw std::runtime_error("fake: logit row is not a chunk end");
-      std::vector<int32_t> seq(size_t(c.s0 + c.n));
-      for (int p = 0; p < c.s0 + c.n; ++p) seq[size_t(p)] = at(c.slot, p);
-      if (fnv(seq.data(), seq.size()) != state_[size_t(c.slot)]) throw std::runtime_error("fake: slot state is stale");
+      const int row = in.logit_rows[r];
+      if (row != c.t0 + c.n - 1 && !verify[size_t(c.slot)])
+        throw std::runtime_error("fake: logit row is not a chunk end (and the chunk is not a verify chunk)");
+      std::vector<int32_t> seq(size_t(c.s0 + (row - c.t0) + 1));
+      for (size_t p = 0; p < seq.size(); ++p) seq[p] = at(c.slot, int(p));
+      if (fnv(seq.data(), seq.size()) != row_state[size_t(row)]) throw std::runtime_error("fake: slot state is stale");
       logits[r * kVocab + size_t(next_token(seq))] = 10.0f;
     }
     for (const StateOp& sv : in.save) {
@@ -123,7 +172,7 @@ class FakeModel final : public StepModel {
       ++saves;
     }
   }
-  int steps = 0, max_batch = 0, max_seen = 0, restores = 0, saves = 0;
+  int steps = 0, max_batch = 0, max_seen = 0, restores = 0, saves = 0, rollbacks = 0, drafts = 0;
 
  private:
   int32_t& at(int slot, int p) {
@@ -136,7 +185,7 @@ class FakeModel final : public StepModel {
   int inflight_;
   std::deque<std::pair<uint64_t, std::vector<float>>> pending_;
   uint64_t next_ = 1;
-  int slots_, ppseq_, pages_, page_, max_tokens_, snapshots_;
+  int slots_, ppseq_, pages_, page_, max_tokens_, snapshots_, draft_block_;
   std::vector<int32_t> store_, tables_;
   std::vector<int> len_;
   struct Snap {
@@ -146,6 +195,10 @@ class FakeModel final : public StepModel {
   };
   std::vector<uint64_t> state_;
   std::vector<Snap> snaps_;
+  struct Backup {
+    int s0 = 0, n = 0;
+  };
+  std::vector<Backup> backup_;
 };
 
 struct Result {
@@ -187,12 +240,14 @@ int main(int argc, char** argv) {
   // Configurations: (slots, pages per seq, pool pages, page tokens, step tokens, batch budget).
   const int configs[][6] = {{8, 64, 512, 16, 256, 256}, {4, 32, 40, 16, 128, 100}, {16, 16, 60, 8, 64, 64},
                             {2, 128, 30, 32, 512, 512}, {32, 20, 200, 16, 96, 96}};
+  for (const int nspec : {0, 4})
   for (const int snaps : {0, 6, 64})
   for (const int depth : {1, 2})
   for (const auto& cfgv : configs) {
     std::mt19937_64 rng(seed);
-    FakeModel model(cfgv[0], cfgv[1], cfgv[2], cfgv[3], cfgv[4], depth, snaps);
+    FakeModel model(cfgv[0], cfgv[1], cfgv[2], cfgv[3], cfgv[4], depth, snaps, nspec ? 5 : 0);
     EngineConfig ec;
+    ec.spec_drafts = nspec;
     ec.max_batch_tokens = cfgv[5];
     Engine eng(model, ec, false);
     int submitted = 0;
@@ -291,13 +346,18 @@ int main(int argc, char** argv) {
       }
     }
     const auto st = eng.stats();
-    std::printf("snaps %d depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, "
+    std::printf("spec %d snaps %d depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, "
                 "%d errors; %d steps, max batch %d, %llu preemptions, free pages %d/%d; cached %llu of %llu prompt "
-                "tokens, %d restores, %d saves\n",
-                snaps, depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors,
+                "tokens, %d restores, %d saves; drafts %d, verified %llu of %llu drafted, %d rollbacks\n",
+                nspec, snaps, depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors,
                 model.steps, model.max_batch, (unsigned long long)st.preemptions, st.free_pages, st.total_pages,
                 (unsigned long long)st.cached_tokens, (unsigned long long)st.prompt_tokens, model.restores,
-                model.saves);
+                model.saves, model.drafts, (unsigned long long)st.spec_accepted, (unsigned long long)st.spec_drafted,
+                model.rollbacks);
+    if (nspec > 0 && (st.spec_accepted == 0 || model.rollbacks == 0)) {
+      std::printf("  speculative decoding never accepted or never rolled back\n");
+      ++failures;
+    }
     if (snaps > 0 && st.cached_tokens == 0) {
       std::printf("  the prefix cache was never used\n");
       ++failures;

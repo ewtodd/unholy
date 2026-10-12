@@ -16,6 +16,10 @@
 // page boundaries, so a request that repeats an earlier one's prefix (the next turn of a chat, a shared
 // system prompt) starts from the deepest matching boundary instead of position 0.
 //
+// --spec-drafts N (default 0: off) turns on speculative decoding with the checkpoint's DSpark drafter
+// (its mtp.* stages: dense parts on card 1, ~10 GB of routed experts on the APU): each decode step
+// verifies up to N drafted tokens (N <= 5) and keeps the ones the model would have produced.
+//
 // --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
 // planner (src/engine/plan.hpp) for the requested cache geometry.
@@ -47,7 +51,8 @@ int usage() {
                "usage: unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]\n"
                "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
-               "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n");
+               "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
+               "                    [--spec-drafts N]\n");
   return 2;
 }
 
@@ -57,6 +62,7 @@ int serve(int argc, char** argv, bool plan_only) {
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
   long long kv_tokens = 0;
   int prefix_snapshots = 128;
+  int spec_drafts = 0;
   double card_margin_gb = 3.0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -75,6 +81,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--max-model-len" || a == "--max-seq") max_seq = std::stoi(v);
     else if (a == "--kv-tokens") kv_tokens = std::stoll(v);
     else if (a == "--prefix-snapshots") prefix_snapshots = std::stoi(v);
+    else if (a == "--spec-drafts") spec_drafts = std::stoi(v);
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
@@ -112,7 +119,9 @@ int serve(int argc, char** argv, bool plan_only) {
   pin.geo = geo;
   pin.max_tokens = max_batch;
   pin.max_seq = max_seq;
-  pin.max_logit_rows = std::max(max_slots, 8);
+  pin.dspark = spec_drafts > 0;
+  // A verify chunk wants logits for its token and every draft.
+  pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
   // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). With
   // 1.5 GB the cards ended up ~300 MB from full and the driver faulted on weight pages.
   pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
@@ -135,7 +144,7 @@ int serve(int argc, char** argv, bool plan_only) {
 
   const auto t0 = std::chrono::steady_clock::now();
   engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows,
-                              prefix_snapshots);
+                              prefix_snapshots, spec_drafts > 0);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, max_slots);
@@ -144,6 +153,7 @@ int serve(int argc, char** argv, bool plan_only) {
   ecfg.max_batch_tokens = max_batch;
   ecfg.eos_id = tok.eos_id();
   ecfg.max_context = max_seq;
+  ecfg.spec_drafts = spec_drafts;
   ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
   engine::Engine eng(model, ecfg);
   // Routing histogram of the traffic served so far, in the --profile format (for re-planning).

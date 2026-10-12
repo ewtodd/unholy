@@ -41,6 +41,10 @@ class Sampler {
   void set_prompt(const std::vector<int32_t>& prompt);
   void accept(int32_t token);
   Sampled sample(const float* logits, int vocab);
+  // Speculative sampling with a deterministic draft: accepts `draft` with its probability under this
+  // request's sampling distribution (greedy: when it is the argmax), otherwise returns a token drawn
+  // from that distribution with `draft` excluded — so the result is distributed exactly as sample().
+  Sampled verify(const float* logits, int vocab, int32_t draft, bool& accepted);
   // Forget generated tokens (recompute after preemption replays them through accept()).
   void reset_output();
 
@@ -51,6 +55,7 @@ class Sampler {
   std::vector<int32_t> prompt_unique_;
   std::vector<float> work_;
   std::vector<std::pair<float, int32_t>> cand_;
+  Sampled sample_impl(const float* logits, int vocab, int32_t draft, bool* accepted);
   bool penalties_ = false;
 };
 

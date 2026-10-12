@@ -147,4 +147,29 @@ void layer_forward(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache
                    const RopeTables& rope, uint16_t* x, const BatchDesc& b, hipStream_t st,
                    RemoteExperts* remote = nullptr);
 
+// ---- DSpark (model.py DSparkBlock / Transformer.forward_spec) ----------------------------------------
+// A draft block per request: rows [B r, B r + B) of the batch (B = dspark_block: the request's next
+// token, then noise tokens) at positions start + 1 .. start + B in `slot`. Each stage's window ring holds
+// the main-KV of the slot's positions; a request sees its last min(128, start + 1) of them in slot order.
+struct DraftDesc {
+  std::vector<int> slots, start;  // host, per request
+  int T = 0;                      // B * requests
+  const int32_t* ids = nullptr;   // device [T]
+  const int32_t* pos = nullptr;   // device [T]
+};
+// main_x = main_norm(main_proj(main_hidden)) for R rows (main_hidden [R, n_target_layers * dim], the
+// target's HC means) and each stage's main-KV of it, stored at pos[r] % 128 of slot slots[r] (device).
+void dspark_main_kv(const Dsv4Config& c, const DSparkWeights& d, std::vector<LayerCache>& stages,
+                    const Scratch& scr, const RopeTables& rope, const uint16_t* main_hidden, const int32_t* slots,
+                    const int32_t* pos, int R, hipStream_t st);
+// One stage over the draft blocks; x [T, hc, dim] in place.
+void dspark_stage(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
+                  const RopeTables& rope, uint16_t* x, const DraftDesc& d, hipStream_t st,
+                  RemoteExperts* remote = nullptr);
+// The head path after the last stage: hc_head, norm, the LM head (head_w bf16 [vocab, dim]) into logits
+// [T, vocab] f32, then per position i the Markov bias of token i and its argmax as token i + 1 (tok
+// [R, B + 1], column 0 set by the caller), and the confidences conf [T].
+void dspark_head(const Dsv4Config& c, const DSparkWeights& d, const Scratch& scr, const uint16_t* x,
+                 const uint16_t* head_w, int R, float* logits, int32_t* tok, float* conf, hipStream_t st);
+
 }  // namespace unholy::model

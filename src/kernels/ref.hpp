@@ -114,6 +114,9 @@ struct AttnKv {
   const int32_t* comp_idx = nullptr;
   int ncomp = 0;  // width of comp_idx, or 0 for "all visible"
   int ratio = 0;  // 0: window only
+  // DSpark stage attention (dspark_slots >= 0): every query sees ring slots [0, dspark_slots) in slot
+  // order, then chunk_kv rows [0, dspark_chunk) (the draft block, both directions); no positions.
+  int dspark_slots = -1, dspark_chunk = 0;
 };
 void sparse_attn(const bf16* q, const int32_t* pos, AttnKv kv, const float* sink, bf16* o, int T, int H, int D,
                  float scale, hipStream_t st);

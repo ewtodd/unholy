@@ -267,9 +267,10 @@ __global__ void sparse_attn_kernel(const bf16* q, const int32_t* pos, AttnKv kv,
   const int t = blockIdx.x / H, h = blockIdx.x % H;
   const int p_t = pos[t];
   for (int i = threadIdx.x; i < D; i += blockDim.x) qs[i] = bf16_to_f32(q[(size_t(t) * H + h) * D + i]);
-  const int visible = kv.ratio ? (p_t + 1) / kv.ratio : 0;
-  const int ncomp = kv.ratio == 0 ? 0 : (kv.ncomp > 0 ? kv.ncomp : visible);
-  const int total = 128 + ncomp;
+  const bool dspark = kv.dspark_slots >= 0;
+  const int visible = kv.ratio && !dspark ? (p_t + 1) / kv.ratio : 0;
+  const int ncomp = kv.ratio == 0 || dspark ? 0 : (kv.ncomp > 0 ? kv.ncomp : visible);
+  const int total = dspark ? kv.dspark_slots + kv.dspark_chunk : 128 + ncomp;
   if (threadIdx.x == 0) {
     m_run = -INFINITY;
     l_run = 0.0f;
@@ -281,7 +282,10 @@ __global__ void sparse_attn_kernel(const bf16* q, const int32_t* pos, AttnKv kv,
     if (threadIdx.x < kBlock) {
       const int e = e0 + threadIdx.x;
       const bf16* r = nullptr;
-      if (e < 128) {
+      if (dspark) {
+        if (e < kv.dspark_slots) r = kv.ring + size_t(e) * D;
+        else if (e < total) r = kv.chunk_kv + size_t(e - kv.dspark_slots) * D;
+      } else if (e < 128) {
         // Ascending positions from max(0, p - 127), unused slots at the end (reference order).
         const int wp = max(0, p_t - 127) + e;
         if (wp <= p_t) r = wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;

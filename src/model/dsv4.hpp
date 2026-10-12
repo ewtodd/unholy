@@ -121,11 +121,30 @@ struct LoadOptions {
   bool dense = true;                               // attention, norms, router, shared expert
   const std::vector<uint8_t>* experts = nullptr;  // [E]: 1 = load this routed expert (null: all)
   rt::Arena* arena = nullptr;                      // allocate weights from here (null: one hipMalloc each)
+  std::string prefix;                              // tensor-name prefix (empty: "layers.<layer>.")
 };
 // Loads one layer's weights to `dev` with coalesced O_DIRECT reads. Expert vectors always have
 // n_experts entries; experts not loaded here are empty (has_expert() false).
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
                         const LoadOptions& opt = {});
+
+// DSpark speculative drafter: the checkpoint's mtp.* stages (model.py DSparkBlock). Stage i is layer
+// n_layers + i of the config (compress ratio 0: sliding-window attention, no compressor). Its attention
+// keys are a 128-position window of "main-KV" — each stage's wkv of main_x = main_norm(main_proj(the
+// target's HC-mean hidden states after the dspark target layers)) — plus the draft block itself; the
+// last stage carries the head path: hc_head, norm, the target's LM head, a rank-256 Markov bias on the
+// previous token and a confidence head.
+struct DSparkWeights {
+  std::vector<LayerWeights> stages;  // dense parts and the routed experts LoadOptions selects
+  Fp8Linear main_proj;               // [dim, n_target_layers * dim]
+  DevTensor main_norm, norm;         // bf16 [dim]
+  DevTensor hc_head_fn, hc_head_base, hc_head_scale;  // f32 [hc, hc*dim], [hc], [1]
+  DevTensor markov_w1, markov_w2;    // bf16 [vocab, rank]
+  DevTensor conf_proj;               // bf16 [1, dim + rank]
+};
+// Loads the stages (routed experts per opt.experts, like load_layer) and the drafter tensors to `dev`.
+DSparkWeights load_dspark(const Checkpoint& ck, const Dsv4Config& c, int dev, hipStream_t st,
+                          const LoadOptions& opt);
 
 struct RopeTables {
   rt::DeviceBuffer plain, yarn;  // float2 [max_pos][rope_dim/2]

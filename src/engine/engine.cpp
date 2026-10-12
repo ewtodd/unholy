@@ -44,6 +44,9 @@ struct Engine::Seq {
   int rolling = -1;              // the snapshot decoding saved last, superseded by the next
   uint64_t rolling_hash = 0;
   int cached = 0;                // prompt tokens served from the cache at the first admission
+  // Speculative decoding: the drafter's proposals for the tokens after the last sampled one.
+  std::vector<int32_t> drafts;
+  std::vector<float> draft_conf;
 
   Seq(uint64_t id_, GenRequest r, Sink s, uint64_t seed)
       : id(id_), req(std::move(r)), sink(std::move(s)), sampler(req.sampling, seed) {}
@@ -59,6 +62,8 @@ Engine::Engine(StepModel& model, EngineConfig cfg, bool start) : model_(model), 
   cfg_.max_batch_tokens = std::min(cfg_.max_batch_tokens > 0 ? cfg_.max_batch_tokens : model_.max_tokens(),
                                    model_.max_tokens());
   cache_on_ = cfg_.prefix_cache && model_.num_snapshots() > 0;
+  spec_max_ = std::min({cfg_.spec_drafts, model_.draft_block(), model_.max_verify() - 1});
+  spec_on_ = spec_max_ > 0;
   page_info_.resize(size_t(model_.num_pages()));
   if (cache_on_) {
     snap_info_.resize(size_t(model_.num_snapshots()));
@@ -143,6 +148,7 @@ void Engine::release(Seq& s) {
   s.slot = -1;
   s.computed = s.done_pos = s.registered = s.cut = s.last_save = 0;
   s.rolling = -1;
+  s.drafts.clear();
 }
 
 int32_t Engine::take_page() {
@@ -399,9 +405,16 @@ bool Engine::submit_step(int budget0) {
         if (s.cut > s.computed && s.computed + n > s.cut) n = s.cut - s.computed;
         const bool logits = n == remaining;
         if (logits && logit_rows == 0) continue;
-        plan.push_back({&s, n, logits, -1, -1, -1, s.computed + n});
-        budget -= n;
-        logit_rows -= logits;
+        // Decoding with drafts: verify as many as the step, the context and max_tokens allow.
+        int k = 0;
+        if (pass == 0 && spec_on_ && !s.drafts.empty()) {
+          k = std::min({int(s.drafts.size()), spec_max_, budget - 1, logit_rows - 1, max_context_ - 1 - s.computed});
+          if (s.req.max_tokens > 0) k = std::min(k, s.req.max_tokens - s.generated() - 1);
+          k = std::max(k, 0);
+        }
+        plan.push_back({&s, n + k, logits, -1, -1, -1, s.computed + n + k, k});
+        budget -= n + k;
+        logit_rows -= logits ? 1 + k : 0;
       }
   };
   for (;;) {
@@ -443,7 +456,7 @@ bool Engine::submit_step(int budget0) {
       it.restore = s.restore;
       s.restore = -1;
     }
-    if (cache_on_ && save_at(s, it.end, it.n == 1)) {
+    if (cache_on_ && save_at(s, it.end, it.n == 1 || it.ndraft > 0)) {
       it.save = take_snapshot();
       if (it.save >= 0) {
         in.save.push_back({s.slot, it.save});
@@ -452,13 +465,15 @@ bool Engine::submit_step(int budget0) {
     }
     if (it.end == s.cut) s.cut = 0;
     in.chunks.push_back({s.slot, s.computed, it.n, t0});
+    const int fed = it.n - it.ndraft;  // tokens of the sequence; the rest are drafts
     for (int k = 0; k < it.n; ++k) {
-      in.ids.push_back(s.tokens[size_t(s.computed + k)]);
+      in.ids.push_back(k < fed ? s.tokens[size_t(s.computed + k)] : s.drafts[size_t(k - fed)]);
       in.pos.push_back(s.computed + k);
     }
-    if (it.logits) {
+    if (it.ndraft > 0) in.backup.push_back({s.slot, s.computed, it.n});
+    if (it.logits) {  // a verify chunk wants every row (its token and each draft are judged)
       it.row = int(in.logit_rows.size());
-      in.logit_rows.push_back(t0 + it.n - 1);
+      for (int k = it.ndraft > 0 ? 0 : it.n - 1; k < it.n; ++k) in.logit_rows.push_back(t0 + k);
     }
   }
   if (tables_dirty_) {
@@ -493,20 +508,8 @@ void Engine::complete_step() {
   }
   int prefill = 0, decode = 0;
   const int V = model_.vocab();
-  for (const auto& it : f.items) {
-    Seq& s = *it.s;
-    --s.inflight;
-    if (it.restore >= 0) put_snapshot(it.restore);
-    if (cache_on_) {
-      s.done_pos = std::max(s.done_pos, it.end);
-      register_pages(s);
-      if (it.save >= 0) commit_snapshot(s, it.save, it.end);
-    }
-    (it.n == 1 && it.logits ? decode : prefill) += it.n;
-    if (!it.logits) continue;
-    s.awaiting_logits = false;
-    if (s.abort_pending || s.done) continue;
-    const Sampled smp = s.sampler.sample(logits_.data() + size_t(it.row) * V, V);
+  // Appends a sampled token; true when it ends the sequence.
+  const auto emit = [&](Seq& s, const Sampled& smp) {
     const int32_t tok = smp.token;
     s.tokens.push_back(tok);
     s.sampler.accept(tok);
@@ -517,13 +520,82 @@ void Engine::complete_step() {
       s.out.stop_token = tok;
       s.done = true;  // finished below, once nothing of it is in flight
       s.out.reason = FinishReason::Stop;
-      continue;
+      return true;
     }
     s.out.tokens.push_back(tok);
     s.out.samples.push_back(smp);
     if ((s.req.max_tokens > 0 && s.generated() >= s.req.max_tokens) || int(s.tokens.size()) >= max_context_) {
       s.done = true;
       s.out.reason = FinishReason::Length;
+      return true;
+    }
+    return false;
+  };
+  std::vector<RingRestore> restores;
+  std::vector<Seq*> sampled;
+  for (const auto& it : f.items) {
+    Seq& s = *it.s;
+    --s.inflight;
+    if (it.restore >= 0) put_snapshot(it.restore);
+    const int s0 = it.end - it.n;
+    // A verify chunk: the fed token, then drafts while the target agrees (speculative sampling), then
+    // the target's own token (a replacement, or the bonus after the last draft).
+    int valid_end = it.end, accepted = 0;
+    if (it.ndraft > 0 && !s.abort_pending && !s.done) {
+      bool stopped = false;
+      for (int j = 0; j <= it.ndraft && !stopped; ++j) {
+        const float* row = logits_.data() + size_t(it.row + j) * V;
+        bool ok = false;
+        const Sampled smp = j < it.ndraft ? s.sampler.verify(row, V, s.drafts[size_t(j)], ok) : s.sampler.sample(row, V);
+        stopped = emit(s, smp);
+        if (!ok) break;
+        ++accepted;
+      }
+      valid_end = s0 + 1 + accepted;
+      s.computed = valid_end;
+      if (valid_end < it.end && !s.done) restores.push_back({s.slot, s0, valid_end, it.end});
+      std::lock_guard lk(stats_mu_);
+      ++stats_.spec_steps;
+      stats_.spec_drafted += uint64_t(it.ndraft);
+      stats_.spec_accepted += uint64_t(accepted);
+    }
+    if (cache_on_) {
+      s.done_pos = std::max(s.done_pos, valid_end);
+      register_pages(s);
+      if (it.save >= 0) {
+        if (valid_end == it.end) commit_snapshot(s, it.save, it.end);
+        else put_snapshot(it.save);  // saved past a rejected draft: not the sequence's state
+      }
+    }
+    (it.n == 1 + it.ndraft && it.logits ? decode : prefill) += it.ndraft ? 1 + accepted : it.n;
+    if (!it.logits) continue;
+    s.awaiting_logits = false;
+    s.drafts.clear();
+    if (s.abort_pending || s.done) continue;
+    if (it.ndraft == 0) emit(s, s.sampler.sample(logits_.data() + size_t(it.row) * V, V));
+    if (!s.done) sampled.push_back(&s);
+  }
+  // Drafts for the sequences that just sampled (and the restores of rejected positions first).
+  if (spec_on_ && (!sampled.empty() || !restores.empty())) {
+    std::vector<DraftReq> reqs;
+    for (Seq* s : sampled)
+      if (int(s->tokens.size()) - s->computed == 1 && s->computed + 1 < max_context_)
+        reqs.push_back({s->slot, s->computed - 1, s->tokens.back()});
+    std::vector<int32_t> toks;
+    std::vector<float> conf;
+    try {
+      model_.draft(restores, reqs, toks, conf);
+    } catch (const std::exception& e) {
+      fail_all(std::string("draft failed: ") + e.what());
+      return;
+    }
+    const size_t Bd = size_t(model_.draft_block());
+    size_t r = 0;
+    for (Seq* s : sampled) {
+      if (int(s->tokens.size()) - s->computed != 1 || s->computed + 1 >= max_context_) continue;
+      s->drafts.assign(toks.begin() + ptrdiff_t(r * Bd), toks.begin() + ptrdiff_t((r + 1) * Bd));
+      s->draft_conf.assign(conf.begin() + ptrdiff_t(r * Bd), conf.begin() + ptrdiff_t((r + 1) * Bd));
+      ++r;
     }
   }
   for (auto& s : running_) {

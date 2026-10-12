@@ -87,6 +87,7 @@ add_library(unholy_ref STATIC
   src/kernels/gemv.hip
   src/kernels/indexer.hip
   src/kernels/mx_moe.hip
+  src/kernels/dspark.hip
 )
 target_include_directories(unholy_ref PUBLIC src third_party)
 target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)
@@ -140,5 +141,7 @@ target_link_libraries(unholy-exl3-gemm-test PRIVATE unholy_ref)
 add_executable(unholy-curve tools/bench/curve.hip)
 target_link_libraries(unholy-curve PRIVATE unholy_engine)
 
+add_executable(unholy-dspark-test tools/kernel_test/dspark.hip)
+target_link_libraries(unholy-dspark-test PRIVATE unholy_ref)
 add_executable(unholy-mx-test tools/kernel_test/mx_moe.hip)
 target_link_libraries(unholy-mx-test PRIVATE unholy_ref)

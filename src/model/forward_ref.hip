@@ -8,6 +8,7 @@
 #include <string>
 
 #include "kernels/attn_wmma.hpp"
+#include "kernels/dspark.hpp"
 #include "kernels/exl3_moe.hpp"
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
@@ -493,8 +494,10 @@ void compressor_proj(const Dsv4Config& c, const CompressorWeights& cw, const Scr
   for (const auto& ch : b.chunks) k::add_ape(ps + size_t(ch.t0) * width, cw.ape.p<float>(), ch.s0, ch.n, cw.ratio, width, st);
 }
 
+// draft != null: a DSpark stage (ratio 0) over draft blocks instead of sequence chunks.
 void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
-                    const RopeTables& rope, bf16* x, const BatchDesc& b, hipStream_t st) {
+                    const RopeTables& rope, bf16* x, const BatchDesc& b, hipStream_t st,
+                    const DraftDesc* draft = nullptr) {
   const int D = c.dim, H = c.n_heads, HD = c.head_dim, rd = c.rope_dim, T = b.T, L = w.layer;
   const float2* freqs = (w.ratio ? rope.yarn : rope.plain).as<float2>();
   const int32_t* pos = b.pos;
@@ -571,6 +574,18 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   const float scale = float(1.0 / std::sqrt(double(HD)));
   dump(L, b, "sa_q", q, size_t(T) * H * HD * 2, st);
   dump(L, b, "sa_kv", kv, size_t(T) * HD * 2, st);
+  if (draft) {  // DSparkAttention: the request's window (slot order), then its whole block
+    const int B = c.dspark_block;
+    for (size_t r = 0; r < draft->slots.size(); ++r) {
+      k::AttnKv akv;
+      akv.chunk_kv = kv + r * B * HD;
+      akv.ring = cache.window_rows.as<bf16>() + size_t(draft->slots[r]) * c.window * HD;
+      akv.dspark_slots = std::min(c.window, draft->start[r] + 1);
+      akv.dspark_chunk = B;
+      k::sparse_attn(q + r * B * H * HD, pos + r * B, akv, w.sink.p<float>(), o + r * B * H * HD, B, H, HD, scale,
+                     st);
+    }
+  }
   for (const auto& ch : b.chunks) {
     const int32_t* cpos = pos + ch.t0;
     bf16* window = cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD;
@@ -847,6 +862,63 @@ void layer_forward(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache
   }
   attention_half(c, w, cache, scr, rope, x, b, st);
   moe_half(c, w, scr, x, b, st, remote);
+}
+
+// ---- DSpark ---------------------------------------------------------------------------------------
+
+void dspark_main_kv(const Dsv4Config& c, const DSparkWeights& d, std::vector<LayerCache>& stages,
+                    const Scratch& scr, const RopeTables& rope, const bf16* main_hidden, const int32_t* slots,
+                    const int32_t* pos, int R, hipStream_t st) {
+  if (R <= 0) return;
+  const int D = c.dim, HD = c.head_dim, rd = c.rope_dim, MD = int(c.dspark_target_layers.size()) * D;
+  uint8_t* qb = B<uint8_t>(scr, kQBuf);
+  uint8_t* qs = B<uint8_t>(scr, kQSc);
+  bf16* mx = B<bf16>(scr, kY);
+  bf16* kv = B<bf16>(scr, kKV);
+  if (size_t(R) * MD > scr.bufs[kQBuf].size()) throw std::runtime_error("dspark_main_kv: too many rows");
+  // main_x = main_norm(main_proj(main_hidden)): an fp8 linear (act_quant per 128, fp8 GEMM).
+  k::act_quant_fp8(main_hidden, MD, qb, qs, R, MD, 128, st);
+  dense_w8a8(qb, qs, d.main_proj.w.p<uint8_t>(), d.main_proj.s.p<uint8_t>(), mx, D, R, D, MD, st);
+  k::rmsnorm(mx, D, d.main_norm.p<bf16>(), mx, D, R, D, c.norm_eps, st);
+  // Each stage's main_kv = kv_norm(wkv(main_x)), roped (plain table: ratio 0) and fp8-simulated.
+  k::act_quant_fp8(mx, D, qb, qs, R, D, 128, st);
+  for (size_t i = 0; i < stages.size(); ++i) {
+    const LayerWeights& w = d.stages[i];
+    dense_w8a8(qb, qs, w.wkv.w.p<uint8_t>(), w.wkv.s.p<uint8_t>(), kv, HD, R, HD, D, st);
+    k::rmsnorm(kv, HD, w.kv_norm.p<bf16>(), kv, HD, R, HD, c.norm_eps, st);
+    k::rope(kv, HD, R, 1, HD, HD - rd, rd / 2, pos, rope.plain.as<float2>(), false, st);
+    k::fake_quant_fp8(kv, HD, R, HD - rd, 64, st);
+    k::scatter_window(kv, R, HD, slots, pos, stages[i].window_rows.as<bf16>(), st);
+  }
+}
+
+void dspark_stage(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
+                  const RopeTables& rope, bf16* x, const DraftDesc& d, hipStream_t st, RemoteExperts* remote) {
+  BatchDesc b;
+  b.T = d.T;
+  b.ids = d.ids;
+  b.pos = d.pos;
+  attention_half(c, w, cache, scr, rope, x, b, st, &d);
+  moe_half(c, w, scr, x, b, st, remote);
+}
+
+void dspark_head(const Dsv4Config& c, const DSparkWeights& d, const Scratch& scr, const bf16* x, const bf16* head_w,
+                 int R, float* logits, int32_t* tok, float* conf, hipStream_t st) {
+  const int D = c.dim, V = c.vocab, Bk = c.dspark_block, K = c.dspark_markov_rank, T = R * Bk;
+  bf16* xh = B<bf16>(scr, kY);
+  bf16* xn = B<bf16>(scr, kA);
+  bf16* emb = B<bf16>(scr, kQA);
+  void* part = B<float>(scr, kAF);
+  if (size_t(T) * K * 2 > scr.bufs[kQA].size() || k::markov_scratch_bytes(V, R) > scr.bufs[kAF].size())
+    throw std::runtime_error("dspark_head: scratch too small");
+  k::hc_head(x, d.hc_head_fn.p<float>(), d.hc_head_scale.p<float>(), d.hc_head_base.p<float>(), xh, T, c.hc_mult, D,
+             c.norm_eps, c.hc_eps, st);
+  k::rmsnorm(xh, D, d.norm.p<bf16>(), xn, D, T, D, c.norm_eps, st);
+  if (T <= k::kGemvMaxRows) k::gemv_bf16_f32out(xn, D, head_w, logits, V, T, V, D, st);
+  else k::gemm_bf16_f32out_wmma(xn, D, head_w, logits, V, T, V, D, st);
+  for (int i = 0; i < Bk; ++i)
+    k::markov_step(d.markov_w1.p<bf16>(), d.markov_w2.p<bf16>(), V, K, logits, Bk, tok, emb, R, i, part, st);
+  k::dspark_confidence(xh, D, emb, K, d.conf_proj.p<bf16>(), conf, T, st);
 }
 
 }  // namespace unholy::model

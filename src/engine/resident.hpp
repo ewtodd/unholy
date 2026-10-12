@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "engine/plan.hpp"
@@ -61,7 +62,7 @@ class ResidentModel final : public StepModel {
   // kept for prefix reuse, in pinned host memory (~7 MB each); 0 disables prefix reuse.
   ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense, const model::Checkpoint* exl3,
                 const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq,
-                int max_logit_rows = 0, int snapshots = 0);
+                int max_logit_rows = 0, int snapshots = 0, bool dspark = false);
   ~ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -72,6 +73,11 @@ class ResidentModel final : public StepModel {
   int num_pages() const override { return geo_.num_pages; }
   int page_tokens() const override { return model::kPageTokens; }
   int num_snapshots() const override { return snapshots_; }
+  // DSpark (dspark = true): verify chunks of up to 1 + dspark_block tokens, drafts on card 1.
+  int draft_block() const override { return dspark_ ? c_.dspark_block : 0; }
+  int max_verify() const override { return dspark_ ? c_.dspark_block + 1 : 0; }
+  void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs, std::vector<int32_t>& tokens,
+             std::vector<float>& conf) override;
   // Block tables [max_slots][max_pages_per_seq] (host), uploaded to both cards.
   void set_block_tables(const std::vector<int32_t>& tables) override;
   // Two steps in flight: card 0 runs step k + 1 while card 1 finishes step k (UNHOLY_INFLIGHT=1: one).
@@ -132,6 +138,29 @@ class ResidentModel final : public StepModel {
   size_t snap_bytes_[2] = {0, 0};
   uint8_t* snap_host_[2] = {nullptr, nullptr};
   void state_copies(int k, const std::vector<StateOp>& ops, bool save);
+
+  // DSpark. The stages' dense parts and windows live on card 1, their routed experts on the APU (shared
+  // layer table, own channel). Every step records the HC means of the target layers for the last <= 128
+  // rows of each chunk (cap_*) and writes the stages' main-KV of them; verify chunks back up the rings
+  // they overwrite (ring_* per card: descriptors and [slot][1 + block][pos_bytes] backups).
+  bool dspark_ = false;
+  model::DSparkWeights dw_;
+  std::vector<model::LayerCache> dcache_;
+  model::Scratch dscr_;
+  hipStream_t dst_ = nullptr;
+  std::unique_ptr<ApuExperts> dchan_;
+  rt::DeviceBuffer mh_, cap_dev_;                     // [cap_max][n_target * dim]; rows, slots, positions
+  rt::DeviceBuffer d_x_, d_in_, d_logits_, d_tok_, d_conf_;  // draft block, ids + positions, outputs
+  int32_t* cap_host_[2] = {nullptr, nullptr};          // per flight: rows, slots, positions
+  uint16_t* d_x_host_ = nullptr;                        // draft block [rows][hc][dim]
+  int32_t* d_io_host_ = nullptr;                        // ids, positions, tokens [R][block + 1]
+  float* d_conf_host_ = nullptr;
+  int cap_max_ = 0;
+  rt::DeviceBuffer ring_desc_[2], ring_bak_[2];
+  int n_rings_[2] = {0, 0};
+  size_t ring_pos_bytes_[2] = {0, 0};
+  std::span<const uint16_t> embed_host_;  // the checkpoint's embedding table (mmap)
+  void ring_ops(int k, hipStream_t st, const std::vector<RingBackup>* backup, const std::vector<RingRestore>* restore);
   // Diagnostics (UNHOLY_CHECK_PTRS): the cards' per-layer weight pointers as loaded, verified per step.
   std::vector<std::vector<const void*>> ptr_snapshot_;
   kernels::HcCanaryLog* canary_ = nullptr;  // UNHOLY_CANARY (host-mapped)

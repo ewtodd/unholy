@@ -416,6 +416,9 @@ struct OpenAIServer::Impl {
           }
           engine::FinishReason reason = engine::FinishReason::None;
           std::string error;
+          // A long prefill produces nothing for minutes: an SSE comment every 10 s keeps proxies and
+          // clients from timing the stream out.
+          auto last_event = std::chrono::steady_clock::now();
           for (;;) {
             engine::GenOutput o;
             if (!ch->pop(o, std::chrono::milliseconds(200))) {
@@ -423,8 +426,16 @@ struct OpenAIServer::Impl {
                 eng.abort(rid);
                 return false;
               }
+              if (std::chrono::steady_clock::now() - last_event > std::chrono::seconds(10)) {
+                if (!write(": keepalive\n\n")) {
+                  eng.abort(rid);
+                  return false;
+                }
+                last_event = std::chrono::steady_clock::now();
+              }
               continue;
             }
+            last_event = std::chrono::steady_clock::now();
             cached = std::max(cached, o.cached_tokens);
             completion = std::max(completion, o.completion_tokens);
             text::ParsedDelta d;
@@ -682,12 +693,14 @@ struct OpenAIServer::Impl {
                     "unholy_preemptions_total %llu\nunholy_busy_seconds_total %.3f\nunholy_running %d\n"
                     "unholy_waiting %d\nunholy_free_pages %d\nunholy_total_pages %d\nunholy_http_requests_total %llu\n"
                     "unholy_http_errors_total %llu\nunholy_prompt_tokens_total %llu\nunholy_cached_prompt_tokens_total %llu\n"
-                    "unholy_cached_pages %d\nunholy_cached_snapshots %d\n",
+                    "unholy_cached_pages %d\nunholy_cached_snapshots %d\nunholy_spec_verify_steps_total %llu\n"
+                    "unholy_spec_drafted_total %llu\nunholy_spec_accepted_total %llu\n",
                     (unsigned long long)s.steps, (unsigned long long)s.prefill_tokens,
                     (unsigned long long)s.decode_tokens, (unsigned long long)s.preemptions, s.busy_seconds, s.running,
                     s.waiting, s.free_pages, s.total_pages, (unsigned long long)requests.load(),
                     (unsigned long long)errors.load(), (unsigned long long)s.prompt_tokens,
-                    (unsigned long long)s.cached_tokens, s.cached_pages, s.snapshots);
+                    (unsigned long long)s.cached_tokens, s.cached_pages, s.snapshots, (unsigned long long)s.spec_steps,
+                    (unsigned long long)s.spec_drafted, (unsigned long long)s.spec_accepted);
       res.set_content(buf, "text/plain; version=0.0.4");
     });
   }

@@ -28,11 +28,29 @@ struct StateOp {
   int slot = 0, snapshot = 0;
 };
 
+// Speculative decoding. A verify chunk feeds a sequence's next token followed by drafted tokens, with
+// logits for every row. Before it runs, `backup` copies the ring entries (attention windows, compressor
+// and drafter rings) that its positions overwrite; once the drafts are judged, a RingRestore puts back
+// the entries of the rejected positions [from, to) (s0: the backed-up chunk's first position).
+struct RingBackup {
+  int slot = 0, s0 = 0, n = 0;
+};
+struct RingRestore {
+  int slot = 0, s0 = 0, from = 0, to = 0;
+};
+// A draft block: the sequence's token at position start + 1 (the last one sampled), drafting the
+// following draft_block() tokens from the target's state at positions <= start.
+struct DraftReq {
+  int slot = 0, start = 0;
+  int32_t token = 0;
+};
+
 struct StepInput {
   std::vector<Chunk> chunks;
   std::vector<int32_t> ids, pos;     // [T]
   std::vector<int32_t> logit_rows;   // batch rows whose logits are wanted
   std::vector<StateOp> restore, save;
+  std::vector<RingBackup> backup;
 };
 
 class StepModel {
@@ -47,6 +65,14 @@ class StepModel {
   virtual int page_tokens() const = 0;
   virtual int max_inflight() const { return 1; }
   virtual int num_snapshots() const { return 0; }  // 0: no prefix reuse
+  virtual int draft_block() const { return 0; }    // tokens one draft proposes; 0: no drafter
+  virtual int max_verify() const { return 0; }     // longest verify chunk (1 + drafts) backups cover
+  // Applies `restore` (both cards' rings), then drafts for each request: tokens [reqs][draft_block()]
+  // and their confidences. Runs after every submitted step that wrote these slots has completed.
+  virtual void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs,
+                     std::vector<int32_t>& tokens, std::vector<float>& conf) {
+    (void)restore, (void)reqs, (void)tokens, (void)conf;
+  }
   // Block tables [max_slots][max_pages_per_seq] of physical page ids, for steps submitted from now on.
   virtual void set_block_tables(const std::vector<int32_t>& tables) = 0;
   virtual uint64_t submit(const StepInput& in) = 0;

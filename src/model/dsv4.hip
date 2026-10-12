@@ -221,7 +221,7 @@ CompressorWeights compressor(LoadCtx& lc, const std::string& prefix, int ratio, 
 
 LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, int dev, hipStream_t st,
                         const LoadOptions& opt) {
-  const std::string p = "layers." + std::to_string(layer) + ".";
+  const std::string p = opt.prefix.empty() ? "layers." + std::to_string(layer) + "." : opt.prefix;
   LoadCtx lc{ck, dev, {}, opt.arena};
   LayerWeights w;
   w.layer = layer;
@@ -323,7 +323,7 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
     }
     w.exl3_tab = rt::DeviceBuffer(dev, tab.size() * sizeof(void*));
     UH_CHECK(hipMemcpy(w.exl3_tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
-  } else if (w.n_resident > 0) {
+  } else {  // even with no expert here: the grouped kernels read the (all-null) table
     // Native MXFP4 experts: repacked tile-major for the grouped kernels (kernels/mx_moe.hpp; the
     // reference GEMM reads that layout too), then the same table layout, [w1, w3, w2] x [packed e2m1,
     // e8m0 scales].
@@ -347,6 +347,43 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
     UH_CHECK(hipMemcpy(w.exl3_tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
   }
   return w;
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+DSparkWeights load_dspark(const Checkpoint& ck, const Dsv4Config& c, int dev, hipStream_t st,
+                          const LoadOptions& opt) {
+  if (c.n_mtp <= 0 || c.dspark_block <= 0) throw std::runtime_error("load_dspark: the checkpoint has no DSpark stages");
+  DSparkWeights d;
+  for (int i = 0; i < c.n_mtp; ++i) {
+    LoadOptions o = opt;
+    o.prefix = "mtp." + std::to_string(i) + ".";
+    d.stages.push_back(load_layer(ck, c, c.n_layers + i, dev, st, o));
+  }
+  if (!opt.dense) return d;
+  LoadCtx lc{ck, dev, {}, opt.arena};
+  const std::string last = "mtp." + std::to_string(c.n_mtp - 1) + ".";
+  d.main_proj = fp8(lc, "mtp.0.main_proj");
+  d.main_norm = upload(lc, "mtp.0.main_norm.weight");
+  d.norm = upload(lc, last + "norm.weight");
+  d.hc_head_fn = upload(lc, last + "hc_head_fn");
+  d.hc_head_base = upload(lc, last + "hc_head_base");
+  d.hc_head_scale = upload(lc, last + "hc_head_scale");
+  d.markov_w1 = upload(lc, last + "markov_head.markov_w1.weight");
+  d.markov_w2 = upload(lc, last + "markov_head.markov_w2.weight");
+  d.conf_proj = upload(lc, last + "confidence_head.proj.weight");
+  rt::DeviceGuard g(dev);
+  std::unique_ptr<Uploader> up;
+  Uploader* u = opt.up;
+  if (!u) {
+    up = std::make_unique<Uploader>(ck);
+    u = up.get();
+  }
+  u->upload_many(std::move(lc.items), st);
+  u->sync();
+  return d;
 }
 
 }  // namespace unholy::model

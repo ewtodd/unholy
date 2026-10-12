@@ -69,6 +69,7 @@ struct EngineConfig {
   int max_context = 0;          // positions per sequence; 0 = the block table's reach
   uint64_t seed = 0;            // base for requests without a seed
   bool prefix_cache = true;      // when the model keeps snapshots
+  int spec_drafts = 0;           // speculative decoding: drafts verified per step (0: off; model's drafter)
 };
 
 struct EngineStats {
@@ -76,6 +77,7 @@ struct EngineStats {
   uint64_t prompt_tokens = 0, cached_tokens = 0;  // admitted prompt tokens, those served from the cache
   int running = 0, waiting = 0, free_pages = 0, total_pages = 0;  // free: unused or cached-unreferenced
   int cached_pages = 0, snapshots = 0;
+  uint64_t spec_steps = 0, spec_drafted = 0, spec_accepted = 0;  // verify chunks, drafts in them, accepted
   double busy_seconds = 0;
 };
 
@@ -130,6 +132,7 @@ class Engine {
       int row;  // logit row, -1 if none
       int restore = -1, save = -1;  // snapshots loaded before / saved after the chunk
       int end = 0;                  // the chunk's end position
+      int ndraft = 0;               // a verify chunk: the fed token, then this many drafts
     };
     uint64_t ticket = 0;
     std::vector<Item> items;
@@ -166,6 +169,8 @@ class Engine {
     std::list<int>::iterator lru;
   };
   bool cache_on_ = false;
+  bool spec_on_ = false;  // speculative decoding with the model's drafter
+  int spec_max_ = 0;      // drafts verified per step at most
   std::vector<PageInfo> page_info_;
   std::list<int32_t> evictable_;
   std::unordered_map<uint64_t, int32_t> page_by_hash_;

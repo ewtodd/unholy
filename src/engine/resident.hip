@@ -10,6 +10,7 @@
 
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
+#include "kernels/dspark.hpp"
 #include "kernels/hc_fast.hpp"
 #include "kernels/ref.hpp"
 #include "model/loader.hpp"
@@ -66,6 +67,7 @@ ApuExperts::~ApuExperts() {
 
 void ApuExperts::add_layer(model::LayerWeights w) {
   const int L = w.layer;
+  if (layers_->size() <= size_t(L)) layers_->resize(size_t(L) + 1);
   layers_->at(size_t(L)) = std::make_unique<model::LayerWeights>(std::move(w));
 }
 
@@ -127,15 +129,18 @@ rt::DeviceBuffer upload_tensor(model::Uploader& up, const model::Checkpoint& ck,
 
 ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense,
                              const model::Checkpoint* exl3, const Plan& plan, const model::CacheGeometry& geo,
-                             int max_tokens, int max_seq, int max_logit_rows, int snapshots)
+                             int max_tokens, int max_seq, int max_logit_rows, int snapshots, bool dspark)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
-      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), snapshots_(snapshots) {
+      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), snapshots_(snapshots),
+      dspark_(dspark) {
   model::Uploader up(dense);
   std::unique_ptr<model::Uploader> xup;
   if (exl3) xup = std::make_unique<model::Uploader>(*exl3);
   {
     auto layers = std::make_shared<ApuExperts::Layers>();
     for (auto& ch : chan_) ch = std::make_unique<ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers);
+    if (dspark_)
+      dchan_ = std::make_unique<ApuExperts>(c, plan.apu, size_t(c.dspark_block) * geo.max_slots * c.n_active, layers);
   }
   if (const char* v = std::getenv("UNHOLY_INFLIGHT")) inflight_ = std::clamp(std::atoi(v), 1, 2);
   if (std::getenv("UNHOLY_CANARY")) {
@@ -221,6 +226,77 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
       }
     }
   }
+  const auto pin_host = [](auto** p, size_t bytes) {
+    UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), bytes, hipHostMallocPortable | hipHostMallocMapped));
+  };
+  if (dspark_) {
+    for (const int L : c.dspark_target_layers)
+      if (plan.layer_card[size_t(L)] != 1) throw std::runtime_error("dspark: target layers must be on card 1");
+    Card& cd = card_[1];
+    rt::DeviceGuard g(cd.dev);
+    UH_CHECK(hipStreamCreateWithFlags(&dst_, hipStreamNonBlocking));
+    const std::vector<uint8_t> none(size_t(c.n_experts), 0), all(size_t(c.n_experts), 1);
+    model::LoadOptions lo;
+    lo.up = &up;
+    lo.experts = &none;
+    lo.arena = card_arena_[1].get();
+    dw_ = model::load_dspark(dense, c, cd.dev, cd.st, lo);
+    for (const auto& w : dw_.stages) dcache_.push_back(model::make_layer_cache(c, w, geo, cd.dev, cd.st));
+    model::LoadOptions la;
+    la.up = &up;
+    la.dense = false;
+    la.experts = &all;
+    la.arena = apu_arena_.get();
+    {
+      rt::DeviceGuard ga(plan.apu);
+      auto apu = model::load_dspark(dense, c, plan.apu, chan_[0]->stream(), la);
+      for (auto& w : apu.stages) chan_[0]->add_layer(std::move(w));
+    }
+    const int rows = c.dspark_block * geo.max_slots;
+    dscr_ = model::make_scratch(c, cd.dev, rows, 4096);
+    cap_max_ = geo.max_slots * 128;
+    mh_ = rt::DeviceBuffer(cd.dev, size_t(cap_max_) * c.dspark_target_layers.size() * c.dim * 2);
+    cap_dev_ = rt::DeviceBuffer(cd.dev, size_t(cap_max_) * 3 * 4);
+    d_x_ = rt::DeviceBuffer(cd.dev, size_t(rows) * c.hc_mult * c.dim * 2);
+    d_in_ = rt::DeviceBuffer(cd.dev, size_t(rows) * 2 * 4);
+    d_logits_ = rt::DeviceBuffer(cd.dev, size_t(rows) * c.vocab * 4);
+    d_tok_ = rt::DeviceBuffer(cd.dev, size_t(geo.max_slots) * (c.dspark_block + 1) * 4);
+    d_conf_ = rt::DeviceBuffer(cd.dev, size_t(rows) * 4);
+    for (auto& p : cap_host_) pin_host(&p, size_t(cap_max_) * 3 * 4);
+    pin_host(&d_x_host_, size_t(rows) * c.hc_mult * c.dim * 2);
+    pin_host(&d_io_host_, (size_t(rows) * 2 + size_t(geo.max_slots) * (c.dspark_block + 1)) * 4);
+    pin_host(&d_conf_host_, size_t(rows) * 4);
+    embed_host_ = dense.as<uint16_t>(dense.at("embed.weight"));
+    // Ring backups for verify chunks: every per-slot ring of each card (and the stages' windows).
+    for (int k = 0; k < 2; ++k) {
+      std::vector<k::RingDesc> descs;
+      size_t off = 0;
+      const auto add = [&](const rt::DeviceBuffer& b, int ring, int row_bytes) {
+        descs.push_back({static_cast<uint8_t*>(const_cast<void*>(b.data())), size_t(ring) * row_bytes, ring, row_bytes, off});
+        off += size_t(row_bytes);
+      };
+      const auto add_cache = [&](const model::LayerCache& lc) {
+        add(lc.window_rows, c.window, c.head_dim * 2);
+        if (lc.ratio) {
+          add(lc.ring_kv, lc.ring, lc.width * 4);
+          add(lc.ring_sc, lc.ring, lc.width * 4);
+        }
+        if (lc.indexer) {
+          add(lc.iring_kv, lc.iring, lc.iwidth * 4);
+          add(lc.iring_sc, lc.iring, lc.iwidth * 4);
+        }
+      };
+      for (const auto& lc : card_[k].cache) add_cache(lc);
+      if (k == 1)
+        for (const auto& lc : dcache_) add_cache(lc);
+      rt::DeviceGuard gk(card_[k].dev);
+      n_rings_[k] = int(descs.size());
+      ring_pos_bytes_[k] = off;
+      ring_desc_[k] = rt::DeviceBuffer(card_[k].dev, descs.size() * sizeof(k::RingDesc));
+      UH_CHECK(hipMemcpy(ring_desc_[k].data(), descs.data(), descs.size() * sizeof(k::RingDesc), hipMemcpyHostToDevice));
+      ring_bak_[k] = rt::DeviceBuffer(card_[k].dev, size_t(geo.max_slots) * (c.dspark_block + 1) * off);
+    }
+  }
   for (Flight& f : flight_) {
     const auto pinned = [](auto** p, size_t bytes) {
       UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), bytes, hipHostMallocPortable | hipHostMallocMapped));
@@ -288,6 +364,8 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
         snap_segs_[k].push_back({static_cast<uint8_t*>(const_cast<void*>(b.data())), per_slot, off});
         off += per_slot;
       };
+      if (k == 1)  // the drafter's windows are per-slot state too
+        for (const model::LayerCache& lc : dcache_) add(lc.window_rows, size_t(c.window) * c.head_dim * 2);
       for (const model::LayerCache& lc : card_[k].cache) {
         add(lc.window_rows, size_t(c.window) * c.head_dim * 2);
         if (lc.ratio == 4) {
@@ -321,7 +399,88 @@ void ResidentModel::state_copies(int k, const std::vector<StateOp>& ops, bool sa
   }
 }
 
+// Verify-chunk ring backups (before the layers) and restores of rejected positions, on card k.
+void ResidentModel::ring_ops(int k, hipStream_t st, const std::vector<RingBackup>* backup,
+                             const std::vector<RingRestore>* restore) {
+  const auto* descs = ring_desc_[k].as<k::RingDesc>();
+  const size_t per_slot = size_t(c_.dspark_block + 1) * ring_pos_bytes_[k];
+  uint8_t* bak = ring_bak_[k].as<uint8_t>();
+  if (backup)
+    for (const RingBackup& b : *backup) {
+      if (b.n > c_.dspark_block + 1 || b.slot < 0 || b.slot >= geo_.max_slots) throw std::runtime_error("step: bad backup");
+      k::ring_backup(descs, n_rings_[k], b.slot, b.s0, b.n, bak + size_t(b.slot) * per_slot, ring_pos_bytes_[k], st);
+    }
+  if (restore)
+    for (const RingRestore& r : *restore) {
+      if (r.to - r.s0 > c_.dspark_block + 1 || r.from < r.s0 || r.slot < 0 || r.slot >= geo_.max_slots)
+        throw std::runtime_error("draft: bad restore");
+      k::ring_restore(descs, n_rings_[k], r.slot, r.s0, r.from, r.to, bak + size_t(r.slot) * per_slot,
+                      ring_pos_bytes_[k], st);
+    }
+}
+
+// Restores first (card 0 on its stream, ahead of its next step; card 1 on the draft stream), then the
+// draft blocks through the stages and the head on card 1's draft stream, its own scratch and APU
+// channel — alongside whatever step card 1 is running for other sequences.
+void ResidentModel::draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs,
+                          std::vector<int32_t>& tokens, std::vector<float>& conf) {
+  tokens.clear();
+  conf.clear();
+  if (!dspark_) throw std::runtime_error("draft: no drafter loaded");
+  if (!restore.empty()) {
+    rt::DeviceGuard g0(card_[0].dev);
+    ring_ops(0, card_[0].st, nullptr, &restore);
+  }
+  Card& cd = card_[1];
+  rt::DeviceGuard g(cd.dev);
+  if (!restore.empty()) ring_ops(1, dst_, nullptr, &restore);
+  const int R = int(reqs.size()), Bk = c_.dspark_block, T = R * Bk, D = c_.dim, HC = c_.hc_mult;
+  if (R > geo_.max_slots) throw std::runtime_error("draft: too many requests");
+  if (R > 0) {
+    int32_t* ids = d_io_host_;
+    int32_t* pos = ids + T;
+    int32_t* tok = pos + T;
+    model::DraftDesc dd;
+    dd.T = T;
+    for (int r = 0; r < R; ++r) {
+      dd.slots.push_back(reqs[size_t(r)].slot);
+      dd.start.push_back(reqs[size_t(r)].start);
+      tok[r * (Bk + 1)] = reqs[size_t(r)].token;
+      for (int i = 0; i < Bk; ++i) {
+        const int32_t id = i == 0 ? reqs[size_t(r)].token : c_.dspark_noise_token;
+        ids[r * Bk + i] = id;
+        pos[r * Bk + i] = reqs[size_t(r)].start + 1 + i;
+        const uint16_t* e = embed_host_.data() + size_t(id) * D;
+        for (int h = 0; h < HC; ++h) std::memcpy(d_x_host_ + (size_t(r * Bk + i) * HC + h) * D, e, size_t(D) * 2);
+      }
+    }
+    k::copy_kernel(d_x_.data(), d_x_host_, size_t(T) * HC * D * 2, dst_);
+    k::copy_kernel(d_in_.data(), ids, size_t(T) * 2 * 4, dst_);
+    k::copy_kernel(d_tok_.data(), tok, size_t(R) * (Bk + 1) * 4, dst_);
+    dd.ids = d_in_.as<int32_t>();
+    dd.pos = d_in_.as<int32_t>() + T;
+    for (size_t s = 0; s < dw_.stages.size(); ++s)
+      model::dspark_stage(c_, dw_.stages[s], dcache_[s], dscr_, cd.rope, d_x_.as<uint16_t>(), dd, dst_, dchan_.get());
+    model::dspark_head(c_, dw_, dscr_, d_x_.as<uint16_t>(), head_.as<uint16_t>(), R, d_logits_.as<float>(),
+                       d_tok_.as<int32_t>(), d_conf_.as<float>(), dst_);
+    k::copy_kernel(tok, d_tok_.data(), size_t(R) * (Bk + 1) * 4, dst_);
+    k::copy_kernel(d_conf_host_, d_conf_.data(), size_t(T) * 4, dst_);
+  }
+  UH_CHECK(hipStreamSynchronize(dst_));
+  const int32_t* tok = d_io_host_ + 2 * T;
+  for (int r = 0; r < R; ++r)
+    for (int i = 1; i <= Bk; ++i) tokens.push_back(tok[r * (Bk + 1) + i]);
+  conf.assign(d_conf_host_, d_conf_host_ + T);
+}
+
 ResidentModel::~ResidentModel() {
+  if (dst_) {
+    rt::DeviceGuard g(card_[1].dev);
+    (void)hipStreamDestroy(dst_);
+  }
+  for (void* p : {static_cast<void*>(cap_host_[0]), static_cast<void*>(cap_host_[1]), static_cast<void*>(d_x_host_),
+                  static_cast<void*>(d_io_host_), static_cast<void*>(d_conf_host_)})
+    if (p) (void)hipHostFree(p);
   for (uint8_t* p : snap_host_)
     if (p) (void)hipHostFree(p);
   for (auto& cd : card_)
@@ -421,6 +580,22 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     k::copy_kernel(cd.pos.data(), f.ids_host + max_tokens_, size_t(T) * 4, cd.st);
     if (tables) k::copy_kernel(cd.tables.data(), f.tables_host, tables_.size() * 4, cd.st);
   }
+  // DSpark: the rows whose target hidden states feed the drafter's main-KV (each chunk's last <= 128).
+  int ncap = 0;
+  if (dspark_) {
+    int32_t* cap = cap_host_[ticket % 2];
+    for (const Chunk& ch : in.chunks)
+      for (int t = ch.t0 + std::max(0, ch.n - 128); t < ch.t0 + ch.n; ++t) {
+        if (ncap == cap_max_) throw std::runtime_error("step: too many dspark capture rows");
+        cap[ncap] = t;
+        cap[cap_max_ + ncap] = ch.slot;
+        cap[2 * cap_max_ + ncap] = ch.s0 + (t - ch.t0);
+        ++ncap;
+      }
+    rt::DeviceGuard g(card_[1].dev);
+    k::copy_kernel(cap_dev_.data(), cap, size_t(cap_max_) * 3 * 4, card_[1].st);
+  }
+  if (!in.backup.empty() && !dspark_) throw std::runtime_error("step: verify chunks without a drafter");
   model::BatchDesc b;
   for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0});
   b.T = T;
@@ -440,9 +615,20 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     b.pos = cd.pos.as<int32_t>();
     b.block_tables = cd.tables.as<int32_t>();
     state_copies(k, in.restore, false);
-    for (size_t i = 0; i < cd.layers.size(); ++i)
+    if (!in.backup.empty()) ring_ops(k, cd.st, &in.backup, nullptr);
+    const int nt = int(c_.dspark_target_layers.size());
+    const auto* cap_rows = cap_dev_.as<int32_t>();
+    for (size_t i = 0; i < cd.layers.size(); ++i) {
       model::layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, cd.x.as<uint16_t>(), b, cd.st,
                            chan_[k].get());
+      for (int j = 0; dspark_ && ncap > 0 && j < nt; ++j)
+        if (cd.layers[i] == c_.dspark_target_layers[size_t(j)])
+          k::hc_mean_rows(cd.x.as<uint16_t>(), c_.hc_mult, c_.dim, cap_rows, ncap, mh_.as<uint16_t>() + size_t(j) * c_.dim,
+                          nt * c_.dim, cd.st);
+    }
+    if (dspark_ && k == 1)
+      model::dspark_main_kv(c_, dw_, dcache_, cd.scratch, cd.rope, mh_.as<uint16_t>(), cap_rows + cap_max_,
+                            cap_rows + 2 * cap_max_, ncap, cd.st);
     if (k == 0) {
       // The flight's buffer may still be read by card 1 for the step two tickets back.
       UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));

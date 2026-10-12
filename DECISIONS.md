@@ -494,3 +494,50 @@ Ruled out, each by a run:
 Working hypothesis: a timing-dependent hardware/firmware-level problem on c7's path in the card-1
 role (one bit of a kernel-argument pointer, bit 44, arrives cleared). Kept from the investigation:
 no kernel uses scratch, staging by kernels, `stage_remote`, `--card-margin-gb`, the debug dumps.
+
+## 2026-10-12 — the fault: a register bit flip on c7 under the 230 W power cap
+
+Follow-up to the entry above. Two more facts settled it:
+- One hardware queue per card (GPU_MAX_HW_QUEUES=1, as the vLLM service runs) still faulted (21
+  requests in). The kernel log also shows vLLM itself faulting on these cards before unholy existed
+  (c7 on 2026-09-28, c3 on 2026-10-04) — but those were ordinary out-of-bounds reads (runs of
+  consecutive pages; c3's other faults were null pointers from an early engine build), not this.
+- A canary in hc_pre_tiled (UNHOLY_CANARY, kept): the kernel gets the weight pointer twice, once more as
+  an integer at the end of the argument list, and checks every load address against one recomputed
+  from the copy. At kernel entry the two always agreed. The faulting address is fn + 0xb000: 44 of the
+  64 K-chunks had been read with the same base before it. In the ISA (gfx1201) the base lives in a VGPR
+  pair that the loop only increments by 0x400 (v_add_co_u32 / v_add_co_ci_u32, carry via s0); nothing
+  in the code can clear bit 12 of the high dword. A register changed under the kernel, on c7 only
+  (13/13 faulting runs; never on c3, including when c3 ran the identical role).
+
+c7 also runtime-suspends/resumes (BACO, "PSP is resuming") about once a minute when idle — 340 times
+the day before — which c3 never does, and the unclean host reset at 05:08 on 2026-10-12 followed a
+burst of those cycles every ~6 s.
+
+Resolution: the LACT power cap (230 W on both cards; stock 300 W) was removed in /etc/nixos. At 300 W:
+96/96 requests with the plain kernel and 48/48 with the canary, no fault and no canary event (at 230 W
+every run faulted within 2-25 requests). Working explanation: power-limit throttling transients push
+the weaker chip (c7) past its timing margin. If it recurs, the canary names the wave's HW_ID1 (SE / SA
+/ WGP / SIMD) so the unit can be masked with HSA_CU_MASK.
+
+## 2026-10-12 — prefix caching, vLLM-style KV settings, 1M context
+
+KV settings follow vLLM: `--kv-tokens` is one pool of 256-token pages shared by all requests,
+`--max-model-len` caps a request, `--max-num-seqs` caps concurrency (a slot is ~17 MB of fixed state:
+the attention window and compressor rings). ~5.8 KB per token of pool (bf16 compressed rows + fp4
+indexer keys), split across the cards; every GB displaces ~80 hot experts.
+
+Prefix caching (engine.cpp): pages are named by a hash chained over the tokens to their end; a finished
+request's pages stay cached until evicted (LRU, a sequence's tail before its head). DSV4's unpaged
+per-slot state means a prefix is reusable only where that state was saved: snapshots (window rows +
+ratio-4 compressor and indexer rings, ~7 MB, pinned host memory, `--prefix-snapshots`) at the prompt's
+last page boundary, every 4k/16k/64k of prefill, and every page decoding completes (each superseding the
+previous). The ratio-128 rings are skipped: at a page boundary (a multiple of 128) no later block reads
+them. Restores and saves are StepInput ops run in stream order on each card around the step's layers.
+Verified: the scheduler test's fake model checks restored state against the slot's pages; on DSV4 a
+16.8k-token prompt repeated, with a different question, and as the next chat turn reused 16,640 tokens
+each, with logprobs identical to uncached runs.
+
+1M context: the rope tables (512 B per position per card) were not in the plan — 0.5 GB per card at 1M,
+which overflowed the 1.5 GB default margin; now planned, and the planner's default margin is serve's
+3 GB. Two 1M requests (a 2M-token pool) fit native: 6 GB of cache per card, 50% of routing on the cards.
