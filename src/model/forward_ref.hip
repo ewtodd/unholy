@@ -168,7 +168,8 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   s.expert = make_expert_scratch(c, dev, max_tokens);
   s.exl3 = make_exl3_moe_scratch(c, dev, max_tokens * c.n_active);
   s.dispatch.max_tiles = s.exl3.max_tiles;
-  s.route_hist = rt::DeviceBuffer(dev, size_t(c.n_layers) * c.n_experts * 4);
+  // Every layer the MoE runs for: the target's and the DSpark stages (n_layers + n_mtp).
+  s.route_hist = rt::DeviceBuffer(dev, std::max(size_t(c.n_layers + c.n_mtp), c.compress_ratios.size()) * c.n_experts * 4);
   UH_CHECK(hipMemset(s.route_hist.data(), 0, s.route_hist.size()));
   s.dispatch.count = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
