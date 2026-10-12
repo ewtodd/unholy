@@ -137,7 +137,9 @@ def install_capture(block, d):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="/scratch/dsv4-ve")
-    ap.add_argument("--ids", required=True, help="uint32 token ids")
+    ap.add_argument("--ids", help="uint32 token ids (or --vl-request)")
+    ap.add_argument("--vl-request", help="JSON {messages, thinking_mode?}: a prompt with images (data URLs or paths)")
+    ap.add_argument("--decode-ids", default="", help="with --vl-request: comma list of teacher-forced continuation ids")
     ap.add_argument("--prompt", type=int, required=True)
     ap.add_argument("--decode", type=int, default=0)
     ap.add_argument("--layers", type=int, default=None, help="run only the first N layers (no logits)")
@@ -158,7 +160,28 @@ def main():
 
     with open(os.path.join(args.ckpt, "inference", "config.json")) as f:
         cfg = json.load(f)
-    ids = np.fromfile(args.ids, dtype=np.uint32)[: args.prompt + args.decode].astype(np.int64)
+    images = None
+    if args.vl_request:
+        # The reference request path: encode_messages -> tokenizer -> prepare_vl_inputs (image blocks).
+        sys.path.insert(0, os.path.join(args.ckpt, "encoding"))
+        import encoding_dsv4 as E
+        import image_processor as ip
+        from transformers import AutoTokenizer
+        req = json.load(open(args.vl_request))
+        prompt, media = E.encode_messages(req["messages"], thinking_mode=req.get("thinking_mode", "chat"),
+                                          return_multi_modal_data=True)
+        tok = AutoTokenizer.from_pretrained(args.ckpt)
+        vargs = types.SimpleNamespace(**cfg)
+        with open(os.path.join(args.ckpt, "config.json")) as f:
+            for k, v in json.load(f).items():
+                if k.startswith("vision_") and not hasattr(vargs, k):
+                    setattr(vargs, k, v)
+        pids, images = ip.prepare_vl_inputs(prompt, media["images"], tok, vargs)
+        dec = [int(x) for x in args.decode_ids.split(",") if x.strip()]
+        ids = np.array(list(pids) + dec, dtype=np.int64)
+        args.prompt, args.decode = len(pids), len(dec)
+    else:
+        ids = np.fromfile(args.ids, dtype=np.uint32)[: args.prompt + args.decode].astype(np.int64)
     S, P = len(ids), args.prompt
     margs = M.ModelArgs(**cfg, max_batch_size=1, max_seq_len=((S + 127) // 128) * 128)
     # Normally set by Transformer.__init__.
@@ -180,8 +203,28 @@ def main():
     input_ids = torch.tensor(ids, dtype=torch.int64, device=dev).unsqueeze(0)
     with torch.inference_mode():
         emb = ck.get("embed.weight").to(dev)
-        h = emb[input_ids].unsqueeze(2).repeat(1, 1, margs.hc_mult, 1)  # [1, S, hc, D] bf16
+        image_mask = input_ids >= margs.vocab_size
+        h = emb[torch.where(image_mask, 0, input_ids)]  # ParallelEmbedding: ids past the vocab embed as 0
+        h[image_mask] = 0
         del emb
+        visible = None
+        if images:
+            # merge_image_embeddings with the reference ViT / Aligner, then the prompt's visibility.
+            import vision as V
+            ViT, Aligner = V.ViT(margs).to(dev), V.Aligner(margs).to(dev)
+            for mod, prefix in ((ViT, "vision."), (Aligner, "aligner.")):
+                for pname, prm in mod.named_parameters():
+                    prm.data.copy_(ck.get(prefix + pname).to(dev).to(prm.dtype))
+            params = torch.stack([ck.get(nm).to(dev) for nm in ("image_start", "image_pad", "image_pad",
+                                                                 "image_newline", "image_end")])
+            for img in images:
+                emb_i = Aligner(ViT(img.patches.to(dev), img.n_vit_h, img.n_vit_w), img.n_vit_h, img.n_vit_w)[img.perm.to(dev)]
+                blk = params[img.types.to(dev)].clone()
+                blk[img.types.to(dev) == ip.IMAGE] = emb_i
+                h[0, img.start:img.start + blk.size(0)] = blk
+            del ViT, Aligner
+            visible = M.get_image_visible(input_ids[:, :P], margs.vocab_size, margs.vision_max_n_token)
+        h = h.unsqueeze(2).repeat(1, 1, margs.hc_mult, 1)  # [1, S, hc, D] bf16
         for L in range(n_layers):
             t0 = time.time()
             block = M.Block(L, margs)
@@ -189,7 +232,7 @@ def main():
             if L == args.capture_layer:
                 install_capture(block, os.path.join(args.out, f"cap_{L:03d}"))
             t1 = time.time()
-            outs = [block(h[:, :P], 0, input_ids[:, :P])]
+            outs = [block(h[:, :P], 0, input_ids[:, :P], visible) if visible is not None else block(h[:, :P], 0, input_ids[:, :P])]
             for t in range(P, S):
                 outs.append(block(h[:, t:t + 1], t, input_ids[:, t:t + 1]))
             h = torch.cat(outs, 1)
