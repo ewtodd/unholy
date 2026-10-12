@@ -32,6 +32,15 @@ ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows
   // Each job is one expert: at most every token of a step.
   scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));
   xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows));
+  max_tiles = xscratch_.max_tiles;
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&plan_host), sizeof(kernels::MoePlan), flags));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&tiles_host), size_t(max_tiles) * sizeof(kernels::Exl3Tile), flags));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&plan_dev_), plan_host, 0));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&tiles_dev_), tiles_host, 0));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&req_flag_), 64, flags | hipHostMallocCoherent));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&done_flag_), 64, flags | hipHostMallocCoherent));
+  *req_flag_ = 0;
+  *done_flag_ = 0;
   layers_.resize(size_t(c.n_layers));
 }
 
@@ -42,6 +51,10 @@ ApuExperts::~ApuExperts() {
   if (out_host) (void)hipHostFree(out_host);
   if (w_host) (void)hipHostFree(w_host);
   if (e_host) (void)hipHostFree(e_host);
+  if (plan_host) (void)hipHostFree(plan_host);
+  if (tiles_host) (void)hipHostFree(tiles_host);
+  if (req_flag_) (void)hipHostFree(req_flag_);
+  if (done_flag_) (void)hipHostFree(done_flag_);
 }
 
 void ApuExperts::add_layer(model::LayerWeights w) {
@@ -71,6 +84,24 @@ void ApuExperts::run(int layer, const std::vector<Job>& jobs) {
                           st_);
   }
   UH_CHECK(hipStreamSynchronize(st_));
+}
+
+// Device-ordered handoff: the card stream raises req after writing the inputs; the APU stream waits for
+// it, runs the remote tiles, raises done; join() makes the card stream wait for done. Flags are
+// sequence numbers (>= waits), so no reset is needed and nothing blocks the host.
+void ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
+  const auto& w = *layers_.at(size_t(layer));
+  ++seq_;
+  UH_CHECK(hipStreamWriteValue32(card_st, req_flag_, seq_, 0));
+  rt::DeviceGuard g(dev_);
+  UH_CHECK(hipStreamWaitValue32(st_, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
+  model::exl3_moe_forward_dev(c_, w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P,
+                              xscratch_, out_dev_, st_);
+  UH_CHECK(hipStreamWriteValue32(st_, done_flag_, seq_, 0));
+}
+
+void ApuExperts::join(hipStream_t card_st) {
+  UH_CHECK(hipStreamWaitValue32(card_st, done_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
 }
 
 // ---------------------------------------------------------------------------------------------------

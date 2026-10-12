@@ -17,7 +17,10 @@
 #include <cstdint>
 #include <vector>
 
+#include <stdexcept>
+
 #include "kernels/exl3_moe.hpp"
+#include "kernels/moe_dispatch.hpp"
 #include "model/dsv4.hpp"
 
 namespace unholy::model {
@@ -74,15 +77,26 @@ bool exl3_fast_enabled();
 void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
                       const int32_t* row_expert, const std::vector<kernels::Exl3Tile>& tiles, int P,
                       const Exl3MoeScratch& s, uint16_t* out, hipStream_t st);
+// Same with the tile list on the device: the grid is sized for max_tiles, *ntiles_dev tiles run.
+void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
+                          const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
+                          int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st);
 // Tiles of <= 64 rows for each (expert, row0, cnt) run.
 std::vector<kernels::Exl3Tile> exl3_tiles(const std::vector<std::array<int, 3>>& runs);
 
 // Scratch for batches of up to max_tokens tokens whose sequences are at most max_seq long.
+// Device-side MoE dispatch state (kernels/moe_dispatch.hpp).
+struct MoeDispatchScratch {
+  rt::DeviceBuffer count, off, fill, plan, ltiles, rtiles;
+  int max_tiles = 0;
+};
+
 struct Scratch {
   int max_tokens = 0, max_keys = 0;
   std::vector<rt::DeviceBuffer> bufs;
   ExpertScratch expert;
   Exl3MoeScratch exl3;
+  MoeDispatchScratch dispatch;
   void* get(size_t i) const { return bufs.at(i).data(); }
 };
 Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq);
@@ -107,6 +121,15 @@ class RemoteExperts {
   };
   virtual ~RemoteExperts() = default;
   virtual void run(int layer, const std::vector<Job>& jobs) = 0;
+  // Device-dispatch mode. Before enqueue() the card's stream has written plan_host, tiles_host (remote
+  // tiles), in_host / w_host / e_host. enqueue() orders the remote computation after the card stream's
+  // preceding work; join() orders the card stream's following work after it. No host waits.
+  virtual bool can_enqueue() const { return false; }
+  virtual void enqueue(int layer, hipStream_t card_st, int P) { throw std::runtime_error("enqueue unsupported"); }
+  virtual void join(hipStream_t card_st) { throw std::runtime_error("join unsupported"); }
+  kernels::MoePlan* plan_host = nullptr;
+  kernels::Exl3Tile* tiles_host = nullptr;
+  int max_tiles = 0;
   uint16_t* in_host = nullptr;
   float* w_host = nullptr;
   uint16_t* out_host = nullptr;

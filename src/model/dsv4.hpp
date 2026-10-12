@@ -99,6 +99,8 @@ struct LayerWeights {
   // Fast EXL3 path: device pointer tables [w1, w3, w2] x [trellis, suh, svh] x E (null where the
   // expert is not on this device), and each matrix's bit width (uniform over resident experts).
   rt::DeviceBuffer exl3_tab;
+  rt::DeviceBuffer resident;  // uint8 [E]: 1 = this device holds the routed expert
+  int n_resident = 0;
   int exl3_bits[3] = {0, 0, 0};
   const uint16_t* const* exl3_ptrs(int m, int f, int n_experts) const {
     return exl3_tab.as<const uint16_t* const>() + size_t(m * 3 + f) * n_experts;

@@ -128,7 +128,7 @@ __global__ __launch_bounds__(NT) void exl3_gemm_kernel(const uint16_t* __restric
                                                        const Exl3Tile* __restrict__ tiles,
                                                        const uint16_t* const* __restrict__ trellis_tab,
                                                        const uint16_t* const* __restrict__ svh_tab, bf16* out,
-                                                       int ldo, int N) {
+                                                       int ldo, int N, const int* ntiles_dev) {
   constexpr int NW = 8 * BITS;           // uint32 words per 16x16 trellis tile
   constexpr int NTILE = (BN / 16) * (KS / 16);  // trellis tiles per K-slab
   constexpr int APAD = KS + 8;
@@ -136,6 +136,7 @@ __global__ __launch_bounds__(NT) void exl3_gemm_kernel(const uint16_t* __restric
   __shared__ alignas(16) _Float16 sB[BN][APAD];  // [n][k]
   __shared__ uint32_t sT[NTILE][NW];
   __shared__ float sC[BM][BN + 4];
+  if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;  // grid sized for the maximum
   const Exl3Tile tile = tiles[blockIdx.y];
   const int n0 = blockIdx.x * BN;
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
@@ -246,16 +247,16 @@ void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32
 
 void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
                        const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
-                       int ldo, int N, hipStream_t st) {
+                       int ldo, int N, hipStream_t st, const int* ntiles_dev) {
   if (ntiles <= 0) return;
   if (K % KS || N % BN) throw std::runtime_error("exl3_grouped_gemm: K/N not multiples of 32/128");
   const dim3 grid(N / BN, ntiles);
   switch (bits) {
-    case 2: exl3_gemm_kernel<2><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N); break;
-    case 3: exl3_gemm_kernel<3><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N); break;
-    case 4: exl3_gemm_kernel<4><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N); break;
-    case 5: exl3_gemm_kernel<5><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N); break;
-    case 6: exl3_gemm_kernel<6><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N); break;
+    case 2: exl3_gemm_kernel<2><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 3: exl3_gemm_kernel<3><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 4: exl3_gemm_kernel<4><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 5: exl3_gemm_kernel<5><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 6: exl3_gemm_kernel<6><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
     default: throw std::runtime_error("exl3_grouped_gemm: unsupported bit width");
   }
   UH_CHECK_LAUNCH();

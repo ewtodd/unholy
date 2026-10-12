@@ -254,6 +254,10 @@ __global__ void scale_bf16_kernel(bf16* x, float c, size_t n) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
     x[i] = f32_to_bf16(bf16_to_f32(x[i]) * c);
 }
+__global__ void positions_kernel(int32_t* out, int n, int start, int step) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = start + i * step;
+}
 __global__ void add_bf16_to_f32_kernel(const bf16* x, float* y, size_t n) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
     y[i] += bf16_to_f32(x[i]);
@@ -328,6 +332,12 @@ void add_bf16_to_f32(const bf16* x, float* y, size_t n, hipStream_t st) {
 
 void scale_bf16(bf16* x, float c, size_t n, hipStream_t st) {
   scale_bf16_kernel<<<std::min(cdiv(n, 256), 65535), 256, 0, st>>>(x, c, n);
+  UH_CHECK_LAUNCH();
+}
+
+void positions(int32_t* out, int n, int start, int step, hipStream_t st) {
+  if (n <= 0) return;
+  positions_kernel<<<(n + 255) / 256, 256, 0, st>>>(out, n, start, step);
   UH_CHECK_LAUNCH();
 }
 

@@ -295,6 +295,15 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
     up->sync();
   };
   run(ck, opt.up, lc.items);
+  {
+    std::vector<uint8_t> mask(E, 0);
+    for (size_t e = 0; e < E; ++e) {
+      mask[e] = w.has_expert(int(e)) ? 1 : 0;
+      w.n_resident += mask[e];
+    }
+    w.resident = rt::DeviceBuffer(dev, E);
+    UH_CHECK(hipMemcpy(w.resident.data(), mask.data(), E, hipMemcpyHostToDevice));
+  }
   if (opt.exl3) run(*opt.exl3, opt.exl3_up, lx.items);
   if (w.exl3_experts) {
     // Pointer tables for the grouped kernels.

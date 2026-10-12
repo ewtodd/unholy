@@ -23,6 +23,9 @@ class ApuExperts final : public model::RemoteExperts {
   ~ApuExperts() override;
   void add_layer(model::LayerWeights w);  // experts-only weights of one layer, on this device
   void run(int layer, const std::vector<Job>& jobs) override;
+  bool can_enqueue() const override { return true; }
+  void enqueue(int layer, hipStream_t card_st, int P) override;
+  void join(hipStream_t card_st) override;
   int device() const { return dev_; }
   hipStream_t stream() const { return st_; }
 
@@ -34,6 +37,11 @@ class ApuExperts final : public model::RemoteExperts {
   model::ExpertScratch scratch_;
   model::Exl3MoeScratch xscratch_;
   int32_t* e_dev_ = nullptr;
+  kernels::MoePlan* plan_dev_ = nullptr;   // device views of plan_host / tiles_host
+  kernels::Exl3Tile* tiles_dev_ = nullptr;
+  uint32_t* req_flag_ = nullptr;           // pinned, coherent: card -> APU
+  uint32_t* done_flag_ = nullptr;          // APU -> card
+  uint32_t seq_ = 0;
   uint16_t* in_dev_ = nullptr;
   float* w_dev_ = nullptr;
   uint16_t* out_dev_ = nullptr;

@@ -55,6 +55,7 @@ add_library(unholy_ref STATIC
   src/kernels/gemm_wmma.hip
   src/kernels/attn_wmma.hip
   src/kernels/hc_fast.hip
+  src/kernels/moe_dispatch.hip
 )
 target_include_directories(unholy_ref PUBLIC src third_party)
 target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)

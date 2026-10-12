@@ -157,6 +157,13 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   for (size_t i = 0; i < kNumBufs; ++i) s.bufs.emplace_back(dev, std::max<size_t>(sz[i], 256));
   s.expert = make_expert_scratch(c, dev, max_tokens);
   s.exl3 = make_exl3_moe_scratch(c, dev, max_tokens * c.n_active);
+  s.dispatch.max_tiles = s.exl3.max_tiles;
+  s.dispatch.count = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
+  s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
+  s.dispatch.fill = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
+  s.dispatch.plan = rt::DeviceBuffer(dev, sizeof(kernels::MoePlan));
+  s.dispatch.ltiles = rt::DeviceBuffer(dev, size_t(s.dispatch.max_tiles) * sizeof(kernels::Exl3Tile));
+  s.dispatch.rtiles = rt::DeviceBuffer(dev, size_t(s.dispatch.max_tiles) * sizeof(kernels::Exl3Tile));
   return s;
 }
 
@@ -258,6 +265,27 @@ void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t
   k::exl3_grouped_gemm(xh3, D, dt, nt, w.exl3_ptrs(1, 0, E), w.exl3_ptrs(1, 2, E), w.exl3_bits[1], h3, I, I, st);
   k::exl3_swiglu_xform(h1, h3, rw, row_expert, w.exl3_ptrs(2, 1, E), xh2, P, I, c.swiglu_limit, st);
   k::exl3_grouped_gemm(xh2, I, dt, nt, w.exl3_ptrs(2, 0, E), w.exl3_ptrs(2, 2, E), w.exl3_bits[2], out, D, D, st);
+}
+
+void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
+                          const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
+                          int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st) {
+  if (P > s.rows) throw std::runtime_error("exl3_moe_forward_dev: scratch too small");
+  const int D = c.dim, I = c.moe_inter, E = c.n_experts;
+  uint16_t* xh1 = s.xh1.as<uint16_t>();
+  uint16_t* xh3 = s.xh3.as<uint16_t>();
+  uint16_t* xh2 = s.xh2.as<uint16_t>();
+  bf16* h1 = s.h1.as<bf16>();
+  bf16* h3 = s.h3.as<bf16>();
+  k::exl3_xform_in(in, D, row_expert, w.exl3_ptrs(0, 1, E), xh1, P, D, true, st);
+  k::exl3_xform_in(in, D, row_expert, w.exl3_ptrs(1, 1, E), xh3, P, D, true, st);
+  k::exl3_grouped_gemm(xh1, D, tiles, max_tiles, w.exl3_ptrs(0, 0, E), w.exl3_ptrs(0, 2, E), w.exl3_bits[0], h1, I, I,
+                       st, ntiles_dev);
+  k::exl3_grouped_gemm(xh3, D, tiles, max_tiles, w.exl3_ptrs(1, 0, E), w.exl3_ptrs(1, 2, E), w.exl3_bits[1], h3, I, I,
+                       st, ntiles_dev);
+  k::exl3_swiglu_xform(h1, h3, rw, row_expert, w.exl3_ptrs(2, 1, E), xh2, P, I, c.swiglu_limit, st);
+  k::exl3_grouped_gemm(xh2, I, tiles, max_tiles, w.exl3_ptrs(2, 0, E), w.exl3_ptrs(2, 2, E), w.exl3_bits[2], out, D, D,
+                       st, ntiles_dev);
 }
 
 namespace {
@@ -369,10 +397,8 @@ void compress_chunk(const Dsv4Config& c, const CompressorWeights& cw, const floa
                      st);
     k::cast_f32_bf16(rf, rb, size_t(nrows) * d, st);
     k::rmsnorm(rb, d, cw.norm.p<bf16>(), rb, d, nrows, d, c.norm_eps, st);
-    std::vector<int32_t> rpos(static_cast<size_t>(nrows));
-    for (int j = 0; j < nrows; ++j) rpos[size_t(j)] = (row0 + j) * cw.ratio;
     int32_t* dpos = B<int32_t>(scr, kRowPos);
-    UH_CHECK(hipMemcpyAsync(dpos, rpos.data(), rpos.size() * 4, hipMemcpyHostToDevice, st));
+    k::positions(dpos, nrows, row0 * cw.ratio, cw.ratio, st);
     k::rope(rb, d, nrows, 1, d, d - c.rope_dim, c.rope_dim / 2, dpos, rope.yarn.as<float2>(), false, st);
     if (cw.rotate) {
       k::hadamard128(rb, size_t(nrows) * d / 128, st);
@@ -381,7 +407,6 @@ void compress_chunk(const Dsv4Config& c, const CompressorWeights& cw, const floa
       k::fake_quant_fp8(rb, d, nrows, d - c.rope_dim, 64, st);
     }
     k::store_rows(rb, nrows, d, dst, row0, st);
-    UH_CHECK(hipStreamSynchronize(st));  // rpos is on the host stack
   }
   k::ring_update(cpk, cps, ring_kv, ring_sc, ch.s0, ch.n, cw.ring(), width, st);
 }
@@ -516,6 +541,50 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   k::hc_post(ao, x, post, comb, x, T, c.hc_mult, D, st);
 }
 
+// Routing -> pair rows -> experts entirely on the device (EXL3 fast path). Pair rows are laid out
+// resident experts first, then remote ones; the remote block goes to the remote side through pinned
+// memory with stream-ordered flags, so the host only enqueues.
+void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, const bf16* f,
+                         const int32_t* sel, const float* wt, int T, hipStream_t st, RemoteExperts* remote) {
+  const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
+  const auto& ds = scr.dispatch;
+  int32_t* count = ds.count.as<int32_t>();
+  int32_t* off = ds.off.as<int32_t>();
+  int32_t* fill = ds.fill.as<int32_t>();
+  auto* plan = ds.plan.as<k::MoePlan>();
+  auto* lt = ds.ltiles.as<k::Exl3Tile>();
+  auto* rtl = ds.rtiles.as<k::Exl3Tile>();
+  int32_t* eidx = B<int32_t>(scr, kEIdx);
+  float* ewt = B<float>(scr, kEWt);
+  int32_t* pidx = B<int32_t>(scr, kPairIdx);
+  int32_t* row_expert = scr.exl3.row_expert.as<int32_t>();
+  bf16* pair_in = B<bf16>(scr, kPairIn);
+  bf16* pair_out = B<bf16>(scr, kPairOut);
+  k::moe_count(sel, T, K, count, E, st);
+  k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st);
+  k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
+  k::gather_rows(f, eidx, pair_in, P, D, st);
+  const bool any_remote = w.n_resident < E;
+  if (any_remote) {
+    if (!remote || !remote->can_enqueue()) throw std::runtime_error("moe: remote experts need an enqueue backend");
+    if (size_t(P) > remote->capacity_rows || ds.max_tiles > remote->max_tiles)
+      throw std::runtime_error("moe: remote staging too small");
+    UH_CHECK(hipMemcpyAsync(remote->plan_host, plan, sizeof(k::MoePlan), hipMemcpyDeviceToHost, st));
+    UH_CHECK(hipMemcpyAsync(remote->tiles_host, rtl, size_t(ds.max_tiles) * sizeof(k::Exl3Tile), hipMemcpyDeviceToHost,
+                            st));
+    UH_CHECK(hipMemcpyAsync(remote->e_host, row_expert, size_t(P) * 4, hipMemcpyDeviceToHost, st));
+    UH_CHECK(hipMemcpyAsync(remote->w_host, ewt, size_t(P) * 4, hipMemcpyDeviceToHost, st));
+    k::copy_remote_rows(pair_in, remote->in_host, plan, D, P, st);
+    remote->enqueue(w.layer, st, P);
+  }
+  exl3_moe_forward_dev(c, w, pair_in, ewt, row_expert, lt, ds.max_tiles, &plan->n_local_tiles, P, scr.exl3, pair_out,
+                       st);
+  if (any_remote) {
+    remote->join(st);
+    k::copy_remote_rows(remote->out_host, pair_out, plan, D, P, st);
+  }
+}
+
 void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
               hipStream_t st, RemoteExperts* remote) {
   const int D = c.dim, I = c.moe_inter, E = c.n_experts, K = c.n_active, T = b.T, L = w.layer;
@@ -545,106 +614,112 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   dump(L, b, "gate_out0", wt, size_t(T) * K * 4, st);
   dump(L, b, "gate_out1", sel, size_t(T) * K * 4, st);
 
-  // Expert-major pairs (ascending expert id): pair p computes expert e on token t into row p of the
-  // pair-output buffer; pidx[t][j] lists token t's pairs in ascending expert order for the combine.
-  std::vector<int32_t> hsel(size_t(T) * K);
-  std::vector<float> hwt(size_t(T) * K);
-  UH_CHECK(hipMemcpyAsync(hsel.data(), sel, hsel.size() * 4, hipMemcpyDeviceToHost, st));
-  UH_CHECK(hipMemcpyAsync(hwt.data(), wt, hwt.size() * 4, hipMemcpyDeviceToHost, st));
-  UH_CHECK(hipStreamSynchronize(st));
-  std::vector<int> count(size_t(E), 0), off(size_t(E) + 1, 0);
-  for (int32_t e : hsel) ++count[size_t(e)];
-  if (g_expert_hist) {
-    if (g_expert_hist->size() <= size_t(L)) g_expert_hist->resize(size_t(L) + 1);
-    auto& hl = (*g_expert_hist)[size_t(L)];
-    hl.resize(size_t(E), 0);
-    for (int e = 0; e < E; ++e) hl[size_t(e)] += uint64_t(count[size_t(e)]);
-  }
-  // Pair rows: this device's experts first, then the remote ones (each group in ascending expert
-  // order), so the remote rows are one contiguous block [remote0, P) to ship each way. The combine
-  // follows pidx (each token's pairs by expert id), so the placement does not change the sum order.
-  int remote0 = 0;
-  {
-    int next = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-      if (pass == 1) remote0 = next;
-      for (int e = 0; e < E; ++e)
-        if (w.has_expert(e) == (pass == 0)) {
-          off[size_t(e)] = next;
-          next += count[size_t(e)];
-        }
-    }
-  }
-  std::vector<int32_t> eidx(size_t(T) * K), pidx(size_t(T) * K);
-  std::vector<float> ewt(size_t(T) * K);
-  std::vector<int> fill(off.begin(), off.begin() + E);
-  for (int t = 0; t < T; ++t) {
-    // Token t's picks sorted by expert id (selection order is by score).
-    std::vector<std::pair<int32_t, float>> picks;
-    for (int j = 0; j < K; ++j) picks.push_back({hsel[size_t(t) * K + j], hwt[size_t(t) * K + j]});
-    std::sort(picks.begin(), picks.end(), [](auto& a, auto& b2) { return a.first < b2.first; });
-    for (int j = 0; j < K; ++j) {
-      const int p = fill[size_t(picks[size_t(j)].first)]++;
-      eidx[size_t(p)] = t;
-      ewt[size_t(p)] = picks[size_t(j)].second;
-      pidx[size_t(t) * K + j] = p;
-    }
-  }
-  int32_t* deidx = B<int32_t>(scr, kEIdx);
-  float* dewt = B<float>(scr, kEWt);
+  const bool device_path = w.exl3_experts && exl3_fast_enabled() && !g_expert_hist &&
+                           (w.n_resident == E || (remote && remote->can_enqueue()));
   int32_t* dpidx = B<int32_t>(scr, kPairIdx);
-  UH_CHECK(hipMemcpyAsync(deidx, eidx.data(), eidx.size() * 4, hipMemcpyHostToDevice, st));
-  UH_CHECK(hipMemcpyAsync(dewt, ewt.data(), ewt.size() * 4, hipMemcpyHostToDevice, st));
-  UH_CHECK(hipMemcpyAsync(dpidx, pidx.data(), pidx.size() * 4, hipMemcpyHostToDevice, st));
-
   bf16* pair_out = B<bf16>(scr, kPairOut);
-  bf16* pair_in = B<bf16>(scr, kPairIn);
-  const int P = T * K;
-  k::gather_rows(f, deidx, pair_in, P, D, st);
-  const bool fast = w.exl3_experts && exl3_fast_enabled();
-  std::vector<int32_t> row_expert;
-  if (fast) {
-    row_expert.resize(size_t(P));
-    for (int e = 0; e < E; ++e)
-      for (int p = off[size_t(e)]; p < off[size_t(e)] + count[size_t(e)]; ++p) row_expert[size_t(p)] = e;
-    UH_CHECK(hipMemcpyAsync(scr.exl3.row_expert.data(), row_expert.data(), size_t(P) * 4, hipMemcpyHostToDevice, st));
-  }
-  // Experts this device does not hold: ship every pair's input once (the remote side only reads the
-  // rows of its jobs); local experts are queued meanwhile and overlap the remote computation.
-  std::vector<RemoteExperts::Job> jobs;
-  for (int e = 0; e < E; ++e)
-    if (count[size_t(e)] && !w.has_expert(e)) jobs.push_back({e, off[size_t(e)], count[size_t(e)]});
-  hipEvent_t shipped = nullptr;
-  if (!jobs.empty()) {
-    if (!remote) throw std::runtime_error("moe: experts missing on this device and no remote backend");
-    if (size_t(P) > remote->capacity_rows) throw std::runtime_error("moe: remote staging too small");
-    UH_CHECK(hipMemcpyAsync(remote->in_host + size_t(remote0) * D, pair_in + size_t(remote0) * D,
-                            size_t(P - remote0) * D * 2, hipMemcpyDeviceToHost, st));
-    std::copy(ewt.begin(), ewt.end(), remote->w_host);
-    if (fast) std::copy(row_expert.begin(), row_expert.end(), remote->e_host);
-    UH_CHECK(hipEventCreateWithFlags(&shipped, hipEventDisableTiming));
-    UH_CHECK(hipEventRecord(shipped, st));
-  }
-  if (fast) {
-    std::vector<std::array<int, 3>> runs;
-    for (int e = 0; e < E; ++e)
-      if (count[size_t(e)] && w.has_expert(e)) runs.push_back({e, off[size_t(e)], count[size_t(e)]});
-    exl3_moe_forward(c, w, pair_in, dewt, scr.exl3.row_expert.as<int32_t>(), exl3_tiles(runs), P, scr.exl3, pair_out,
-                     st);
+  if (device_path) {
+    moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote);
   } else {
-    for (int e = 0; e < E; ++e) {
-      const int cnt = count[size_t(e)];
-      if (!cnt || !w.has_expert(e)) continue;
-      const size_t o = size_t(off[size_t(e)]);
-      expert_forward(c, w, e, pair_in + o * D, dewt + o, cnt, pair_out + o * D, scr.expert, st);
+    // Expert-major pairs (ascending expert id): pair p computes expert e on token t into row p of the
+    // pair-output buffer; pidx[t][j] lists token t's pairs in ascending expert order for the combine.
+    std::vector<int32_t> hsel(size_t(T) * K);
+    std::vector<float> hwt(size_t(T) * K);
+    UH_CHECK(hipMemcpyAsync(hsel.data(), sel, hsel.size() * 4, hipMemcpyDeviceToHost, st));
+    UH_CHECK(hipMemcpyAsync(hwt.data(), wt, hwt.size() * 4, hipMemcpyDeviceToHost, st));
+    UH_CHECK(hipStreamSynchronize(st));
+    std::vector<int> count(size_t(E), 0), off(size_t(E) + 1, 0);
+    for (int32_t e : hsel) ++count[size_t(e)];
+    if (g_expert_hist) {
+      if (g_expert_hist->size() <= size_t(L)) g_expert_hist->resize(size_t(L) + 1);
+      auto& hl = (*g_expert_hist)[size_t(L)];
+      hl.resize(size_t(E), 0);
+      for (int e = 0; e < E; ++e) hl[size_t(e)] += uint64_t(count[size_t(e)]);
     }
-  }
-  if (!jobs.empty()) {
-    UH_CHECK(hipEventSynchronize(shipped));
-    UH_CHECK(hipEventDestroy(shipped));
-    remote->run(L, jobs);
-    UH_CHECK(hipMemcpyAsync(pair_out + size_t(remote0) * D, remote->out_host + size_t(remote0) * D,
-                            size_t(P - remote0) * D * 2, hipMemcpyHostToDevice, st));
+    // Pair rows: this device's experts first, then the remote ones (each group in ascending expert
+    // order), so the remote rows are one contiguous block [remote0, P) to ship each way. The combine
+    // follows pidx (each token's pairs by expert id), so the placement does not change the sum order.
+    int remote0 = 0;
+    {
+      int next = 0;
+      for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) remote0 = next;
+        for (int e = 0; e < E; ++e)
+          if (w.has_expert(e) == (pass == 0)) {
+            off[size_t(e)] = next;
+            next += count[size_t(e)];
+          }
+      }
+    }
+    std::vector<int32_t> eidx(size_t(T) * K), pidx(size_t(T) * K);
+    std::vector<float> ewt(size_t(T) * K);
+    std::vector<int> fill(off.begin(), off.begin() + E);
+    for (int t = 0; t < T; ++t) {
+      // Token t's picks sorted by expert id (selection order is by score).
+      std::vector<std::pair<int32_t, float>> picks;
+      for (int j = 0; j < K; ++j) picks.push_back({hsel[size_t(t) * K + j], hwt[size_t(t) * K + j]});
+      std::sort(picks.begin(), picks.end(), [](auto& a, auto& b2) { return a.first < b2.first; });
+      for (int j = 0; j < K; ++j) {
+        const int p = fill[size_t(picks[size_t(j)].first)]++;
+        eidx[size_t(p)] = t;
+        ewt[size_t(p)] = picks[size_t(j)].second;
+        pidx[size_t(t) * K + j] = p;
+      }
+    }
+    int32_t* deidx = B<int32_t>(scr, kEIdx);
+    float* dewt = B<float>(scr, kEWt);
+    UH_CHECK(hipMemcpyAsync(deidx, eidx.data(), eidx.size() * 4, hipMemcpyHostToDevice, st));
+    UH_CHECK(hipMemcpyAsync(dewt, ewt.data(), ewt.size() * 4, hipMemcpyHostToDevice, st));
+    UH_CHECK(hipMemcpyAsync(dpidx, pidx.data(), pidx.size() * 4, hipMemcpyHostToDevice, st));
+
+    bf16* pair_in = B<bf16>(scr, kPairIn);
+    const int P = T * K;
+    k::gather_rows(f, deidx, pair_in, P, D, st);
+    const bool fast = w.exl3_experts && exl3_fast_enabled();
+    std::vector<int32_t> row_expert;
+    if (fast) {
+      row_expert.resize(size_t(P));
+      for (int e = 0; e < E; ++e)
+        for (int p = off[size_t(e)]; p < off[size_t(e)] + count[size_t(e)]; ++p) row_expert[size_t(p)] = e;
+      UH_CHECK(hipMemcpyAsync(scr.exl3.row_expert.data(), row_expert.data(), size_t(P) * 4, hipMemcpyHostToDevice, st));
+    }
+    // Experts this device does not hold: ship every pair's input once (the remote side only reads the
+    // rows of its jobs); local experts are queued meanwhile and overlap the remote computation.
+    std::vector<RemoteExperts::Job> jobs;
+    for (int e = 0; e < E; ++e)
+      if (count[size_t(e)] && !w.has_expert(e)) jobs.push_back({e, off[size_t(e)], count[size_t(e)]});
+    hipEvent_t shipped = nullptr;
+    if (!jobs.empty()) {
+      if (!remote) throw std::runtime_error("moe: experts missing on this device and no remote backend");
+      if (size_t(P) > remote->capacity_rows) throw std::runtime_error("moe: remote staging too small");
+      UH_CHECK(hipMemcpyAsync(remote->in_host + size_t(remote0) * D, pair_in + size_t(remote0) * D,
+                              size_t(P - remote0) * D * 2, hipMemcpyDeviceToHost, st));
+      std::copy(ewt.begin(), ewt.end(), remote->w_host);
+      if (fast) std::copy(row_expert.begin(), row_expert.end(), remote->e_host);
+      UH_CHECK(hipEventCreateWithFlags(&shipped, hipEventDisableTiming));
+      UH_CHECK(hipEventRecord(shipped, st));
+    }
+    if (fast) {
+      std::vector<std::array<int, 3>> runs;
+      for (int e = 0; e < E; ++e)
+        if (count[size_t(e)] && w.has_expert(e)) runs.push_back({e, off[size_t(e)], count[size_t(e)]});
+      exl3_moe_forward(c, w, pair_in, dewt, scr.exl3.row_expert.as<int32_t>(), exl3_tiles(runs), P, scr.exl3, pair_out,
+                       st);
+    } else {
+      for (int e = 0; e < E; ++e) {
+        const int cnt = count[size_t(e)];
+        if (!cnt || !w.has_expert(e)) continue;
+        const size_t o = size_t(off[size_t(e)]);
+        expert_forward(c, w, e, pair_in + o * D, dewt + o, cnt, pair_out + o * D, scr.expert, st);
+      }
+    }
+    if (!jobs.empty()) {
+      UH_CHECK(hipEventSynchronize(shipped));
+      UH_CHECK(hipEventDestroy(shipped));
+      remote->run(L, jobs);
+      UH_CHECK(hipMemcpyAsync(pair_out + size_t(remote0) * D, remote->out_host + size_t(remote0) * D,
+                              size_t(P - remote0) * D * 2, hipMemcpyHostToDevice, st));
+    }
   }
   bf16* h1 = B<bf16>(scr, kH1);
   bf16* h3 = B<bf16>(scr, kH3);
@@ -662,7 +737,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
   dump(L, b, "ffn_out", fo, size_t(T) * D * 2, st);
   k::hc_post(fo, x, post, comb, x, T, c.hc_mult, D, st);
-  UH_CHECK(hipStreamSynchronize(st));  // host vectors above
+  if (!device_path) UH_CHECK(hipStreamSynchronize(st));  // the host path's vectors
 }
 
 }  // namespace

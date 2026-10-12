@@ -20,9 +20,10 @@ void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint
 // xh[r] = fp16(H128(fq(bf16(silu(min(g,lim)) * clamp(u,±lim) * w[r])) * suh[e_r]) / sqrt(128)).
 void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
                        const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st);
-// out[r] = bf16(H128(xh[r] @ W_inner[e]) * svh[e] / sqrt(128)) for the rows of each tile.
+// out[r] = bf16(H128(xh[r] @ W_inner[e]) * svh[e] / sqrt(128)) for the rows of each tile. With
+// ntiles_dev, the grid is sized for `ntiles` and only the first *ntiles_dev tiles run.
 void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
                        const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
-                       int ldo, int N, hipStream_t st);
+                       int ldo, int N, hipStream_t st, const int* ntiles_dev = nullptr);
 
 }  // namespace unholy::kernels

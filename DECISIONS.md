@@ -275,3 +275,18 @@ softmax with bf16 P, sink in the denominator. Softmax blocks are 16 keys instead
 - `hc_pre_tiled` (src/kernels/hc_fast.hip): 16 tokens per block share each LDS-staged chunk of the
   [24, 16384] fp32 mixing matrix (the reference kernel re-read 1.5 MB per token).
 Resident EXL3 model: KL 2.44e-2, prefill 1024 tokens 3.06 -> 2.68 s, decode 0.24 s/token.
+
+## 2026-10-11 — device-side MoE dispatch, APU behind stream flags
+
+`src/kernels/moe_dispatch.hip`: count -> plan (pair offsets with resident experts first, remote0, the
+<=64-row tile lists of both groups) -> scatter (each token's picks sorted by expert, atomic row
+placement within an expert's block; row-independent experts and the pidx-ordered combine make the
+placement irrelevant to the result) -> gather. The grouped EXL3 GEMM takes its tile count from
+device memory (grid sized for the maximum). Remote rows, weights, experts, plan and tiles go to
+pinned memory on the card's stream; `ApuExperts::enqueue` raises a sequence-numbered request flag
+(hipStreamWriteValue32), the APU stream waits on it, runs the remote tiles, raises done; `join`
+makes the card stream wait for done. The compressor's row positions are computed on the device. The
+EXL3 fast path now has no host synchronization in a layer.
+
+Single EXL3 layer on one card, 1024 prefill: 162 -> 75 ms; resident model: KL 2.438e-2 (same),
+prefill 1024 tokens 2.68 -> 2.44 s, decode 0.24 -> 0.20 s/token (~4.4 ms per layer per token).

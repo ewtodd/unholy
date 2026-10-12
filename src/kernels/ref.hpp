@@ -127,6 +127,8 @@ void gather_rows(const bf16* src, const int32_t* rows_idx, bf16* dst, int n, int
 void moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
                  hipStream_t st);
 void add_bf16_to_f32(const bf16* x, float* y, size_t n, hipStream_t st);
+// out[j] = start + j * step.
+void positions(int32_t* out, int n, int start, int step, hipStream_t st);
 
 // ---- EXL3 (reference) ------------------------------------------------------------------------------
 // xh [M, K] fp32 = H128(x * suh) per 128-block (suh fp16 [K]).
