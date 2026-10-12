@@ -370,3 +370,22 @@ C++ binary.
   is launch/latency-bound (a batch-1 token reads ~2.5 GB of weights, ~4 ms at the cards' bandwidth,
   but takes 58 ms), and per-chunk attention/compressor work plus more distinct experts (and more APU
   round trips) grow with the batch. Next: profile the batch-4 decode step.
+
+## 2026-10-11 — long context, part 1: fp4 indexer keys, int8-WMMA scores, bounded score scratch
+
+Baseline before (bf16 keys, fp32 scalar scores over a [T, max_seq/4] fp32 buffer): the indexer cost
+grew linearly with depth (0.58 -> 1.6 s per 4096-token chunk from 4k to 8k), the score scratch was
+N x keys x 4 bytes (2 GB at 512k).
+- Keys are stored as the reference already quantizes them: Hadamard, then e2m1 codes + one e8m0
+  scale per 32 (68 B/key instead of 256). `store_rows_fp4` round-trips to exactly fake_quant_fp4's
+  bf16 values (0 differences on 20M values). The reference indexer reads the same pool.
+- Fast scores: queries -> int8 codes (2 x e2m1) + scales; int8 WMMA per 32-value block (exact integer
+  dot), scaled by the two exact power-of-two scales; then the reference's bf16(dot), ReLU, bf16(x w_h)
+  and in-order fp32 head sum. Scores are bf16 [T, keys]; top-k is a 16-bit radix select. Against the
+  reference kernels (`unholy-indexer-test`, up to 131k keys, shuffled block tables): scores and top-512
+  indices identical. Queries go through a 256 MB score buffer in sub-batches.
+- Measured (1 slot, 4096-token chunks): 16k 679 tok/s, 64k 585 tok/s, 128k 521 tok/s average; the
+  last 128k chunk 9.3 s (442 tok/s). Decode at 128k depth 65 ms/token. Profile of that chunk: indexer
+  2.1 s (~22 TOPS: the per-element scaling/epilogue dominates), EXL3 GEMM 2.0 s on the cards and 3.2 s
+  on the APU (now on the critical path: 1.5 s of card waits), remote-row copies 0.95 s, sparse
+  attention 0.73 s (HCA: one block per query re-reads every compressed row).

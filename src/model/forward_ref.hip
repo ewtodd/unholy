@@ -12,6 +12,7 @@
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
 #include "kernels/hc_fast.hpp"
+#include "kernels/indexer.hpp"
 #include "kernels/ref.hpp"
 
 namespace unholy::model {
@@ -50,7 +51,7 @@ LayerCache make_layer_cache(const Dsv4Config& c, const LayerWeights& w, const Ca
     lc.iwidth = w.idx_comp->width();
     lc.iring_kv = alloc_zero(size_t(g.max_slots) * lc.iring * lc.iwidth * 4);
     lc.iring_sc = alloc_zero(size_t(g.max_slots) * lc.iring * lc.iwidth * 4);
-    lc.idx = rt::DeviceBuffer(dev, size_t(g.num_pages) * (kPageTokens / 4) * c.idx_dim * 2);
+    lc.idx = rt::DeviceBuffer(dev, size_t(g.num_pages) * k::kFp4PageBytes);  // packed fp4 keys
   }
   UH_CHECK(hipStreamSynchronize(st));
   return lc;
@@ -61,7 +62,7 @@ namespace {
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
   kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
-  kY2F, kPairIn, kHcPart, kNumBufs
+  kY2F, kPairIn, kHcPart, kQC, kQCS, kNumBufs
 };
 
 template <typename T>
@@ -72,6 +73,7 @@ T* B(const Scratch& s, Buf b) {
 }  // namespace
 
 namespace {
+constexpr size_t kIndexerScoreBytes = size_t(256) << 20;
 std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_seq) {
   const size_t N = size_t(max_tokens);
   const size_t rows = N / 4 + 2;
@@ -96,7 +98,11 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kRowPos] = rows * 4;
   sz[kQI] = N * c.idx_heads * c.idx_dim * 2;
   sz[kWI] = N * c.idx_heads * 2;
-  sz[kISc] = N * keys * 4;
+  // Indexer scores for a sub-batch of a chunk's queries (fp32 rows on the reference path, bf16 on the
+  // fast one): capped, the chunk's queries go through it in turns.
+  sz[kISc] = std::max(keys * 4, std::min(N * keys * 4, kIndexerScoreBytes));
+  sz[kQC] = N * c.idx_heads * c.idx_dim;
+  sz[kQCS] = N * c.idx_heads * (c.idx_dim / 32);
   sz[kIdx] = N * c.idx_topk * 4;
   sz[kO] = N * c.n_heads * c.head_dim * 2;
   sz[kOA] = N * c.o_groups * c.o_lora * 2;
@@ -146,7 +152,7 @@ size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const Cac
   }
   if (indexer) {
     b += 2 * size_t(g.max_slots) * 8 * (2 * c.idx_dim) * 4;
-    b += size_t(g.num_pages) * (kPageTokens / 4) * c.idx_dim * 2;
+    b += size_t(g.num_pages) * k::kFp4PageBytes;
   }
   return b;
 }
@@ -401,12 +407,24 @@ void dump(int layer, const BatchDesc& b, const char* name, const void* dptr, siz
 k::PagedRows paged(rt::DeviceBuffer& pool, const BatchDesc& b, int slot, int rows_per_page, int d) {
   return k::PagedRows{pool.as<bf16>(), b.block_tables + size_t(slot) * b.max_pages_per_seq, rows_per_page, d};
 }
+k::PagedFp4 paged_fp4(rt::DeviceBuffer& pool, const BatchDesc& b, int slot) {
+  return k::PagedFp4{pool.as<uint8_t>(), b.block_tables + size_t(slot) * b.max_pages_per_seq};
+}
+
+// Indexer dispatch: int8-WMMA scores over fp4 codes on gfx12 unless UNHOLY_REF_INDEXER=1.
+bool fast_indexer() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_REF_INDEXER");
+    return !v || std::string(v) == "0";
+  }();
+  return on && on_gfx12();
+}
 
 // Compressor rows for one chunk, given the batch-wide projections (pk/ps already include ape):
 // emitted rows are normed, roped at their block start, quant-simulated and stored to the pool.
 void compress_chunk(const Dsv4Config& c, const CompressorWeights& cw, const float* pk, const float* ps,
-                    float* ring_kv, float* ring_sc, k::PagedRows dst, const Scratch& scr, const RopeTables& rope,
-                    const ChunkDesc& ch, hipStream_t st) {
+                    float* ring_kv, float* ring_sc, k::PagedRows dst, k::PagedFp4 dst4, const Scratch& scr,
+                    const RopeTables& rope, const ChunkDesc& ch, hipStream_t st) {
   const int width = cw.width(), d = cw.d;
   const float* cpk = pk + size_t(ch.t0) * width;
   const float* cps = ps + size_t(ch.t0) * width;
@@ -421,13 +439,13 @@ void compress_chunk(const Dsv4Config& c, const CompressorWeights& cw, const floa
     int32_t* dpos = B<int32_t>(scr, kRowPos);
     k::positions(dpos, nrows, row0 * cw.ratio, cw.ratio, st);
     k::rope(rb, d, nrows, 1, d, d - c.rope_dim, c.rope_dim / 2, dpos, rope.yarn.as<float2>(), false, st);
-    if (cw.rotate) {
+    if (cw.rotate) {  // indexer keys: Hadamard, then fp4 codes + scales (the reference's fake quant, stored)
       k::hadamard128(rb, size_t(nrows) * d / 128, st);
-      k::fake_quant_fp4(rb, d, nrows, d, 32, st);
+      k::store_rows_fp4(rb, nrows, dst4, row0, st);
     } else {
       k::fake_quant_fp8(rb, d, nrows, d - c.rope_dim, 64, st);
+      k::store_rows(rb, nrows, d, dst, row0, st);
     }
-    k::store_rows(rb, nrows, d, dst, row0, st);
   }
   k::ring_update(cpk, cps, ring_kv, ring_sc, ch.s0, ch.n, cw.ring(), width, st);
 }
@@ -493,7 +511,8 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
                  st);
     k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
     k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
-    k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
+    if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<int8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
+    else k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
     dense_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
     // weights_proj(x) * (softmax_scale * n_heads^-0.5): the Python double, applied as fp32.
     const double wscale = (1.0 / std::sqrt(double(ID))) * (1.0 / std::sqrt(double(IH)));
@@ -504,7 +523,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       compress_chunk(c, *w.idx_comp, B<float>(scr, kPK), B<float>(scr, kPS),
                      cache.iring_kv.as<float>() + size_t(ch.slot) * cache.iring * cache.iwidth,
                      cache.iring_sc.as<float>() + size_t(ch.slot) * cache.iring * cache.iwidth,
-                     paged(cache.idx, b, ch.slot, kPageTokens / 4, ID), scr, rope, ch, st);
+                     k::PagedRows{}, paged_fp4(cache.idx, b, ch.slot), scr, rope, ch, st);
   }
   if (w.ratio) {
     compressor_proj(c, *w.comp, scr, b, st);
@@ -512,7 +531,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       compress_chunk(c, *w.comp, B<float>(scr, kPK), B<float>(scr, kPS),
                      cache.ring_kv.as<float>() + size_t(ch.slot) * cache.ring * cache.width,
                      cache.ring_sc.as<float>() + size_t(ch.slot) * cache.ring * cache.width,
-                     paged(cache.comp, b, ch.slot, kPageTokens / w.ratio, HD), scr, rope, ch, st);
+                     paged(cache.comp, b, ch.slot, kPageTokens / w.ratio, HD), k::PagedFp4{}, scr, rope, ch, st);
   }
 
   // Per chunk: indexer top-k, sparse attention, window ring.
@@ -534,10 +553,26 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       const int kk = std::min(c.idx_topk, nkeys);
       int32_t* idx = B<int32_t>(scr, kIdx);
       if (kk > 0) {
-        float* sc = B<float>(scr, kISc);
-        k::indexer_scores(qi + size_t(ch.t0) * IH * ID, wi + size_t(ch.t0) * IH,
-                          paged(cache.idx, b, ch.slot, kPageTokens / 4, ID), cpos, sc, ch.n, IH, ID, nkeys, 4, st);
-        k::topk_rows(sc, ch.n, nkeys, kk, idx, st);
+        // The chunk's queries in sub-batches that fit the score buffer.
+        const bool fast = fast_indexer();
+        const size_t row_bytes = size_t(nkeys) * (fast ? 2 : 4);
+        const int sub = int(std::max<size_t>(1, std::min<size_t>(size_t(ch.n), scr.bufs[kISc].size() / row_bytes)));
+        const k::PagedFp4 keys = paged_fp4(cache.idx, b, ch.slot);
+        for (int t = 0; t < ch.n; t += sub) {
+          const int nt = std::min(sub, ch.n - t), tt = ch.t0 + t;
+          if (fast) {
+            uint16_t* sc = B<uint16_t>(scr, kISc);
+            k::indexer_scores_fp4(B<int8_t>(scr, kQC) + size_t(tt) * IH * ID,
+                                  B<uint8_t>(scr, kQCS) + size_t(tt) * IH * (ID / 32), wi + size_t(tt) * IH, keys,
+                                  pos + tt, sc, nt, IH, nkeys, 4, st);
+            k::topk_bf16(sc, nt, nkeys, kk, idx + size_t(t) * kk, st);
+          } else {
+            float* sc = B<float>(scr, kISc);
+            k::indexer_scores(qi + size_t(tt) * IH * ID, wi + size_t(tt) * IH, keys, pos + tt, sc, nt, IH, ID, nkeys,
+                              4, st);
+            k::topk_rows(sc, nt, nkeys, kk, idx + size_t(t) * kk, st);
+          }
+        }
         if (b.chunks.size() == 1) dump(L, b, "indexer_out", idx, size_t(ch.n) * kk * 4, st);
       }
       akv.comp_idx = idx;

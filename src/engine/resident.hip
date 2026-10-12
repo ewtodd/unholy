@@ -1,6 +1,9 @@
 #include "engine/resident.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -193,6 +196,10 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
                          hipHostMallocPortable));
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&logits_host_), size_t(max_logit_rows_) * c.vocab * 4,
                          hipHostMallocPortable));
+  {
+    rt::DeviceGuard g(card_[0].dev);
+    UH_CHECK(hipEventCreateWithFlags(&handoff_, hipEventDisableTiming));
+  }
 }
 
 ResidentModel::~ResidentModel() {
@@ -203,6 +210,7 @@ ResidentModel::~ResidentModel() {
     }
   if (x_host_) (void)hipHostFree(x_host_);
   if (logits_host_) (void)hipHostFree(logits_host_);
+  if (handoff_) (void)hipEventDestroy(handoff_);
 }
 
 void ResidentModel::set_block_tables(const std::vector<int32_t>& tables) {
@@ -215,6 +223,9 @@ void ResidentModel::set_block_tables(const std::vector<int32_t>& tables) {
 }
 
 void ResidentModel::step(const StepInput& in, std::vector<float>& out) {
+  static const bool timing = std::getenv("UNHOLY_STEP_TIMING") != nullptr;
+  const auto t_begin = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point t_enq[2];
   const int T = int(in.ids.size());
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
   if (int(in.logit_rows.size()) > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
@@ -234,7 +245,8 @@ void ResidentModel::step(const StepInput& in, std::vector<float>& out) {
   for (int k = 0; k < 2; ++k) {
     Card& cd = card_[k];
     rt::DeviceGuard g(cd.dev);
-    if (k == 1) {  // residual handoff through pinned host memory
+    if (k == 1) {  // residual handoff through pinned host memory, ordered by an event (no host wait)
+      UH_CHECK(hipStreamWaitEvent(cd.st, handoff_, 0));
       UH_CHECK(hipMemcpyAsync(cd.x.data(), x_host_, size_t(T) * row * 2, hipMemcpyHostToDevice, cd.st));
     }
     model::BatchDesc b;
@@ -248,8 +260,9 @@ void ResidentModel::step(const StepInput& in, std::vector<float>& out) {
       model::layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, cd.x.as<uint16_t>(), b, cd.st, apu_.get());
     if (k == 0) {
       UH_CHECK(hipMemcpyAsync(x_host_, cd.x.data(), size_t(T) * row * 2, hipMemcpyDeviceToHost, cd.st));
-      UH_CHECK(hipStreamSynchronize(cd.st));
+      UH_CHECK(hipEventRecord(handoff_, cd.st));
     }
+    if (timing) t_enq[k] = std::chrono::steady_clock::now();
   }
   // Head on card 1 for the requested rows.
   const int R = int(in.logit_rows.size());
@@ -276,6 +289,11 @@ void ResidentModel::step(const StepInput& in, std::vector<float>& out) {
                              c_.vocab, c_.dim, cd.st);
   UH_CHECK(hipMemcpyAsync(logits_host_, logits_.data(), out.size() * 4, hipMemcpyDeviceToHost, cd.st));
   UH_CHECK(hipStreamSynchronize(cd.st));
+  if (timing) {
+    const auto ms = [&](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::fprintf(stderr, "step T=%d: enqueue card0 %.1f ms, card1 %.1f ms, total %.1f ms\n", T, ms(t_begin, t_enq[0]),
+                 ms(t_enq[0], t_enq[1]), ms(t_begin, std::chrono::steady_clock::now()));
+  }
   std::memcpy(out.data(), logits_host_, out.size() * 4);
 }
 

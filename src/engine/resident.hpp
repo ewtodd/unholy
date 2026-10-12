@@ -92,6 +92,7 @@ class ResidentModel final : public StepModel {
   rt::DeviceBuffer hrows_, hb_, hf_, logits_, rows_idx_;              // head scratch on card 1
   uint16_t* x_host_ = nullptr;                                        // pinned residual handoff
   float* logits_host_ = nullptr;                                      // pinned [max_logit_rows][vocab]
+  hipEvent_t handoff_ = nullptr;                                      // card 0 residual written to x_host_
 };
 
 }  // namespace unholy::engine

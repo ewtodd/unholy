@@ -11,6 +11,8 @@
 
 #include <cstdint>
 
+#include "kernels/indexer.hpp"
+
 namespace unholy::kernels {
 
 using bf16 = uint16_t;
@@ -87,9 +89,9 @@ struct PagedRows {
 };
 void store_rows(const bf16* rows, int n, int width, PagedRows dst, int row0, hipStream_t st);
 
-// Indexer scores: q [T, H, D] bf16, w [T, H] bf16, keys = rows [0, nkeys) of `keys`; query t sees
+// Indexer scores: q [T, H, D] bf16, w [T, H] bf16, keys = rows [0, nkeys) of the fp4 key pool; query t sees
 // keys j < (pos[t] + 1) / ratio. out [T, nkeys] f32 (bf16-valued; -inf when not visible).
-void indexer_scores(const bf16* q, const bf16* w, PagedRows keys, const int32_t* pos, float* out, int T, int H,
+void indexer_scores(const bf16* q, const bf16* w, PagedFp4 keys, const int32_t* pos, float* out, int T, int H,
                     int D, int nkeys, int ratio, hipStream_t st);
 // Top-k per row of scores (desc, ties -> lower index); idx [T, k] (-1 padded when fewer visible).
 void topk_rows(const float* scores, int T, int n, int k, int32_t* idx, hipStream_t st);

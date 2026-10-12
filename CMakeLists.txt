@@ -85,6 +85,7 @@ add_library(unholy_ref STATIC
   src/kernels/hc_fast.hip
   src/kernels/moe_dispatch.hip
   src/kernels/gemv.hip
+  src/kernels/indexer.hip
 )
 target_include_directories(unholy_ref PUBLIC src third_party)
 target_link_libraries(unholy_ref PUBLIC unholy_host hip::host)
@@ -124,3 +125,9 @@ target_compile_definitions(unholy PRIVATE UNHOLY_DATA_DIR="${CMAKE_INSTALL_PREFI
 target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
 install(TARGETS unholy unholy-text-test unholy-sched-test RUNTIME DESTINATION bin)
 install(FILES data/expert_profile_dsv4engine_code32k.txt DESTINATION share/unholy)
+
+add_executable(unholy-bench tools/bench/main.hip)
+target_link_libraries(unholy-bench PRIVATE unholy_engine)
+
+add_executable(unholy-indexer-test tools/kernel_test/indexer.hip)
+target_link_libraries(unholy-indexer-test PRIVATE unholy_ref)

@@ -85,7 +85,7 @@ __global__ void store_rows_kernel(const bf16* rows, int n, int width, PagedRows 
 
 // ---- indexer ----
 // Block: one query, 32 keys; 256 threads = 8 waves; each wave scores 4 keys (one head per lane pass).
-__global__ void indexer_scores_kernel(const bf16* q, const bf16* w, PagedRows keys, const int32_t* pos, float* out,
+__global__ void indexer_scores_kernel(const bf16* q, const bf16* w, PagedFp4 keys, const int32_t* pos, float* out,
                                       int H, int D, int nkeys, int ratio) {
   extern __shared__ float qs[];  // [H * D] + [H]
   float* ws = qs + H * D;
@@ -102,10 +102,17 @@ __global__ void indexer_scores_kernel(const bf16* q, const bf16* w, PagedRows ke
       if (lane == 0) out[size_t(t) * nkeys + j] = -INFINITY;
       continue;
     }
-    const bf16* kr = paged_row(keys, j);
+    // Key row j from the fp4 pool: the values the reference's fake_quant_fp4 produced (exact in bf16).
+    const int page = keys.table[j / kFp4RowsPerPage], slot = j % kFp4RowsPerPage;
+    const uint8_t* kc = keys.pool + size_t(page) * kFp4PageBytes + size_t(slot) * kFp4RowBytes;
+    const uint8_t* ks = keys.pool + size_t(page) * kFp4PageBytes + kFp4RowsPerPage * kFp4RowBytes + size_t(slot) * 4;
     float kf[4];
     const int per = D / 32;  // D = 128 -> 4 dims per lane
-    for (int e = 0; e < per; ++e) kf[e] = bf16_to_f32(kr[lane * per + e]);
+    for (int e = 0; e < per; ++e) {
+      const int c = lane * per + e;
+      const uint32_t nib = (c & 1) ? kc[c / 2] >> 4 : kc[c / 2] & 15;
+      kf[e] = round_bf16(e2m1_to_f32(nib) * e8m0_to_f32(ks[c / 32]));
+    }
     float total = 0.0f;
     for (int h = 0; h < H; ++h) {
       float dot = 0.0f;
@@ -356,7 +363,7 @@ void store_rows(const bf16* rows, int n, int width, PagedRows dst, int row0, hip
   store_rows_kernel<<<cdiv(size_t(n) * width, 256), 256, 0, st>>>(rows, n, width, dst, row0);
   UH_CHECK_LAUNCH();
 }
-void indexer_scores(const bf16* q, const bf16* w, PagedRows keys, const int32_t* pos, float* out, int T, int H, int D,
+void indexer_scores(const bf16* q, const bf16* w, PagedFp4 keys, const int32_t* pos, float* out, int T, int H, int D,
                     int nkeys, int ratio, hipStream_t st) {
   if (D != 128) throw std::runtime_error("indexer_scores: D must be 128");
   dim3 grid(cdiv(nkeys, 32), T);
