@@ -17,6 +17,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "engine/engine.hpp"
 
@@ -260,6 +261,9 @@ int main(int argc, char** argv) {
     EngineConfig ec;
     ec.spec_drafts = nspec;
     ec.max_batch_tokens = cfgv[5];
+    std::unordered_map<uint64_t, RequestLog> logs;
+    int log_dups = 0;
+    ec.on_finish = [&](const RequestLog& l) { log_dups += !logs.emplace(l.id, l).second; };
     Engine eng(model, ec, false);
     int submitted = 0;
     const int max_ctx = eng.max_context();
@@ -352,13 +356,32 @@ int main(int argc, char** argv) {
       ++failures;
       continue;
     }
-    int ok = 0, bad = 0, aborts_seen = 0, errors = 0;
+    int ok = 0, bad = 0, aborts_seen = 0, errors = 0, log_bad = log_dups;
+    uint64_t log_drafted = 0, log_accepted = 0;
     for (size_t i = 0; i < res.size(); ++i) {
       const Result& r = *res[i];
       if (!r.finished) {
         ++bad;
         std::printf("  request %zu never finished\n", i);
         continue;
+      }
+      // The request log: one entry per request, agreeing with what was delivered.
+      if (const auto it = logs.find(rid[i]); it == logs.end()) {
+        ++log_bad;
+      } else {
+        const RequestLog& l = it->second;
+        log_drafted += uint64_t(l.spec_drafted);
+        log_accepted += uint64_t(l.spec_accepted);
+        const int delivered = int(r.tokens.size()) + (r.reason == FinishReason::Stop);
+        const bool timing = l.queue_s >= 0 && (l.ttft_s < 0 || (l.ttft_s >= l.queue_s && l.prefill_s >= 0 &&
+                                                                  l.decode_s >= 0));
+        if (l.reason != r.reason || (r.reason != FinishReason::Abort && l.completion_tokens != delivered) ||
+            l.prompt_tokens != int(spec[i].first.size()) || !timing || (l.ttft_s < 0) != (l.completion_tokens == 0)) {
+          if (++log_bad <= 3)
+            std::printf("  request %zu: log says %s, %d completion tokens, queue %.3f ttft %.3f; delivered %d (%s)\n", i,
+                        finish_reason_name(l.reason), l.completion_tokens, l.queue_s, l.ttft_s, delivered,
+                        finish_reason_name(r.reason));
+        }
       }
       FinishReason want_reason;
       const auto want = reference(spec[i].first, spec[i].second, max_ctx, want_reason);
@@ -392,6 +415,15 @@ int main(int argc, char** argv) {
                 (unsigned long long)st.cached_tokens, (unsigned long long)st.prompt_tokens, model.restores,
                 model.saves, model.drafts, (unsigned long long)st.spec_accepted, (unsigned long long)st.spec_drafted,
                 model.rollbacks, model.image_blocks);
+    if (log_bad > 0 || logs.size() != res.size() || log_drafted != st.spec_drafted ||
+        log_accepted != st.spec_accepted || st.spec_pos_drafted[0] != st.spec_steps) {
+      std::printf("  request log: %d bad, %zu logged of %zu, drafts %llu/%llu vs %llu/%llu, position 0 drafted %llu of %llu "
+                  "verify steps\n",
+                  log_bad, logs.size(), res.size(), (unsigned long long)log_accepted, (unsigned long long)log_drafted,
+                  (unsigned long long)st.spec_accepted, (unsigned long long)st.spec_drafted,
+                  (unsigned long long)st.spec_pos_drafted[0], (unsigned long long)st.spec_steps);
+      ++failures;
+    }
     if (nspec > 0 && (st.spec_accepted == 0 || model.rollbacks == 0)) {
       std::printf("  speculative decoding never accepted or never rolled back\n");
       ++failures;

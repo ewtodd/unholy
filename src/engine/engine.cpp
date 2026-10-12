@@ -34,6 +34,11 @@ struct Engine::Seq {
   bool awaiting_logits = false; // one of them samples its next token
   bool abort_pending = false;   // aborted while in flight: finished when the last such step completes
   bool admitted_once = false;
+  FinishReason abort_reason = FinishReason::Abort;
+  // Request log.
+  std::chrono::steady_clock::time_point t_submit, t_admit, t_first;
+  bool first_token = false;
+  int preemptions = 0, spec_steps = 0, spec_drafted = 0, spec_accepted = 0;
   // Prefix cache.
   std::vector<uint64_t> hashes;  // chained hash of each full page of `tokens`, computed as needed
   int registered = 0;            // leading pages entered in the cache (or found there)
@@ -105,14 +110,15 @@ uint64_t Engine::submit(GenRequest req, Sink sink) {
   s->n_prompt = int(s->tokens.size());
   s->out.prompt_tokens = s->n_prompt;
   s->sampler.set_prompt(s->tokens);
+  s->t_submit = std::chrono::steady_clock::now();
   incoming_.push_back(std::move(s));
   cv_.notify_all();
   return id;
 }
 
-void Engine::abort(uint64_t id) {
+void Engine::abort(uint64_t id, FinishReason why) {
   std::lock_guard lk(mu_);
-  aborts_.push_back(id);
+  aborts_.emplace_back(id, why);
   cv_.notify_all();
 }
 
@@ -129,6 +135,30 @@ void Engine::finish(Seq& s, FinishReason r, const std::string& err) {
   s.out.reason = r;
   s.out.error = err;
   s.out.completion_tokens = s.generated();
+  if (cfg_.on_finish) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto sec = [](auto d) { return std::chrono::duration<double>(d).count(); };
+    RequestLog l;
+    l.id = s.id;
+    l.tag = s.req.tag;
+    l.reason = r;
+    l.error = err;
+    l.prompt_tokens = s.n_prompt;
+    l.cached_tokens = s.cached;
+    l.completion_tokens = s.out.completion_tokens;
+    l.images = int(s.req.images.size());
+    l.preemptions = s.preemptions;
+    l.queue_s = sec((s.admitted_once ? s.t_admit : now) - s.t_submit);
+    if (s.first_token) {
+      l.ttft_s = sec(s.t_first - s.t_submit);
+      l.prefill_s = sec(s.t_first - s.t_admit);
+      l.decode_s = sec(now - s.t_first);
+    }
+    l.spec_steps = s.spec_steps;
+    l.spec_drafted = s.spec_drafted;
+    l.spec_accepted = s.spec_accepted;
+    cfg_.on_finish(l);
+  }
   if (s.sink) s.sink(std::move(s.out));
   s.out = GenOutput{};
 }
@@ -286,6 +316,7 @@ bool Engine::save_at(const Seq& s, int end, bool decode) const {
 
 void Engine::preempt(Seq& s) {
   release(s);
+  ++s.preemptions;
   {
     std::lock_guard lk(stats_mu_);
     ++stats_.preemptions;
@@ -303,7 +334,7 @@ bool Engine::alloc_pages(Seq& s, int upto) {
 
 void Engine::intake() {
   std::vector<std::unique_ptr<Seq>> in;
-  std::vector<uint64_t> aborts;
+  std::vector<std::pair<uint64_t, FinishReason>> aborts;
   {
     std::lock_guard lk(mu_);
     in.swap(incoming_);
@@ -321,10 +352,10 @@ void Engine::intake() {
       finish(*s, FinishReason::Error, "an image block does not fit one step (or lies outside the prompt)");
     else waiting_.push_back(std::move(s));
   }
-  for (const uint64_t id : aborts) {
+  for (const auto& [id, why] : aborts) {
     for (auto it = waiting_.begin(); it != waiting_.end(); ++it)
       if ((*it)->id == id) {
-        finish(**it, FinishReason::Abort);
+        finish(**it, why);
         waiting_.erase(it);
         break;
       }
@@ -332,8 +363,9 @@ void Engine::intake() {
       if ((*it)->id == id) {
         if ((*it)->inflight > 0) {
           (*it)->abort_pending = true;  // its step still uses the slot's state; finish on completion
+          (*it)->abort_reason = why;
         } else {
-          finish(**it, FinishReason::Abort);
+          finish(**it, why);
           running_.erase(it);
         }
         break;
@@ -371,6 +403,7 @@ bool Engine::iterate() {
     }
     if (!s.admitted_once) {
       s.admitted_once = true;
+      s.t_admit = std::chrono::steady_clock::now();
       s.cached = s.computed;
       s.out.cached_tokens = s.cached;
       std::lock_guard lk(stats_mu_);
@@ -549,6 +582,10 @@ void Engine::complete_step() {
     const int32_t tok = smp.token;
     s.tokens.push_back(tok);
     s.sampler.accept(tok);
+    if (!s.first_token) {
+      s.first_token = true;
+      s.t_first = std::chrono::steady_clock::now();
+    }
     const bool eos = tok == cfg_.eos_id && !s.req.ignore_eos;
     const bool stop_id = std::find(s.req.stop_token_ids.begin(), s.req.stop_token_ids.end(), tok) !=
                          s.req.stop_token_ids.end();
@@ -590,10 +627,17 @@ void Engine::complete_step() {
       valid_end = s0 + 1 + accepted;
       s.computed = valid_end;
       if (valid_end < it.end && !s.done) restores.push_back({s.slot, s0, valid_end, it.end});
+      ++s.spec_steps;
+      s.spec_drafted += it.ndraft;
+      s.spec_accepted += accepted;
       std::lock_guard lk(stats_mu_);
       ++stats_.spec_steps;
       stats_.spec_drafted += uint64_t(it.ndraft);
       stats_.spec_accepted += uint64_t(accepted);
+      for (int j = 0; j < std::min(it.ndraft, int(stats_.spec_pos_drafted.size())); ++j) {
+        ++stats_.spec_pos_drafted[size_t(j)];
+        stats_.spec_pos_accepted[size_t(j)] += j < accepted;
+      }
     }
     if (cache_on_) {
       s.done_pos = std::max(s.done_pos, valid_end);
@@ -637,7 +681,7 @@ void Engine::complete_step() {
   for (auto& s : running_) {
     if (s->inflight > 0) continue;
     if (s->abort_pending) {
-      finish(*s, FinishReason::Abort);
+      finish(*s, s->abort_reason);
     } else if (s->done && !s->out.finished) {
       const FinishReason r = s->out.reason;
       s->done = false;  // finish() sets it again

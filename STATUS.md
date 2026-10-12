@@ -67,6 +67,9 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
 - [x] GPU fault: c7 under the 230 W power cap (DECISIONS 2026-10-12); clean at 300 W
 - [x] vision: CPU preprocessing bit-exact with the reference, ViT + Aligner on the APU at the reference's
       own noise floor, image tokens end to end (DECISIONS 2026-10-12)
+- [x] logging: a line per finished request (queue, ttft, prefill / decode tok/s, draft acceptance) and a
+      periodic engine line (`--log-interval`, default 10 s: throughput, queue, KV use, prefix hit rate,
+      draft acceptance by position); request log checked against deliveries in `unholy-sched-test`
 - [ ] disk tier for the prefix cache
 - [ ] decode scaling: batch 4 gives 29.7 tok/s aggregate (7.8/stream) vs 16.4 at batch 1
 - [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s

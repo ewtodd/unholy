@@ -21,6 +21,7 @@
 // stop strings belong to the frontend, which aborts the request when it sees one.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -32,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "engine/sampler.hpp"
@@ -58,6 +60,7 @@ struct GenRequest {
   int max_tokens = 0;  // completion tokens; <= 0: until the context limit
   std::vector<int32_t> stop_token_ids;
   bool ignore_eos = false;
+  std::string tag;  // names the request in the request log (the API's completion id)
 };
 
 // Delivered incrementally: the tokens generated since the previous delivery.
@@ -72,6 +75,19 @@ struct GenOutput {
   int cached_tokens = 0;  // prompt tokens served from the prefix cache
 };
 
+// One finished request, for the request log: token counts, where its time went (queue: submitted ->
+// admitted; ttft: submitted -> first token; prefill: admitted -> first token; decode: first token ->
+// end; negative when it never got there) and how its drafts fared.
+struct RequestLog {
+  uint64_t id = 0;
+  std::string tag;
+  FinishReason reason = FinishReason::None;
+  std::string error;
+  int prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, images = 0, preemptions = 0;
+  double queue_s = -1, ttft_s = -1, prefill_s = -1, decode_s = -1;
+  int spec_steps = 0, spec_drafted = 0, spec_accepted = 0;
+};
+
 struct EngineConfig {
   int max_batch_tokens = 2048;  // rows per step (<= the model's max_tokens)
   int max_running = 0;          // concurrent sequences (<= the model's slots); 0 = all slots
@@ -81,6 +97,7 @@ struct EngineConfig {
   bool prefix_cache = true;      // when the model keeps snapshots
   int spec_drafts = 0;           // speculative decoding: drafts verified per step (0: off; model's drafter)
   float spec_min_conf = -1e30f;  // verify only the leading drafts whose drafter confidence is at least this
+  std::function<void(const RequestLog&)> on_finish;  // every request that ends; on the engine thread
 };
 
 struct EngineStats {
@@ -89,6 +106,7 @@ struct EngineStats {
   int running = 0, waiting = 0, free_pages = 0, total_pages = 0;  // free: unused or cached-unreferenced
   int cached_pages = 0, snapshots = 0;
   uint64_t spec_steps = 0, spec_drafted = 0, spec_accepted = 0;  // verify chunks, drafts in them, accepted
+  std::array<uint64_t, 8> spec_pos_drafted{}, spec_pos_accepted{};  // by draft position
   double busy_seconds = 0;
 };
 
@@ -103,7 +121,8 @@ class Engine {
 
   // Thread-safe. Requests that can never fit (prompt longer than the context) finish with Error.
   uint64_t submit(GenRequest req, Sink sink);
-  void abort(uint64_t id);
+  // `why` is the reason the request log gives (Stop when the frontend matched a stop string).
+  void abort(uint64_t id, FinishReason why = FinishReason::Abort);
   EngineStats stats() const;
   // Diagnostics (tests): one line per running request (positions, flags, drafts, images).
   std::string debug_state() const;
@@ -159,7 +178,7 @@ class Engine {
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::vector<std::unique_ptr<Seq>> incoming_;
-  std::vector<uint64_t> aborts_;
+  std::vector<std::pair<uint64_t, FinishReason>> aborts_;
   bool stop_ = false;
   uint64_t next_id_ = 1;
 

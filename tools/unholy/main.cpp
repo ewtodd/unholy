@@ -22,13 +22,23 @@
 // --spec-min-conf C: verify only the leading drafts whose confidence-head score is >= C (default 0.5: on
 // short-context code and prose, 5 drafts at 0.5 gave 33.6 / 23.9 tok/s vs 30.0 / 19.1 verifying all).
 //
+// Logging (stdout, so journald under systemd): a line per finished request (its tokens, queue time, time
+// to first token, prefill and decode tok/s, draft acceptance) and, every --log-interval seconds (default
+// 10; 0: off) while there is traffic, the engine's throughput, queue, KV pool use, prefix-cache hit rate
+// and draft acceptance (rate, mean tokens per verify step, by draft position) over the interval.
+//
 // --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
 // planner (src/engine/plan.hpp) for the requested cache geometry.
+#include <chrono>
+#include <condition_variable>
+#include <stop_token>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -54,8 +64,75 @@ int usage() {
                "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
                "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
-               "                    [--spec-drafts N] [--spec-min-conf C]\n");
+               "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n");
   return 2;
+}
+
+// Log lines are written whole under one lock, each prefixed with the local time.
+std::mutex g_log_mu;
+
+void log_line(const std::string& line) {
+  const std::time_t t = std::time(nullptr);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  char ts[16];
+  std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+  std::lock_guard lk(g_log_mu);
+  std::printf("%s %s\n", ts, line.c_str());
+  std::fflush(stdout);
+}
+
+std::string fmt(const char* f, auto... a) {
+  char buf[256];
+  std::snprintf(buf, sizeof(buf), f, a...);
+  return buf;
+}
+
+std::string request_line(const engine::RequestLog& l) {
+  std::string out = "request " + (l.tag.empty() ? std::to_string(l.id) : l.tag) + ": " +
+                    engine::finish_reason_name(l.reason);
+  if (!l.error.empty()) out += " (" + l.error + ")";
+  out += fmt(" | prompt %d", l.prompt_tokens);
+  if (l.cached_tokens > 0) out += fmt(" (%d cached)", l.cached_tokens);
+  if (l.images > 0) out += fmt(", %d image%s", l.images, l.images > 1 ? "s" : "");
+  out += fmt(", completion %d | queue %.2f s", l.completion_tokens, l.queue_s);
+  if (l.ttft_s >= 0) {
+    out += fmt(", ttft %.2f s", l.ttft_s);
+    const int computed = l.prompt_tokens - l.cached_tokens;
+    if (l.prefill_s > 0) out += fmt(", prefill %.1f tok/s", computed / l.prefill_s);
+    if (l.completion_tokens > 1 && l.decode_s > 0)
+      out += fmt(", decode %.1f tok/s", (l.completion_tokens - 1) / l.decode_s);
+  }
+  if (l.spec_drafted > 0)
+    out += fmt(" | drafts %d/%d accepted (%.1f%%), %.2f tok/step", l.spec_accepted, l.spec_drafted,
+               100.0 * l.spec_accepted / l.spec_drafted, 1.0 + double(l.spec_accepted) / l.spec_steps);
+  if (l.preemptions > 0) out += fmt(" | preempted %d", l.preemptions);
+  return out;
+}
+
+// The engine over the interval since `a` (vLLM's periodic stats line).
+std::string engine_line(const engine::EngineStats& a, const engine::EngineStats& b, double dt, bool spec) {
+  const auto d = [](uint64_t x, uint64_t y) { return double(y - x); };
+  std::string out = fmt("engine: prompt %.1f tok/s, generation %.1f tok/s | running %d, waiting %d",
+                        d(a.prefill_tokens, b.prefill_tokens) / dt, d(a.decode_tokens, b.decode_tokens) / dt,
+                        b.running, b.waiting);
+  const int used = b.total_pages - b.free_pages;
+  out += fmt(" | kv %.1f%% (%d/%d pages, %d cached)", 100.0 * used / std::max(b.total_pages, 1), used, b.total_pages,
+             b.cached_pages);
+  if (b.prompt_tokens > a.prompt_tokens)
+    out += fmt(" | prefix hit %.1f%%", 100.0 * d(a.cached_tokens, b.cached_tokens) / d(a.prompt_tokens, b.prompt_tokens));
+  if (b.preemptions > a.preemptions) out += fmt(" | preempted %llu", (unsigned long long)(b.preemptions - a.preemptions));
+  if (spec && b.spec_steps > a.spec_steps) {
+    const double drafted = d(a.spec_drafted, b.spec_drafted), accepted = d(a.spec_accepted, b.spec_accepted);
+    out += fmt(" | drafts accepted %.1f%%, %.2f tok/step, by position", drafted > 0 ? 100.0 * accepted / drafted : 0.0,
+               1.0 + accepted / d(a.spec_steps, b.spec_steps));
+    for (size_t j = 0; j < b.spec_pos_drafted.size(); ++j) {
+      const double n = d(a.spec_pos_drafted[j], b.spec_pos_drafted[j]);
+      if (n <= 0) break;
+      out += fmt(" %.2f", d(a.spec_pos_accepted[j], b.spec_pos_accepted[j]) / n);
+    }
+  }
+  return out;
 }
 
 int serve(int argc, char** argv, bool plan_only) {
@@ -68,6 +145,7 @@ int serve(int argc, char** argv, bool plan_only) {
   bool vision = true;
   float spec_min_conf = 0.5f;
   double card_margin_gb = 2.0;
+  double log_interval = 10;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -91,6 +169,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
+    else if (a == "--log-interval") log_interval = std::stod(v);
     else return usage();
   }
   if (model_dir.empty()) return usage();
@@ -165,7 +244,35 @@ int serve(int argc, char** argv, bool plan_only) {
   ecfg.spec_drafts = spec_drafts;
   ecfg.spec_min_conf = spec_min_conf;
   ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+  ecfg.on_finish = [](const engine::RequestLog& l) { log_line(request_line(l)); };
   engine::Engine eng(model, ecfg);
+  // Logs while there is traffic, plus the interval after it ends (throughput back to zero). A jthread
+  // declared after the engine: stopped and joined before the engine goes away.
+  std::jthread stats_thread;
+  if (log_interval > 0) {
+    stats_thread = std::jthread([&eng, log_interval, spec = spec_drafts > 0](std::stop_token stop) {
+      std::mutex m;
+      std::condition_variable_any cv;
+      auto prev = eng.stats();
+      auto t_prev = std::chrono::steady_clock::now();
+      bool was_active = false;
+      for (;;) {
+        {
+          std::unique_lock lk(m);
+          cv.wait_for(lk, stop, std::chrono::duration<double>(log_interval), [] { return false; });
+        }
+        if (stop.stop_requested()) return;
+        const auto cur = eng.stats();
+        const auto now = std::chrono::steady_clock::now();
+        const bool active = cur.steps != prev.steps || cur.running > 0 || cur.waiting > 0;
+        if (active || was_active)
+          log_line(engine_line(prev, cur, std::chrono::duration<double>(now - t_prev).count(), spec));
+        was_active = active;
+        prev = cur;
+        t_prev = now;
+      }
+    });
+  }
   if (model.has_vision()) {
     scfg.encode_image = [&model](const vision::Patches& p, const vision::ImageBlock& b, std::vector<uint16_t>& rows) {
       model.encode_image(p, b, rows);

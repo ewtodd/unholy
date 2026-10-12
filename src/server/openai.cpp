@@ -308,6 +308,7 @@ struct OpenAIServer::Impl {
     engine::GenRequest gen = job->p.gen;
     gen.prompt = job->prompt;
     gen.images = job->images;
+    gen.tag = job->id;
     const int ctx = eng.max_context();
     if (int(gen.prompt.size()) >= ctx)
       throw HttpError(400, "this model's maximum context length is " + std::to_string(ctx) +
@@ -449,7 +450,7 @@ struct OpenAIServer::Impl {
               eng.abort(rid);
               return false;
             }
-            if (st->stop.stopped() && !o.finished) eng.abort(rid);
+            if (st->stop.stopped() && !o.finished) eng.abort(rid, engine::FinishReason::Stop);
             if (o.finished || st->stop.stopped()) {
               reason = o.finished ? o.reason : engine::FinishReason::Stop;
               error = o.error;
@@ -511,7 +512,7 @@ struct OpenAIServer::Impl {
       st->push(o.tokens, raw, all);
       if (o.finished || st->stop.stopped()) {
         st->finish(raw, all);
-        if (!o.finished) eng.abort(rid);
+        if (!o.finished) eng.abort(rid, engine::FinishReason::Stop);
         reason = o.finished ? o.reason : engine::FinishReason::Stop;
         error = o.error;
         break;
