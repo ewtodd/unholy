@@ -10,6 +10,7 @@
 #include "kernels/attn_wmma.hpp"
 #include "kernels/exl3_moe.hpp"
 #include "kernels/gemm_wmma.hpp"
+#include "kernels/hc_fast.hpp"
 #include "kernels/ref.hpp"
 
 namespace unholy::model {
@@ -321,6 +322,17 @@ void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sin
   else k::sparse_attn(q, pos, kv, sink, o, T, H, D, scale, st);
 }
 
+// Hyper-Connection pre-mix dispatch: token-tiled kernel unless UNHOLY_REF_HC=1.
+void hc_pre(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post, float* comb,
+            int T, int hc, int dim, int iters, float norm_eps, float hc_eps, hipStream_t st) {
+  static const bool fast = [] {
+    const char* v = std::getenv("UNHOLY_REF_HC");
+    return !v || std::string(v) == "0";
+  }();
+  if (fast) k::hc_pre_tiled(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
+  else k::hc_pre(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
+}
+
 // UNHOLY_DUMP=dir: raw intermediates of batches whose first chunk starts at position 0, named like
 // the oracle's captures (tools/ref/oracle/run.py --capture-layer), for tools/ref/compare_dump.py.
 void dump(int layer, const BatchDesc& b, const char* name, const void* dptr, size_t bytes, hipStream_t st) {
@@ -397,7 +409,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   uint8_t* qb = B<uint8_t>(scr, kQBuf);
   uint8_t* qs = B<uint8_t>(scr, kQSc);
 
-  k::hc_pre(x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), y, post, comb, T,
+  hc_pre(x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), y, post, comb, T,
             c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
   dump(L, b, "hcpre_attn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_attn_post", post, size_t(T) * c.hc_mult * 4, st);
@@ -513,7 +525,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   float* comb = B<float>(scr, kComb);
   uint8_t* qb = B<uint8_t>(scr, kQBuf);
   uint8_t* qs = B<uint8_t>(scr, kQSc);
-  k::hc_pre(x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), y, post, comb, T,
+  hc_pre(x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), y, post, comb, T,
             c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
   dump(L, b, "hcpre_ffn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_ffn_post", post, size_t(T) * c.hc_mult * 4, st);
@@ -548,10 +560,24 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
     hl.resize(size_t(E), 0);
     for (int e = 0; e < E; ++e) hl[size_t(e)] += uint64_t(count[size_t(e)]);
   }
-  for (int e = 0; e < E; ++e) off[size_t(e) + 1] = off[size_t(e)] + count[size_t(e)];
+  // Pair rows: this device's experts first, then the remote ones (each group in ascending expert
+  // order), so the remote rows are one contiguous block [remote0, P) to ship each way. The combine
+  // follows pidx (each token's pairs by expert id), so the placement does not change the sum order.
+  int remote0 = 0;
+  {
+    int next = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+      if (pass == 1) remote0 = next;
+      for (int e = 0; e < E; ++e)
+        if (w.has_expert(e) == (pass == 0)) {
+          off[size_t(e)] = next;
+          next += count[size_t(e)];
+        }
+    }
+  }
   std::vector<int32_t> eidx(size_t(T) * K), pidx(size_t(T) * K);
   std::vector<float> ewt(size_t(T) * K);
-  std::vector<int> fill(off.begin(), off.end() - 1);
+  std::vector<int> fill(off.begin(), off.begin() + E);
   for (int t = 0; t < T; ++t) {
     // Token t's picks sorted by expert id (selection order is by score).
     std::vector<std::pair<int32_t, float>> picks;
@@ -580,7 +606,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   if (fast) {
     row_expert.resize(size_t(P));
     for (int e = 0; e < E; ++e)
-      for (int p = off[size_t(e)]; p < off[size_t(e) + 1]; ++p) row_expert[size_t(p)] = e;
+      for (int p = off[size_t(e)]; p < off[size_t(e)] + count[size_t(e)]; ++p) row_expert[size_t(p)] = e;
     UH_CHECK(hipMemcpyAsync(scr.exl3.row_expert.data(), row_expert.data(), size_t(P) * 4, hipMemcpyHostToDevice, st));
   }
   // Experts this device does not hold: ship every pair's input once (the remote side only reads the
@@ -592,7 +618,8 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   if (!jobs.empty()) {
     if (!remote) throw std::runtime_error("moe: experts missing on this device and no remote backend");
     if (size_t(P) > remote->capacity_rows) throw std::runtime_error("moe: remote staging too small");
-    UH_CHECK(hipMemcpyAsync(remote->in_host, pair_in, size_t(P) * D * 2, hipMemcpyDeviceToHost, st));
+    UH_CHECK(hipMemcpyAsync(remote->in_host + size_t(remote0) * D, pair_in + size_t(remote0) * D,
+                            size_t(P - remote0) * D * 2, hipMemcpyDeviceToHost, st));
     std::copy(ewt.begin(), ewt.end(), remote->w_host);
     if (fast) std::copy(row_expert.begin(), row_expert.end(), remote->e_host);
     UH_CHECK(hipEventCreateWithFlags(&shipped, hipEventDisableTiming));
@@ -616,9 +643,8 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
     UH_CHECK(hipEventSynchronize(shipped));
     UH_CHECK(hipEventDestroy(shipped));
     remote->run(L, jobs);
-    for (const auto& j : jobs)
-      UH_CHECK(hipMemcpyAsync(pair_out + size_t(j.row0) * D, remote->out_host + size_t(j.row0) * D,
-                              size_t(j.cnt) * D * 2, hipMemcpyHostToDevice, st));
+    UH_CHECK(hipMemcpyAsync(pair_out + size_t(remote0) * D, remote->out_host + size_t(remote0) * D,
+                            size_t(P - remote0) * D * 2, hipMemcpyHostToDevice, st));
   }
   bf16* h1 = B<bf16>(scr, kH1);
   bf16* h3 = B<bf16>(scr, kH3);

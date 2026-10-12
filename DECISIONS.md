@@ -264,3 +264,14 @@ softmax with bf16 P, sink in the denominator. Softmax blocks are 16 keys instead
 64 (bf16 rounding of P against a different running max: noise-level). Layers 2/3 vs oracle:
 4.62e-3 / 7.79e-3 (reference attention 4.56e-3 / 7.67e-3). Resident EXL3 model: KL 2.59e-2, prefill
 1024 tokens 6.67 -> 3.06 s (~335 tok/s), decode 0.23 s/token.
+
+## 2026-10-11 — head on WMMA, contiguous remote pairs, token-tiled HC mixing
+
+- LM head: bf16 WMMA with fp32 output on the bf16 normed state (the reference's fp32 linear, exact
+  products).
+- Pair rows are laid out local experts first, then remote (APU) experts, so the rows shipped to the
+  APU and back are one contiguous block each way (was one copy per remote expert: ~71k tiny
+  copyBuffer launches per run). The combine follows pidx, so the summation order is unchanged.
+- `hc_pre_tiled` (src/kernels/hc_fast.hip): 16 tokens per block share each LDS-staged chunk of the
+  [24, 16384] fp32 mixing matrix (the reference kernel re-read 1.5 MB per token).
+Resident EXL3 model: KL 2.44e-2, prefill 1024 tokens 3.06 -> 2.68 s, decode 0.24 s/token.
