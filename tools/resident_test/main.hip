@@ -111,7 +111,8 @@ int main(int argc, char** argv) {
       in.logit_rows.resize(size_t(P));
       std::iota(in.logit_rows.begin(), in.logit_rows.end(), 0);
       const auto ts = std::chrono::steady_clock::now();
-      auto out = m.step(in);
+      std::vector<float> out;
+      m.step(in, out);
       std::printf("prefill %d tokens: %.2f s\n", P,
                   std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
       logits.insert(logits.end(), out.begin(), out.end());
@@ -123,7 +124,8 @@ int main(int argc, char** argv) {
       in.pos = {t};
       in.logit_rows = {0};
       const auto ts = std::chrono::steady_clock::now();
-      auto out = m.step(in);
+      std::vector<float> out;
+      m.step(in, out);
       std::printf("decode pos %d: %.0f ms\n", t,
                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count());
       logits.insert(logits.end(), out.begin(), out.end());

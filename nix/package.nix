@@ -8,6 +8,7 @@
   patchelf,
   pkg-config,
   pcre2,
+  httplib,
   rocmSdk,
   rocmSdkCc,
   gpuTargets,
@@ -34,7 +35,10 @@ stdenv.mkDerivation {
     pkg-config
   ];
 
-  buildInputs = [ pcre2 ];
+  buildInputs = [
+    pcre2
+    httplib
+  ];
 
   cmakeFlags = [
     (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")

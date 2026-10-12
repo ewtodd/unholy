@@ -121,8 +121,9 @@ rt::DeviceBuffer upload_tensor(model::Uploader& up, const model::Checkpoint& ck,
 
 ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense,
                              const model::Checkpoint* exl3, const Plan& plan, const model::CacheGeometry& geo,
-                             int max_tokens, int max_seq)
-    : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens) {
+                             int max_tokens, int max_seq, int max_logit_rows)
+    : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
+      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens) {
   model::Uploader up(dense);
   std::unique_ptr<model::Uploader> xup;
   if (exl3) xup = std::make_unique<model::Uploader>(*exl3);
@@ -185,10 +186,12 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     hrows_ = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * c.hc_mult * c.dim * 2);
     hb_ = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * c.dim * 2);
     hf_ = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * c.dim * 4);
-    logits_ = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * c.vocab * 4);
+    logits_ = rt::DeviceBuffer(cd.dev, size_t(max_logit_rows_) * c.vocab * 4);
     rows_idx_ = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
   }
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&x_host_), size_t(max_tokens) * c.hc_mult * c.dim * 2,
+                         hipHostMallocPortable));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&logits_host_), size_t(max_logit_rows_) * c.vocab * 4,
                          hipHostMallocPortable));
 }
 
@@ -199,6 +202,7 @@ ResidentModel::~ResidentModel() {
       (void)hipStreamDestroy(cd.st);
     }
   if (x_host_) (void)hipHostFree(x_host_);
+  if (logits_host_) (void)hipHostFree(logits_host_);
 }
 
 void ResidentModel::set_block_tables(const std::vector<int32_t>& tables) {
@@ -210,9 +214,10 @@ void ResidentModel::set_block_tables(const std::vector<int32_t>& tables) {
   }
 }
 
-std::vector<float> ResidentModel::step(const StepInput& in) {
+void ResidentModel::step(const StepInput& in, std::vector<float>& out) {
   const int T = int(in.ids.size());
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
+  if (int(in.logit_rows.size()) > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
   const size_t row = size_t(c_.hc_mult) * c_.dim;
   for (int k = 0; k < 2; ++k) {
     Card& cd = card_[k];
@@ -233,7 +238,7 @@ std::vector<float> ResidentModel::step(const StepInput& in) {
       UH_CHECK(hipMemcpyAsync(cd.x.data(), x_host_, size_t(T) * row * 2, hipMemcpyHostToDevice, cd.st));
     }
     model::BatchDesc b;
-    b.chunks = in.chunks;
+    for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0});
     b.T = T;
     b.ids = cd.ids.as<int32_t>();
     b.pos = cd.pos.as<int32_t>();
@@ -248,8 +253,12 @@ std::vector<float> ResidentModel::step(const StepInput& in) {
   }
   // Head on card 1 for the requested rows.
   const int R = int(in.logit_rows.size());
-  std::vector<float> out(size_t(R) * c_.vocab);
-  if (R == 0) return out;
+  out.resize(size_t(R) * c_.vocab);
+  if (R == 0) {
+    rt::DeviceGuard g(card_[1].dev);
+    UH_CHECK(hipStreamSynchronize(card_[1].st));
+    return;
+  }
   Card& cd = card_[1];
   rt::DeviceGuard g(cd.dev);
   UH_CHECK(hipMemcpyAsync(rows_idx_.data(), in.logit_rows.data(), size_t(R) * 4, hipMemcpyHostToDevice, cd.st));
@@ -265,9 +274,9 @@ std::vector<float> ResidentModel::step(const StepInput& in) {
   else
     k::gemm_bf16_f32out_wmma(hb_.as<uint16_t>(), c_.dim, head_.as<uint16_t>(), logits_.as<float>(), c_.vocab, R,
                              c_.vocab, c_.dim, cd.st);
-  UH_CHECK(hipMemcpyAsync(out.data(), logits_.data(), out.size() * 4, hipMemcpyDeviceToHost, cd.st));
+  UH_CHECK(hipMemcpyAsync(logits_host_, logits_.data(), out.size() * 4, hipMemcpyDeviceToHost, cd.st));
   UH_CHECK(hipStreamSynchronize(cd.st));
-  return out;
+  std::memcpy(out.data(), logits_host_, out.size() * 4);
 }
 
 }  // namespace unholy::engine

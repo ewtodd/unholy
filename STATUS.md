@@ -21,6 +21,8 @@ nix develop -c bash -c 'cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=$CMAKE
   -DCMAKE_HIP_COMPILER=$CMAKE_HIP_COMPILER -DCMAKE_HIP_COMPILER_ROCM_ROOT=$ROCM_PATH \
   -DCMAKE_PREFIX_PATH=$ROCM_PATH && ninja -C build'
 nix develop -c ./build/unholy-probe --json probe.json
+nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/models/dsv4-ve-exl3-3.04bpw \
+  --profile data/expert_profile_dsv4engine_code32k.txt --max-slots 4 --max-seq 32768 --max-batch-tokens 1024 --port 8100
 ```
 
 ## Milestone 1 (foundation)
@@ -51,8 +53,14 @@ nix develop -c ./build/unholy-probe --json probe.json
       `encoding_dsv4.py` (golden 4/4, 20k random conversations), request path identical to vLLM's
       `apply_chat_template` (text and ids), parser identical to the reference at any chunking
       (`tools/ref/chat_compare.py`)
-- [ ] scheduler + paged cache manager (continuous batching, chunked prefill, slots)
-- [ ] OpenAI-compatible HTTP server (SSE), `unholy` CLI, NixOS module
+- [x] scheduler + paged cache manager (`src/engine/engine.cpp`): continuous batching, decode-first
+      steps with chunked prefill in the remaining budget, shared page pool with recompute preemption,
+      slots; verified against a fake paged model under contention (`unholy-sched-test`)
+- [x] OpenAI-compatible server (`src/server/openai.cpp`, cpp-httplib): chat + completions with SSE,
+      tool calls, reasoning (`reasoning` and `reasoning_content`), stop strings, logprobs, usage,
+      /tokenize, /detokenize, /metrics; `unholy serve` (`tools/unholy/main.cpp`)
+- [ ] NixOS module / service
+- [ ] decode scaling: batch 4 gives 29.7 tok/s aggregate (7.8/stream) vs 16.4 at batch 1
 
 ### Reference path vs oracle, per layer (1024 prefill + 8 decode, code prompt)
 

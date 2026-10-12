@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "engine/plan.hpp"
+#include "engine/step.hpp"
 #include "model/dsv4.hpp"
 #include "model/forward_ref.hpp"
 
@@ -47,24 +48,25 @@ class ApuExperts final : public model::RemoteExperts {
   uint16_t* out_dev_ = nullptr;
 };
 
-// One step's work: chunks over slots, flattened token ids/positions, and the batch rows whose logits
-// are wanted.
-struct StepInput {
-  std::vector<model::ChunkDesc> chunks;
-  std::vector<int32_t> ids, pos;
-  std::vector<int32_t> logit_rows;
-};
-
-class ResidentModel {
+class ResidentModel final : public StepModel {
  public:
+  // max_logit_rows: rows of logits one step can return (0: max_tokens).
   ResidentModel(const model::Dsv4Config& c, const model::Checkpoint& dense, const model::Checkpoint* exl3,
-                const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq);
-  ~ResidentModel();
+                const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq,
+                int max_logit_rows = 0);
+  ~ResidentModel() override;
 
+  int vocab() const override { return c_.vocab; }
+  int max_tokens() const override { return max_tokens_; }
+  int max_logit_rows() const override { return max_logit_rows_; }
+  int max_slots() const override { return geo_.max_slots; }
+  int max_pages_per_seq() const override { return geo_.max_pages_per_seq; }
+  int num_pages() const override { return geo_.num_pages; }
+  int page_tokens() const override { return model::kPageTokens; }
   // Block tables [max_slots][max_pages_per_seq] (host), uploaded to both cards.
-  void set_block_tables(const std::vector<int32_t>& tables);
-  // Runs one step; returns logits [logit_rows.size()][vocab] fp32.
-  std::vector<float> step(const StepInput& in);
+  void set_block_tables(const std::vector<int32_t>& tables) override;
+  // Runs one step; logits [logit_rows.size()][vocab] fp32.
+  void step(const StepInput& in, std::vector<float>& logits) override;
 
   const Plan& plan() const { return plan_; }
 
@@ -82,13 +84,14 @@ class ResidentModel {
   const model::Dsv4Config& c_;
   Plan plan_;
   model::CacheGeometry geo_;
-  int max_tokens_ = 0;
+  int max_tokens_ = 0, max_logit_rows_ = 0;
   Card card_[2];
   std::unique_ptr<ApuExperts> apu_;
   std::unique_ptr<rt::Arena> card_arena_[2], apu_arena_;  // weights (256 MiB slabs)
   rt::DeviceBuffer embed_, head_, norm_, hc_fn_, hc_scale_, hc_base_;  // embed on card 0, the rest card 1
   rt::DeviceBuffer hrows_, hb_, hf_, logits_, rows_idx_;              // head scratch on card 1
   uint16_t* x_host_ = nullptr;                                        // pinned residual handoff
+  float* logits_host_ = nullptr;                                      // pinned [max_logit_rows][vocab]
 };
 
 }  // namespace unholy::engine

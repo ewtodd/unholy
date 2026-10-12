@@ -343,3 +343,30 @@ C++ binary.
   partial terminals; the "\n\n" before a tool block is dropped from content as the reference does.
   Identical to `parse_message_from_completion_text` on 24k reference-rendered completions fed in
   chunks of 1..13 bytes and whole.
+
+## 2026-10-11 — engine loop, scheduler, OpenAI server: first served tokens
+
+- `StepModel` (`src/engine/step.hpp`) is the scheduler's whole view of a model (one batched step over
+  chunks + block tables), so the scheduler is tested on the CPU: `unholy-sched-test` runs a fake model
+  that stores tokens in its own paged pool through the block tables it is given and derives one-hot
+  logits from the whole sequence read back through them; greedy outputs must equal a standalone
+  simulation under random arrivals, aborts, tiny page pools (constant preemption), small step budgets
+  (chunking) and slot/page reuse. 5 configurations x 3 seeds x 400 requests: all identical, no leaks.
+- Scheduling (vLLM V1-like): every running sequence with one token left to feed decodes; prefills
+  fill the remaining token budget in admission order, one chunk per sequence per step; pages are
+  allocated as positions advance; when the pool cannot cover a step, the most recently admitted
+  sequence is preempted (cache dropped, recomputed later from prompt + output). Admission wants pages
+  for the first chunk plus one page of headroom per running sequence.
+- Sampling on the host from the step's fp32 logits (penalties, temperature, top-k/top-p/min-p, per
+  request seeded RNG, raw logprobs). Logits come back through a pinned buffer sized for the logit rows
+  a step can request (not max_tokens rows: 0.53 GB at 1024).
+- HTTP: cpp-httplib (header-only, via pkg-config so its CMake config does not pull in OpenSSL), one
+  thread per in-flight request; deliveries go engine thread -> per-request channel -> HTTP thread,
+  which runs detokenizer -> stop strings -> DSV4 parser. A disconnected client or a matched stop
+  string aborts the request in the engine.
+- First served run (4 slots x 32k, 1024-token steps, EXL3 3.04 bpw experts, load 21 s): correct
+  answers with reasoning, parallel tool calls in one streamed response with finish_reason
+  tool_calls. Decode: 16.4 tok/s for one stream; 4 streams 29.7 tok/s aggregate (7.8 each) — the step
+  is launch/latency-bound (a batch-1 token reads ~2.5 GB of weights, ~4 ms at the cards' bandwidth,
+  but takes 58 ms), and per-chunk attention/compressor work plus more distinct experts (and more APU
+  round trips) grow with the batch. Next: profile the batch-4 decode step.

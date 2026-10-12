@@ -21,6 +21,8 @@ endif()
 find_package(hip REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
+# cpp-httplib, header-only, without TLS (its CMake config would pull in OpenSSL).
+pkg_check_modules(HTTPLIB REQUIRED IMPORTED_TARGET httplib)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 # therock-sdk-nix's clang wrapper appends its link flags to compile-only invocations too.
@@ -54,6 +56,18 @@ target_link_libraries(unholy_text PUBLIC PkgConfig::PCRE2)
 
 add_executable(unholy-text-test tools/text_test/main.cpp)
 target_link_libraries(unholy-text-test PRIVATE unholy_text)
+
+# Scheduler / sampler: host-only, tested against a fake model.
+add_library(unholy_sched STATIC
+  src/engine/engine.cpp
+  src/engine/sampler.cpp
+)
+target_include_directories(unholy_sched PUBLIC src)
+find_package(Threads REQUIRED)
+target_link_libraries(unholy_sched PUBLIC Threads::Threads)
+
+add_executable(unholy-sched-test tools/sched_test/main.cpp)
+target_link_libraries(unholy-sched-test PRIVATE unholy_sched)
 
 # Reference kernels + the DSV4 reference model path.
 add_library(unholy_ref STATIC
@@ -98,3 +112,15 @@ target_link_libraries(unholy_engine PUBLIC unholy_ref)
 
 add_executable(unholy-resident-test tools/resident_test/main.hip)
 target_link_libraries(unholy-resident-test PRIVATE unholy_engine)
+
+# The server: OpenAI-compatible HTTP frontend + the `unholy` binary.
+add_library(unholy_server STATIC src/server/openai.cpp)
+target_include_directories(unholy_server PUBLIC src)
+target_link_libraries(unholy_server PUBLIC unholy_text unholy_sched PkgConfig::HTTPLIB)
+
+add_executable(unholy tools/unholy/main.cpp)
+set_source_files_properties(tools/unholy/main.cpp PROPERTIES LANGUAGE HIP)
+target_compile_definitions(unholy PRIVATE UNHOLY_DATA_DIR="${CMAKE_INSTALL_PREFIX}/share/unholy")
+target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
+install(TARGETS unholy unholy-text-test unholy-sched-test RUNTIME DESTINATION bin)
+install(FILES data/expert_profile_dsv4engine_code32k.txt DESTINATION share/unholy)

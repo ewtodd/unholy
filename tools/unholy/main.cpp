@@ -1,0 +1,139 @@
+// unholy: the serving binary.
+//
+//   unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]
+//                [--served-model-name NAME] [--max-slots N] [--max-seq N] [--num-pages N]
+//                [--max-batch-tokens N] [--api-key KEY] [--http-threads N] [--max-tokens-default N]
+//
+// --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
+// quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
+// planner (src/engine/plan.hpp) for the requested cache geometry.
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <thread>
+
+#include "engine/engine.hpp"
+#include "engine/plan.hpp"
+#include "engine/resident.hpp"
+#include "model/dsv4.hpp"
+#include "model/safetensors.hpp"
+#include "server/openai.hpp"
+#include "text/tokenizer.hpp"
+
+#ifndef UNHOLY_DATA_DIR
+#define UNHOLY_DATA_DIR "data"
+#endif
+
+using namespace unholy;
+
+namespace {
+
+int usage() {
+  std::fprintf(stderr,
+               "usage: unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]\n"
+               "                    [--served-model-name NAME] [--max-slots N] [--max-seq N] [--num-pages N]\n"
+               "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
+               "                    [--max-tokens-default N]\n");
+  return 2;
+}
+
+int serve(int argc, char** argv) {
+  std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_dsv4engine_code32k.txt";
+  server::ServerConfig scfg;
+  int max_slots = 4, max_seq = 65536, num_pages = 0, max_batch = 2048;
+  for (int i = 2; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (i + 1 >= argc) return usage();
+    const std::string v = argv[++i];
+    if (a == "--model") model_dir = v;
+    else if (a == "--exl3") exl3_dir = v;
+    else if (a == "--profile") profile = v;
+    else if (a == "--host") scfg.host = v;
+    else if (a == "--port") scfg.port = std::stoi(v);
+    else if (a == "--served-model-name") scfg.model_name = v;
+    else if (a == "--api-key") scfg.api_key = v;
+    else if (a == "--http-threads") scfg.threads = std::stoi(v);
+    else if (a == "--max-tokens-default") scfg.default_max_tokens = std::stoi(v);
+    else if (a == "--max-slots") max_slots = std::stoi(v);
+    else if (a == "--max-seq") max_seq = std::stoi(v);
+    else if (a == "--num-pages") num_pages = std::stoi(v);
+    else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
+    else return usage();
+  }
+  if (model_dir.empty()) return usage();
+  if (scfg.api_key.empty())
+    if (const char* k = std::getenv("UNHOLY_API_KEY")) scfg.api_key = k;
+
+  // Block SIGINT/SIGTERM in every thread; one thread waits for them and stops the server.
+  sigset_t sigs;
+  sigemptyset(&sigs);
+  sigaddset(&sigs, SIGINT);
+  sigaddset(&sigs, SIGTERM);
+  pthread_sigmask(SIG_BLOCK, &sigs, nullptr);
+
+  const auto tok = text::Tokenizer::load(model_dir + "/tokenizer.json");
+  auto ck = model::Checkpoint::open(model_dir);
+  std::unique_ptr<model::Checkpoint> xck;
+  if (!exl3_dir.empty()) xck = model::Checkpoint::open(exl3_dir);
+  const auto c = model::Dsv4Config::from_hf(ck->config());
+
+  max_seq = (max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
+  model::CacheGeometry geo;
+  geo.max_slots = max_slots;
+  geo.max_pages_per_seq = max_seq / model::kPageTokens;
+  geo.num_pages = num_pages > 0 ? num_pages : max_slots * geo.max_pages_per_seq;
+
+  engine::PlanInput pin;
+  pin.cfg = &c;
+  pin.dense = ck.get();
+  pin.exl3 = xck.get();
+  pin.usage = engine::load_usage_profile(profile, c.n_layers, c.n_experts);
+  pin.geo = geo;
+  pin.max_tokens = max_batch;
+  pin.max_seq = max_seq;
+  const auto plan = engine::make_plan(pin);
+  std::printf("%s", plan.summary().c_str());
+  std::fflush(stdout);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, std::max(max_slots, 8));
+  std::printf("loaded in %.1f s; %d slots, context %d, %d pages of %d tokens\n",
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), max_slots, max_seq,
+              geo.num_pages, model::kPageTokens);
+
+  engine::EngineConfig ecfg;
+  ecfg.max_batch_tokens = max_batch;
+  ecfg.eos_id = tok.eos_id();
+  ecfg.max_context = max_seq;
+  ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+  engine::Engine eng(model, ecfg);
+  server::OpenAIServer srv(eng, tok, scfg);
+
+  std::thread sig([&] {
+    int s = 0;
+    sigwait(&sigs, &s);
+    std::printf("signal %d: stopping\n", s);
+    std::fflush(stdout);
+    srv.stop();
+  });
+  sig.detach();
+  std::printf("serving %s on http://%s:%d\n", scfg.model_name.c_str(), scfg.host.c_str(), scfg.port);
+  std::fflush(stdout);
+  srv.run();
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) return usage();
+  try {
+    if (!std::strcmp(argv[1], "serve")) return serve(argc, argv);
+    return usage();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
+}
