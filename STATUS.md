@@ -70,6 +70,10 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
 - [x] logging: a line per finished request (queue, ttft, prefill / decode tok/s, draft acceptance) and a
       periodic engine line (`--log-interval`, default 10 s: throughput, queue, KV use, prefix hit rate,
       draft acceptance by position); request log checked against deliveries in `unholy-sched-test`
+- [x] PLX switch (both cards on one Gen4 x4 uplink): compact card <-> APU expert transport (fp8 inputs per
+      token, bit-identical; outputs combined per token on the APU): prefill 1062 tok/s average to 512k
+      (971 before the switch), card <-> card 26 GB/s (DECISIONS 2026-10-12)
+- [ ] decode latency behind the switch (+5.7 ms/token single-stream; per-layer card <-> APU round trips)
 - [ ] disk tier for the prefix cache
 - [ ] decode scaling: batch 4 gives 29.7 tok/s aggregate (7.8/stream) vs 16.4 at batch 1
 - [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s

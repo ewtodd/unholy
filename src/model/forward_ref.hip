@@ -64,7 +64,7 @@ namespace {
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
   kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
-  kY2F, kPairIn, kHcPart, kQC, kQCS, kNumBufs
+  kY2F, kPairIn, kHcPart, kQC, kQCS, kRTok, kNumBufs
 };
 
 template <typename T>
@@ -125,6 +125,7 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kY2F] = N * c.dim * 4;
   sz[kPairIn] = N * K * c.dim * 2;
   sz[kHcPart] = size_t(32) * 32 * 25 * 4;
+  sz[kRTok] = N * 2 * 4;  // remote_tokens: tok2u [T], u2t [T]
   return sz;
 }
 }  // namespace
@@ -293,6 +294,33 @@ void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t
   k::exl3_grouped_gemm(xh3, D, dt, nt, w.exl3_ptrs(1, 0, E), w.exl3_ptrs(1, 2, E), w.exl3_bits[1], h3, I, I, st);
   k::exl3_swiglu_xform(h1, h3, rw, row_expert, w.exl3_ptrs(2, 1, E), xh2, P, I, c.swiglu_limit, st);
   k::exl3_grouped_gemm(xh2, I, dt, nt, w.exl3_ptrs(2, 0, E), w.exl3_ptrs(2, 2, E), w.exl3_bits[2], out, D, D, st);
+}
+
+void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint8_t* q, const uint8_t* s,
+                          const int32_t* p2u, const kernels::MoePlan* plan, const float* rw, const int32_t* row_expert,
+                          const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev, int P,
+                          const Exl3MoeScratch& sc, uint16_t* out, hipStream_t st, const int32_t* u2p) {
+  if (P > sc.rows) throw std::runtime_error("mx_moe_forward_dev_q: scratch too small");
+  if (w.exl3_experts) throw std::runtime_error("mx_moe_forward_dev_q: native MXFP4 experts only");
+  const int D = c.dim, I = c.moe_inter, E = c.n_experts;
+  max_tiles = std::min(max_tiles, P);
+  const auto tab = [&](int m, int f) { return reinterpret_cast<const uint8_t* const*>(w.exl3_ptrs(m, f, E)); };
+  bf16* xa = sc.xh1.as<bf16>();
+  bf16* hh = sc.xh2.as<bf16>();
+  bf16* g = sc.h1.as<bf16>();
+  bf16* u = sc.h3.as<bf16>();
+  k::mx_xform_in_q(q, s, p2u, plan, row_expert, tab(0, 1), xa, P, D, st);
+  const bool gemv = P / c.n_active <= 8;
+  const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
+  lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev);
+  lin(xa, D, tiles, max_tiles, tab(1, 0), tab(1, 1), u, I, I, st, ntiles_dev);
+  k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
+  if (!u2p) {
+    lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev);
+    return;
+  }
+  lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), xa, D, D, st, ntiles_dev);  // xa is free after the up GEMMs
+  k::remote_combine(xa, u2p, plan, out, c.n_active, D, P / c.n_active, st);
 }
 
 void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
@@ -649,7 +677,8 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
 // Routing -> pair rows -> experts entirely on the device (EXL3 fast path). Pair rows are laid out
 // resident experts first, then remote ones; the remote block goes to the remote side through pinned
 // memory with stream-ordered flags, so the host only enqueues.
-void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, const bf16* f,
+// Returns true when the remote experts' outputs came back combined per token (moe_combine_partial).
+bool moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, const bf16* f,
                          const int32_t* sel, const float* wt, int T, hipStream_t st, RemoteExperts* remote) {
   const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
   const auto& ds = scr.dispatch;
@@ -670,6 +699,7 @@ void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
   k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
   k::gather_rows(f, eidx, pair_in, P, D, st);
   const bool any_remote = w.n_resident < E;
+  bool qin = false, combined = false;
   if (any_remote) {
     if (!remote || !remote->can_enqueue()) throw std::runtime_error("moe: remote experts need an enqueue backend");
     if (size_t(P) > remote->capacity_rows || ds.max_tiles > remote->max_tiles)
@@ -677,9 +707,20 @@ void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
     // A kernel, not async copies: the copies were not reliably ordered after the previous layer's
     // stream wait on the remote side's done flag (DECISIONS 2026-10-12), so they could overwrite the
     // staging the remote side was still reading.
+    // Native experts: one fp8 row per token with remote pairs instead of a bf16 row per remote pair (the
+    // remote side rebuilds the same expert inputs; ~5x fewer bytes over the host link, which both cards
+    // share behind the PCIe switch). Before stage_remote: it copies the plan with the token count.
+    qin = !w.exl3_experts && remote->quant_in();
+    combined = qin && remote->combine_out();
+    if (qin) {
+      int32_t* tok2u = B<int32_t>(scr, kRTok);
+      k::remote_tokens(pidx, eidx, T, K, plan, tok2u, tok2u + T, remote->p2u_host, combined ? remote->u2p_host : nullptr,
+                       st);
+      k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
+    }
     k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host, remote->e_host,
                     P, st);
-    k::copy_remote_rows(pair_in, remote->in_host, plan, D, P, st);
+    if (!qin) k::copy_remote_rows(pair_in, remote->in_host, plan, D, P, st);
     static const bool stats = std::getenv("UNHOLY_MOE_STATS") != nullptr;
     if (stats) {  // diagnostics only: synchronizes the stream
       k::MoePlan hp;
@@ -694,8 +735,10 @@ void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
                        st);
   if (any_remote) {
     remote->join(st);
-    k::copy_remote_rows(remote->out_host, pair_out, plan, D, P, st);
+    if (combined) k::copy_remote_partial(remote->out_host, pair_out, plan, D, T, st);
+    else k::copy_remote_rows(remote->out_host, pair_out, plan, D, P, st);
   }
+  return combined;
 }
 
 void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
@@ -732,8 +775,9 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
                            (w.n_resident == E || (remote && remote->can_enqueue()));
   int32_t* dpidx = B<int32_t>(scr, kPairIdx);
   bf16* pair_out = B<bf16>(scr, kPairOut);
+  bool combined = false;
   if (device_path) {
-    moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote);
+    combined = moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote);
   } else {
     // Expert-major pairs (ascending expert id): pair p computes expert e on token t into row p of the
     // pair-output buffer; pidx[t][j] lists token t's pairs in ascending expert order for the combine.
@@ -848,7 +892,11 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
   dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
   bf16* fo = B<bf16>(scr, kAO);
-  k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
+  if (combined)
+    k::moe_combine_partial(pair_out, dpidx, scr.dispatch.plan.as<k::MoePlan>(), B<int32_t>(scr, kRTok), shared, fo, T, K,
+                           D, st);
+  else
+    k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
   dump(L, b, "ffn_out", fo, size_t(T) * D * 2, st);
   k::hc_post(fo, x, post, comb, x, T, c.hc_mult, D, st);
   if (!device_path) UH_CHECK(hipStreamSynchronize(st));  // the host path's vectors

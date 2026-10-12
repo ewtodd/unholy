@@ -49,6 +49,19 @@ ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&in_dev_), in_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&out_dev_), out_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&w_dev_), w_host, 0));
+  // Compact fp8 inputs: at most one row per token of a step (capacity_rows / n_active tokens).
+  if (const char* q = std::getenv("UNHOLY_REMOTE_Q")) quant_in_ = std::string(q) != "0";
+  const size_t cap_tokens = (capacity_rows + size_t(c.n_active) - 1) / size_t(c.n_active);
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&inq_host), cap_tokens * c.dim, flags));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&ins_host), cap_tokens * (c.dim / 128), flags));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&p2u_host), capacity_rows * 4, flags));
+  combine_out_ = quant_in_;
+  if (const char* m = std::getenv("UNHOLY_REMOTE_COMBINE")) combine_out_ = quant_in_ && std::string(m) != "0";
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&u2p_host), cap_tokens * size_t(c.n_active) * 4, flags));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&u2p_dev_), u2p_host, 0));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&inq_dev_), inq_host, 0));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&ins_dev_), ins_host, 0));
+  UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&p2u_dev_), p2u_host, 0));
   // Each job is one expert: at most every token of a step.
   scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));
   xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows));
@@ -68,6 +81,10 @@ ApuExperts::~ApuExperts() {
   rt::DeviceGuard g(dev_);
   if (st_) (void)hipStreamDestroy(st_);
   if (in_host) (void)hipHostFree(in_host);
+  if (inq_host) (void)hipHostFree(inq_host);
+  if (ins_host) (void)hipHostFree(ins_host);
+  if (p2u_host) (void)hipHostFree(p2u_host);
+  if (u2p_host) (void)hipHostFree(u2p_host);
   if (out_host) (void)hipHostFree(out_host);
   if (w_host) (void)hipHostFree(w_host);
   if (e_host) (void)hipHostFree(e_host);
@@ -116,8 +133,12 @@ void ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
   UH_CHECK(hipStreamWriteValue32(card_st, req_flag_, seq_, 0));
   rt::DeviceGuard g(dev_);
   UH_CHECK(hipStreamWaitValue32(st_, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
-  model::exl3_moe_forward_dev(c_, w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P,
-                              xscratch_, out_dev_, st_);
+  if (!w.exl3_experts && quant_in_)  // the card sent compact fp8 inputs (moe_device_dispatch)
+    model::mx_moe_forward_dev_q(c_, w, inq_dev_, ins_dev_, p2u_dev_, plan_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles,
+                                &plan_dev_->n_remote_tiles, P, xscratch_, out_dev_, st_, combine_out_ ? u2p_dev_ : nullptr);
+  else
+    model::exl3_moe_forward_dev(c_, w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P,
+                                xscratch_, out_dev_, st_);
   UH_CHECK(hipStreamWriteValue32(st_, done_flag_, seq_, 0));
 }
 

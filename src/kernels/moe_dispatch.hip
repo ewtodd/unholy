@@ -9,12 +9,15 @@
 // The row order inside an expert's block depends on atomic arrival order; every expert kernel is
 // row-independent and the combine follows pidx (ascending expert per token), so results do not.
 #include <algorithm>
+#include <stdexcept>
 
 #include "kernels/dev.hip.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "rt/hip.hpp"
 
 namespace unholy::kernels {
+
+using namespace unholy::dev;
 
 namespace {
 
@@ -49,6 +52,7 @@ __global__ void moe_plan_kernel(const int32_t* count, const uint8_t* resident, i
     plan->remote0 = remote0;
     plan->n_local_tiles = nl;
     plan->n_remote_tiles = nr;
+    plan->n_remote_tokens = 0;
   }
   for (int e = threadIdx.x; e < E; e += blockDim.x) fill[e] = 0;
 }
@@ -120,7 +124,170 @@ __global__ void stage_remote_kernel(const MoePlan* plan, const Exl3Tile* rtiles,
   __threadfence_system();
 }
 
+// One block of 1024 threads: an exclusive scan of "has a remote pair" over the tokens, 1024 at a time.
+__global__ __launch_bounds__(1024) void remote_tokens_kernel(const int32_t* pidx, const int32_t* eidx, int T, int K,
+                                                             MoePlan* plan, int32_t* tok2u, int32_t* u2t,
+                                                             int32_t* p2u, int32_t* u2p) {
+  __shared__ int wsum[32];
+  __shared__ int carry;
+  const int r0 = plan->remote0, P = plan->P;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, nw = blockDim.x >> 5;
+  if (tid == 0) carry = 0;
+  __syncthreads();
+  for (int base = 0; base < T; base += blockDim.x) {
+    const int t = base + tid;
+    int f = 0;
+    if (t < T)
+      for (int j = 0; j < K; ++j) f |= pidx[size_t(t) * K + j] >= r0;
+    int v = f;  // inclusive scan within the wave
+    for (int o = 1; o < 32; o <<= 1) {
+      const int n = __shfl_up(v, o, 32);
+      if (lane >= o) v += n;
+    }
+    if (lane == 31) wsum[wave] = v;
+    __syncthreads();
+    if (wave == 0) {
+      int s = lane < nw ? wsum[lane] : 0;
+      for (int o = 1; o < 32; o <<= 1) {
+        const int n = __shfl_up(s, o, 32);
+        if (lane >= o) s += n;
+      }
+      if (lane < nw) wsum[lane] = s;
+    }
+    __syncthreads();
+    const int excl = carry + (wave ? wsum[wave - 1] : 0) + v - f;
+    if (t < T) {
+      tok2u[t] = f ? excl : -1;
+      if (f) u2t[excl] = t;
+      if (f && u2p)
+        for (int j = 0; j < K; ++j) {
+          const int p = pidx[size_t(t) * K + j];
+          u2p[size_t(excl) * K + j] = p >= r0 ? p : -1;
+        }
+    }
+    __syncthreads();
+    if (tid == int(blockDim.x) - 1) carry = excl + f;
+    __syncthreads();
+  }
+  if (tid == 0) plan->n_remote_tokens = carry;
+  for (int p = r0 + tid; p < P; p += blockDim.x) p2u[p] = tok2u[eidx[p]];
+  __threadfence_system();
+}
+
+// Block-stride over the compact tokens; each thread sums 8 columns (16-byte loads / stores).
+__global__ __launch_bounds__(256) void remote_combine_kernel(const uint16_t* pair_out, const int32_t* u2p,
+                                                             const MoePlan* plan, uint16_t* dst, int K, int dim) {
+  const int U = plan->n_remote_tokens, cols = dim / 8;
+  for (int u = blockIdx.x; u < U; u += gridDim.x)
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+      float acc[8] = {};
+      for (int j = 0; j < K; ++j) {
+        const int p = u2p[size_t(u) * K + j];
+        if (p < 0) continue;
+        const uint4 r = reinterpret_cast<const uint4*>(pair_out + size_t(p) * dim)[c];
+        const uint32_t w[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          acc[2 * k] += bf16_to_f32(uint16_t(w[k]));
+          acc[2 * k + 1] += bf16_to_f32(uint16_t(w[k] >> 16));
+        }
+      }
+      uint32_t o[4];
+#pragma unroll
+      for (int k = 0; k < 4; ++k) o[k] = uint32_t(f32_to_bf16(acc[2 * k])) | (uint32_t(f32_to_bf16(acc[2 * k + 1])) << 16);
+      reinterpret_cast<uint4*>(dst + size_t(u) * dim)[c] = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+  __threadfence_system();
+}
+
+__global__ void copy_remote_partial_kernel(const uint16_t* src, uint16_t* dst, const MoePlan* plan, int dim) {
+  const size_t n = size_t(plan->n_remote_tokens) * dim / 8;
+  const uint4* s = reinterpret_cast<const uint4*>(src);
+  uint4* d = reinterpret_cast<uint4*>(dst + size_t(plan->remote0) * dim);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) d[i] = s[i];
+}
+
+__global__ void moe_combine_partial_kernel(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan,
+                                           const int32_t* tok2u, const uint16_t* shared, uint16_t* out, int K,
+                                           int dim) {
+  const int t = blockIdx.x, r0 = plan->remote0, u = tok2u[t];
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int j = 0; j < K; ++j) {
+      const int p = pidx[size_t(t) * K + j];
+      if (p < r0) acc += bf16_to_f32(pair_out[size_t(p) * dim + d]);
+    }
+    if (u >= 0) acc += bf16_to_f32(pair_out[size_t(r0 + u) * dim + d]);
+    acc += bf16_to_f32(shared[size_t(t) * dim + d]);
+    out[size_t(t) * dim + d] = f32_to_bf16(acc);
+  }
+}
+
+// Wave = one 128-value segment of one compact token (4 values per lane): the scale as
+// fake_quant_fp8_block computes it, the codes packed into one 4-byte store per lane (a 128-byte run per
+// wave). Grid-stride over (token, segment) with one system-scope fence per block at the end: a fence per
+// segment (131k blocks per layer) made the kernel wait on bus round trips.
+__global__ __launch_bounds__(256) void quant_remote_tokens_kernel(const uint16_t* x, int dim, const int32_t* u2t,
+                                                                  const MoePlan* plan, uint8_t* q, uint8_t* s) {
+  const int lane = threadIdx.x & 31, nwave = blockDim.x >> 5, segs = dim / 128;
+  const size_t n = size_t(plan->n_remote_tokens) * segs;
+  for (size_t w = size_t(blockIdx.x) * nwave + (threadIdx.x >> 5); w < n; w += size_t(gridDim.x) * nwave) {
+    const int u = int(w / segs), seg = int(w % segs);
+    const uint2 raw = reinterpret_cast<const uint2*>(x + size_t(u2t[u]) * dim + seg * 128)[lane];
+    const float v[4] = {bf16_to_f32(uint16_t(raw.x)), bf16_to_f32(uint16_t(raw.x >> 16)), bf16_to_f32(uint16_t(raw.y)),
+                        bf16_to_f32(uint16_t(raw.y >> 16))};
+    float a = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    a = fmaxf(warp_max(a), 1e-4f);
+    const uint8_t e = pow2_ceil_e8m0(a * (1.0f / 448.0f));
+    const float sc = e8m0_to_f32(e);
+    uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) packed |= uint32_t(f32_to_e4m3(fminf(fmaxf(v[k] / sc, -448.0f), 448.0f))) << (8 * k);
+    reinterpret_cast<uint32_t*>(q + size_t(u) * dim + seg * 128)[lane] = packed;
+    if (lane == 0) s[size_t(u) * segs + seg] = e;
+  }
+  __threadfence_system();
+}
+
 }  // namespace
+
+void remote_tokens(const int32_t* pidx, const int32_t* eidx, int T, int K, MoePlan* plan, int32_t* tok2u,
+                   int32_t* u2t, int32_t* p2u_dst, int32_t* u2p_dst, hipStream_t st) {
+  remote_tokens_kernel<<<1, 1024, 0, st>>>(pidx, eidx, T, K, plan, tok2u, u2t, p2u_dst, u2p_dst);
+  UH_CHECK_LAUNCH();
+}
+
+void remote_combine(const uint16_t* pair_out, const int32_t* u2p, const MoePlan* plan, uint16_t* dst, int K, int dim,
+                    int max_tokens, hipStream_t st) {
+  if (max_tokens <= 0) return;
+  if (dim % 8) throw std::runtime_error("remote_combine: dim % 8");
+  remote_combine_kernel<<<std::min(max_tokens, 512), 256, 0, st>>>(pair_out, u2p, plan, dst, K, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void copy_remote_partial(const uint16_t* src, uint16_t* dst, const MoePlan* plan, int dim, int max_tokens,
+                         hipStream_t st) {
+  const size_t units = size_t(std::max(max_tokens, 1)) * dim / 8;
+  copy_remote_partial_kernel<<<int(std::min<size_t>((units + 255) / 256, 1024)), 256, 0, st>>>(src, dst, plan, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void moe_combine_partial(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan, const int32_t* tok2u,
+                         const uint16_t* shared, uint16_t* out, int T, int K, int dim, hipStream_t st) {
+  if (T <= 0) return;
+  moe_combine_partial_kernel<<<T, 256, 0, st>>>(pair_out, pidx, plan, tok2u, shared, out, K, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void quant_remote_tokens(const uint16_t* x, int dim, const int32_t* u2t, const MoePlan* plan, uint8_t* q_dst,
+                         uint8_t* s_dst, int max_tokens, hipStream_t st) {
+  if (max_tokens <= 0) return;
+  if (dim % 128) throw std::runtime_error("quant_remote_tokens: dim % 128");
+  const size_t waves = size_t(max_tokens) * (dim / 128);
+  const int blocks = int(std::min<size_t>((waves + 7) / 8, 1024));
+  quant_remote_tokens_kernel<<<blocks, 256, 0, st>>>(x, dim, u2t, plan, q_dst, s_dst);
+  UH_CHECK_LAUNCH();
+}
 
 void stage_remote(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt, const int32_t* row_expert,
                   MoePlan* plan_dst, Exl3Tile* tiles_dst, float* w_dst, int32_t* e_dst, int max_rows, hipStream_t st) {

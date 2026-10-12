@@ -3,7 +3,10 @@
 // oracle and, bit for bit, with a single-card streaming run (`unholy-ref-run --out`) of the same
 // weights: same kernels in the same order, so the placement must not change a single bit.
 //
-//   unholy-resident-test --oracle DIR --profile FILE [--exl3 DIR] [--ref logits.bin] [--ckpt DIR]
+//   unholy-resident-test --oracle DIR --profile FILE [--exl3 DIR] [--ref logits.bin] [--ckpt DIR] [--out FILE]
+//
+// --out writes this run's logits (fp32 [steps, vocab]) for a later --ref: e.g. the same placement with
+// UNHOLY_REMOTE_Q=0 (bf16 pair rows to the APU) as the reference for the compact fp8 transport.
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -54,7 +57,7 @@ double kl_row(const float* a, const float* b, int V) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string ckpt = "/scratch/dsv4-ve", oracle, exl3_dir, profile, ref_path;
+  std::string ckpt = "/scratch/dsv4-ve", oracle, exl3_dir, profile, ref_path, out_path;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() { return std::string(argv[++i]); };
@@ -63,8 +66,9 @@ int main(int argc, char** argv) {
     else if (a == "--exl3") exl3_dir = next();
     else if (a == "--profile") profile = next();
     else if (a == "--ref") ref_path = next();
+    else if (a == "--out") out_path = next();
     else {
-      std::fprintf(stderr, "usage: %s --oracle DIR --profile FILE [--exl3 DIR] [--ref logits.bin]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s --oracle DIR --profile FILE [--exl3 DIR] [--ref logits.bin] [--out FILE]\n", argv[0]);
       return 2;
     }
   }
@@ -140,6 +144,10 @@ int main(int argc, char** argv) {
       agree += std::max_element(a, a + c.vocab) - a == std::max_element(b, b + c.vocab) - b;
     }
     std::printf("vs oracle: mean KL %.3e, top-1 agreement %.2f%%\n", kl / S, 100.0 * agree / S);
+    if (!out_path.empty()) {
+      std::ofstream of(out_path, std::ios::binary);
+      of.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * 4));
+    }
     if (!ref_path.empty()) {
       const auto single = read_f32(ref_path, logits.size());
       size_t same = 0;

@@ -605,3 +605,59 @@ Memory: three 512k requests + DSpark + the vision tower did not fit (a pinned al
 The card margin goes 3 -> 2 GB (the faults it was raised for were the power cap) and son-of-anton keeps
 64 prefix snapshots: loads with ~2 GB more experts on the cards (53.3% of routing vs 51.6%); GSM8K at
 concurrency 4 (warm cache): 44.5 tok/s aggregate, 97.9%.
+
+## 2026-10-12 — PLX switch; compact card <-> APU expert transport
+
+Topology since today: both R9700s behind a PEX88048 switch card (2 x16 downstream ports, Gen4) in the M.2
+slot at root port 00:02.5, i.e. one Gen4 x4 uplink to the Strix Halo shared by both cards. `unholy-probe`:
+
+| path | before | behind the switch |
+|---|---|---|
+| card <- card, kernel pull (verified) | 7.1 GB/s (root complex) | 26.3 / 26.7 GB/s |
+| host -> card / card -> host, one card | 7.16 / 6.96 GB/s | 4.6-5.2 / 5.5-5.8 GB/s |
+| both cards at once, h2d / d2h aggregate | 14.4 / 14.0 GB/s | 6.1 / 5.2 GB/s |
+| card <- APU memory pull / card -> APU push | 7.2 / 7.2 GB/s | 5.8-6.0 / 5.5-5.6 GB/s |
+
+Kernel parameters (hosts/son-of-anton): `pci=disable_acs_redir=pci:1000:c012` — with ACS redirect on (the
+kernel requests it whenever an IOMMU driver is loaded, `iommu=pt` included) card -> card reads are sent
+to the root complex, which does not route them back down the port they came from: the reading queue
+wedges (killing it forced a GPU reset that took the box down). Bring-up also hit "device lost from bus"
+dropouts and data-fabric sync-flood resets under load (`x86/amd: Previous system reset reason`); they
+were a physical short on the new boards, not software. 25 min of sweep + 512k curve + a 3-minute
+card <-> card soak at 26 GB/s afterwards: nothing lost.
+
+Cost, old transport (`unholy-curve` 1 x 512k, docs/bench/curve-native-1x512k-plx-old-transport-*.txt):
+average prefill 971 -> 851 tok/s. A rocprofv3 trace of a 64k prefill showed why: per card, 28% of the
+time in `copy_remote_rows` (bf16 pair rows to the APU and back over the shared uplink), 28% waiting for
+the APU, ~30% computing; the APU computing 58% of the time.
+
+Transport changes (native MXFP4 experts; `moe_device_dispatch`, `ApuExperts`):
+- Inputs: one fp8 row per token with remote pairs (e4m3 codes + an e8m0 exponent per 128 —
+  `quant_remote_tokens`) instead of one bf16 row per remote pair: the exact values `mx_xform_in` computes
+  on the APU, which rebuilds them (`mx_xform_in_q`). ~5x fewer bytes out; bit-identical (code1024
+  oracle: 133,416,960 / 133,416,960 logits). The first version launched a block per 128-value segment
+  with a system-scope fence each (131k fences per layer) and was slower than the copy it replaced
+  (11.0 vs 8.7 s per card); grid-stride with one fence per block fixed it.
+- Outputs: the APU sums each token's remote pairs (fp32, ascending expert order, `remote_combine`) and
+  returns one bf16 row per token (~2.6x fewer bytes back); the card adds it after its local pairs
+  (`moe_combine_partial`). This rounds the remote share to bf16 once and makes the sum order depend on
+  placement (the reference model accumulates every expert's output in bf16). code1024: KL vs the oracle
+  1.027e-2 -> 1.000e-2, top-1 96.32% -> 95.64% (7 near-ties of ~1032); GSM8K, 200 questions,
+  concurrency 8: strict 0.615 vs 0.645 (CI +-0.067), flexible 0.980 vs 0.980.
+- Switches: `UNHOLY_REMOTE_COMBINE=0` (pair rows back, bit-exact), `UNHOLY_REMOTE_Q=0` (the old
+  transport); `unholy-resident-test --out` saves logits for a later `--ref`.
+
+| 128k curve, same plan (60.5% on cards) | avg prefill | decode at 4k |
+|---|---|---|
+| old transport | 1018 tok/s | 57.1 ms |
+| fp8 inputs (bit-identical) | 1114 tok/s | 57.2 ms |
+| fp8 inputs + combined outputs | 1254 tok/s | 56.4 ms |
+
+512k curve (docs/bench/curve-native-1x512k-plx-2026-10-12.txt): average 1062 tok/s (971 before the
+switch), 896 tok/s at 491k. GSM8K production sweep (3 x 512k, DSpark 5, vision): concurrency 1/2/4/8
+22.2 / 36.5 / 45.5 / 56.3 tok/s aggregate (before the switch 20.1 / 34.2 / 39.9-44.5 / 50.8).
+
+Open: raw single-sequence decode is ~5.7 ms/token slower behind the switch with the same code (58422ca:
+51.6 -> 57.3 ms at 4k), ~130 us per layer. The card links stay at Gen4 throughout decode (not PCIe DPM);
+the suspect is per-round-trip latency of the per-layer card <-> APU handoffs (flags, polls, copies)
+through the switch. With DSpark (several tokens per round trip) the sweep shows no decode loss.

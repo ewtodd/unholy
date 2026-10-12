@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include "kernels/exl3_moe.hpp"
+#include "kernels/moe_dispatch.hpp"
 
 namespace unholy::kernels {
 
@@ -29,6 +30,11 @@ void mx_repack(uint8_t* w, uint8_t* s, int N, int K, uint8_t* tmp, hipStream_t s
 void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P,
                  int K, hipStream_t st);
 // hh[r] = bf16(fq8_128(bf16(silu(min(g, lim)) * clamp(u, +-lim) * w[r]))).
+// The same xa rows rebuilt from compact fp8 inputs (quant_remote_tokens): row r in [plan->remote0,
+// plan->P) whose expert is resident takes token p2u[r]'s codes and scale exponents. Bit-identical to
+// mx_xform_in on the pair rows those tokens would have been gathered into.
+void mx_xform_in_q(const uint8_t* q, const uint8_t* s, const int32_t* p2u, const MoePlan* plan,
+                   const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P, int K, hipStream_t st);
 void mx_swiglu(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert, const uint8_t* const* s_tab,
                bf16* hh, int P, int I, float limit, hipStream_t st);
 // out[r] = xa[r] @ W[e]^T for the rows of each tile (<= kExl3TileRows); K % 64 == 0, N % 128 == 0.

@@ -84,6 +84,14 @@ void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t
 void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
                           const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
                           int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st);
+// Native MXFP4 experts on compact fp8 inputs (kernels::quant_remote_tokens): rows [plan->remote0,
+// plan->P) rebuilt from their tokens' codes / scale exponents, then the same GEMMs as the pair-row path.
+// With u2p: the pair outputs stay in scratch and `out` gets one combined row per token
+// (kernels::remote_combine).
+void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint8_t* q, const uint8_t* s,
+                          const int32_t* p2u, const kernels::MoePlan* plan, const float* rw, const int32_t* row_expert,
+                          const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev, int P,
+                          const Exl3MoeScratch& sc, uint16_t* out, hipStream_t st, const int32_t* u2p = nullptr);
 // Tiles of <= 64 rows for each (expert, row0, cnt) run.
 std::vector<kernels::Exl3Tile> exl3_tiles(const std::vector<std::array<int, 3>>& runs);
 
@@ -139,6 +147,17 @@ class RemoteExperts {
   uint16_t* out_host = nullptr;
   int32_t* e_host = nullptr;  // expert of each pair row
   size_t capacity_rows = 0;
+  // Compact fp8 inputs instead of in_host (native MXFP4 experts, when quant_in()): codes [tokens, dim]
+  // and e8m0 scale exponents [tokens, dim / 128] of the tokens with remote pairs, and each remote pair
+  // row's index into them (p2u_host [capacity_rows]).
+  virtual bool quant_in() const { return false; }
+  // Combined outputs (with quant_in()): one bf16 row per token with remote pairs in out_host (the
+  // remote pairs' sum, kernels::remote_combine), u2p_host [tokens, K] says which pair rows to sum.
+  virtual bool combine_out() const { return false; }
+  int32_t* u2p_host = nullptr;
+  uint8_t* inq_host = nullptr;
+  uint8_t* ins_host = nullptr;
+  int32_t* p2u_host = nullptr;
 };
 
 // Optional per-layer routing histogram ([layer][expert] counts), filled when set.

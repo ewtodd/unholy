@@ -34,6 +34,8 @@ class ApuExperts final : public model::RemoteExperts {
   void add_layer(model::LayerWeights w);  // experts-only weights of one layer, on this device
   void run(int layer, const std::vector<Job>& jobs) override;
   bool can_enqueue() const override { return true; }
+  bool quant_in() const override { return quant_in_; }
+  bool combine_out() const override { return combine_out_; }
   void enqueue(int layer, hipStream_t card_st, int P) override;
   void join(hipStream_t card_st) override;
   int device() const { return dev_; }
@@ -55,6 +57,12 @@ class ApuExperts final : public model::RemoteExperts {
   uint16_t* in_dev_ = nullptr;
   float* w_dev_ = nullptr;
   uint16_t* out_dev_ = nullptr;
+  bool quant_in_ = true;  // UNHOLY_REMOTE_Q=0: bf16 pair rows (the pre-switch transport, for A/B checks)
+  bool combine_out_ = true;  // UNHOLY_REMOTE_COMBINE=0: pair rows back, summed on the card (bit-exact path)
+  int32_t* u2p_dev_ = nullptr;
+  uint8_t* inq_dev_ = nullptr;
+  uint8_t* ins_dev_ = nullptr;
+  int32_t* p2u_dev_ = nullptr;
 };
 
 class ResidentModel final : public StepModel {

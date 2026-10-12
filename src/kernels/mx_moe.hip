@@ -66,6 +66,16 @@ __global__ __launch_bounds__(128) void mx_xform_in_kernel(const bf16* x, int ldx
   xa[size_t(r) * K + seg * 128 + i] = f32_to_bf16(v);
 }
 
+__global__ __launch_bounds__(128) void mx_xform_in_q_kernel(const uint8_t* q, const uint8_t* s, const int32_t* p2u,
+                                                            const MoePlan* plan, const int32_t* row_expert,
+                                                            const uint8_t* const* s_tab, bf16* xa, int K) {
+  const int r = blockIdx.y, seg = blockIdx.x, i = threadIdx.x;
+  if (r < plan->remote0 || r >= plan->P || !s_tab[row_expert[r]]) return;  // uniform per block
+  const size_t u = size_t(p2u[r]);
+  const float v = round_bf16(e4m3_to_f32(q[u * K + seg * 128 + i]) * e8m0_to_f32(s[u * (K / 128) + seg]));
+  xa[size_t(r) * K + seg * 128 + i] = f32_to_bf16(v);
+}
+
 __global__ __launch_bounds__(128) void mx_swiglu_kernel(const bf16* g, const bf16* u, const float* w,
                                                         const int32_t* row_expert, const uint8_t* const* s_tab,
                                                         bf16* hh, int I, float limit) {
@@ -275,6 +285,13 @@ void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_
                  int K, hipStream_t st) {
   if (P <= 0) return;
   mx_xform_in_kernel<<<dim3(K / 128, P), 128, 0, st>>>(x, ldx, row_expert, s_tab, xa, K);
+  UH_CHECK_LAUNCH();
+}
+
+void mx_xform_in_q(const uint8_t* q, const uint8_t* s, const int32_t* p2u, const MoePlan* plan,
+                   const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P, int K, hipStream_t st) {
+  if (P <= 0) return;
+  mx_xform_in_q_kernel<<<dim3(K / 128, P), 128, 0, st>>>(q, s, p2u, plan, row_expert, s_tab, xa, K);
   UH_CHECK_LAUNCH();
 }
 
