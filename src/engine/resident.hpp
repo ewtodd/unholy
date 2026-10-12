@@ -16,6 +16,10 @@
 #include "model/dsv4.hpp"
 #include "model/forward_ref.hpp"
 
+namespace unholy::kernels {
+struct HcCanaryLog;
+}
+
 namespace unholy::engine {
 
 // The APU's cold experts as seen by one card: its own stream, flags, pinned staging and scratch, so
@@ -116,6 +120,8 @@ class ResidentModel final : public StepModel {
   Flight flight_[2];
   // Diagnostics (UNHOLY_CHECK_PTRS): the cards' per-layer weight pointers as loaded, verified per step.
   std::vector<std::vector<const void*>> ptr_snapshot_;
+  kernels::HcCanaryLog* canary_ = nullptr;  // UNHOLY_CANARY (host-mapped)
+  unsigned canary_seen_ = 0;
   uint64_t steps_ = 0;
   std::vector<const void*> layer_ptrs(int k) const;
   uint64_t next_ticket_ = 1;

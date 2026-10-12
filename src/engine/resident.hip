@@ -10,6 +10,7 @@
 
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
+#include "kernels/hc_fast.hpp"
 #include "kernels/ref.hpp"
 #include "model/loader.hpp"
 #include "rt/hip.hpp"
@@ -137,6 +138,11 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     for (auto& ch : chan_) ch = std::make_unique<ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers);
   }
   if (const char* v = std::getenv("UNHOLY_INFLIGHT")) inflight_ = std::clamp(std::atoi(v), 1, 2);
+  if (std::getenv("UNHOLY_CANARY")) {
+    UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&canary_), sizeof(*canary_), hipHostMallocPortable | hipHostMallocMapped));
+    std::memset(canary_, 0, sizeof(*canary_));
+    k::hc_set_canary(canary_);
+  }
   for (int k = 0; k < 2; ++k) card_arena_[k] = std::make_unique<rt::Arena>(plan.card[k], size_t(256) << 20);
   apu_arena_ = std::make_unique<rt::Arena>(plan.apu, size_t(256) << 20);
 
@@ -440,6 +446,20 @@ void ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {
   {
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventSynchronize(f.done));
+  }
+  if (canary_ && canary_->count != canary_seen_) {
+    const unsigned now = canary_->count;
+    for (unsigned i = canary_seen_; i < now && i < kernels::HcCanaryLog::kMax; ++i) {
+      const auto& e = canary_->ev[i];
+      std::fprintf(stderr,
+                   "canary: hc_pre_tiled load address %#lx, expected %#lx (xor %#lx) at k0 %u i %u; HW_ID1 %#x: SE %u SA %u "
+                   "WGP %u SIMD %u wave %u\n",
+                   (unsigned long)e.got, (unsigned long)e.want, (unsigned long)(e.got ^ e.want), e.where >> 16,
+                   e.where & 0xffff, e.hw_id1, (e.hw_id1 >> 18) & 7, (e.hw_id1 >> 16) & 1, (e.hw_id1 >> 10) & 15,
+                   (e.hw_id1 >> 8) & 3, e.hw_id1 & 31);
+    }
+    if (now > kernels::HcCanaryLog::kMax) std::fprintf(stderr, "canary: %u mismatches in all\n", now);
+    canary_seen_ = now;
   }
   out.resize(size_t(f.rows) * c_.vocab);
   std::memcpy(out.data(), f.logits_host, out.size() * 4);

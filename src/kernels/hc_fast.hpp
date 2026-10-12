@@ -14,4 +14,18 @@ void hc_pre_small(const bf16* x, const float* fn, const float* scale, const floa
                   hipStream_t st);
 constexpr int kHcSmallMaxTokens = 32;
 
+// Fault diagnostics (UNHOLY_CANARY): hc_pre_tiled checks the address of every weight load against one
+// recomputed from a second copy of the pointer passed at the end of the argument list. A mismatch (a
+// register that changed under the kernel) is recorded with the wave's hardware id (HW_ID1: SE / SA /
+// WGP / SIMD) and the load uses the recomputed address instead of faulting.
+struct HcCanaryLog {
+  static constexpr unsigned kMax = 64;
+  unsigned count, pad;
+  struct Event {
+    uint64_t got, want;
+    unsigned hw_id1, where;  // where: k0 << 16 | i
+  } ev[kMax];
+};
+void hc_set_canary(HcCanaryLog* log);
+
 }  // namespace unholy::kernels

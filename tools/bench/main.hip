@@ -5,7 +5,10 @@
 // time / aggregate rate. Token ids are drawn from --ids (a raw int32 file) or are random.
 //
 //   unholy-bench --model DIR [--exl3 DIR] --profile FILE [--batch 1,2,4,8] [--ctx 1024] [--chunk 1024]
-//                [--steps 16] [--ids FILE]
+//                [--steps 16] [--ids FILE] [--verify N]
+//
+// --verify N: every decode step gives each sequence N tokens with N logit rows (a speculative-decoding
+// verification step of N - 1 drafts), so the step time is what verifying N - 1 drafts costs.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -29,7 +32,7 @@ using namespace unholy;
 int main(int argc, char** argv) {
   std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path, hist_path;
   std::vector<int> batches = {1, 2, 4, 8};
-  int ctx = 1024, chunk = 1024, steps = 16;
+  int ctx = 1024, chunk = 1024, steps = 16, verify = 1;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
     if (a == "--model") model_dir = v;
@@ -40,6 +43,7 @@ int main(int argc, char** argv) {
     else if (a == "--ctx") ctx = std::stoi(v);
     else if (a == "--chunk") chunk = std::stoi(v);
     else if (a == "--steps") steps = std::stoi(v);
+    else if (a == "--verify") verify = std::stoi(v);
     else if (a == "--batch") {
       batches.clear();
       std::stringstream ss(v);
@@ -56,9 +60,9 @@ int main(int argc, char** argv) {
     const auto c = model::Dsv4Config::from_hf(ck->config());
     int max_b = 1;
     for (int b : batches) max_b = std::max(max_b, b);
-    const int max_seq = (ctx + steps + 1 + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
+    const int max_seq = (ctx + steps * verify + 1 + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
     model::CacheGeometry geo{max_b, max_seq / model::kPageTokens, max_b * (max_seq / model::kPageTokens)};
-    const int max_tokens = std::max(chunk, max_b);
+    const int max_tokens = std::max(chunk, max_b * verify);
     engine::PlanInput pin;
     pin.cfg = &c;
     pin.dense = ck.get();
@@ -67,10 +71,10 @@ int main(int argc, char** argv) {
     pin.geo = geo;
     pin.max_tokens = max_tokens;
     pin.max_seq = max_seq;
-    pin.max_logit_rows = max_b;
+    pin.max_logit_rows = max_b * verify;
     const auto plan = engine::make_plan(pin);
     std::printf("%s", plan.summary().c_str());
-    engine::ResidentModel m(c, *ck, xck.get(), plan, geo, max_tokens, max_seq, max_b);
+    engine::ResidentModel m(c, *ck, xck.get(), plan, geo, max_tokens, max_seq, max_b * verify);
     std::vector<int32_t> tables(size_t(geo.max_slots) * geo.max_pages_per_seq);
     for (size_t i = 0; i < tables.size(); ++i) tables[i] = int32_t(i);
     m.set_block_tables(tables);
@@ -127,10 +131,13 @@ int main(int argc, char** argv) {
       for (int st = 0; st < steps; ++st) {
         engine::StepInput in;
         for (int s = 0; s < B; ++s) {
-          in.chunks.push_back({s, ctx + st, 1, s});
-          in.ids.push_back(tok_at(s, ctx + st));
-          in.pos.push_back(ctx + st);
-          in.logit_rows.push_back(s);
+          const int p0 = ctx + st * verify;
+          in.chunks.push_back({s, p0, verify, s * verify});
+          for (int k = 0; k < verify; ++k) {
+            in.ids.push_back(tok_at(s, p0 + k));
+            in.pos.push_back(p0 + k);
+            in.logit_rows.push_back(s * verify + k);
+          }
         }
         const auto t0 = std::chrono::steady_clock::now();
         m.step(in, logits);
@@ -141,9 +148,9 @@ int main(int argc, char** argv) {
       for (size_t i = 1; i < ts.size(); ++i) mean += ts[i];  // drop the fastest as warm-up noise? keep median too
       mean /= double(ts.size() - 1);
       const double med = ts[ts.size() / 2];
-      std::printf("B=%d ctx=%d: prefill %.0f tok/s; decode step median %.1f ms (mean %.1f) -> %.1f tok/s/stream, "
-                  "%.1f tok/s aggregate\n",
-                  B, ctx, B * ctx / pre_s, med * 1e3, mean * 1e3, 1.0 / med, B / med);
+      std::printf("B=%d ctx=%d verify=%d: prefill %.0f tok/s; decode step median %.1f ms (mean %.1f) -> %.1f "
+                  "steps/s/stream, %.1f steps/s aggregate\n",
+                  B, ctx, verify, B * ctx / pre_s, med * 1e3, mean * 1e3, 1.0 / med, B / med);
       std::fflush(stdout);
     }
   } catch (const std::exception& e) {

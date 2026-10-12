@@ -2,8 +2,14 @@
 //
 //   unholy plan  ...the same options: print the placement for the geometry without loading anything
 //   unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]
-//                [--served-model-name NAME] [--max-slots N] [--max-seq N] [--num-pages N]
+//                [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]
 //                [--max-batch-tokens N] [--api-key KEY] [--http-threads N] [--max-tokens-default N]
+//
+// The KV cache is one pool of --kv-tokens positions (pages of 256) shared by all requests, as in vLLM:
+// a request takes pages as it grows, up to --max-model-len; --max-num-seqs caps the requests running at
+// once (each holds ~17 MB of fixed state: the attention window and compressor rings). When the pool
+// runs dry the newest request is preempted and recomputed later. Default pool: 2 x --max-model-len.
+// (--max-slots, --max-seq and --num-pages are the older names of the same three settings.)
 //
 // --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
@@ -34,16 +40,17 @@ namespace {
 int usage() {
   std::fprintf(stderr,
                "usage: unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]\n"
-               "                    [--served-model-name NAME] [--max-slots N] [--max-seq N] [--num-pages N]\n"
+               "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
                "                    [--max-tokens-default N] [--card-margin-gb G]\n");
   return 2;
 }
 
 int serve(int argc, char** argv, bool plan_only) {
-  std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_dsv4engine_code32k.txt";
+  std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
   server::ServerConfig scfg;
-  int max_slots = 4, max_seq = 65536, num_pages = 0, max_batch = 2048;
+  int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
+  long long kv_tokens = 0;
   double card_margin_gb = 3.0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -58,8 +65,9 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--api-key") scfg.api_key = v;
     else if (a == "--http-threads") scfg.threads = std::stoi(v);
     else if (a == "--max-tokens-default") scfg.default_max_tokens = std::stoi(v);
-    else if (a == "--max-slots") max_slots = std::stoi(v);
-    else if (a == "--max-seq") max_seq = std::stoi(v);
+    else if (a == "--max-num-seqs" || a == "--max-slots") max_slots = std::stoi(v);
+    else if (a == "--max-model-len" || a == "--max-seq") max_seq = std::stoi(v);
+    else if (a == "--kv-tokens") kv_tokens = std::stoll(v);
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
@@ -86,7 +94,8 @@ int serve(int argc, char** argv, bool plan_only) {
   model::CacheGeometry geo;
   geo.max_slots = max_slots;
   geo.max_pages_per_seq = max_seq / model::kPageTokens;
-  geo.num_pages = num_pages > 0 ? num_pages : max_slots * geo.max_pages_per_seq;
+  if (kv_tokens <= 0) kv_tokens = num_pages > 0 ? (long long)(num_pages) * model::kPageTokens : 2LL * max_seq;
+  geo.num_pages = int((kv_tokens + model::kPageTokens - 1) / model::kPageTokens);
 
   engine::PlanInput pin;
   pin.cfg = &c;
@@ -101,8 +110,10 @@ int serve(int argc, char** argv, bool plan_only) {
   // 1.5 GB the cards ended up ~300 MB from full and the driver faulted on weight pages.
   pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
   if (plan_only) {
-    std::printf("geometry: %d slots x %d tokens, %d pages; step %d tokens; experts %s\n", max_slots, max_seq,
-                geo.num_pages, max_batch, xck ? "EXL3" : "native (MXFP4)");
+    std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
+                "tokens; experts %s\n",
+                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, max_slots, max_batch,
+                xck ? "EXL3" : "native (MXFP4)");
     try {
       std::printf("%s", engine::make_plan(pin).summary().c_str());
     } catch (const std::exception& e) {
@@ -117,9 +128,9 @@ int serve(int argc, char** argv, bool plan_only) {
 
   const auto t0 = std::chrono::steady_clock::now();
   engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows);
-  std::printf("loaded in %.1f s; %d slots, context %d, %d pages of %d tokens\n",
-              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), max_slots, max_seq,
-              geo.num_pages, model::kPageTokens);
+  std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+              (long long)(geo.num_pages) * model::kPageTokens, max_seq, max_slots);
 
   engine::EngineConfig ecfg;
   ecfg.max_batch_tokens = max_batch;

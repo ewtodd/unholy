@@ -125,7 +125,8 @@ set_source_files_properties(tools/unholy/main.cpp PROPERTIES LANGUAGE HIP)
 target_compile_definitions(unholy PRIVATE UNHOLY_DATA_DIR="${CMAKE_INSTALL_PREFIX}/share/unholy")
 target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
 install(TARGETS unholy unholy-text-test unholy-sched-test RUNTIME DESTINATION bin)
-install(FILES data/expert_profile_dsv4engine_code32k.txt DESTINATION share/unholy)
+install(FILES data/expert_profile_dsv4engine_code32k.txt data/expert_profile_unholy_mixed.txt
+              data/expert_profile_unholy_code32k.txt DESTINATION share/unholy)
 
 add_executable(unholy-bench tools/bench/main.hip)
 target_link_libraries(unholy-bench PRIVATE unholy_engine)

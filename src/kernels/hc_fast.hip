@@ -20,7 +20,8 @@ __global__ __launch_bounds__(NT) void hc_pre_tiled_kernel(const bf16* __restrict
                                                           const float* __restrict__ base, bf16* __restrict__ y,
                                                           float* __restrict__ post_out, float* __restrict__ comb_out,
                                                           int T, int hc, int dim, int iters, float norm_eps,
-                                                          float hc_eps) {
+                                                          float hc_eps,
+                                                          uint64_t want_fn, HcCanaryLog* log) {
   __shared__ float sFn[MIX][KC];
   __shared__ float sMix[TB][MIX];
   __shared__ float sPre[TB][4];
@@ -34,7 +35,27 @@ __global__ __launch_bounds__(NT) void hc_pre_tiled_kernel(const bf16* __restrict
   for (int j = 0; j < MIX; ++j) acc[j] = 0.0f;
   float ss = 0.0f;
   for (int k0 = 0; k0 < width; k0 += KC) {
-    for (int i = tid; i < MIX * KC; i += NT) sFn[i / KC][i % KC] = fn[size_t(i / KC) * width + k0 + i % KC];
+    for (int i = tid; i < MIX * KC; i += NT) {
+      const size_t off = size_t(i / KC) * width + k0 + i % KC;
+      const float* p = fn + off;
+      if (log != nullptr) {
+        uint64_t got = reinterpret_cast<uint64_t>(p);
+        asm volatile("" : "+v"(got));  // the compiler may not fold the check into one on the arguments
+        const uint64_t want = want_fn + off * 4;
+        if (got != want) {
+          const unsigned n = __hip_atomic_fetch_add(&log->count, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          if (n < HcCanaryLog::kMax) {
+            log->ev[n].got = got;
+            log->ev[n].want = want;
+            log->ev[n].hw_id1 = __builtin_amdgcn_s_getreg((31 << 11) | 23);  // HW_REG_HW_ID1
+            log->ev[n].where = (unsigned(k0) << 16) | unsigned(i);
+          }
+          got = want;
+        }
+        p = reinterpret_cast<const float*>(got);
+      }
+      sFn[i / KC][i % KC] = *p;
+    }
     __syncthreads();
     if (valid)
       for (int kk = kl; kk < KC; kk += 16) {
@@ -229,11 +250,15 @@ __global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ 
 
 }  // namespace
 
+HcCanaryLog* g_canary = nullptr;
+
+void hc_set_canary(HcCanaryLog* log) { g_canary = log; }
+
 void hc_pre_tiled(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
                   float* comb, int T, int hc, int dim, int iters, float norm_eps, float hc_eps, hipStream_t st) {
   if (hc != 4 || (hc * dim) % KC) throw std::runtime_error("hc_pre_tiled: unsupported shape");
   hc_pre_tiled_kernel<<<(T + TB - 1) / TB, NT, 0, st>>>(x, fn, scale, base, y, post, comb, T, hc, dim, iters,
-                                                         norm_eps, hc_eps);
+                                                         norm_eps, hc_eps, reinterpret_cast<uint64_t>(fn), g_canary);
   UH_CHECK_LAUNCH();
 }
 
