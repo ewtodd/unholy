@@ -9,6 +9,9 @@
   pkg-config,
   pcre2,
   httplib,
+  libjpeg_turbo,
+  libpng,
+  libwebp,
   rocmSdk,
   rocmSdkCc,
   gpuTargets,
@@ -38,6 +41,9 @@ stdenv.mkDerivation {
   buildInputs = [
     pcre2
     httplib
+    libjpeg_turbo
+    libpng
+    libwebp
   ];
 
   cmakeFlags = [
@@ -57,7 +63,15 @@ stdenv.mkDerivation {
   # Linked by the SDK clang, not nix's ld wrapper: add the SDK and our own lib dir to the runpath.
   postFixup = ''
     for f in $out/bin/*; do
-      [ -L "$f" ] || patchelf --add-rpath ${rocmSdk}/lib:${lib.getLib pcre2}/lib:$out/lib "$f"
+      [ -L "$f" ] || patchelf --add-rpath ${
+        lib.makeLibraryPath [
+          rocmSdk
+          pcre2
+          libjpeg_turbo
+          libpng
+          libwebp
+        ]
+      }:$out/lib "$f"
     done
   '';
 

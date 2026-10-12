@@ -23,6 +23,9 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 # cpp-httplib, header-only, without TLS (its CMake config would pull in OpenSSL).
 pkg_check_modules(HTTPLIB REQUIRED IMPORTED_TARGET httplib)
+pkg_check_modules(TURBOJPEG REQUIRED IMPORTED_TARGET libturbojpeg)
+pkg_check_modules(LIBPNG REQUIRED IMPORTED_TARGET libpng)
+pkg_check_modules(LIBWEBP REQUIRED IMPORTED_TARGET libwebp)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 # therock-sdk-nix's clang wrapper appends its link flags to compile-only invocations too.
@@ -56,6 +59,13 @@ target_link_libraries(unholy_text PUBLIC PkgConfig::PCRE2)
 
 add_executable(unholy-text-test tools/text_test/main.cpp)
 target_link_libraries(unholy-text-test PRIVATE unholy_text)
+
+# Image preprocessing for the vision encoder (decode, PIL-exact resize, patches, token layout). No device code.
+add_library(unholy_vision STATIC src/vision/image.cpp)
+target_include_directories(unholy_vision PUBLIC src)
+target_link_libraries(unholy_vision PUBLIC PkgConfig::TURBOJPEG PkgConfig::LIBPNG PkgConfig::LIBWEBP)
+add_executable(unholy-vision-test tools/vision_test/main.cpp)
+target_link_libraries(unholy-vision-test PRIVATE unholy_vision unholy_text)
 
 # Scheduler / sampler: host-only, tested against a fake model.
 add_library(unholy_sched STATIC
@@ -125,7 +135,7 @@ add_executable(unholy tools/unholy/main.cpp)
 set_source_files_properties(tools/unholy/main.cpp PROPERTIES LANGUAGE HIP)
 target_compile_definitions(unholy PRIVATE UNHOLY_DATA_DIR="${CMAKE_INSTALL_PREFIX}/share/unholy")
 target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
-install(TARGETS unholy unholy-text-test unholy-sched-test RUNTIME DESTINATION bin)
+install(TARGETS unholy unholy-text-test unholy-sched-test unholy-vision-test RUNTIME DESTINATION bin)
 install(FILES data/expert_profile_dsv4engine_code32k.txt data/expert_profile_unholy_mixed.txt
               data/expert_profile_unholy_code32k.txt DESTINATION share/unholy)
 

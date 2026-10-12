@@ -80,7 +80,18 @@ int main(int argc, char** argv) {
           if (const Value* d = c.find("drop_thinking")) opt.drop_thinking = d->truthy();
           if (const Value* b = c.find("add_bos")) opt.add_bos = b->truthy();
           const Value* ctx = c.find("context");
-          out.push_back(Value(text::encode_messages(c.at("messages"), opt, ctx && !ctx->is_null() ? ctx : nullptr)));
+          std::vector<std::string> images;
+          const std::string prompt = text::encode_messages(c.at("messages"), opt, ctx && !ctx->is_null() ? ctx : nullptr, &images);
+          if (images.empty()) {
+            out.push_back(Value(prompt));
+          } else {  // with images: {"prompt", "images": [url, ...]}
+            Value r = Value::object();
+            r.set("prompt", Value(prompt));
+            Value urls = Value::array();
+            for (auto& u : images) urls.push_back(Value(std::move(u)));
+            r.set("images", std::move(urls));
+            out.push_back(std::move(r));
+          }
         } catch (const std::exception& e) {
           out.push_back(error_value(e));
         }

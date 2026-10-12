@@ -61,6 +61,31 @@ TOOLS = [
 ]
 
 
+def rand_image(rng):
+    r = rng.random()
+    if r < 0.4:
+        return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + rng.choice(["iVBORw0KGgo=", "AAAA", "/9j/4AAQ"])}}
+    if r < 0.6:
+        return {"type": "image_url", "image_url": "data:image/jpeg;base64,/9j/4AAQSkZJRg=="}
+    return {"type": "image", "source": {"type": "base64", "media_type": rng.choice(["image/jpeg", "image/webp"]),
+                                        "data": rng.choice(["UklGRg==", "/9j/"])}}
+
+
+def image_urls(records):
+    """The reference's image records as the URLs our encoder returns."""
+    out = []
+    for r in records:
+        if r.get("url"):
+            out.append(r["url"])
+        elif isinstance(r.get("source"), dict) and r["source"].get("data") is not None:
+            out.append("data:" + r["source"].get("media_type", "image") + ";base64," + r["source"]["data"])
+        elif isinstance(r.get("source"), dict):
+            out.append(r["source"].get("url"))
+        else:
+            out.append("data:image;base64," + r["data"])
+    return out
+
+
 def rand_message(rng, role, call_ids):
     m = {"role": role}
     if role == "system":
@@ -77,6 +102,9 @@ def rand_message(rng, role, call_ids):
         r = rng.random()
         if r < 0.15:
             m["content"] = [{"type": "text", "text": rng.choice(TEXTS)} for _ in range(rng.randint(1, 3))]
+        elif r < 0.3:  # text and images interleaved
+            m["content"] = [rand_image(rng) if rng.random() < 0.5 else {"type": "text", "text": rng.choice(TEXTS)}
+                            for _ in range(rng.randint(1, 4))]
         else:
             m["content"] = rng.choice(TEXTS)
         if rng.random() < 0.05:
@@ -99,7 +127,8 @@ def rand_message(rng, role, call_ids):
             m["wo_eos"] = True
     elif role == "tool":
         m["tool_call_id"] = rng.choice(call_ids) if call_ids and rng.random() < 0.9 else "unknown"
-        m["content"] = rng.choice(TEXTS + [[{"type": "text", "text": "a"}, {"type": "other"}]])
+        m["content"] = rng.choice(TEXTS + [[{"type": "text", "text": "a"}, {"type": "other"}],
+                                           [{"type": "text", "text": "screenshot:"}, rand_image(rng)]])
     elif role == "latest_reminder":
         m["content"] = "2026-10-11,星期日"
     return m
@@ -190,7 +219,9 @@ def main():
             skipped += 1
             continue
         try:
-            w = E.encode_messages(copy.deepcopy(msgs), context=copy.deepcopy(ctx), **opt)
+            w, media = E.encode_messages(copy.deepcopy(msgs), context=copy.deepcopy(ctx), return_multi_modal_data=True, **opt)
+            if media["images"]:
+                w = {"prompt": w, "images": image_urls(media["images"])}
         except Exception as e:  # the reference rejects it; we only require that we do not crash
             w = {"error": repr(e)}
         cases.append({"messages": msgs, "context": ctx, **opt})
@@ -198,15 +229,16 @@ def main():
     got = run(args.tool, "chat", cases)
     bad = rejected = 0
     for c, g, w in zip(cases, got, want):
-        if isinstance(w, dict):
+        if isinstance(w, dict) and "error" in w:
             rejected += 1
             continue
         if g != w:
             bad += 1
             if bad <= 5:
-                k = next((i for i in range(min(len(str(g)), len(w))) if str(g)[i] != w[i]), 0)
+                gs, ws = json.dumps(g, ensure_ascii=False), json.dumps(w, ensure_ascii=False)
+                k = next((i for i in range(min(len(gs), len(ws))) if gs[i] != ws[i]), 0)
                 print(f"RANDOM differs at {k}:\n  case {json.dumps(c, ensure_ascii=False)[:600]}\n"
-                      f"  ours {str(g)[max(0, k - 80):k + 120]!r}\n  want {w[max(0, k - 80):k + 120]!r}")
+                      f"  ours {gs[max(0, k - 80):k + 120]!r}\n  want {ws[max(0, k - 80):k + 120]!r}")
     print(f"random: {len(cases) - rejected - bad}/{len(cases) - rejected} identical "
           f"({rejected} rejected by the reference, {skipped} cases with deliberate (vLLM) differences skipped)")
     failures += bad

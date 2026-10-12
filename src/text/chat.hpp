@@ -38,13 +38,16 @@ struct EncodeOptions {
 
 // messages / context: JSON arrays of messages (roles system, developer, user, assistant, tool,
 // latest_reminder). Throws ChatError on input the reference rejects.
+// Image content blocks become the image placeholder token; their URLs (base64 sources as data: URLs)
+// are appended to `images` in prompt order.
 std::string encode_messages(const json::Value& messages, const EncodeOptions& opt,
-                            const json::Value* context = nullptr);
+                            const json::Value* context = nullptr, std::vector<std::string>* images = nullptr);
 
 // An OpenAI chat-completions request body, interpreted as vLLM does for DeepSeek-V4.
 struct RenderedChat {
   std::string prompt;
   bool thinking = false;  // the completion starts inside <think>
+  std::vector<std::string> images;  // image URLs, one per placeholder token in the prompt, in order
 };
 RenderedChat render_request(const json::Value& request);
 

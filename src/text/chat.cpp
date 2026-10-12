@@ -275,9 +275,53 @@ std::string render_message(size_t index, const std::vector<Value>& msgs, bool th
   return prompt;
 }
 
-// Content lists -> content_blocks (and a "\n\n"-joined text content), as process_image_messages does
-// for the text path. Images are rejected until the vision tower lands.
-std::vector<Value> preprocess(const Value& messages) {
+// Image blocks -> text blocks holding the placeholder token, collecting each image's URL in order
+// (_process_image_blocks, recursing into tool results). Anthropic-style base64 sources become data URLs.
+Value replace_images(const Value& blocks, std::vector<std::string>* images) {
+  Value out = Value::array();
+  for (const Value& b : blocks.items()) {
+    if (!b.is_object()) {
+      out.push_back(b);
+      continue;
+    }
+    const std::string type = b.get_str("type");
+    if (type == "image" || type == "image_url") {
+      std::string url;
+      if (type == "image_url") {
+        const Value& iu = member(b, "image_url");
+        url = iu.is_string() ? iu.str() : member(iu, "url").is_string() ? member(iu, "url").str() : "";
+      } else if (const Value& src = member(b, "source"); src.is_object()) {
+        if (member(src, "data").is_string())
+          url = "data:" + (member(src, "media_type").is_string() ? member(src, "media_type").str() : std::string("image")) +
+                ";base64," + member(src, "data").str();
+        else if (member(src, "url").is_string())
+          url = member(src, "url").str();
+      } else if (member(b, "url").is_string()) {
+        url = member(b, "url").str();
+      } else if (member(b, "data").is_string()) {
+        url = "data:image;base64," + member(b, "data").str();
+      }
+      if (url.empty()) throw ChatError("Image block does not contain a valid source");
+      Value t = Value::object();
+      t.set("type", "text");
+      t.set("text", Value(std::string(kImage)));
+      out.push_back(std::move(t));
+      if (images) images->push_back(std::move(url));
+    } else if (type == "tool_result" && member(b, "content").is_array()) {
+      Value nb = b;
+      nb.set("content", replace_images(member(b, "content"), images));
+      out.push_back(std::move(nb));
+    } else {
+      if (type == "text" && b.get_str("text").find(kImage) != std::string::npos)
+        throw ChatError("text block contains the image placeholder token");
+      out.push_back(b);
+    }
+  }
+  return out;
+}
+
+// Content lists -> content_blocks (and a "\n\n"-joined text content), as process_image_messages does.
+std::vector<Value> preprocess(const Value& messages, std::vector<std::string>* images) {
   if (!messages.is_array()) throw ChatError("messages must be an array");
   std::vector<Value> out;
   for (const Value& m0 : messages.items()) {
@@ -291,20 +335,13 @@ std::vector<Value> preprocess(const Value& messages) {
       m.erase("content");
       m.set("content_blocks", std::move(blocks));
     }
-    if (const Value* blocks = m.find("content_blocks"); blocks && blocks->truthy()) {
+    if (const Value* b0 = m.find("content_blocks"); b0 && b0->truthy()) {
+      Value replaced = replace_images(*b0, images);
+      m.set("content_blocks", std::move(replaced));
+      const Value* blocks = m.find("content_blocks");
       std::string text;
       bool first = true;
-      const auto check = [](const Value& b) {
-        const std::string type = b.get_str("type");
-        if (type == "image" || type == "image_url") throw ChatError("image inputs are not supported yet");
-        if (type == "text" && b.get_str("text").find(kImage) != std::string::npos)
-          throw ChatError("text block contains the image placeholder token");
-      };
       for (const Value& b : blocks->items()) {
-        check(b);
-        if (b.get_str("type") == "tool_result")
-          if (const Value* tc = b.find("content"); tc && tc->is_array())
-            for (const Value& nb : tc->items()) check(nb);
         if (b.get_str("type") == "text") {
           if (!first) text += "\n\n";
           first = false;
@@ -415,10 +452,12 @@ std::vector<Value> drop_thinking_messages(const std::vector<Value>& msgs) {
 
 }  // namespace
 
-std::string encode_messages(const Value& messages_in, const EncodeOptions& opt, const Value* context_in) {
-  std::vector<Value> messages = merge_tool_messages(preprocess(messages_in));
+std::string encode_messages(const Value& messages_in, const EncodeOptions& opt, const Value* context_in,
+                            std::vector<std::string>* images) {
+  std::vector<Value> messages = merge_tool_messages(preprocess(messages_in, images));
   std::vector<Value> context;
-  if (context_in && context_in->truthy()) context = merge_tool_messages(preprocess(*context_in));
+  // The context's images are not returned (as in the reference).
+  if (context_in && context_in->truthy()) context = merge_tool_messages(preprocess(*context_in, nullptr));
 
   std::vector<Value> full = context;
   full.insert(full.end(), messages.begin(), messages.end());
@@ -482,7 +521,10 @@ RenderedChat render_request(const Value& req) {
   }
   opt.thinking = thinking;
   if (const Value* d = kwargs.find("drop_thinking")) opt.drop_thinking = d->truthy();
-  return {encode_messages(messages, opt), thinking};
+  RenderedChat r;
+  r.prompt = encode_messages(messages, opt, nullptr, &r.images);
+  r.thinking = thinking;
+  return r;
 }
 
 // ---- completion parsing -------------------------------------------------------------------------
