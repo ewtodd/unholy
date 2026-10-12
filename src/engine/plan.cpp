@@ -129,7 +129,8 @@ Plan make_plan(const PlanInput& in) {
                     (k == 1 ? size_t(in.max_logit_rows > 0 ? in.max_logit_rows : in.max_tokens) * c.vocab * 4 +
                                   size_t(in.max_tokens) * c.dim * 6
                             : 0) +
-                    size_t(in.max_tokens) * c.hc_mult * c.dim * 2;
+                    size_t(in.max_tokens) * c.hc_mult * c.dim * 2 +
+                    model::rope_table_bytes(c, in.max_seq + 128);  // as ResidentModel allocates them
     const size_t used = pl.dense[k] + pl.cache[k] + pl.scratch[k] + in.card_margin;
     const size_t free = info(pl.card[k]).free_bytes;
     if (used > free) throw std::runtime_error("plan: card " + std::to_string(k) + " cannot hold its dense layers");

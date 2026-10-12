@@ -132,5 +132,7 @@ struct RopeTables {
   int max_pos = 0;
 };
 RopeTables make_rope_tables(const Dsv4Config& c, int dev, int max_pos);
+// Device bytes of make_rope_tables (two fp32 tables of rope_dim values per position).
+inline size_t rope_table_bytes(const Dsv4Config& c, int max_pos) { return 2 * size_t(max_pos) * c.rope_dim * 4; }
 
 }  // namespace unholy::model
