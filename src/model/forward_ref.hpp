@@ -93,6 +93,7 @@ struct MoeDispatchScratch {
 
 struct Scratch {
   int max_tokens = 0, max_keys = 0;
+  rt::DeviceBuffer route_hist;  // uint32 [n_layers][n_experts]: pairs routed per expert, running total
   std::vector<rt::DeviceBuffer> bufs;
   ExpertScratch expert;
   Exl3MoeScratch exl3;

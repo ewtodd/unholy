@@ -17,7 +17,8 @@ struct MoePlan {
   int n_remote_tiles;  // tiles in remote_tiles
 };
 
-void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st);
+// count[e] = pairs routed to e; also accumulated into hist[e] (a running routing histogram) if given.
+void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st, uint32_t* hist = nullptr);
 // `resident` [E]: 1 = this device holds the expert. Also clears `fill`.
 void moe_plan(const int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
               Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st);

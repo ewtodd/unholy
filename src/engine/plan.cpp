@@ -51,6 +51,16 @@ UsageProfile load_usage_profile(const std::string& path, int n_layers, int n_exp
   return u;
 }
 
+std::string format_usage_profile(const std::vector<std::vector<uint64_t>>& counts) {
+  std::string s;
+  for (size_t L = 0; L < counts.size(); ++L) {
+    s += "L" + std::to_string(L);
+    for (const uint64_t v : counts[L]) s += " " + std::to_string(v);
+    s += "\n";
+  }
+  return s;
+}
+
 size_t expert_bytes(const model::Checkpoint& ck, int layer, int expert, bool exl3) {
   const std::string p = "layers." + std::to_string(layer) + ".ffn.experts." + std::to_string(expert) + ".";
   size_t b = 0;
@@ -116,7 +126,9 @@ Plan make_plan(const PlanInput& in) {
   for (int k = 0; k < 2; ++k) {
     // Scratch, plus a logits buffer on the head card.
     pl.scratch[k] = model::scratch_bytes(c, in.max_tokens, in.max_seq) +
-                    (k == 1 ? size_t(in.max_tokens) * c.vocab * 4 + size_t(in.max_tokens) * c.dim * 6 : 0) +
+                    (k == 1 ? size_t(in.max_logit_rows > 0 ? in.max_logit_rows : in.max_tokens) * c.vocab * 4 +
+                                  size_t(in.max_tokens) * c.dim * 6
+                            : 0) +
                     size_t(in.max_tokens) * c.hc_mult * c.dim * 2;
     const size_t used = pl.dense[k] + pl.cache[k] + pl.scratch[k] + in.card_margin;
     const size_t free = info(pl.card[k]).free_bytes;

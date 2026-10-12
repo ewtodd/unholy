@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -26,7 +27,7 @@
 using namespace unholy;
 
 int main(int argc, char** argv) {
-  std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path;
+  std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path, hist_path;
   std::vector<int> batches = {1, 2, 4, 8};
   int ctx = 1024, chunk = 1024, steps = 16;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -35,6 +36,7 @@ int main(int argc, char** argv) {
     else if (a == "--exl3") exl3_dir = v;
     else if (a == "--profile") profile = v;
     else if (a == "--ids") ids_path = v;
+    else if (a == "--hist") hist_path = v;  // routing histogram of the prefills -> FILE (profile format)
     else if (a == "--ctx") ctx = std::stoi(v);
     else if (a == "--chunk") chunk = std::stoi(v);
     else if (a == "--steps") steps = std::stoi(v);
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
     pin.geo = geo;
     pin.max_tokens = max_tokens;
     pin.max_seq = max_seq;
+    pin.max_logit_rows = max_b;
     const auto plan = engine::make_plan(pin);
     std::printf("%s", plan.summary().c_str());
     engine::ResidentModel m(c, *ck, xck.get(), plan, geo, max_tokens, max_seq, max_b);
@@ -84,9 +87,13 @@ int main(int argc, char** argv) {
       return int32_t(1000 + rng() % 100000);
     };
     std::vector<float> logits;
+    std::vector<std::vector<uint64_t>> hist;
+    if (!hist_path.empty()) model::set_expert_histogram(&hist);
     for (const int B : batches) {
-      // Prefill.
-      double pre_s = 0;
+      // Prefill: chunks of a sequence are submitted ahead (up to the model's in-flight depth); stream
+      // order keeps each chunk after the one before it on every card.
+      const auto tp = std::chrono::steady_clock::now();
+      std::deque<uint64_t> flying;
       for (int s = 0; s < B; ++s)
         for (int p0 = 0; p0 < ctx; p0 += chunk) {
           const int n = std::min(chunk, ctx - p0);
@@ -97,10 +104,24 @@ int main(int argc, char** argv) {
             in.pos.push_back(p0 + k);
           }
           if (p0 + n == ctx) in.logit_rows = {n - 1};
-          const auto t0 = std::chrono::steady_clock::now();
-          m.step(in, logits);
-          pre_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          if (int(flying.size()) >= m.max_inflight()) {
+            m.wait(flying.front(), logits);
+            flying.pop_front();
+          }
+          flying.push_back(m.submit(in));
         }
+      for (; !flying.empty(); flying.pop_front()) m.wait(flying.front(), logits);
+      const double pre_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count();
+      if (!hist_path.empty()) {
+        model::set_expert_histogram(nullptr);
+        std::ofstream f(hist_path);
+        for (size_t L = 0; L < hist.size(); ++L) {
+          f << "L" << L;
+          for (const uint64_t v : hist[L]) f << " " << v;
+          f << "\n";
+        }
+        hist_path.clear();
+      }
       // Decode.
       std::vector<double> ts;
       for (int st = 0; st < steps; ++st) {

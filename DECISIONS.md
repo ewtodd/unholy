@@ -389,3 +389,54 @@ N x keys x 4 bytes (2 GB at 512k).
   2.1 s (~22 TOPS: the per-element scaling/epilogue dominates), EXL3 GEMM 2.0 s on the cards and 3.2 s
   on the APU (now on the critical path: 1.5 s of card waits), remote-row copies 0.95 s, sparse
   attention 0.73 s (HCA: one block per query re-reads every compressed row).
+
+## 2026-10-11 — routing profile from our own traffic; EXL3 grouped GEMM v2
+
+- The placement profile inherited from dsv4-engine (`data/expert_profile_dsv4engine_code32k.txt`)
+  matches this model's routing only in the early layers: per-layer correlation with our own histogram
+  of the same code prompt is 0.88-1.0 for layers 0-12 and 0.13-0.49 from layer 16 on. With it, a
+  4096-token prefill chunk sent 11-50% of a layer's pairs to the APU (planner prediction: 7%) — the
+  copies and the APU's GEMMs were on the critical path. Our histogram's top-128 experts per layer hold
+  86% of the routing mass vs 75% for the old profile's top-128.
+- The device MoE count now also accumulates a running per-layer histogram (one more atomic per pair,
+  no extra launch); `unholy serve` exposes it at GET /unholy/routing_profile (profile format) with
+  POST /unholy/routing_profile/reset, and `tools/ref/routing_workload.py` drives a mixed workload
+  (code, math, English/Chinese/other-language writing, tool calls, long documents, thinking on/off)
+  through a server to produce the profile the planner should use.
+- EXL3 grouped GEMM v2 (prefill): 128-row tiles (an expert's weights are decoded once per step for
+  up to 128 rows instead of once per 64), each wave decodes exactly the 16-column trellis slice it
+  multiplies into wave-private LDS (no block barrier for B), a lane decodes its 8 consecutive trellis
+  steps from three words with funnel shifts and the mul1 byte sum is one `v_dot4_u32_u8`, next-slab
+  loads are in flight during the current slab. Same k-step order and epilogue as v1: outputs
+  bit-identical on gfx1201 and gfx1151 (`unholy-exl3-gemm-test`); 3.1-4x faster (~300 G weights/s,
+  44 TFLOPS on a shared card). The decode-path GEMV uses the same lane decode (agrees with the GEMM to
+  rel L2 1e-4; it sums in a different order).
+
+## 2026-10-11 — two steps in flight (card pipelining)
+
+`StepModel` is asynchronous (submit -> ticket, wait in order, up to max_inflight). The resident model
+keeps two steps in flight: card 0 runs step k + 1 while card 1 finishes step k. Each in-flight step
+has its own pinned staging (ids/positions/logit rows, block tables, the card 0 -> 1 residual, logits)
+and three events (residual written, residual consumed, logits ready); block tables are uploaded on the
+card streams with the next step instead of synchronously; each card has its own channel to the APU
+experts (stream, flags, pinned staging, scratch; weights shared), so both cards can have expert work
+on the APU at once. Stream order keeps every step after the ones submitted before it, so consecutive
+prefill chunks of one sequence overlap safely. The engine plans only sequences that are not waiting
+for logits, advances positions at submission, preempts only sequences with nothing in flight, and
+defers aborts of in-flight sequences to their step's completion (fake-model scheduler test at depth 1
+and 2: all outputs identical, no leaks). UNHOLY_INFLIGHT=1 restores one step at a time.
+
+Measured (16k context, 4096-token chunks, mixed-traffic profile, EXL3 GEMM v2): prefill 1087 tok/s
+one step at a time, 1680 tok/s with two in flight (679 tok/s earlier today with v1 and the old
+profile); single-stream decode 53.4 ms/token (18.7 tok/s).
+
+Full-model KL vs the oracle moves with placement (old profile 2.445e-2, mixed profile 2.833e-2) but
+per-layer errors are the same on a card and on the APU (layer 5: 3.255e-2 vs 3.262e-2, layer 16
+3.727e-2 vs 3.701e-2, layer 30 1.842e-2 both) and the grouped GEMM agrees across gfx1201/gfx1151 to
+bf16 rounding: the spread is accumulation-order noise amplified through 43 layers of fp8 activation
+quantization. Single-prompt KL numbers need averaging (several prompts/perturbations) before they
+can rank quantizations.
+
+`unholy plan` prints the placement for a geometry without loading. With the mixed profile and bf16
+KV: native MXFP4 experts at 4 x 512k fit (APU 109 GB of 129.5 GB free; 52.8% of routing on the cards;
+1 x 512k: 59.7%); EXL3 3.04 bpw at 4 x 512k: 63.9%. fp8 KV storage would free ~6 GB more on the cards.

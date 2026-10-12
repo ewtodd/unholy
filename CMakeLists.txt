@@ -131,3 +131,6 @@ target_link_libraries(unholy-bench PRIVATE unholy_engine)
 
 add_executable(unholy-indexer-test tools/kernel_test/indexer.hip)
 target_link_libraries(unholy-indexer-test PRIVATE unholy_ref)
+
+add_executable(unholy-exl3-gemm-test tools/kernel_test/exl3_gemm.hip)
+target_link_libraries(unholy-exl3-gemm-test PRIVATE unholy_ref)

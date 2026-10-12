@@ -30,6 +30,8 @@ std::vector<DeviceInfo> query_devices();
 using UsageProfile = std::vector<std::vector<double>>;
 // "L<n> c0 c1 ... c255" lines (dsv4-engine's expert_profile.txt format, and ours).
 UsageProfile load_usage_profile(const std::string& path, int n_layers, int n_experts);
+// Counts [layer][expert] in that format.
+std::string format_usage_profile(const std::vector<std::vector<uint64_t>>& counts);
 
 struct PlanInput {
   const model::Dsv4Config* cfg = nullptr;
@@ -38,6 +40,7 @@ struct PlanInput {
   UsageProfile usage;
   model::CacheGeometry geo;
   int max_tokens = 0, max_seq = 0;
+  int max_logit_rows = 0;  // rows of logits a step returns (0: max_tokens)
   size_t card_margin = size_t(1536) << 20;  // runtime, fragmentation, HIP's own allocations
   size_t apu_margin = size_t(4) << 30;
 };

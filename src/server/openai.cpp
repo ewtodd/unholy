@@ -659,6 +659,16 @@ struct OpenAIServer::Impl {
                b.set("prompt", Value(text::sanitize_utf8(tok.decode(ids))));
                send_json(res, b);
              }));
+    for (const auto& [path, fn] : cfg.extra_get)
+      svr.Get(path, wrap([this, fn](const httplib::Request& req, httplib::Response& res) {
+                check_auth(req);
+                res.set_content(fn(), "text/plain");
+              }));
+    for (const auto& [path, fn] : cfg.extra_post)
+      svr.Post(path, wrap([this, fn](const httplib::Request& req, httplib::Response& res) {
+                 check_auth(req);
+                 res.set_content(fn(), "text/plain");
+               }));
     svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
       const auto s = eng.stats();
       char buf[1024];

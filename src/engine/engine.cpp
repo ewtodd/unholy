@@ -24,12 +24,15 @@ struct Engine::Seq {
   Sampler sampler;
   std::vector<int32_t> tokens;  // prompt + generated
   int n_prompt = 0;
-  int computed = 0;             // positions whose cache is valid
+  int computed = 0;             // positions submitted to the model (cache valid once their steps complete)
   int slot = -1;
   std::vector<int32_t> pages;   // logical page -> physical page
   uint64_t admitted = 0;
   GenOutput out;                // pending delivery
   bool done = false;
+  int inflight = 0;             // submitted steps that include this sequence and have not completed
+  bool awaiting_logits = false; // one of them samples its next token
+  bool abort_pending = false;   // aborted while in flight: finished when the last such step completes
 
   Seq(uint64_t id_, GenRequest r, Sink s, uint64_t seed)
       : id(id_), req(std::move(r)), sink(std::move(s)), sampler(req.sampling, seed) {}
@@ -60,6 +63,13 @@ Engine::~Engine() {
   }
   cv_.notify_all();
   if (thread_.joinable()) thread_.join();
+  while (!inflight_.empty()) {
+    try {
+      model_.wait(inflight_.front().ticket, logits_);
+    } catch (const std::exception&) {
+    }
+    inflight_.pop_front();
+  }
   for (auto& s : incoming_) finish(*s, FinishReason::Abort);
   for (auto& s : waiting_) finish(*s, FinishReason::Abort);
   for (auto& s : running_) finish(*s, FinishReason::Abort);
@@ -156,8 +166,12 @@ void Engine::intake() {
       }
     for (auto it = running_.begin(); it != running_.end(); ++it)
       if ((*it)->id == id) {
-        finish(**it, FinishReason::Abort);
-        running_.erase(it);
+        if ((*it)->inflight > 0) {
+          (*it)->abort_pending = true;  // its step still uses the slot's state; finish on completion
+        } else {
+          finish(**it, FinishReason::Abort);
+          running_.erase(it);
+        }
         break;
       }
   }
@@ -181,7 +195,7 @@ bool Engine::iterate() {
     running_.push_back(std::move(waiting_.front()));
     waiting_.pop_front();
   }
-  if (running_.empty()) {
+  if (running_.empty() && inflight_.empty()) {
     if (!waiting_.empty()) {
       // Nothing runs and the head does not fit an empty pool: it never will.
       finish(*waiting_.front(), FinishReason::Error, "request does not fit the page pool");
@@ -190,26 +204,39 @@ bool Engine::iterate() {
     }
     return false;
   }
+  const bool submitted = int(inflight_.size()) < model_.max_inflight() && submit_step(budget0);
+  bool completed = false;
+  if (!inflight_.empty() && (int(inflight_.size()) >= model_.max_inflight() || !submitted)) {
+    complete_step();
+    completed = true;
+  }
+  const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+  std::lock_guard lk(stats_mu_);
+  stats_.busy_seconds += dt;
+  stats_.running = int(running_.size());
+  stats_.waiting = int(waiting_.size());
+  stats_.free_pages = int(free_pages_.size());
+  return submitted || completed;
+}
 
-  // Plan: decoding sequences first (one token each), then prefill chunks in admission order.
-  struct Item {
-    Seq* s;
-    int n;
-    bool logits;
-  };
-  std::vector<Item> plan;
+// Plans and submits one step over the sequences that are not waiting for logits: decoding sequences
+// first (one token each), then prefill chunks in admission order. Returns false if nothing was
+// submitted.
+bool Engine::submit_step(int budget0) {
+  std::vector<InFlight::Item> plan;
   const auto build = [&]() {
     plan.clear();
     int budget = budget0, logit_rows = model_.max_logit_rows();
     for (int pass = 0; pass < 2; ++pass)
       for (auto& sp : running_) {
         Seq& s = *sp;
+        if (s.awaiting_logits || s.abort_pending || s.done) continue;
         const int remaining = int(s.tokens.size()) - s.computed;
-        if ((remaining == 1) != (pass == 0) || budget == 0) continue;
+        if (remaining <= 0 || (remaining == 1) != (pass == 0) || budget == 0) continue;
         const int n = std::min(remaining, budget);
         const bool logits = n == remaining;
         if (logits && logit_rows == 0) continue;
-        plan.push_back({&s, n, logits});
+        plan.push_back({&s, n, logits, -1});
         budget -= n;
         logit_rows -= logits;
       }
@@ -217,28 +244,34 @@ bool Engine::iterate() {
   for (;;) {
     build();
     size_t need = 0;
-    for (const Item& it : plan) {
+    for (const auto& it : plan) {
       const size_t want = size_t((it.s->computed + it.n + page_tokens_ - 1) / page_tokens_);
       need += want > it.s->pages.size() ? want - it.s->pages.size() : 0;
     }
     if (need <= free_pages_.size()) break;
-    // Preempt the most recently admitted request and plan again.
-    auto victim = std::max_element(running_.begin(), running_.end(),
-                                   [](const auto& a, const auto& b) { return a->admitted < b->admitted; });
-    if (running_.size() == 1) {
+    // Preempt the most recently admitted request with nothing in flight and plan again; if every
+    // candidate is in flight, let those steps complete first.
+    auto victim = running_.end();
+    for (auto it = running_.begin(); it != running_.end(); ++it)
+      if ((*it)->inflight == 0 && (victim == running_.end() || (*it)->admitted > (*victim)->admitted)) victim = it;
+    if (victim == running_.end()) return false;
+    if (running_.size() == 1 && inflight_.empty()) {
       finish(**victim, FinishReason::Error, "request does not fit the page pool");
       running_.clear();
-      return true;
+      return false;
     }
-    preempt(**victim);
-    waiting_.push_front(std::move(*victim));
-    running_.erase(victim);
+    if (inflight_.empty() || running_.size() > 1) {
+      preempt(**victim);
+      waiting_.push_front(std::move(*victim));
+      running_.erase(victim);
+    } else {
+      return false;
+    }
   }
   if (plan.empty()) return false;
 
   StepInput in;
-  std::vector<std::pair<Seq*, int>> sampled;  // (seq, logit row index)
-  for (const Item& it : plan) {
+  for (auto& it : plan) {
     Seq& s = *it.s;
     if (!alloc_pages(s, s.computed + it.n)) throw std::logic_error("engine: page accounting");
     const int t0 = int(in.ids.size());
@@ -248,7 +281,7 @@ bool Engine::iterate() {
       in.pos.push_back(s.computed + k);
     }
     if (it.logits) {
-      sampled.emplace_back(&s, int(in.logit_rows.size()));
+      it.row = int(in.logit_rows.size());
       in.logit_rows.push_back(t0 + it.n - 1);
     }
   }
@@ -256,24 +289,42 @@ bool Engine::iterate() {
     model_.set_block_tables(tables_);
     tables_dirty_ = false;
   }
+  uint64_t ticket = 0;
   try {
-    model_.step(in, logits_);
+    ticket = model_.submit(in);
   } catch (const std::exception& e) {
-    // A failed step leaves the device state unknown: fail everything that was running.
-    for (auto& s : running_) finish(*s, FinishReason::Error, std::string("step failed: ") + e.what());
-    running_.clear();
-    return true;
+    fail_all(std::string("step failed: ") + e.what());
+    return false;
   }
-
-  int prefill = 0, decode = 0;
-  for (const Item& it : plan) {
+  for (auto& it : plan) {
     it.s->computed += it.n;
-    (it.n == 1 && it.logits ? decode : prefill) += it.n;
+    ++it.s->inflight;
+    it.s->awaiting_logits |= it.logits;
   }
+  inflight_.push_back({ticket, std::move(plan)});
+  return true;
+}
+
+// Waits for the oldest submitted step, samples the sequences it ends, delivers their tokens.
+void Engine::complete_step() {
+  InFlight f = std::move(inflight_.front());
+  inflight_.pop_front();
+  try {
+    model_.wait(f.ticket, logits_);
+  } catch (const std::exception& e) {
+    fail_all(std::string("step failed: ") + e.what());
+    return;
+  }
+  int prefill = 0, decode = 0;
   const int V = model_.vocab();
-  for (const auto& [sp, r] : sampled) {
-    Seq& s = *sp;
-    const Sampled smp = s.sampler.sample(logits_.data() + size_t(r) * V, V);
+  for (const auto& it : f.items) {
+    Seq& s = *it.s;
+    --s.inflight;
+    (it.n == 1 && it.logits ? decode : prefill) += it.n;
+    if (!it.logits) continue;
+    s.awaiting_logits = false;
+    if (s.abort_pending || s.done) continue;
+    const Sampled smp = s.sampler.sample(logits_.data() + size_t(it.row) * V, V);
     const int32_t tok = smp.token;
     s.tokens.push_back(tok);
     s.sampler.accept(tok);
@@ -282,34 +333,49 @@ bool Engine::iterate() {
                          s.req.stop_token_ids.end();
     if (eos || stop_id) {
       s.out.stop_token = tok;
-      finish(s, FinishReason::Stop);
+      s.done = true;  // finished below, once nothing of it is in flight
+      s.out.reason = FinishReason::Stop;
       continue;
     }
     s.out.tokens.push_back(tok);
     s.out.samples.push_back(smp);
-    if ((s.req.max_tokens > 0 && s.generated() >= s.req.max_tokens) || int(s.tokens.size()) >= max_context_)
-      finish(s, FinishReason::Length);
+    if ((s.req.max_tokens > 0 && s.generated() >= s.req.max_tokens) || int(s.tokens.size()) >= max_context_) {
+      s.done = true;
+      s.out.reason = FinishReason::Length;
+    }
   }
-  for (auto& s : running_)
-    if (!s->done && !s->out.tokens.empty()) {
+  for (auto& s : running_) {
+    if (s->inflight > 0) continue;
+    if (s->abort_pending) {
+      finish(*s, FinishReason::Abort);
+    } else if (s->done && !s->out.finished) {
+      const FinishReason r = s->out.reason;
+      s->done = false;  // finish() sets it again
+      finish(*s, r);
+    } else if (!s->done && !s->out.tokens.empty()) {
       s->out.completion_tokens = s->generated();
       s->sink(std::move(s->out));
       s->out = GenOutput{};
       s->out.prompt_tokens = s->n_prompt;
     }
-  running_.erase(std::remove_if(running_.begin(), running_.end(), [](const auto& s) { return s->done; }),
+  }
+  running_.erase(std::remove_if(running_.begin(), running_.end(),
+                                [](const auto& s) { return s->done && s->inflight == 0; }),
                  running_.end());
-
-  const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
   std::lock_guard lk(stats_mu_);
   ++stats_.steps;
   stats_.prefill_tokens += uint64_t(prefill);
   stats_.decode_tokens += uint64_t(decode);
-  stats_.busy_seconds += dt;
-  stats_.running = int(running_.size());
-  stats_.waiting = int(waiting_.size());
-  stats_.free_pages = int(free_pages_.size());
-  return true;
+}
+
+// A failed step leaves the device state unknown: everything running or in flight fails.
+void Engine::fail_all(const std::string& why) {
+  inflight_.clear();
+  for (auto& s : running_) {
+    s->inflight = 0;
+    finish(*s, FinishReason::Error, why);
+  }
+  running_.clear();
 }
 
 void Engine::loop() {
@@ -317,7 +383,8 @@ void Engine::loop() {
     {
       std::unique_lock lk(mu_);
       cv_.wait(lk, [&] {
-        return stop_ || !incoming_.empty() || !aborts_.empty() || !running_.empty() || !waiting_.empty();
+        return stop_ || !incoming_.empty() || !aborts_.empty() || !running_.empty() || !waiting_.empty() ||
+               !inflight_.empty();
       });
       if (stop_) return;
     }

@@ -166,6 +166,8 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   s.expert = make_expert_scratch(c, dev, max_tokens);
   s.exl3 = make_exl3_moe_scratch(c, dev, max_tokens * c.n_active);
   s.dispatch.max_tiles = s.exl3.max_tiles;
+  s.route_hist = rt::DeviceBuffer(dev, size_t(c.n_layers) * c.n_experts * 4);
+  UH_CHECK(hipMemset(s.route_hist.data(), 0, s.route_hist.size()));
   s.dispatch.count = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   s.dispatch.fill = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
@@ -250,7 +252,7 @@ bool exl3_fast_enabled() {
 std::vector<kernels::Exl3Tile> exl3_tiles(const std::vector<std::array<int, 3>>& runs) {
   std::vector<kernels::Exl3Tile> t;
   for (const auto& r : runs)
-    for (int i = 0; i < r[2]; i += 64) t.push_back({r[0], r[1] + i, std::min(64, r[2] - i)});
+    for (int i = 0; i < r[2]; i += k::kExl3TileRows) t.push_back({r[0], r[1] + i, std::min(k::kExl3TileRows, r[2] - i)});
   return t;
 }
 
@@ -616,7 +618,7 @@ void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
   int32_t* row_expert = scr.exl3.row_expert.as<int32_t>();
   bf16* pair_in = B<bf16>(scr, kPairIn);
   bf16* pair_out = B<bf16>(scr, kPairOut);
-  k::moe_count(sel, T, K, count, E, st);
+  k::moe_count(sel, T, K, count, E, st, scr.route_hist.as<uint32_t>() + size_t(w.layer) * E);
   k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st);
   k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
   k::gather_rows(f, eidx, pair_in, P, D, st);
@@ -631,6 +633,14 @@ void moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
     UH_CHECK(hipMemcpyAsync(remote->e_host, row_expert, size_t(P) * 4, hipMemcpyDeviceToHost, st));
     UH_CHECK(hipMemcpyAsync(remote->w_host, ewt, size_t(P) * 4, hipMemcpyDeviceToHost, st));
     k::copy_remote_rows(pair_in, remote->in_host, plan, D, P, st);
+    static const bool stats = std::getenv("UNHOLY_MOE_STATS") != nullptr;
+    if (stats) {  // diagnostics only: synchronizes the stream
+      k::MoePlan hp;
+      UH_CHECK(hipMemcpyAsync(&hp, plan, sizeof hp, hipMemcpyDeviceToHost, st));
+      UH_CHECK(hipStreamSynchronize(st));
+      std::fprintf(stderr, "moe L%d: %d pairs, %d remote (%.1f%%)\n", w.layer, hp.P, hp.P - hp.remote0,
+                   100.0 * (hp.P - hp.remote0) / std::max(1, hp.P));
+    }
     remote->enqueue(w.layer, st, P);
   }
   exl3_moe_forward_dev(c, w, pair_in, ewt, row_expert, lt, ds.max_tiles, &plan->n_local_tiles, P, scr.exl3, pair_out,

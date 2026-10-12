@@ -10,6 +10,7 @@
 //   unholy-sched-test [--requests N] [--seed S]
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -35,8 +36,8 @@ int32_t next_token(const std::vector<int32_t>& seq) {
 
 class FakeModel final : public StepModel {
  public:
-  FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens)
-      : slots_(slots), ppseq_(pages_per_seq), pages_(pages), page_(page_tokens), max_tokens_(max_tokens),
+  FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens, int inflight)
+      : inflight_(inflight), slots_(slots), ppseq_(pages_per_seq), pages_(pages), page_(page_tokens), max_tokens_(max_tokens),
         store_(size_t(pages) * page_tokens, -1), len_(size_t(slots), 0) {}
   int vocab() const override { return kVocab; }
   int max_tokens() const override { return max_tokens_; }
@@ -49,7 +50,23 @@ class FakeModel final : public StepModel {
     if (t.size() != size_t(slots_) * ppseq_) throw std::runtime_error("fake: table size");
     tables_ = t;
   }
-  void step(const StepInput& in, std::vector<float>& logits) override {
+  int max_inflight() const override { return inflight_; }
+  // Executes at submission (steps run in submission order, as on the devices); wait() hands back the
+  // logits, checking the engine waits in order and never exceeds the in-flight limit.
+  uint64_t submit(const StepInput& in) override {
+    if (int(pending_.size()) >= inflight_) throw std::runtime_error("fake: too many steps in flight");
+    std::vector<float> logits;
+    run(in, logits);
+    pending_.push_back({next_, std::move(logits)});
+    max_seen = std::max(max_seen, int(pending_.size()));
+    return next_++;
+  }
+  void wait(uint64_t ticket, std::vector<float>& logits) override {
+    if (pending_.empty() || pending_.front().first != ticket) throw std::runtime_error("fake: out-of-order wait");
+    logits = std::move(pending_.front().second);
+    pending_.pop_front();
+  }
+  void run(const StepInput& in, std::vector<float>& logits) {
     ++steps;
     if (in.ids.size() != in.pos.size() || int(in.ids.size()) > max_tokens_) throw std::runtime_error("fake: T");
     int t = 0;
@@ -81,7 +98,7 @@ class FakeModel final : public StepModel {
       logits[r * kVocab + size_t(next_token(seq))] = 10.0f;
     }
   }
-  int steps = 0, max_batch = 0;
+  int steps = 0, max_batch = 0, max_seen = 0;
 
  private:
   int32_t& at(int slot, int p) {
@@ -91,6 +108,9 @@ class FakeModel final : public StepModel {
     if (phys < 0 || phys >= pages_) throw std::runtime_error("fake: bad page id");
     return store_[size_t(phys) * page_ + size_t(p % page_)];
   }
+  int inflight_;
+  std::deque<std::pair<uint64_t, std::vector<float>>> pending_;
+  uint64_t next_ = 1;
   int slots_, ppseq_, pages_, page_, max_tokens_;
   std::vector<int32_t> store_, tables_;
   std::vector<int> len_;
@@ -135,9 +155,10 @@ int main(int argc, char** argv) {
   // Configurations: (slots, pages per seq, pool pages, page tokens, step tokens, batch budget).
   const int configs[][6] = {{8, 64, 512, 16, 256, 256}, {4, 32, 40, 16, 128, 100}, {16, 16, 60, 8, 64, 64},
                             {2, 128, 30, 32, 512, 512}, {32, 20, 200, 16, 96, 96}};
+  for (const int depth : {1, 2})
   for (const auto& cfgv : configs) {
     std::mt19937_64 rng(seed);
-    FakeModel model(cfgv[0], cfgv[1], cfgv[2], cfgv[3], cfgv[4]);
+    FakeModel model(cfgv[0], cfgv[1], cfgv[2], cfgv[3], cfgv[4], depth);
     EngineConfig ec;
     ec.max_batch_tokens = cfgv[5];
     Engine eng(model, ec, false);
@@ -217,9 +238,10 @@ int main(int argc, char** argv) {
       }
     }
     const auto st = eng.stats();
-    std::printf("config slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, %d errors; %d steps, "
-                "max batch %d, %llu preemptions, free pages %d/%d\n",
-                cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors, model.steps, model.max_batch,
+    std::printf("depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, %d errors; "
+                "%d steps, max batch %d, %llu preemptions, free pages %d/%d\n",
+                depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors, model.steps,
+                model.max_batch,
                 (unsigned long long)st.preemptions, st.free_pages, st.total_pages);
     if (st.free_pages != st.total_pages) {
       std::printf("  page leak\n");

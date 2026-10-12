@@ -229,6 +229,193 @@ __global__ __launch_bounds__(NT) void exl3_gemm_kernel(const uint16_t* __restric
   }
 }
 
+
+// ---- v2: 128-row tiles, decode once per (tile, 16-column slice), wave-private B ----------------------
+//
+// Block = one tile (<= 128 rows of one expert) x 128 output columns; wave w owns columns
+// [n0 + 16w, n0 + 16w + 16) and all rows, so it decodes exactly the trellis tiles it multiplies
+// (16 columns x 64 k per slab) into its own LDS slice: no block barrier for B. A lane decodes 8
+// consecutive trellis steps from three words with funnel shifts; the mul1 byte sum is one udot4.
+// The accumulation runs over the same 16-wide k-steps in the same order as v1, and the epilogue is
+// the same, so the results are identical.
+constexpr int V2_BM = 128, V2_BN = 128, V2_KS = 64, V2_NT = 256, V2_PAD = 8;
+
+// fp16 bits of mul1(state) for two states: x = s * 0x83DCD12D; byte sum + 0x6400 as fp16; h * 0x1eee + 0xc931.
+__device__ __forceinline__ uint32_t decode_mul1_x2(uint32_t s0, uint32_t s1) {
+  const uint32_t a = __builtin_amdgcn_udot4(s0 * 0x83DCD12Du, 0x01010101u, 0x6400u, false);
+  const uint32_t b = __builtin_amdgcn_udot4(s1 * 0x83DCD12Du, 0x01010101u, 0x6400u, false);
+  const __half2 h = __halves2half2(__ushort_as_half(uint16_t(a)), __ushort_as_half(uint16_t(b)));
+  const __half2 r = __hfma2(h, __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee)),
+                            __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931)));
+  return uint32_t(__half_as_ushort(__low2half(r))) | (uint32_t(__half_as_ushort(__high2half(r))) << 16);
+}
+
+// Lane L's 8 trellis steps (8L .. 8L + 7) of one tile (`w`: its 8*BITS words), as 4 packed fp16 pairs:
+// p[0] = (k r0, r0 + 1) at column c0, p[1] = (r0 + 8, r0 + 9) at c0, p[2], p[3] the same at c0 + 8, with
+// r0 = (L & 3) * 2, c0 = L >> 2 (the tensor-core permutation).
+template <int BITS>
+__device__ __forceinline__ void decode_lane8(const uint32_t* w, int L, uint32_t p[4]) {
+  constexpr int LEN = 256 * BITS, NW = 8 * BITS;
+  const int s = (8 * L * BITS + BITS - 16 + LEN) % LEN;  // first bit of step 8L's window
+  const int i0 = s >> 5, o0 = s & 31;
+  const uint32_t w0 = w[i0], w1 = w[(i0 + 1) % NW], w2 = w[(i0 + 2) % NW];
+  const uint64_t lo = (uint64_t(w0) << 32) | w1, hi = (uint64_t(w1) << 32) | w2;
+  uint32_t st[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int o = o0 + j * BITS;  // window = bits [o, o + 16) of w0 w1 w2 (MSB first)
+    st[j] = o <= 48 ? uint32_t(lo >> (48 - o)) & 0xffffu : uint32_t(hi >> (80 - o)) & 0xffffu;
+  }
+  p[0] = decode_mul1_x2(st[0], st[1]);
+  p[1] = decode_mul1_x2(st[2], st[3]);
+  p[2] = decode_mul1_x2(st[4], st[5]);
+  p[3] = decode_mul1_x2(st[6], st[7]);
+}
+
+template <int BITS>
+__global__ __launch_bounds__(V2_NT) void exl3_gemm_v2_kernel(const uint16_t* __restrict__ xh, int K,
+                                                             const Exl3Tile* __restrict__ tiles,
+                                                             const uint16_t* const* __restrict__ trellis_tab,
+                                                             const uint16_t* const* __restrict__ svh_tab, bf16* out,
+                                                             int ldo, int N, const int* ntiles_dev) {
+  constexpr int NW = 8 * BITS, KT = V2_KS / 16;
+  constexpr int AROW = V2_KS + V2_PAD;
+  constexpr int A_BYTES = V2_BM * AROW * 2, B_BYTES = 8 * 16 * AROW * 2;
+  constexpr int C_BYTES = 64 * (V2_BN + 4) * 4;  // epilogue: 64 rows at a time
+  constexpr int AB_BYTES = A_BYTES + B_BYTES > C_BYTES ? A_BYTES + B_BYTES : C_BYTES;
+  __shared__ alignas(16) uint8_t smem[AB_BYTES];
+  __shared__ uint32_t sW[8][KT][NW];
+  _Float16(*sA)[AROW] = reinterpret_cast<_Float16(*)[AROW]>(smem);
+  _Float16(*sB)[16][AROW] = reinterpret_cast<_Float16(*)[16][AROW]>(smem + A_BYTES);  // [wave][n][k]
+  float(*sC)[V2_BN + 4] = reinterpret_cast<float(*)[V2_BN + 4]>(smem);
+
+  if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
+  const Exl3Tile tile = tiles[blockIdx.y];
+  const int n0 = blockIdx.x * V2_BN;
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const uint32_t* trellis = reinterpret_cast<const uint32_t*>(trellis_tab[tile.expert]);
+  const int tiles_n = N / 16, nt = n0 / 16 + wave;
+  const int mtiles = (tile.rows + 15) >> 4;  // row tiles holding rows (wave-uniform)
+
+  float8_t acc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[i][e] = 0.0f;
+
+  // Software pipeline: slab k + 1's A rows and trellis words are loaded into registers while slab k is
+  // decoded and multiplied.
+  constexpr int WPL = (KT * NW + 31) / 32;  // trellis words per lane
+  uint4 ra[4];
+  uint32_t rw[WPL];
+  auto load_slab = [&](int k0) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int idx = tid + q * V2_NT, r = idx >> 3, c = (idx & 7) * 8;
+      ra[q] = r < tile.rows ? *reinterpret_cast<const uint4*>(xh + size_t(tile.row0 + r) * K + k0 + c)
+                            : uint4{0, 0, 0, 0};
+    }
+#pragma unroll
+    for (int j = 0; j < WPL; ++j) {
+      const int i = lane + j * 32;
+      if (i < KT * NW) {
+        const int kt = i / NW, wd = i % NW;
+        rw[j] = trellis[(size_t(k0 / 16 + kt) * tiles_n + nt) * NW + wd];
+      }
+    }
+  };
+  load_slab(0);
+  for (int k0 = 0; k0 < K; k0 += V2_KS) {
+    // A slab (128 rows x 64 halves) and this wave's trellis tiles (k-tiles k0/16 .. +3 of column tile nt).
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int idx = tid + q * V2_NT, r = idx >> 3, c = (idx & 7) * 8;
+      *reinterpret_cast<uint4*>(&sA[r][c]) = ra[q];
+    }
+#pragma unroll
+    for (int j = 0; j < WPL; ++j) {
+      const int i = lane + j * 32;
+      if (i < KT * NW) sW[wave][i / NW][i % NW] = rw[j];
+    }
+    __builtin_amdgcn_wave_barrier();
+    if (k0 + V2_KS < K) load_slab(k0 + V2_KS);
+    {
+      const int r0 = (lane & 3) * 2, c0 = lane >> 2;
+#pragma unroll
+      for (int kt = 0; kt < KT; ++kt) {
+        uint32_t p[4];
+        decode_lane8<BITS>(sW[wave][kt], lane, p);
+        const int kb = kt * 16;
+        *reinterpret_cast<uint32_t*>(&sB[wave][c0][kb + r0]) = p[0];
+        *reinterpret_cast<uint32_t*>(&sB[wave][c0][kb + r0 + 8]) = p[1];
+        *reinterpret_cast<uint32_t*>(&sB[wave][c0 + 8][kb + r0]) = p[2];
+        *reinterpret_cast<uint32_t*>(&sB[wave][c0 + 8][kb + r0 + 8]) = p[3];
+      }
+    }
+    __syncthreads();  // A from every thread; B is this wave's own
+#pragma unroll
+    for (int kt = 0; kt < KT; ++kt) {
+      const int kk = kt * 16;
+#if defined(UH_GFX12)
+      const half8_t bf = *reinterpret_cast<const half8_t*>(&sB[wave][lane & 15][kk + (lane >> 4) * 8]);
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        if (i < mtiles) {
+          const half8_t af = *reinterpret_cast<const half8_t*>(&sA[i * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
+          acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, bf, acc[i]);
+        }
+#elif defined(UH_GFX11)
+      const half16_t bf = load16(&sB[wave][lane & 15][kk]);
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        if (i < mtiles) {
+          const half16_t af = load16(&sA[i * 16 + (lane & 15)][kk]);
+          acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc[i]);
+        }
+#endif
+    }
+    __syncthreads();  // before the next slab overwrites A and B
+  }
+  // Epilogue in two halves of 64 rows: accumulators -> sC, output Hadamard per row, * svh, bf16.
+  const uint16_t* svh = svh_tab[tile.expert];
+  const int col = wave * 16 + (lane & 15);
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    if (half * 64 >= tile.rows) break;  // block-uniform
+#pragma unroll
+    for (int ii = 0; ii < 4; ++ii) {
+      const int i = half * 4 + ii;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+#if defined(UH_GFX12)
+        const int row = ii * 16 + (lane >> 4) * 8 + e;
+#else
+        const int row = ii * 16 + 2 * e + (lane >> 4);
+#endif
+        sC[row][col] = acc[i][e];
+      }
+    }
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+      for (int p = tid; p < 64 * 64; p += V2_NT) {
+        const int row = p >> 6, q = p & 63;
+        const int a = (q / h) * 2 * h + (q % h);
+        const float x0 = sC[row][a], x1 = sC[row][a + h];
+        sC[row][a] = x0 + x1;
+        sC[row][a + h] = x0 - x1;
+      }
+      __syncthreads();
+    }
+    for (int p = tid; p < 64 * V2_BN; p += V2_NT) {
+      const int row = p / V2_BN, c = p % V2_BN, grow = half * 64 + row;
+      if (grow >= tile.rows) continue;
+      const float v = sC[row][c] * 0.08838834764831845f * __half2float(__ushort_as_half(svh[n0 + c]));
+      out[size_t(tile.row0 + grow) * ldo + n0 + c] = f32_to_bf16(v);
+    }
+    __syncthreads();
+  }
+}
+
 }  // namespace
 
 void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint16_t* const* suh_tab, uint16_t* xh,
@@ -245,11 +432,11 @@ void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32
   UH_CHECK_LAUNCH();
 }
 
-void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
-                       const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
-                       int ldo, int N, hipStream_t st, const int* ntiles_dev) {
+void exl3_grouped_gemm_v1(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
+                          const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
+                          int ldo, int N, hipStream_t st, const int* ntiles_dev) {
   if (ntiles <= 0) return;
-  if (K % KS || N % BN) throw std::runtime_error("exl3_grouped_gemm: K/N not multiples of 32/128");
+  if (K % KS || N % BN) throw std::runtime_error("exl3_grouped_gemm_v1: K/N not multiples of 32/128");
   const dim3 grid(N / BN, ntiles);
   switch (bits) {
     case 2: exl3_gemm_kernel<2><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
@@ -257,6 +444,23 @@ void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int nti
     case 4: exl3_gemm_kernel<4><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
     case 5: exl3_gemm_kernel<5><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
     case 6: exl3_gemm_kernel<6><<<grid, NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    default: throw std::runtime_error("exl3_grouped_gemm_v1: unsupported bit width");
+  }
+  UH_CHECK_LAUNCH();
+}
+
+void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
+                       const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
+                       int ldo, int N, hipStream_t st, const int* ntiles_dev) {
+  if (ntiles <= 0) return;
+  if (K % V2_KS || N % V2_BN) throw std::runtime_error("exl3_grouped_gemm: K/N not multiples of 64/128");
+  const dim3 grid(N / V2_BN, ntiles);
+  switch (bits) {
+    case 2: exl3_gemm_v2_kernel<2><<<grid, V2_NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 3: exl3_gemm_v2_kernel<3><<<grid, V2_NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 4: exl3_gemm_v2_kernel<4><<<grid, V2_NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 5: exl3_gemm_v2_kernel<5><<<grid, V2_NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
+    case 6: exl3_gemm_v2_kernel<6><<<grid, V2_NT, 0, st>>>(xh, K, tiles, trellis_tab, svh_tab, out, ldo, N, ntiles_dev); break;
     default: throw std::runtime_error("exl3_grouped_gemm: unsupported bit width");
   }
   UH_CHECK_LAUNCH();
@@ -271,16 +475,6 @@ namespace unholy::kernels {
 namespace {
 
 constexpr int GV_ROWS = 8, GV_KC = 512, GV_NT = 256;
-
-// 16 bits ending at bit `end` of the circular stream (`w` = the tile's NW words).
-template <int BITS>
-__device__ __forceinline__ uint32_t window_end(const uint32_t* w, int end) {
-  constexpr int LEN = 256 * BITS, NW = 8 * BITS;
-  const int start = (end - 16 + LEN) % LEN;
-  const int w0 = start >> 5, b0 = start & 31;
-  const uint64_t two = (uint64_t(w[w0]) << 32) | w[(w0 + 1) % NW];
-  return uint32_t(two >> (48 - b0)) & 0xffffu;
-}
 
 // One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows.
 template <int BITS>
@@ -316,8 +510,13 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
       for (int i = lane; i < NW; i += 32) sW[wave][i] = trellis[ti * NW + i];
       __builtin_amdgcn_wave_barrier();
       float wv[8];
+      {
+        uint32_t p[4];
+        decode_lane8<BITS>(sW[wave], lane, p);
 #pragma unroll
-      for (int j = 0; j < 8; ++j) wv[j] = float(decode_mul1(window_end<BITS>(sW[wave], (lane * 8 + j + 1) * BITS)));
+        for (int j = 0; j < 8; ++j)
+          wv[j] = __half2float(__ushort_as_half(uint16_t(p[j / 2] >> (16 * (j % 2)))));
+      }
       __builtin_amdgcn_wave_barrier();
       const int kb = kt * 16;
       for (int m = 0; m < M; ++m) {

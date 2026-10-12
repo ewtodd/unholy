@@ -7,8 +7,11 @@
 // engine request.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "engine/engine.hpp"
 #include "text/tokenizer.hpp"
@@ -22,6 +25,8 @@ struct ServerConfig {
   std::string api_key;  // empty: no auth
   int threads = 64;     // concurrent HTTP requests (each stream holds one)
   int default_max_tokens = 0;  // when a request gives none; 0 = until the context limit
+  // Extra plain-text endpoints (path -> handler), e.g. the routing histogram.
+  std::vector<std::pair<std::string, std::function<std::string()>>> extra_get, extra_post;
 };
 
 class OpenAIServer {

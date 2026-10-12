@@ -2,7 +2,7 @@
 //
 //   moe_count     sel [T, K] -> count [E]
 //   moe_plan      count + resident mask -> pair offsets (resident experts first, then remote, each in
-//                 ascending expert order), remote0, and the <=64-row tile lists of both groups
+//                 ascending expert order), remote0, and the <= kExl3TileRows-row tile lists of both groups
 //   moe_scatter   per token: its K picks sorted by expert id; each pick gets a pair row
 //                 (off[e] + atomic fill): eidx (token), ewt (weight), row_expert, pidx[t][j]
 //
@@ -16,9 +16,11 @@ namespace unholy::kernels {
 
 namespace {
 
-__global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count) {
+__global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count, uint32_t* hist) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) atomicAdd(&count[sel[i]], 1);
+  if (i >= n) return;
+  atomicAdd(&count[sel[i]], 1);
+  if (hist) atomicAdd(&hist[sel[i]], 1u);
 }
 
 // One block of 256 threads (E <= 256): serial scans by thread 0 are trivial at E = 256.
@@ -33,8 +35,8 @@ __global__ void moe_plan_kernel(const int32_t* count, const uint8_t* resident, i
         if ((resident[e] != 0) != (pass == 0)) continue;
         const int c = count[e];
         off[e] = next;
-        for (int i = 0; i < c; i += 64) {
-          const Exl3Tile t{e, next + i, min(64, c - i)};
+        for (int i = 0; i < c; i += kExl3TileRows) {
+          const Exl3Tile t{e, next + i, min(kExl3TileRows, c - i)};
           if (pass == 0 && nl < max_tiles) local_tiles[nl++] = t;
           if (pass == 1 && nr < max_tiles) remote_tiles[nr++] = t;
         }
@@ -101,10 +103,10 @@ __global__ void copy_remote_meta_kernel(const float* ewt, const int32_t* row_exp
 
 }  // namespace
 
-void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st) {
+void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st, uint32_t* hist) {
   UH_CHECK(hipMemsetAsync(count, 0, size_t(E) * 4, st));
   const int n = T * K;
-  moe_count_kernel<<<(n + 255) / 256, 256, 0, st>>>(sel, n, count);
+  moe_count_kernel<<<(n + 255) / 256, 256, 0, st>>>(sel, n, count, hist);
   UH_CHECK_LAUNCH();
 }
 

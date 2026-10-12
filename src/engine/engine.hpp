@@ -92,6 +92,20 @@ class Engine {
   void release(Seq& s);
   void preempt(Seq& s);
   void finish(Seq& s, FinishReason r, const std::string& err = "");
+  bool submit_step(int budget);
+  void complete_step();
+  void fail_all(const std::string& why);
+
+  struct InFlight {
+    struct Item {
+      Seq* s;
+      int n;
+      bool logits;
+      int row;  // logit row, -1 if none
+    };
+    uint64_t ticket = 0;
+    std::vector<Item> items;
+  };
 
   StepModel& model_;
   EngineConfig cfg_;
@@ -107,6 +121,7 @@ class Engine {
   // Engine-thread state.
   std::deque<std::unique_ptr<Seq>> waiting_;
   std::vector<std::unique_ptr<Seq>> running_;  // admission order
+  std::deque<InFlight> inflight_;              // submitted steps, oldest first
   std::vector<int32_t> free_pages_, free_slots_;
   std::vector<int32_t> tables_;
   bool tables_dirty_ = true;

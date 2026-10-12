@@ -1,5 +1,6 @@
 // unholy: the serving binary.
 //
+//   unholy plan  ...the same options: print the placement for the geometry without loading anything
 //   unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]
 //                [--served-model-name NAME] [--max-slots N] [--max-seq N] [--num-pages N]
 //                [--max-batch-tokens N] [--api-key KEY] [--http-threads N] [--max-tokens-default N]
@@ -39,7 +40,7 @@ int usage() {
   return 2;
 }
 
-int serve(int argc, char** argv) {
+int serve(int argc, char** argv, bool plan_only) {
   std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_dsv4engine_code32k.txt";
   server::ServerConfig scfg;
   int max_slots = 4, max_seq = 65536, num_pages = 0, max_batch = 2048;
@@ -93,12 +94,24 @@ int serve(int argc, char** argv) {
   pin.geo = geo;
   pin.max_tokens = max_batch;
   pin.max_seq = max_seq;
+  pin.max_logit_rows = std::max(max_slots, 8);
+  if (plan_only) {
+    std::printf("geometry: %d slots x %d tokens, %d pages; step %d tokens; experts %s\n", max_slots, max_seq,
+                geo.num_pages, max_batch, xck ? "EXL3" : "native (MXFP4)");
+    try {
+      std::printf("%s", engine::make_plan(pin).summary().c_str());
+    } catch (const std::exception& e) {
+      std::printf("does not fit: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
   const auto plan = engine::make_plan(pin);
   std::printf("%s", plan.summary().c_str());
   std::fflush(stdout);
 
   const auto t0 = std::chrono::steady_clock::now();
-  engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, std::max(max_slots, 8));
+  engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows);
   std::printf("loaded in %.1f s; %d slots, context %d, %d pages of %d tokens\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), max_slots, max_seq,
               geo.num_pages, model::kPageTokens);
@@ -109,6 +122,13 @@ int serve(int argc, char** argv) {
   ecfg.max_context = max_seq;
   ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
   engine::Engine eng(model, ecfg);
+  // Routing histogram of the traffic served so far, in the --profile format (for re-planning).
+  scfg.extra_get.emplace_back("/unholy/routing_profile",
+                              [&model] { return engine::format_usage_profile(model.routing_histogram()); });
+  scfg.extra_post.emplace_back("/unholy/routing_profile/reset", [&model] {
+    model.reset_routing_histogram();
+    return std::string("ok\n");
+  });
   server::OpenAIServer srv(eng, tok, scfg);
 
   std::thread sig([&] {
@@ -130,7 +150,8 @@ int serve(int argc, char** argv) {
 int main(int argc, char** argv) {
   if (argc < 2) return usage();
   try {
-    if (!std::strcmp(argv[1], "serve")) return serve(argc, argv);
+    if (!std::strcmp(argv[1], "serve")) return serve(argc, argv, false);
+    if (!std::strcmp(argv[1], "plan")) return serve(argc, argv, true);  // placement only, nothing loaded
     return usage();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());

@@ -61,6 +61,8 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       /tokenize, /detokenize, /metrics; `unholy serve` (`tools/unholy/main.cpp`)
 - [ ] NixOS module / service
 - [ ] decode scaling: batch 4 gives 29.7 tok/s aggregate (7.8/stream) vs 16.4 at batch 1
+- [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s
+- [x] routing profile from our own traffic (`data/expert_profile_unholy_mixed.txt`, default for runs)
 
 ### Reference path vs oracle, per layer (1024 prefill + 8 decode, code prompt)
 

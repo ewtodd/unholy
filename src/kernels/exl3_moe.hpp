@@ -9,7 +9,8 @@ namespace unholy::kernels {
 
 using bf16 = uint16_t;
 
-// A run of up to 64 pair rows of one expert.
+// A run of up to kExl3TileRows pair rows of one expert.
+constexpr int kExl3TileRows = 128;
 struct Exl3Tile {
   int expert, row0, rows;
 };
@@ -21,10 +22,15 @@ void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint
 void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
                        const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st);
 // out[r] = bf16(H128(xh[r] @ W_inner[e]) * svh[e] / sqrt(128)) for the rows of each tile. With
-// ntiles_dev, the grid is sized for `ntiles` and only the first *ntiles_dev tiles run.
+// ntiles_dev, the grid is sized for `ntiles` and only the first *ntiles_dev tiles run. Tiles of up to
+// kExl3TileRows rows; K % 64 == 0, N % 128 == 0.
 void exl3_grouped_gemm(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
                        const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
                        int ldo, int N, hipStream_t st, const int* ntiles_dev = nullptr);
+// The previous kernel (tiles of <= 64 rows, weights decoded per 64-row tile), kept for comparison.
+void exl3_grouped_gemm_v1(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles,
+                          const uint16_t* const* trellis_tab, const uint16_t* const* svh_tab, int bits, bf16* out,
+                          int ldo, int N, hipStream_t st, const int* ntiles_dev = nullptr);
 
 // Decode variant for tiles of <= 8 rows (batches of <= 8 tokens): K split across waves, each lane
 // decoding 8 trellis steps of a tile in registers; y' (fp32 [P, N]) then the output transform.
