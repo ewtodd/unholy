@@ -275,6 +275,7 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
                           int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st) {
   if (P > s.rows) throw std::runtime_error("exl3_moe_forward_dev: scratch too small");
   const int D = c.dim, I = c.moe_inter, E = c.n_experts;
+  max_tiles = std::min(max_tiles, P);  // every tile has >= 1 row: bounds the grids at small batches
   uint16_t* xh1 = s.xh1.as<uint16_t>();
   uint16_t* xh3 = s.xh3.as<uint16_t>();
   uint16_t* xh2 = s.xh2.as<uint16_t>();

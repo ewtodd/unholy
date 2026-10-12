@@ -161,43 +161,44 @@ __global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ 
   __syncthreads();
   if (tid == 0) {
     const float rs = rsqrtf(m[MIX] / float(width) + norm_eps);
+    constexpr int HC = 4;  // checked by the launcher; constant so the arrays below stay in registers
     float mx[MIX];
-    for (int j = 0; j < MIX; ++j) mx[j] = m[j] * rs;
-    float post[4], comb[4][4];
-    for (int j = 0; j < hc; ++j) pre[j] = 1.0f / (1.0f + expf(-(mx[j] * scale[0] + base[j]))) + hc_eps;
-    for (int j = 0; j < hc; ++j) post[j] = 2.0f / (1.0f + expf(-(mx[hc + j] * scale[1] + base[hc + j])));
-    for (int j = 0; j < hc; ++j) {
+    _Pragma("unroll") for (int j = 0; j < MIX; ++j) mx[j] = m[j] * rs;
+    float post[HC], comb[HC][HC];
+    _Pragma("unroll") for (int j = 0; j < HC; ++j) pre[j] = 1.0f / (1.0f + expf(-(mx[j] * scale[0] + base[j]))) + hc_eps;
+    _Pragma("unroll") for (int j = 0; j < HC; ++j) post[j] = 2.0f / (1.0f + expf(-(mx[HC + j] * scale[1] + base[HC + j])));
+    _Pragma("unroll") for (int j = 0; j < HC; ++j) {
       float mm = -INFINITY;
-      for (int k = 0; k < hc; ++k) {
-        comb[j][k] = mx[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k];
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) {
+        comb[j][k] = mx[2 * HC + j * HC + k] * scale[2] + base[2 * HC + j * HC + k];
         mm = fmaxf(mm, comb[j][k]);
       }
       float sum = 0.0f;
-      for (int k = 0; k < hc; ++k) {
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) {
         comb[j][k] = expf(comb[j][k] - mm);
         sum += comb[j][k];
       }
-      for (int k = 0; k < hc; ++k) comb[j][k] = comb[j][k] / sum + hc_eps;
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) comb[j][k] = comb[j][k] / sum + hc_eps;
     }
     auto col_norm = [&]() {
-      for (int k = 0; k < hc; ++k) {
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) {
         float cs = 0.0f;
-        for (int j = 0; j < hc; ++j) cs += comb[j][k];
-        for (int j = 0; j < hc; ++j) comb[j][k] = comb[j][k] / (cs + hc_eps);
+        _Pragma("unroll") for (int j = 0; j < HC; ++j) cs += comb[j][k];
+        _Pragma("unroll") for (int j = 0; j < HC; ++j) comb[j][k] = comb[j][k] / (cs + hc_eps);
       }
     };
     col_norm();
     for (int it = 0; it < iters - 1; ++it) {
-      for (int j = 0; j < hc; ++j) {
+      _Pragma("unroll") for (int j = 0; j < HC; ++j) {
         float rsum = 0.0f;
-        for (int k = 0; k < hc; ++k) rsum += comb[j][k];
-        for (int k = 0; k < hc; ++k) comb[j][k] = comb[j][k] / (rsum + hc_eps);
+        _Pragma("unroll") for (int k = 0; k < HC; ++k) rsum += comb[j][k];
+        _Pragma("unroll") for (int k = 0; k < HC; ++k) comb[j][k] = comb[j][k] / (rsum + hc_eps);
       }
       col_norm();
     }
-    for (int j = 0; j < hc; ++j) {
-      post_out[size_t(t) * hc + j] = post[j];
-      for (int k = 0; k < hc; ++k) comb_out[(size_t(t) * hc + j) * hc + k] = comb[j][k];
+    _Pragma("unroll") for (int j = 0; j < HC; ++j) {
+      post_out[size_t(t) * HC + j] = post[j];
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) comb_out[(size_t(t) * HC + j) * HC + k] = comb[j][k];
     }
   }
   __syncthreads();

@@ -307,3 +307,8 @@ HC pre-mix ran one block over K = 16384 (575 us x2), the router one thread with 
   {c0, c0+8}), then the output Hadamard * svh per row.
 Decode error vs the oracle unchanged (layer 3: 3.612e-2); per-layer decode 4.4 -> ~1.7 ms;
 resident model decode 0.20 s -> 79 ms/token (12.7 tok/s raw), KL 2.438e-2.
+Follow-up from the full decode-step trace (87 ms, 3702 launches): the EXL3 GEMV/out grids were sized
+for the worst-case tile count (257) and launched ~50k empty blocks per call (now bounded by the
+pair-row count), the HC finish ran Sinkhorn out of scratch memory (runtime-indexed arrays; now
+compile-time hc = 4, registers), and the LM head used the 64-row WMMA tile at M = 1 (now the GEMV;
+1.06 GB of bf16 head per token is its floor). Decode 79 -> 58 ms/token (~17 tok/s raw), KL unchanged.

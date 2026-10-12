@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "kernels/gemm_wmma.hpp"
+#include "kernels/gemv.hpp"
 #include "kernels/ref.hpp"
 #include "model/loader.hpp"
 #include "rt/hip.hpp"
@@ -258,8 +259,12 @@ std::vector<float> ResidentModel::step(const StepInput& in) {
   k::rmsnorm(hb_.as<uint16_t>(), c_.dim, norm_.as<uint16_t>(), hb_.as<uint16_t>(), c_.dim, R, c_.dim, c_.norm_eps,
              cd.st);
   // The reference head is an fp32 linear on the bf16-valued normed state: bf16 WMMA, exact products.
-  k::gemm_bf16_f32out_wmma(hb_.as<uint16_t>(), c_.dim, head_.as<uint16_t>(), logits_.as<float>(), c_.vocab, R, c_.vocab,
-                           c_.dim, cd.st);
+  if (R <= k::kGemvMaxRows)
+    k::gemv_bf16_f32out(hb_.as<uint16_t>(), c_.dim, head_.as<uint16_t>(), logits_.as<float>(), c_.vocab, R, c_.vocab,
+                        c_.dim, cd.st);
+  else
+    k::gemm_bf16_f32out_wmma(hb_.as<uint16_t>(), c_.dim, head_.as<uint16_t>(), logits_.as<float>(), c_.vocab, R,
+                             c_.vocab, c_.dim, cd.st);
   UH_CHECK(hipMemcpyAsync(out.data(), logits_.data(), out.size() * 4, hipMemcpyDeviceToHost, cd.st));
   UH_CHECK(hipStreamSynchronize(cd.st));
   return out;
