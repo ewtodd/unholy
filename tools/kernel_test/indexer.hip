@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
 
   rt::DeviceBuffer dk(dev, hk.size() * 2), dq(dev, hq.size() * 2), dq2(dev, hq.size() * 2), dw(dev, hw.size() * 2),
       dpos(dev, size_t(T) * 4), dtab(dev, size_t(pages) * 4), pool(dev, size_t(pages) * k::kFp4PageBytes),
-      qc(dev, size_t(T) * H * D), qs(dev, size_t(T) * H * 4), sref(dev, size_t(T) * nkeys * 4),
+      qc(dev, size_t(T) * H * D), qs(dev, size_t(T) * H), sref(dev, size_t(T) * nkeys * 4),
       sfast(dev, size_t(T) * nkeys * 2), iref(dev, size_t(T) * topk * 4), ifast(dev, size_t(T) * topk * 4);
   UH_CHECK(hipMemcpy(dk.data(), hk.data(), hk.size() * 2, hipMemcpyHostToDevice));
   UH_CHECK(hipMemcpy(dq.data(), hq.data(), hq.size() * 2, hipMemcpyHostToDevice));
@@ -100,10 +100,10 @@ int main(int argc, char** argv) {
                     4, nullptr);
   k::topk_rows(sref.as<float>(), T, nkeys, topk, iref.as<int32_t>(), nullptr);
   // Fast path.
-  k::quant_q_fp4(dq2.as<uint16_t>(), T, H, qc.as<int8_t>(), qs.as<uint8_t>(), nullptr);
+  k::quant_q_fp4(dq2.as<uint16_t>(), T, H, qc.as<uint8_t>(), qs.as<uint8_t>(), nullptr);
   UH_CHECK(hipDeviceSynchronize());
   const auto t0 = std::chrono::steady_clock::now();
-  k::indexer_scores_fp4(qc.as<int8_t>(), qs.as<uint8_t>(), dw.as<uint16_t>(), keys, dpos.as<int32_t>(),
+  k::indexer_scores_fp4(qc.as<uint8_t>(), qs.as<uint8_t>(), dw.as<uint16_t>(), keys, dpos.as<int32_t>(),
                         sfast.as<uint16_t>(), T, H, nkeys, 4, nullptr);
   UH_CHECK(hipDeviceSynchronize());
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

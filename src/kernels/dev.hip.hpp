@@ -29,6 +29,11 @@ __device__ __forceinline__ bf16 f32_to_bf16(float f) {
 
 // bf16(x) as float: the value torch would hold after rounding an fp32 intermediate to bf16.
 __device__ __forceinline__ float round_bf16(float f) { return bf16_to_f32(f32_to_bf16(f)); }
+// The same for finite inputs only (no NaN branch): three integer ops.
+__device__ __forceinline__ float round_bf16_finite(float f) {
+  const uint32_t u = __float_as_uint(f);
+  return __uint_as_float((u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
+}
 
 // OCP fp8 e4m3fn.
 __device__ __forceinline__ float e4m3_to_f32(uint8_t v) {

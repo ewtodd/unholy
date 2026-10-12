@@ -102,7 +102,7 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   // fast one): capped, the chunk's queries go through it in turns.
   sz[kISc] = std::max(keys * 4, std::min(N * keys * 4, kIndexerScoreBytes));
   sz[kQC] = N * c.idx_heads * c.idx_dim;
-  sz[kQCS] = N * c.idx_heads * (c.idx_dim / 32);
+  sz[kQCS] = N * c.idx_heads;
   sz[kIdx] = N * c.idx_topk * 4;
   sz[kO] = N * c.n_heads * c.head_dim * 2;
   sz[kOA] = N * c.o_groups * c.o_lora * 2;
@@ -511,7 +511,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
                  st);
     k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
     k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
-    if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<int8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
+    if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
     else k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
     dense_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
     // weights_proj(x) * (softmax_scale * n_heads^-0.5): the Python double, applied as fp32.
@@ -562,8 +562,8 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
           const int nt = std::min(sub, ch.n - t), tt = ch.t0 + t;
           if (fast) {
             uint16_t* sc = B<uint16_t>(scr, kISc);
-            k::indexer_scores_fp4(B<int8_t>(scr, kQC) + size_t(tt) * IH * ID,
-                                  B<uint8_t>(scr, kQCS) + size_t(tt) * IH * (ID / 32), wi + size_t(tt) * IH, keys,
+            k::indexer_scores_fp4(B<uint8_t>(scr, kQC) + size_t(tt) * IH * ID, B<uint8_t>(scr, kQCS) + size_t(tt) * IH,
+                                  wi + size_t(tt) * IH, keys,
                                   pos + tt, sc, nt, IH, nkeys, 4, st);
             k::topk_bf16(sc, nt, nkeys, kk, idx + size_t(t) * kk, st);
           } else {
