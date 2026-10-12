@@ -440,3 +440,31 @@ can rank quantizations.
 `unholy plan` prints the placement for a geometry without loading. With the mixed profile and bf16
 KV: native MXFP4 experts at 4 x 512k fit (APU 109 GB of 129.5 GB free; 52.8% of routing on the cards;
 1 x 512k: 59.7%); EXL3 3.04 bpw at 4 x 512k: 63.9%. fp8 KV storage would free ~6 GB more on the cards.
+
+## 2026-10-11 — native MXFP4 experts on grouped kernels; depth curves to 512k
+
+Native experts get the EXL3 path's device dispatch, 128-row tiles and APU channels with their own
+kernels (`src/kernels/mx_moe.hip`): activations fake-quantized to fp8 per 128 into bf16 (exact), each
+wave dequantizes the weight slice it multiplies into LDS through a 256-entry byte -> bf16-pair table
+with the power-of-two scale added to the exponents (per half: a negative offset borrows), bf16 WMMA with
+fp32 accumulation. The GEMV takes the unscaled values and scales each 32-block's partial sum (exact for
+powers of two). Weights are repacked at load into a tile-major layout (one contiguous 512-byte read per
+wave and 64-input slab; lossless; the reference GEMM reads it too and gives identical bits). Against
+the reference A8W4 GEMM: rel L2 ~1e-6, i.e. ulp-level, on gfx1201 and gfx1151. Card: GEMM 38 TFLOPS,
+GEMV 383 GB/s; APU: GEMV 212 GB/s (near its bandwidth). Native load (167.8 GB, with repack) 41.7 s.
+
+`unholy-curve` (one sequence, 4096-token chunks, two in flight, decode probes; logs in docs/bench/):
+
+| depth | prefill EXL3 | prefill native | decode EXL3 | decode native |
+|---|---|---|---|---|
+| 4k | | | 52.5 ms | 50.3 ms |
+| 16k | 2001 tok/s | 1693 tok/s | | |
+| 32k | 1763 | 1574 | 55.9 ms | 53.6 ms |
+| 128k | 1299 | ~1150 | 62.0 ms | 59.8 ms |
+| 256k | 1090 | 1037 | 71.4 ms | 68.0 ms |
+| 512k | 850 | 819 | 84.9 ms | 82.5 ms |
+| average 0-512k | 1044 | 971 | | |
+
+Native (lossless, 59.7% of routing on the cards at 1 x 512k) decodes slightly faster than EXL3 3.04
+bpw (71.9%) — MXFP4 dequantization is far cheaper than trellis decoding — and prefills 3-15% slower
+(more APU work). Both hold the >= 500 tok/s prefill target at 512k depth.

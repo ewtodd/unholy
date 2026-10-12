@@ -84,6 +84,16 @@ struct LoadE2m1 {
     return e2m1_to_f32((k & 1) ? (b >> 4) : (b & 0xf));
   }
 };
+// The tile-major MXFP4 layout of kernels/mx_moe.hpp.
+struct LoadE2m1Tiled {
+  const uint8_t* p;
+  int N;
+  __device__ float operator()(int, int n, int k) const {
+    const size_t chunk = size_t(k / 64) * (N / 16) + n / 16;
+    const uint8_t b = p[chunk * 512 + (n % 16) * 32 + (k % 64) / 2];
+    return e2m1_to_f32((k & 1) ? (b >> 4) : (b & 0xf));
+  }
+};
 struct LoadBf16 {
   const bf16* p;
   int ld;
@@ -131,6 +141,16 @@ struct ScaleA8W4 {
   }
 };
 
+struct ScaleA8W4Tiled {
+  const uint8_t* sa;
+  const uint8_t* sw;
+  int K, N;
+  __device__ float operator()(int, int m, int n, int kb32) const {
+    const size_t chunk = size_t(kb32 / 2) * (N / 16) + n / 16;
+    return e8m0_to_f32(sa[size_t(m) * (K / 128) + kb32 / 4]) * e8m0_to_f32(sw[chunk * 32 + (n % 16) * 2 + kb32 % 2]);
+  }
+};
+
 struct StoreBf16 {
   bf16* c;
   int ldc;
@@ -157,6 +177,11 @@ void gemm_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint
 void gemm_a8w4(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                int N, int K, hipStream_t st) {
   launch(M, N, K, 32, 1, LoadFp8{a, K}, LoadE2m1{w, K}, ScaleA8W4{sa, sw, K}, StoreBf16{c, ldc}, st);
+}
+
+void gemm_a8w4_tiled(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc,
+                     int M, int N, int K, hipStream_t st) {
+  launch(M, N, K, 32, 1, LoadFp8{a, K}, LoadE2m1Tiled{w, N}, ScaleA8W4Tiled{sa, sw, K, N}, StoreBf16{c, ldc}, st);
 }
 
 void gemm_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {

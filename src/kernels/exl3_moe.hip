@@ -68,19 +68,6 @@ __device__ __forceinline__ void fwht128_lds(float* b, int i) {
   }
 }
 
-__device__ __forceinline__ float fake_quant_fp8_block(float v, float* red) {
-  // amax over the 128-block (4 waves): warp max then LDS.
-  float a = warp_max(fabsf(v));
-  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
-  if (lane == 0) red[wave] = a;
-  __syncthreads();
-  a = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
-  __syncthreads();
-  a = fmaxf(a, 1e-4f);
-  const float sc = e8m0_to_f32(pow2_ceil_e8m0(a * (1.0f / 448.0f)));
-  return round_bf16(e4m3_to_f32(f32_to_e4m3(fminf(fmaxf(v / sc, -448.0f), 448.0f))) * sc);
-}
-
 __global__ __launch_bounds__(128) void xform_in_kernel(const bf16* x, int ldx, const int32_t* row_expert,
                                                        const uint16_t* const* suh_tab, uint16_t* xh, int K,
                                                        bool fq) {

@@ -64,9 +64,10 @@ struct Fp8Linear {  // e4m3 [out, in] + e8m0 [ceil(out/128), in/128]
   DevTensor w, s;
   int out = 0, in = 0;
 };
-struct Fp4Linear {  // packed e2m1 [out, in/2] + e8m0 [out, in/32]
+struct Fp4Linear {  // packed e2m1 [out, in/2] + e8m0 [out, in/32] (tiled: kernels/mx_moe.hpp layout)
   DevTensor w, s;
   int out = 0, in = 0;
+  bool tiled = false;
 };
 struct Exl3Weights {  // EXL3 linear (trellis I16, suh/svh F16), mul1 codebook
   DevTensor trellis, suh, svh;
@@ -96,8 +97,9 @@ struct LayerWeights {
   std::vector<Fp4Linear> w1, w2, w3;     // routed experts
   bool exl3_experts = false;              // routed experts in EXL3 instead (x1, x2, x3)
   std::vector<Exl3Weights> x1, x2, x3;
-  // Fast EXL3 path: device pointer tables [w1, w3, w2] x [trellis, suh, svh] x E (null where the
-  // expert is not on this device), and each matrix's bit width (uniform over resident experts).
+  // Grouped expert kernels: device pointer tables [w1, w3, w2] x [trellis, suh, svh] x E for EXL3,
+  // [w1, w3, w2] x [packed e2m1, e8m0 scales, -] x E for native experts (null where the expert is not
+  // on this device), and each EXL3 matrix's bit width (uniform over resident experts).
   rt::DeviceBuffer exl3_tab;
   rt::DeviceBuffer resident;  // uint8 [E]: 1 = this device holds the routed expert
   int n_resident = 0;

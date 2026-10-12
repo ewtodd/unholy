@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include "kernels/mx_moe.hpp"
 #include "kernels/ref.hpp"
 #include "model/exl3.hpp"
 #include "model/loader.hpp"
@@ -320,6 +321,28 @@ LayerWeights load_layer(const Checkpoint& ck, const Dsv4Config& c, int layer, in
         tab[size_t(m * 3 + 2) * E + e] = m3[m]->svh.ptr;
       }
     }
+    w.exl3_tab = rt::DeviceBuffer(dev, tab.size() * sizeof(void*));
+    UH_CHECK(hipMemcpy(w.exl3_tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
+  } else if (w.n_resident > 0) {
+    // Native MXFP4 experts: repacked tile-major for the grouped kernels (kernels/mx_moe.hpp; the
+    // reference GEMM reads that layout too), then the same table layout, [w1, w3, w2] x [packed e2m1,
+    // e8m0 scales].
+    std::vector<const void*> tab(9 * E, nullptr);
+    rt::DeviceBuffer tmp;
+    for (size_t e = 0; e < E; ++e) {
+      Fp4Linear* m3[3] = {&w.w1[e], &w.w3[e], &w.w2[e]};
+      for (int m = 0; m < 3; ++m) {
+        if (!m3[m]->w) continue;
+        Fp4Linear& l = *m3[m];
+        const size_t need = size_t(l.out) * l.in / 2 + size_t(l.out) * (l.in / 32);
+        if (tmp.size() < need) tmp = rt::DeviceBuffer(dev, need);
+        kernels::mx_repack(l.w.p<uint8_t>(), l.s.p<uint8_t>(), l.out, l.in, tmp.as<uint8_t>(), st);
+        l.tiled = true;
+        tab[size_t(m * 3 + 0) * E + e] = m3[m]->w.ptr;
+        tab[size_t(m * 3 + 1) * E + e] = m3[m]->s.ptr;
+      }
+    }
+    UH_CHECK(hipStreamSynchronize(st));
     w.exl3_tab = rt::DeviceBuffer(dev, tab.size() * sizeof(void*));
     UH_CHECK(hipMemcpy(w.exl3_tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
   }

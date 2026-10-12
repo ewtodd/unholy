@@ -113,4 +113,19 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
   return warp_sum(v);
 }
 
+// A8 fake quantization of one 128-value block held by a 128-thread block (one value per thread):
+// the reference's act_quant (amax floor 1e-4, power-of-two e8m0 scale, e4m3, back to bf16). `red`: 4
+// floats of LDS.
+__device__ __forceinline__ float fake_quant_fp8_block(float v, float* red) {
+  float a = warp_max(fabsf(v));
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  if (lane == 0) red[wave] = a;
+  __syncthreads();
+  a = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+  __syncthreads();
+  a = fmaxf(a, 1e-4f);
+  const float sc = e8m0_to_f32(pow2_ceil_e8m0(a * (1.0f / 448.0f)));
+  return round_bf16(e4m3_to_f32(f32_to_e4m3(fminf(fmaxf(v / sc, -448.0f), 448.0f))) * sc);
+}
+
 }  // namespace unholy::dev

@@ -32,6 +32,9 @@ void gemm_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint
 // sa[m][k/128] * sw[n][k/32]; bf16 out.
 void gemm_a8w4(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc,
                int M, int N, int K, hipStream_t st);
+// The same on weights in the tile-major layout of kernels/mx_moe.hpp.
+void gemm_a8w4_tiled(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc,
+                     int M, int N, int K, hipStream_t st);
 // bf16 x bf16 -> bf16.
 void gemm_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st);
 // fp32 x bf16 weights -> fp32 (the reference's fp32 linears: compressor, router, LM head).

@@ -1,0 +1,43 @@
+card 0 (dev 0): layers 0-21  dense 4.48 GB  cache 1.48 GB  scratch 2.94 GB  hot experts 2493 (23.62 GB of 23.62 GB budget)
+card 1 (dev 1): layers 22-42  dense 4.36 GB  cache 1.63 GB  scratch 3.05 GB  hot experts 2479 (23.49 GB of 23.49 GB budget)
+apu (dev 2): cold experts 57.19 GB of 129.53 GB free; predicted routing on cards 71.9%
+experts EXL3; loaded in 21.6 s; in-flight depth 2
+     depth   chunk_ms prefill_tok/s
+decode at depth 4104: median 52.5 ms/token (19.1 tok/s), min 51.7, max 55.1
+     16392       2047         2001
+     32776       2323         1763
+decode at depth 32784: median 55.9 ms/token (17.9 tok/s), min 54.1, max 57.9
+     49168       2942         1392
+     65552       2970         1379
+     81936       2916         1405
+     98320       3175         1290
+    114704       3233         1267
+    131088       3154         1299
+decode at depth 131096: median 62.0 ms/token (16.1 tok/s), min 59.6, max 64.5
+    147480       3260         1256
+    163864       3381         1212
+    180248       3534         1159
+    196632       3654         1121
+    213016       3596         1139
+    229400       3857         1062
+    245784       3680         1113
+    262168       3758         1090
+decode at depth 262176: median 71.4 ms/token (14.0 tok/s), min 67.6, max 74.8
+    278560       3778         1084
+    294944       4126          993
+    311328       3965         1033
+    327712       4324          947
+    344096       4061         1009
+    360480       4315          949
+    376864       4190          977
+    393248       4396          932
+    409632       4311          950
+    426016       4499          910
+    442400       4496          911
+    458784       4674          876
+    475168       4611          888
+    491552       4765          860
+    507936       4668          877
+    524288       4781          850
+decode at depth 524296: median 84.9 ms/token (11.8 tok/s), min 82.2, max 87.4
+prefill 524256 tokens in 502.0 s: 1044 tok/s average (wall 504.7 s incl. decode probes)

@@ -1,0 +1,43 @@
+card 0 (dev 0): layers 0-21  dense 4.48 GB  cache 1.48 GB  scratch 2.94 GB  hot experts 1766 (23.61 GB of 23.62 GB budget)
+card 1 (dev 1): layers 22-42  dense 4.36 GB  cache 1.63 GB  scratch 3.05 GB  hot experts 1757 (23.49 GB of 23.49 GB budget)
+apu (dev 2): cold experts 100.07 GB of 129.53 GB free; predicted routing on cards 59.7%
+experts native MXFP4; loaded in 41.7 s; in-flight depth 2
+     depth   chunk_ms prefill_tok/s
+decode at depth 4104: median 50.3 ms/token (19.9 tok/s), min 48.8, max 53.1
+     16392       2420         1693
+     32776       2602         1574
+decode at depth 32784: median 53.6 ms/token (18.6 tok/s), min 51.4, max 56.3
+     49168       3423         1197
+     65552       3408         1202
+     81936       3525         1162
+     98320       3426         1196
+    114704       3522         1163
+    131088       3387         1209
+decode at depth 131096: median 59.8 ms/token (16.7 tok/s), min 58.4, max 61.4
+    147480       3663         1118
+    163864       3676         1114
+    180248       3811         1075
+    196632       3989         1027
+    213016       4070         1007
+    229400       4029         1017
+    245784       4091         1001
+    262168       3949         1037
+decode at depth 262176: median 68.0 ms/token (14.7 tok/s), min 65.3, max 71.5
+    278560       4198          976
+    294944       4261          961
+    311328       4220          971
+    327712       4361          939
+    344096       4362          939
+    360480       4473          916
+    376864       4472          916
+    393248       4654          880
+    409632       4609          889
+    426016       4749          862
+    442400       4757          861
+    458784       4937          830
+    475168       4882          839
+    491552       5001          819
+    507936       5074          807
+    524288       4959          819
+decode at depth 524296: median 82.5 ms/token (12.1 tok/s), min 81.3, max 85.7
+prefill 524256 tokens in 540.1 s: 971 tok/s average (wall 542.6 s incl. decode probes)

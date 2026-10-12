@@ -13,6 +13,7 @@
 #include "kernels/gemv.hpp"
 #include "kernels/hc_fast.hpp"
 #include "kernels/indexer.hpp"
+#include "kernels/mx_moe.hpp"
 #include "kernels/ref.hpp"
 
 namespace unholy::model {
@@ -216,12 +217,16 @@ void expert_forward(const Dsv4Config& c, const LayerWeights& w, int e, uint16_t*
   } else {
     uint8_t* qb = s.qb.as<uint8_t>();
     uint8_t* qs = s.qs.as<uint8_t>();
+    auto lin = [&](const Fp4Linear& l, bf16* y, int out_dim, int in_dim) {
+      (l.tiled ? k::gemm_a8w4_tiled : k::gemm_a8w4)(qb, qs, l.w.p<uint8_t>(), l.s.p<uint8_t>(), y, out_dim, cnt, out_dim,
+                                                    in_dim, st);
+    };
     k::act_quant_fp8(in, D, qb, qs, cnt, D, 128, st);
-    k::gemm_a8w4(qb, qs, w.w1[size_t(e)].w.p<uint8_t>(), w.w1[size_t(e)].s.p<uint8_t>(), h1, I, cnt, I, D, st);
-    k::gemm_a8w4(qb, qs, w.w3[size_t(e)].w.p<uint8_t>(), w.w3[size_t(e)].s.p<uint8_t>(), h3, I, cnt, I, D, st);
+    lin(w.w1[size_t(e)], h1, I, D);
+    lin(w.w3[size_t(e)], h3, I, D);
     k::swiglu(h1, h3, rw, hh, cnt, I, c.swiglu_limit, st);
     k::act_quant_fp8(hh, I, qb, qs, cnt, I, 128, st);
-    k::gemm_a8w4(qb, qs, w.w2[size_t(e)].w.p<uint8_t>(), w.w2[size_t(e)].s.p<uint8_t>(), out, D, cnt, D, I, st);
+    lin(w.w2[size_t(e)], out, D, I);
   }
 }
 
@@ -248,6 +253,16 @@ bool exl3_fast_enabled() {
   }();
   return on;
 }
+
+// Native MXFP4 experts on the grouped kernels (kernels/mx_moe.hpp) unless UNHOLY_REF_MX=1.
+bool mx_fast_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_REF_MX");
+    return !v || std::string(v) == "0";
+  }();
+  return on;
+}
+bool routed_fast(const LayerWeights& w) { return w.exl3_experts ? exl3_fast_enabled() : mx_fast_enabled(); }
 
 std::vector<kernels::Exl3Tile> exl3_tiles(const std::vector<std::array<int, 3>>& runs) {
   std::vector<kernels::Exl3Tile> t;
@@ -284,6 +299,21 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
   if (P > s.rows) throw std::runtime_error("exl3_moe_forward_dev: scratch too small");
   const int D = c.dim, I = c.moe_inter, E = c.n_experts;
   max_tiles = std::min(max_tiles, P);  // every tile has >= 1 row: bounds the grids at small batches
+  if (!w.exl3_experts) {  // native MXFP4 experts: tables [w1, w3, w2] x [weights, scales]
+    const auto tab = [&](int m, int f) { return reinterpret_cast<const uint8_t* const*>(w.exl3_ptrs(m, f, E)); };
+    bf16* xa = s.xh1.as<bf16>();
+    bf16* hh = s.xh2.as<bf16>();
+    bf16* g = s.h1.as<bf16>();
+    bf16* u = s.h3.as<bf16>();
+    k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st);
+    const bool gemv = P / c.n_active <= 8;
+    const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
+    lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev);
+    lin(xa, D, tiles, max_tiles, tab(1, 0), tab(1, 1), u, I, I, st, ntiles_dev);
+    k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
+    lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev);
+    return;
+  }
   uint16_t* xh1 = s.xh1.as<uint16_t>();
   uint16_t* xh3 = s.xh3.as<uint16_t>();
   uint16_t* xh2 = s.xh2.as<uint16_t>();
@@ -680,7 +710,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   dump(L, b, "gate_out0", wt, size_t(T) * K * 4, st);
   dump(L, b, "gate_out1", sel, size_t(T) * K * 4, st);
 
-  const bool device_path = w.exl3_experts && exl3_fast_enabled() && !g_expert_hist &&
+  const bool device_path = routed_fast(w) && !g_expert_hist &&
                            (w.n_resident == E || (remote && remote->can_enqueue()));
   int32_t* dpidx = B<int32_t>(scr, kPairIdx);
   bf16* pair_out = B<bf16>(scr, kPairOut);
