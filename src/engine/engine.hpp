@@ -70,6 +70,7 @@ struct EngineConfig {
   uint64_t seed = 0;            // base for requests without a seed
   bool prefix_cache = true;      // when the model keeps snapshots
   int spec_drafts = 0;           // speculative decoding: drafts verified per step (0: off; model's drafter)
+  float spec_min_conf = -1e30f;  // verify only the leading drafts whose drafter confidence is at least this
 };
 
 struct EngineStats {

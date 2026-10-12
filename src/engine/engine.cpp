@@ -408,7 +408,9 @@ bool Engine::submit_step(int budget0) {
         // Decoding with drafts: verify as many as the step, the context and max_tokens allow.
         int k = 0;
         if (pass == 0 && spec_on_ && !s.drafts.empty()) {
-          k = std::min({int(s.drafts.size()), spec_max_, budget - 1, logit_rows - 1, max_context_ - 1 - s.computed});
+          int confident = 0;
+          while (confident < int(s.drafts.size()) && s.draft_conf[size_t(confident)] >= cfg_.spec_min_conf) ++confident;
+          k = std::min({confident, spec_max_, budget - 1, logit_rows - 1, max_context_ - 1 - s.computed});
           if (s.req.max_tokens > 0) k = std::min(k, s.req.max_tokens - s.generated() - 1);
           k = std::max(k, 0);
         }

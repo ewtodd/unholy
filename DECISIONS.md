@@ -541,3 +541,36 @@ each, with logprobs identical to uncached runs.
 1M context: the rope tables (512 B per position per card) were not in the plan — 0.5 GB per card at 1M,
 which overflowed the 1.5 GB default margin; now planned, and the planner's default margin is serve's
 3 GB. Two 1M requests (a 2M-token pool) fit native: 6 GB of cache per card, 50% of routing on the cards.
+
+## 2026-10-12 — DSpark speculative decoding
+
+The checkpoint's mtp.* is DeepSeek's DSpark block drafter (model.py DSparkBlock): 3 stages, each a full
+Block (HC, attention, 256-expert MoE) with compress ratio 0. Its attention keys are a 128-position
+window of "main-KV" — each stage's wkv/kv_norm/rope/fp8-sim of main_x = main_norm(main_proj(the
+target's HC means after layers 40-42, concatenated)) — in slot order, plus the whole draft block
+(bidirectional). A draft block is [the last sampled token, 4 noise tokens] at the next 5 positions; the
+last stage adds hc_head, norm, the target's LM head, a rank-256 Markov bias of the previous token and
+an argmax chain (temperature 0), and a confidence head.
+
+Implementation:
+- Weights: dense parts on card 1 (0.74 GB), routed experts on the APU (10.3 GB, own channel).
+- Every target step records the HC means of the target layers for each chunk's last <= 128 rows and
+  writes the stages' main-KV of them (so prefill fills the windows, verify steps extend them).
+- Verify chunks: a decoding sequence feeds its token plus k drafts with logits for every row. Before
+  the chunk, every per-slot ring the positions overwrite (attention windows, ratio-4 and ratio-128
+  compressor rings, indexer rings, the stages' windows) is backed up on both cards; after the drafts
+  are judged, the rejected positions are restored (paged rows need nothing: they are rewritten before
+  any later query can read them). Snapshots for prefix caching include the stages' windows and are kept
+  only when the whole chunk was accepted.
+- Acceptance: speculative sampling with a deterministic proposal — accept draft d with probability
+  p(d) under the request's own sampling (penalties, temperature, top-k/p, min-p), else draw from p
+  without d — so outputs are distributed exactly as without speculation (greedy: accept iff argmax).
+- Drafts run on a card-1 stream of their own (scratch, APU channel) after the verify step completes,
+  alongside the other in-flight step.
+
+Verified: tools/ref/oracle/dspark.py (the reference stages on the oracle's hidden states) vs
+unholy-dspark-test on the same inputs — identical drafts at 7/7 positions, confidences within 0.03,
+logits rel L2 1-4%; the scheduler test with a fake drafter (25% wrong tokens) gives outputs identical
+to non-speculative greedy in every configuration (with prefix caching, preemption, aborts); on DSV4
+greedy outputs with and without speculation are identical. 4 drafts, single stream, short context:
+code 19.9 -> 35.1 tok/s, prose 18.9 -> 23.0 (52% of drafts accepted, 3.1 tokens per verify step).

@@ -42,7 +42,8 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       (`UNHOLY_DUMP`, `tools/ref/compare_dump.py`)
 - [x] full-model logits vs oracle (`unholy-ref-run`): mean KL 9.6e-3, top-1 95.7% vs the oracle's own
       noise floor 9.9e-3 / 96.2% (DECISIONS 2026-10-11) — correct
-- [ ] DSpark (the checkpoint's `mtp.*` block drafter) on the reference path
+- [x] DSpark (the checkpoint's `mtp.*` block drafter): matches the reference; speculative decoding
+      with exact acceptance, ring backups/restores, --spec-drafts (DECISIONS 2026-10-12)
 
 ## Milestone 3 (serving)
 

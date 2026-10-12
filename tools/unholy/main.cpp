@@ -19,6 +19,8 @@
 // --spec-drafts N (default 0: off) turns on speculative decoding with the checkpoint's DSpark drafter
 // (its mtp.* stages: dense parts on card 1, ~10 GB of routed experts on the APU): each decode step
 // verifies up to N drafted tokens (N <= 5) and keeps the ones the model would have produced.
+// --spec-min-conf C: verify only the leading drafts whose confidence-head score is >= C (default 0.5: on
+// short-context code and prose, 5 drafts at 0.5 gave 33.6 / 23.9 tok/s vs 30.0 / 19.1 verifying all).
 //
 // --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
@@ -52,7 +54,7 @@ int usage() {
                "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
                "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
-               "                    [--spec-drafts N]\n");
+               "                    [--spec-drafts N] [--spec-min-conf C]\n");
   return 2;
 }
 
@@ -63,6 +65,7 @@ int serve(int argc, char** argv, bool plan_only) {
   long long kv_tokens = 0;
   int prefix_snapshots = 128;
   int spec_drafts = 0;
+  float spec_min_conf = 0.5f;
   double card_margin_gb = 3.0;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
@@ -82,6 +85,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--kv-tokens") kv_tokens = std::stoll(v);
     else if (a == "--prefix-snapshots") prefix_snapshots = std::stoi(v);
     else if (a == "--spec-drafts") spec_drafts = std::stoi(v);
+    else if (a == "--spec-min-conf") spec_min_conf = std::stof(v);
     else if (a == "--num-pages") num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
@@ -154,6 +158,7 @@ int serve(int argc, char** argv, bool plan_only) {
   ecfg.eos_id = tok.eos_id();
   ecfg.max_context = max_seq;
   ecfg.spec_drafts = spec_drafts;
+  ecfg.spec_min_conf = spec_min_conf;
   ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
   engine::Engine eng(model, ecfg);
   // Routing histogram of the traffic served so far, in the --profile format (for re-planning).
