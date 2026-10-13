@@ -12,7 +12,7 @@ C++20 and HIP; no Python at runtime; every kernel is our own (no rocBLAS / hipBL
 with Nix against TheRock's ROCm 10 SDK.
 <!---->
 It is *vertical*: one model, one machine.
-It was in one day by Claude Opus 5.5 (RIP software engineering), with an engineering log
+It was built in one day by Claude Opus 5.5 (RIP software engineering), with an engineering log
 (`DECISIONS.md`) that records every measurement and dead end along the way.
 <!---->
 ## The machine
