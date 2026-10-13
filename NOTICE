@@ -4,12 +4,22 @@ Copyright 2026 Ethan Todd
 Licensed under the Apache License, Version 2.0 (LICENSE).
 
 Third-party code is credited here as it is taken, with its license. Sources the design draws on
-(no code copied yet): gufo (MIT), antirez ds4.c (MIT), exllamav3 (MIT), Strata (MIT),
+without copying code: gufo (MIT), antirez ds4.c (MIT), exllamav3 (MIT), Strata (MIT),
 llama.cpp / ggml and the llama-halo-hybrid ds4-hybrid branch (MIT), vLLM and sglang
-(Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0).
+(Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0). The model's math follows
+DeepSeek's reference inference code (inference/ in the DeepSeek-V4-Flash checkpoint), which the
+tools/ref oracle scripts import from the checkpoint at run time; none of it is copied here.
 
 third_party/gufo/json.hpp — from gufo (https://github.com/gufo-org/gufo), MIT License,
 Copyright (c) 2026 gufo contributors (third_party/gufo/LICENSE).
+
+src/vision/image.cpp (resize_bicubic and its coefficient tables) — a port of Pillow's
+libImaging/Resample.c (https://github.com/python-pillow/Pillow), MIT-CMU License,
+Copyright (c) 1997-2011 by Secret Labs AB, Copyright (c) 1995-2011 by Fredrik Lundh and
+contributors, Copyright (c) 2010 by Jeffrey 'Alex' Clark and contributors
+(third_party/pillow/LICENSE).
+
+data/expert_profile_dsv4engine_code32k.txt — a routing histogram from dsv4-engine (Apache-2.0).
 
 src/model/exl3.* — the EXL3 format (trellis layout, codebooks, tensor-core permutation) follows
 exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License, Copyright (c) 2025 Turboderp.

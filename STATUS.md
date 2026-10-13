@@ -4,8 +4,8 @@ Live state. Design and targets: `DESIGN.md`; history and evidence: `DECISIONS.md
 
 ## Where things are
 
-- Source of truth: `github.com/ewtodd/unholy` (private), working tree on e-desktop
-  `~/Software/unholy`; build/run tree `son-of-anton:/scratch/unholy` (rsync, no `.git`).
+- Source of truth: `github.com/ewtodd/unholy`; the build/run tree on son-of-anton is
+  `/scratch/unholy` (rsync, no `.git`).
 - Weights: native `/scratch/dsv4-ve` (48 shards, 167.8 GB); EXL3 3.04 bpw
   `/scratch/models/dsv4-ve-exl3-3.04bpw` (16 shards, 118.4 GB).
 - Toolchain: `github:ewtodd/therock-sdk-nix` (ROCm 10.1.0, gfx120X-all dist; fat binaries for

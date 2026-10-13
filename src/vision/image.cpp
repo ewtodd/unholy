@@ -122,7 +122,7 @@ RgbImage decode_webp(std::span<const uint8_t> b) {
   return img;
 }
 
-// ---- PIL resampling (libImaging/Resample.c) ----------------------------------------------------------
+// ---- PIL resampling: a port of Pillow's libImaging/Resample.c (MIT-CMU License; see NOTICE) ----------
 
 constexpr int kPrecisionBits = 32 - 8 - 2;
 
