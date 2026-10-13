@@ -217,7 +217,7 @@ anything at ~3 bits loses something. Order:
 - Long context: needle retrieval at 128k/256k/512k; concurrency: N streams vs N serial
   runs of the same requests must give the same outputs (greedy, same batch composition).
 
-## Donors (and their licenses; credited in NOTICE)
+## Donors (and their licenses; credited in the README)
 
 | source | license | taken |
 |---|---|---|

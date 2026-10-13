@@ -1,5 +1,5 @@
 // Vendored from gufo (https://github.com/gufo-org/gufo, src/core/json.hpp at eb91584), MIT License,
-// Copyright (c) 2026 gufo contributors. Unmodified apart from this header; see NOTICE.
+// Copyright (c) 2026 gufo contributors. Unmodified apart from this header; see the README.
 #ifndef GUFO_CORE_JSON_HPP_
 #define GUFO_CORE_JSON_HPP_
 

@@ -183,8 +183,28 @@ This is not a general-purpose engine:
 | `DECISIONS.md` | dated decisions with their measurements: why each piece is the way it is |
 | `STATUS.md` | what's done and what's open |
 
+## Third-party code and credits
+
+Code taken from other projects, with its license:
+
+- `third_party/gufo/json.hpp`: from [gufo](https://github.com/gufo-org/gufo), MIT License,
+  Copyright (c) 2026 gufo contributors (`third_party/gufo/LICENSE`).
+- `src/vision/image.cpp` (`resize_bicubic` and its coefficient tables): a port of Pillow's
+  `libImaging/Resample.c` ([Pillow](https://github.com/python-pillow/Pillow)), MIT-CMU License,
+  Copyright (c) 1997-2011 by Secret Labs AB, Copyright (c) 1995-2011 by Fredrik Lundh and contributors,
+  Copyright (c) 2010 by Jeffrey 'Alex' Clark and contributors (`third_party/pillow/LICENSE`).
+- `src/model/exl3.*`: the EXL3 format (trellis layout, codebooks, tensor-core permutation) follows
+  [exllamav3](https://github.com/turboderp-org/exllamav3), MIT License, Copyright (c) 2025 Turboderp.
+- `data/expert_profile_dsv4engine_code32k.txt`: a routing histogram from dsv4-engine (Apache-2.0).
+
+The model's math follows DeepSeek's reference inference code (`inference/` in the DeepSeek-V4-Flash
+checkpoint). The oracle scripts in `tools/ref` import it from the checkpoint at run time; none of it
+is copied here. DeepSeek-V4-Flash's weights and reference code are DeepSeek's, under their own license.
+
+The design also draws on these projects, without copying code: gufo (MIT), antirez ds4.c (MIT),
+exllamav3 (MIT), Strata (MIT), llama.cpp / ggml and the llama-halo-hybrid ds4-hybrid branch (MIT),
+vLLM and sglang (Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0).
+
 ## License
 
-Apache-2.0 (`LICENSE`). Third-party code and attributions are listed in `NOTICE`. DeepSeek-V4-Flash's
-weights and reference code are DeepSeek's, under their own license, and are not part of this
-repository.
+Copyright 2026 Ethan Todd. Licensed under the Apache License, Version 2.0 (`LICENSE`).
