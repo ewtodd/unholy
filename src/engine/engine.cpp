@@ -448,38 +448,73 @@ bool Engine::submit_step(int budget0) {
   const auto build = [&]() {
     plan.clear();
     int budget = budget0, logit_rows = model_.max_logit_rows();
-    for (int pass = 0; pass < 2; ++pass)
-      for (auto& sp : running_) {
-        Seq& s = *sp;
-        if (s.awaiting_logits || s.abort_pending || s.done) continue;
-        const int remaining = int(s.tokens.size()) - s.computed;
-        if (remaining <= 0 || (remaining == 1) != (pass == 0) || budget == 0) continue;
-        int n = std::min(remaining, budget);
-        if (s.cut > s.computed && s.computed + n > s.cut) n = s.cut - s.computed;
-        // An image block goes into one chunk whole: stop before it, or take all of it when the step
-        // has room, else wait for a step that does.
-        for (const GenImage& im : s.req.images) {
-          const int a = im.start, e = im.start + im.len;
-          if (n <= 0 || s.computed >= e || s.computed + n <= a || s.computed + n >= e) continue;
-          if (a > s.computed) n = a - s.computed;
-          else n = e - s.computed <= budget ? e - s.computed : 0;
-        }
-        if (n <= 0) continue;
-        const bool logits = n == remaining;
-        if (logits && logit_rows == 0) continue;
-        // Decoding with drafts: verify as many as the step, the context and max_tokens allow.
-        int k = 0;
-        if (pass == 0 && spec_on_ && !s.drafts.empty()) {
-          int confident = 0;
-          while (confident < int(s.drafts.size()) && s.draft_conf[size_t(confident)] >= cfg_.spec_min_conf) ++confident;
-          k = std::min({confident, spec_max_, budget - 1, logit_rows - 1, max_context_ - 1 - s.computed});
-          if (s.req.max_tokens > 0) k = std::min(k, s.req.max_tokens - s.generated() - 1);
-          k = std::max(k, 0);
-        }
-        plan.push_back({&s, n + k, logits, -1, -1, -1, s.computed + n + k, k});
-        budget -= n + k;
-        logit_rows -= logits ? 1 + k : 0;
+    const auto rem = [](const Seq* s) { return int(s->tokens.size()) - s->computed; };
+    // Plans up to `cap` (<= budget) tokens of s.
+    const auto take = [&](Seq& s, int cap, bool decode) {
+      const int remaining = rem(&s);
+      int n = std::min(remaining, cap);
+      // A prefill chunk that stops short of the prompt ends on a page boundary when that leaves it any
+      // tokens (state is saved for the prefix cache only there).
+      if (!decode && n < remaining) {
+        const int aligned = (s.computed + n) / page_tokens_ * page_tokens_ - s.computed;
+        if (aligned > 0) n = aligned;
       }
+      if (s.cut > s.computed && s.computed + n > s.cut) n = s.cut - s.computed;
+      // An image block goes into one chunk whole: stop before it, or take all of it when the step
+      // has room (even past the request's cap), else wait for a step that does.
+      for (const GenImage& im : s.req.images) {
+        const int a = im.start, e = im.start + im.len;
+        if (n <= 0 || s.computed >= e || s.computed + n <= a || s.computed + n >= e) continue;
+        if (a > s.computed) n = a - s.computed;
+        else n = e - s.computed <= budget ? e - s.computed : 0;
+      }
+      if (n <= 0) return;
+      const bool logits = n == remaining;
+      if (logits && logit_rows == 0) return;
+      // Decoding with drafts: verify as many as the step, the context and max_tokens allow.
+      int k = 0;
+      if (decode && spec_on_ && !s.drafts.empty()) {
+        int confident = 0;
+        while (confident < int(s.drafts.size()) && s.draft_conf[size_t(confident)] >= cfg_.spec_min_conf) ++confident;
+        k = std::min({confident, spec_max_, budget - 1, logit_rows - 1, max_context_ - 1 - s.computed});
+        if (s.req.max_tokens > 0) k = std::min(k, s.req.max_tokens - s.generated() - 1);
+        k = std::max(k, 0);
+      }
+      plan.push_back({&s, n + k, logits, -1, -1, -1, s.computed + n + k, k});
+      budget -= n + k;
+      logit_rows -= logits ? 1 + k : 0;
+    };
+    // Decodes first (admission order), then prefill chunks in the configured order.
+    std::vector<Seq*> prefills;
+    for (auto& sp : running_) {
+      Seq& s = *sp;
+      if (s.awaiting_logits || s.abort_pending || s.done || rem(&s) <= 0) continue;
+      if (rem(&s) > 1) prefills.push_back(&s);
+      else if (budget > 0) take(s, budget, true);
+    }
+    if (prefills.empty() || budget == 0) return;
+    const bool shortest = cfg_.prefill_order == PrefillOrder::Shortest;
+    if (shortest)  // stable: admission order among equals
+      std::stable_sort(prefills.begin(), prefills.end(), [&](const Seq* a, const Seq* b) { return rem(a) < rem(b); });
+    const int eligible = int(running_.size() + waiting_.size());
+    int thr = eligible > 1 ? cfg_.long_prefill_threshold : 0;
+    if (thr > 0 && cfg_.long_prefill_adaptive) thr = std::max(thr, cfg_.max_batch_tokens / eligible);
+    // Shortest first: the earliest-submitted prefill keeps a quarter of the step (at least a page), so a
+    // stream of short prompts slows it but cannot stall it.
+    Seq* oldest = nullptr;
+    int reserve = 0;
+    if (shortest && prefills.size() > 1) {
+      for (Seq* s : prefills)
+        if (!oldest || s->id < oldest->id) oldest = s;
+      reserve = std::min({rem(oldest), budget, std::max(page_tokens_, budget / 4 / page_tokens_ * page_tokens_)});
+    }
+    for (Seq* s : prefills) {
+      if (budget == 0) break;
+      int cap = s == oldest ? budget : budget - reserve;
+      if (thr > 0) cap = std::min(cap, thr);
+      if (cap > 0) take(*s, cap, false);
+      if (s == oldest) reserve = 0;
+    }
   };
   for (;;) {
     build();

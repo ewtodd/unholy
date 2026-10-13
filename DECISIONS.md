@@ -661,3 +661,20 @@ Open: raw single-sequence decode is ~5.7 ms/token slower behind the switch with 
 51.6 -> 57.3 ms at 4k), ~130 us per layer. The card links stay at Gen4 throughout decode (not PCIe DPM);
 the suspect is per-round-trip latency of the per-layer card <-> APU handoffs (flags, polls, copies)
 through the switch. With DSpark (several tokens per round trip) the sweep shows no decode loss.
+
+## 2026-10-12 — prefill order: shortest remaining first
+
+In production a 164k-token prompt (1291 tok/s, TTFT 127 s) held up a continuation that arrived 1.6 s
+later with 18,176 of its 18,678 tokens cached: ~500 tokens of prefill, TTFT 115 s. Prefill chunks were
+packed in arrival order, so the long prompt took the whole 4096-token budget every step. vLLM's V1
+scheduler does the same by default (running requests in admission order, each taking min(remaining,
+budget); checked at vllm 189bbfb), and the old vLLM service here set nothing else; its only remedy is
+`--long-prefill-token-threshold` (off by default; `-adaptive` floors it at budget / requests).
+
+Now decodes still go first, then prefill chunks shortest-remaining-first (`--prefill-order shortest`, the
+default); the earliest-submitted prefill keeps a quarter of each step so a stream of short prompts cannot
+stall it. `--prefill-order fcfs` is the old behaviour, and `--long-prefill-token-threshold[-adaptive]`
+are vLLM's knobs with vLLM's semantics. A prefill chunk that gets less than its whole remainder ends on a
+page boundary (snapshots are only taken there). unholy-sched-test runs the whole matrix in all three
+modes and races a 2000-token prompt against a 20-token one a step later (64-token steps): shortest
+31 / 1 (finish steps, long / short), fcfs 31 / 31, fcfs + threshold 16 32 / 2.

@@ -239,6 +239,37 @@ std::vector<int32_t> reference(const std::vector<int32_t>& prompt, int max_token
   }
 }
 
+// Head-of-line blocking: a long prompt, then (one step later) a short one. Returns the step at which
+// each request finished (both with max_tokens = 1), driving the engine by hand.
+std::pair<int, int> race(PrefillOrder order, int threshold, bool adaptive) {
+  FakeModel model(4, 256, 512, 16, 64, 1, 0, 0);
+  EngineConfig ec;
+  ec.max_batch_tokens = 64;
+  ec.prefill_order = order;
+  ec.long_prefill_threshold = threshold;
+  ec.long_prefill_adaptive = adaptive;
+  Engine eng(model, ec, false);
+  int step = 0, done_long = -1, done_short = -1;
+  const auto submit = [&](int len, int* done) {
+    GenRequest r;
+    for (int i = 0; i < len; ++i) r.prompt.push_back(int32_t(2 + (i * 7919) % (kVocab - 2)));
+    r.max_tokens = 1;
+    r.sampling.temperature = 0.0f;
+    eng.submit(std::move(r), [&step, done](GenOutput&& o) {
+      if (o.finished) *done = step;
+    });
+  };
+  submit(2000, &done_long);
+  eng.iterate();
+  ++step;
+  submit(20, &done_short);
+  while ((done_long < 0 || done_short < 0) && step < 10000) {
+    eng.iterate();
+    ++step;
+  }
+  return {done_long, done_short};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -252,6 +283,12 @@ int main(int argc, char** argv) {
   // Configurations: (slots, pages per seq, pool pages, page tokens, step tokens, batch budget).
   const int configs[][6] = {{8, 64, 512, 16, 256, 256}, {4, 32, 40, 16, 128, 100}, {16, 16, 60, 8, 64, 64},
                             {2, 128, 30, 32, 512, 512}, {32, 20, 200, 16, 96, 96}};
+  // Scheduling modes: (prefill order, long-prefill threshold, adaptive).
+  const struct Mode { PrefillOrder order; int thr; bool adaptive; const char* name; } modes[] = {
+      {PrefillOrder::Shortest, 0, false, "shortest"},
+      {PrefillOrder::Fcfs, 0, false, "fcfs"},
+      {PrefillOrder::Fcfs, 24, true, "fcfs+thr24a"}};
+  for (const Mode& mode : modes)
   for (const int nspec : {0, 4})
   for (const int snaps : {0, 6, 64})
   for (const int depth : {1, 2})
@@ -261,6 +298,9 @@ int main(int argc, char** argv) {
     EngineConfig ec;
     ec.spec_drafts = nspec;
     ec.max_batch_tokens = cfgv[5];
+    ec.prefill_order = mode.order;
+    ec.long_prefill_threshold = mode.thr;
+    ec.long_prefill_adaptive = mode.adaptive;
     std::unordered_map<uint64_t, RequestLog> logs;
     int log_dups = 0;
     ec.on_finish = [&](const RequestLog& l) { log_dups += !logs.emplace(l.id, l).second; };
@@ -407,10 +447,10 @@ int main(int argc, char** argv) {
       }
     }
     const auto st = eng.stats();
-    std::printf("spec %d snaps %d depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, "
+    std::printf("%s spec %d snaps %d depth %d (max seen %d) slots=%d pool=%d page=%d budget=%d: %d ok, %d bad, %d aborted, "
                 "%d errors; %d steps, max batch %d, %llu preemptions, free pages %d/%d; cached %llu of %llu prompt "
                 "tokens, %d restores, %d saves; drafts %d, verified %llu of %llu drafted, %d rollbacks; %d image blocks\n",
-                nspec, snaps, depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors,
+                mode.name, nspec, snaps, depth, model.max_seen, cfgv[0], cfgv[2], cfgv[3], cfgv[5], ok, bad, aborts_seen, errors,
                 model.steps, model.max_batch, (unsigned long long)st.preemptions, st.free_pages, st.total_pages,
                 (unsigned long long)st.cached_tokens, (unsigned long long)st.prompt_tokens, model.restores,
                 model.saves, model.drafts, (unsigned long long)st.spec_accepted, (unsigned long long)st.spec_drafted,
@@ -437,6 +477,24 @@ int main(int argc, char** argv) {
       ++failures;
     }
     failures += bad;
+  }
+  // A 2000-token prompt (64-token steps: ~32 steps of prefill), then a 20-token one a step later.
+  // Shortest-first and the threshold let the short one finish within a few steps; FCFS queues it behind
+  // the whole long prefill (vLLM's default).
+  {
+    const auto [l1, s1] = race(PrefillOrder::Shortest, 0, false);
+    const auto [l2, s2] = race(PrefillOrder::Fcfs, 0, false);
+    const auto [l3, s3] = race(PrefillOrder::Fcfs, 16, false);
+    std::printf("race (long, short finish step): shortest %d, %d; fcfs %d, %d; fcfs+thr16 %d, %d\n", l1, s1, l2, s2,
+                l3, s3);
+    if (s1 < 0 || s1 > 4 || l1 < 0 || s2 < l2 || s3 < 0 || s3 > 4) {
+      std::printf("  head-of-line check failed\n");
+      ++failures;
+    }
+    if (l1 > l2 + 2) {
+      std::printf("  shortest-first delayed the long prompt by more than a step or two\n");
+      ++failures;
+    }
   }
   std::printf("%s\n", failures ? "FAILED" : "all ok");
   return failures ? 1 : 0;

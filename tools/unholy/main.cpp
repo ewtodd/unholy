@@ -22,6 +22,13 @@
 // --spec-min-conf C: verify only the leading drafts whose confidence-head score is >= C (default 0.5: on
 // short-context code and prose, 5 drafts at 0.5 gave 33.6 / 23.9 tok/s vs 30.0 / 19.1 verifying all).
 //
+// Prefill scheduling: decodes always go first; prefill chunks fill the rest of the step's token budget
+// (--max-batch-tokens) in --prefill-order: `shortest` (default) packs the least remaining prompt first,
+// so a continuation with a few hundred uncached tokens is not queued behind a long prefill (the oldest
+// prefill keeps a quarter of each step); `fcfs` is arrival order, vLLM's default.
+// --long-prefill-token-threshold N / --long-prefill-token-threshold-adaptive 1: vLLM's per-request cap
+// (when more than one request is running or waiting; adaptive: never below budget / requests). Off.
+//
 // Logging (stdout, so journald under systemd): a line per finished request (its tokens, queue time, time
 // to first token, prefill and decode tok/s, draft acceptance) and, every --log-interval seconds (default
 // 10; 0: off) while there is traffic, the engine's throughput, queue, KV pool use, prefix-cache hit rate
@@ -64,7 +71,9 @@ int usage() {
                "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
                "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
-               "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n");
+               "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
+               "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
+               "                    [--long-prefill-token-threshold-adaptive 0|1]\n");
   return 2;
 }
 
@@ -146,6 +155,9 @@ int serve(int argc, char** argv, bool plan_only) {
   float spec_min_conf = 0.5f;
   double card_margin_gb = 2.0;
   double log_interval = 10;
+  engine::PrefillOrder prefill_order = engine::PrefillOrder::Shortest;
+  int long_prefill_threshold = 0;
+  bool long_prefill_adaptive = false;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -170,6 +182,12 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
     else if (a == "--log-interval") log_interval = std::stod(v);
+    else if (a == "--prefill-order") {
+      if (v == "shortest") prefill_order = engine::PrefillOrder::Shortest;
+      else if (v == "fcfs") prefill_order = engine::PrefillOrder::Fcfs;
+      else return usage();
+    } else if (a == "--long-prefill-token-threshold") long_prefill_threshold = std::stoi(v);
+    else if (a == "--long-prefill-token-threshold-adaptive") long_prefill_adaptive = v != "0" && v != "off" && v != "false";
     else return usage();
   }
   if (model_dir.empty()) return usage();
@@ -245,6 +263,9 @@ int serve(int argc, char** argv, bool plan_only) {
   ecfg.spec_min_conf = spec_min_conf;
   ecfg.seed = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
   ecfg.on_finish = [](const engine::RequestLog& l) { log_line(request_line(l)); };
+  ecfg.prefill_order = prefill_order;
+  ecfg.long_prefill_threshold = long_prefill_threshold;
+  ecfg.long_prefill_adaptive = long_prefill_adaptive;
   engine::Engine eng(model, ecfg);
   // Logs while there is traffic, plus the interval after it ends (throughput back to zero). A jthread
   // declared after the engine: stopped and joined before the engine goes away.

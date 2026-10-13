@@ -88,6 +88,12 @@ struct RequestLog {
   int spec_steps = 0, spec_drafted = 0, spec_accepted = 0;
 };
 
+// Order in which prefill chunks are packed into a step's token budget (decodes always go first).
+//   Shortest: least remaining prompt first, so a continuation with a few hundred uncached tokens is not
+//             queued behind a 160k-token prefill; the oldest prefill keeps a quarter of each step.
+//   Fcfs:     arrival order (vLLM's default: a long prefill takes the whole budget until it is done).
+enum class PrefillOrder { Shortest, Fcfs };
+
 struct EngineConfig {
   int max_batch_tokens = 2048;  // rows per step (<= the model's max_tokens)
   int max_running = 0;          // concurrent sequences (<= the model's slots); 0 = all slots
@@ -98,6 +104,11 @@ struct EngineConfig {
   int spec_drafts = 0;           // speculative decoding: drafts verified per step (0: off; model's drafter)
   float spec_min_conf = -1e30f;  // verify only the leading drafts whose drafter confidence is at least this
   std::function<void(const RequestLog&)> on_finish;  // every request that ends; on the engine thread
+  PrefillOrder prefill_order = PrefillOrder::Shortest;
+  // vLLM's --long-prefill-token-threshold: with more than one request running or waiting, no request
+  // takes more than this many tokens of a step (0: off). Adaptive: never below budget / requests.
+  int long_prefill_threshold = 0;
+  bool long_prefill_adaptive = false;
 };
 
 struct EngineStats {
