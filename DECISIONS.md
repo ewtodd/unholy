@@ -838,3 +838,7 @@ A token ran ~63 kernels per layer on a card, ~4.5 us apart. Removed, bit-identic
   `kv_chain` (kv_norm in place, rope, fp8 fake quant) and `head_rms_rope` (q's per-head RMS and rope) do
   their reference kernels' arithmetic in one launch each. 6 launches fewer per layer, bit-identical: decode
   36.7 / 59.2 / 91.0 -> 35.7 / 58.3 / 89.9 ms at batch 1 / 4 / 8.
+- `index_q_chain`: the indexer query's rope, Hadamard and fp4 codes in one launch (CSA layers), the three
+  kernels' arithmetic: bit-identical, 35.7 -> 35.6 ms at batch 1. The launches left at decode are mostly
+  the MoE dispatch chain and the HC split-K pair, where a fused kernel would serialize work that now runs
+  across workgroups.

@@ -40,6 +40,10 @@ void quant_q_fp4(const bf16* q, int T, int H, uint8_t* q8, uint8_t* qe, hipStrea
 
 // scores [T, nkeys] bf16 (bit patterns as uint16): sum_h bf16(relu(bf16(q_h . k_j)) * w_h) over heads in
 // order, rounded to bf16; -inf for keys a query cannot see (j >= (pos + 1) / ratio). H must be 64.
+// The query chain of the fast indexer in one launch: rope (forward, the last 2 * npair dims of each
+// 128-dim head of q [T, H, 128]), hadamard128, then quant_q_fp4 into q8 / qe; q keeps the rotated bf16 values.
+void index_q_chain(bf16* q, int T, int H, const int32_t* pos, const float2* freqs, int npair, uint8_t* q8, uint8_t* qe,
+                   hipStream_t st);
 void indexer_scores_fp4(const uint8_t* q8, const uint8_t* qe, const bf16* w, PagedFp4 keys, const int32_t* pos,
                         uint16_t* scores, int T, int H, int nkeys, int ratio, hipStream_t st);
 

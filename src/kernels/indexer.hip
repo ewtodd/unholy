@@ -86,6 +86,72 @@ __global__ void quant_q_fp4_kernel(const bf16* q, int rows, uint8_t* q8, uint8_t
   if (lane == 0) qe[wid] = uint8_t(emax);
 }
 
+// The indexer's query chain in one launch: rope_kernel on each 128-dim head's last 2 * npair dims,
+// hadamard128_kernel, quant_q_fp4_kernel. Blocks of 4 waves, a wave per (row, head) segment, the
+// Hadamard's LDS butterflies and barriers as hadamard128_kernel, every value through the same operations.
+__global__ __launch_bounds__(128) void index_q_chain_kernel(bf16* q, size_t nseg, int heads, const int32_t* pos,
+                                                            const float2* freqs, int npair, uint8_t* q8, uint8_t* qe) {
+  __shared__ float buf[4][128];
+  const int local = threadIdx.x / 32, lane = threadIdx.x & 31;
+  const size_t seg = size_t(blockIdx.x) * 4 + local;
+  const bool valid = seg < nseg;
+  bf16* p = q + seg * 128;
+  float* b = buf[local];
+  if (valid) {
+    for (int i = lane; i < 128; i += 32) b[i] = bf16_to_f32(p[i]);
+    if (lane < npair) {  // rope_kernel: its bf16 outputs are what the Hadamard reads
+      const int r = int(seg / heads), j = lane, off = 128 - 2 * npair;
+      const float a = bf16_to_f32(p[off + 2 * j]), c0 = bf16_to_f32(p[off + 2 * j + 1]);
+      const float2 f = freqs[size_t(pos[r]) * npair + j];
+      const float c = f.x, s = f.y;
+      b[off + 2 * j] = bf16_to_f32(f32_to_bf16(a * c - c0 * s));
+      b[off + 2 * j + 1] = bf16_to_f32(f32_to_bf16(a * s + c0 * c));
+    }
+  }
+  __syncthreads();
+  for (int h = 1; h < 128; h <<= 1) {
+    if (valid)
+      for (int t = lane; t < 64; t += 32) {
+        const int i = (t / h) * 2 * h + (t % h);
+        const float a = b[i], c = b[i + h];
+        b[i] = a + c;
+        b[i + h] = a - c;
+      }
+    __syncthreads();
+  }
+  const float hs = 0.08838834764831845f;  // 128^-0.5
+  if (valid)
+    for (int i = lane; i < 128; i += 32) {
+      const bf16 v = f32_to_bf16(b[i] * hs);
+      p[i] = v;
+      b[i] = bf16_to_f32(v);
+    }
+  __syncthreads();
+  if (!valid) return;
+  // quant_q_fp4_kernel on the segment (lane: values 4 lane .. 4 lane + 3).
+  float v[4];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    v[i] = b[lane * 4 + i];
+    amax = fmaxf(amax, fabsf(v[i]));
+  }
+#pragma unroll
+  for (int o = 1; o < 8; o <<= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+  amax = fmaxf(amax, 6.0f * 1.1754943508222875e-38f);
+  const uint8_t se = pow2_ceil_e8m0(amax * (1.0f / 6.0f));
+  uint32_t emax = se;
+  emax = max(emax, uint32_t(__shfl_xor(int(emax), 8, 32)));
+  emax = max(emax, uint32_t(__shfl_xor(int(emax), 16, 32)));
+  const float sc = e8m0_to_f32(se), rel = ldexpf(1.0f, int(se) - int(emax));
+  uint32_t packed = 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    packed |= uint32_t(f32_to_e4m3(round_e2m1(fminf(fmaxf(v[i] / sc, -6.0f), 6.0f)) * rel)) << (8 * i);
+  reinterpret_cast<uint32_t*>(q8 + seg * 128)[lane] = packed;
+  if (lane == 0) qe[seg] = uint8_t(emax);
+}
+
 constexpr int QG = 4, KT = 128, IH = 64, ID = 128, NT = 256, PAD = 16;
 constexpr uint16_t kBf16NegInf = 0xff80;
 
@@ -592,6 +658,15 @@ void quant_q_fp4(const bf16* q, int T, int H, uint8_t* q8, uint8_t* qe, hipStrea
   const int rows = T * H;
   if (rows <= 0) return;
   quant_q_fp4_kernel<<<cdiv(size_t(rows) * 32, 256), 256, 0, st>>>(q, rows, q8, qe);
+  UH_CHECK_LAUNCH();
+}
+
+void index_q_chain(bf16* q, int T, int H, const int32_t* pos, const float2* freqs, int npair, uint8_t* q8, uint8_t* qe,
+                   hipStream_t st) {
+  const size_t nseg = size_t(T) * H;
+  if (nseg == 0) return;
+  if (npair > 32) throw std::runtime_error("index_q_chain: npair > 32");
+  index_q_chain_kernel<<<cdiv(nseg, 4), 128, 0, st>>>(q, nseg, H, pos, freqs, npair, q8, qe);
   UH_CHECK_LAUNCH();
 }
 

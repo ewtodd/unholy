@@ -649,10 +649,14 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   // Indexer inputs (token-parallel; qi from the wq_b launch above); per-chunk scores/top-k below.
   if (w.ratio && !fast_dense()) k::cast_bf16_f32(a, B<float>(scr, kAF), size_t(T) * D, st);  // reference GEMMs' input
   if (w.has_indexer) {
-    k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
-    k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
-    if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
-    else k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
+    if (fast_indexer() && fast_elem() && ID == 128) {  // rope, Hadamard and the fp4 codes in one launch
+      k::index_q_chain(qi, T, IH, pos, freqs, rd / 2, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
+    } else {
+      k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
+      k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
+      if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
+      else k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
+    }
     dense_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
     // weights_proj(x) * (softmax_scale * n_heads^-0.5): the Python double, applied as fp32.
     const double wscale = (1.0 / std::sqrt(double(ID))) * (1.0 / std::sqrt(double(IH)));
