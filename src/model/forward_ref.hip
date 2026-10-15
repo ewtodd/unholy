@@ -85,8 +85,19 @@ std::vector<std::vector<uint64_t>>* g_expert_hist = nullptr;
 bool ref_experts_needed() { return !exl3_fast_enabled() || !mx_fast_enabled() || g_expert_hist != nullptr; }
 
 namespace {
-constexpr size_t kIndexerScoreBytes = size_t(256) << 20;
-std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_seq) {
+// The indexer's score rows go through this buffer in sub-batches (and decode-sized steps' top-k scratch
+// follows their rows in it): 64 MB holds 48 rows at 1M context plus their top-k scratch.
+constexpr size_t kIndexerScoreBytes = size_t(64) << 20;
+// Gathered pair rows (kPairIn): the EXL3 experts' input, the bf16 remote transport (UNHOLY_REMOTE_Q=0) and
+// the reference expert path read them; native experts with the compact fp8 transport read the tokens.
+bool pair_rows_needed(bool exl3) {
+  static const bool remote_bf16 = [] {
+    const char* q = std::getenv("UNHOLY_REMOTE_Q");
+    return q && std::string(q) == "0";
+  }();
+  return exl3 || remote_bf16 || ref_experts_needed();
+}
+std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3) {
   const size_t N = size_t(max_tokens);
   const size_t rows = N / 4 + 2;
   const size_t keys = size_t(max_seq / 4 + 1);
@@ -130,7 +141,7 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kShared] = N * c.dim * 2;
   sz[kEIdx] = N * K * 4;
   sz[kEWt] = N * K * 4;
-  sz[kPairIn] = N * K * c.dim * 2;
+  sz[kPairIn] = pair_rows_needed(exl3) ? N * K * c.dim * 2 : 0;
   sz[kHcPart] = size_t(32) * 32 * 25 * 4;
   sz[kRTok] = N * 2 * 4;  // remote_tokens: tok2u [T], u2t [T]
   return sz;
@@ -157,7 +168,7 @@ size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows, bool exl3) {
 size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3) {
   size_t total = (ref_experts_needed() ? expert_scratch_bytes(c, max_tokens) : 0) +
                  exl3_moe_scratch_bytes(c, max_tokens * c.n_active, exl3);
-  for (size_t b : scratch_sizes(c, max_tokens, max_seq)) total += std::max<size_t>(b, 256);
+  for (size_t b : scratch_sizes(c, max_tokens, max_seq, exl3)) total += std::max<size_t>(b, 256);
   return total;
 }
 
@@ -176,7 +187,7 @@ size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const Cac
 }
 
 Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, bool exl3) {
-  const std::vector<size_t> sz = scratch_sizes(c, max_tokens, max_seq);
+  const std::vector<size_t> sz = scratch_sizes(c, max_tokens, max_seq, exl3);
   Scratch s;
   s.max_tokens = max_tokens;
   s.max_keys = max_seq / 4 + 1;
@@ -340,7 +351,8 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
 
 void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
                           const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
-                          int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st) {
+                          int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st, const int32_t* in_rows) {
+  if (in_rows && w.exl3_experts) throw std::runtime_error("exl3_moe_forward_dev: EXL3 experts take gathered pair rows");
   if (P > s.rows) throw std::runtime_error("exl3_moe_forward_dev: scratch too small");
   const int D = c.dim, I = c.moe_inter, E = c.n_experts;
   max_tiles = std::min(max_tiles, P);  // every tile has >= 1 row: bounds the grids at small batches
@@ -350,7 +362,7 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
     bf16* hh = s.xh2.as<bf16>();
     bf16* g = s.h1.as<bf16>();
     bf16* u = s.h3.as<bf16>();
-    k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st);
+    k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st, in_rows);
     const bool gemv = k::mx_use_gemv(P / c.n_active);
     const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
     lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u);  // w1, w3
@@ -859,6 +871,9 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
   // ordered after the previous layer's stream wait on the remote side's done flag (DECISIONS 2026-10-12),
   // so they could overwrite the staging the remote side was still reading.
   int32_t* tok2u = B<int32_t>(scr, kRTok);
+  // Native experts with the fp8 remote transport read their inputs from the tokens (mx_xform_in x_rows):
+  // no gathered pair rows.
+  const bool gathered = w.exl3_experts || (any_remote && !qin) || pair_rows_needed(false);
   if (T <= k::kMoeSmallMaxTokens && K <= 8 && E <= 256) {  // decode-sized: one block for the bookkeeping
     k::MoeSmallArgs ma{sel, wt, T, K, hist, w.resident.as<uint8_t>(), E, P, ds.max_tiles, tile_rows, plan, lt, rtl, eidx,
                        ewt, row_expert, pidx, any_remote, qin, tok2u, tok2u + T,
@@ -866,13 +881,13 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
                        any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
                        any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
     k::moe_dispatch_small(ma, st);
-    k::gather_rows(f, eidx, pair_in, P, D, st);
+    if (gathered) k::gather_rows(f, eidx, pair_in, P, D, st);
     if (qin) k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
   } else {
     k::moe_count(sel, T, K, count, E, st, hist);
     k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st, tile_rows);
     k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
-    k::gather_rows(f, eidx, pair_in, P, D, st);
+    if (gathered) k::gather_rows(f, eidx, pair_in, P, D, st);
     if (any_remote) {
       if (qin) {  // before stage_remote: it copies the plan with the token count
         k::remote_tokens(pidx, eidx, T, K, plan, tok2u, tok2u + T, remote->p2u_host,
@@ -895,8 +910,8 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
     }
     remote->enqueue(w.layer, st, P);
   }
-  exl3_moe_forward_dev(c, w, pair_in, ewt, row_expert, lt, ds.max_tiles, &plan->n_local_tiles, P, scr.exl3, pair_out,
-                       st);
+  exl3_moe_forward_dev(c, w, gathered ? pair_in : f, ewt, row_expert, lt, ds.max_tiles, &plan->n_local_tiles, P,
+                       scr.exl3, pair_out, st, gathered ? nullptr : eidx);
   return {any_remote, combined};
 }
 

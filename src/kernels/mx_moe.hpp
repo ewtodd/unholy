@@ -27,8 +27,9 @@ namespace unholy::kernels {
 void mx_repack(uint8_t* w, uint8_t* s, int N, int K, uint8_t* tmp, hipStream_t st);
 
 // xa[r] = bf16(fq8_128(x[r])) for rows whose expert is resident (scale table entry non-null).
+// x_rows: pair row r's input is x row x_rows[r] (the token) instead of row r (gathered pair rows).
 void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P,
-                 int K, hipStream_t st);
+                 int K, hipStream_t st, const int32_t* x_rows = nullptr);
 // hh[r] = bf16(fq8_128(bf16(silu(min(g, lim)) * clamp(u, +-lim) * w[r]))).
 // The same xa rows rebuilt from compact fp8 inputs (quant_remote_tokens): row r in [plan->remote0,
 // plan->P) whose expert is resident takes token p2u[r]'s codes and scale exponents. Bit-identical to

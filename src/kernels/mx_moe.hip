@@ -61,11 +61,13 @@ __global__ void mx_repack_kernel(const uint8_t* w, const uint8_t* s, uint8_t* tw
 }
 
 __global__ __launch_bounds__(128) void mx_xform_in_kernel(const bf16* x, int ldx, const int32_t* row_expert,
-                                                          const uint8_t* const* s_tab, bf16* xa, int K) {
+                                                          const uint8_t* const* s_tab, bf16* xa, int K,
+                                                          const int32_t* x_rows) {
   __shared__ float red[4];
   const int r = blockIdx.y, seg = blockIdx.x, i = threadIdx.x;
   if (!s_tab[row_expert[r]]) return;  // expert not on this device (uniform per block)
-  const float v = fake_quant_fp8_block(bf16_to_f32(x[size_t(r) * ldx + seg * 128 + i]), red);
+  const size_t src = x_rows ? size_t(x_rows[r]) : size_t(r);
+  const float v = fake_quant_fp8_block(bf16_to_f32(x[src * ldx + seg * 128 + i]), red);
   xa[size_t(r) * K + seg * 128 + i] = f32_to_bf16(v);
 }
 
@@ -305,9 +307,9 @@ void mx_repack(uint8_t* w, uint8_t* s, int N, int K, uint8_t* tmp, hipStream_t s
 }
 
 void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P,
-                 int K, hipStream_t st) {
+                 int K, hipStream_t st, const int32_t* x_rows) {
   if (P <= 0) return;
-  mx_xform_in_kernel<<<dim3(K / 128, P), 128, 0, st>>>(x, ldx, row_expert, s_tab, xa, K);
+  mx_xform_in_kernel<<<dim3(K / 128, P), 128, 0, st>>>(x, ldx, row_expert, s_tab, xa, K, x_rows);
   UH_CHECK_LAUNCH();
 }
 

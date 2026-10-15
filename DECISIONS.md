@@ -872,3 +872,10 @@ by the planner's difference) logits are bit-identical.
 - `moe_dispatch_small`: for steps of <= 32 tokens, moe_count + moe_plan + moe_scatter + remote_tokens +
   stage_remote in one single-block launch (counts, offsets and fill counters in LDS; the same outputs):
   bit-identical, decode 34.9 / 88.4 -> 34.2 / 87.7 ms at batch 1 / 8; unholy-sched-test all ok.
+- Native experts with the fp8 remote transport no longer gather their inputs into pair rows: `mx_xform_in`
+  reads the tokens through the pair -> token map (`x_rows`), and `kPairIn` (201 MB at 4096 tokens) exists
+  only for the EXL3 experts, the bf16 remote transport (UNHOLY_REMOTE_Q=0) and the reference path. The
+  indexer's score sub-batch buffer is 64 MB instead of 256 (48 decode rows at 1M context plus their top-k
+  scratch fit; prefill takes more, smaller sub-batches). Bit-identical at the old placement; decode 34.2 ->
+  33.9 ms at batch 1. Production plan now: scratch 2.24 / 2.36 GB, hot experts 1554 / 1467, routing on the
+  cards 54.8% (53.3% before these three changes).

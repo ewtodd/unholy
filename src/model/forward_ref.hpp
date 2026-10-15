@@ -82,9 +82,11 @@ void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t
                       const int32_t* row_expert, const std::vector<kernels::Exl3Tile>& tiles, int P,
                       const Exl3MoeScratch& s, uint16_t* out, hipStream_t st);
 // Same with the tile list on the device: the grid is sized for max_tiles, *ntiles_dev tiles run.
+// in_rows (native experts only): `in` is the token rows, pair row r takes row in_rows[r].
 void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint16_t* in, const float* rw,
                           const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
-                          int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st);
+                          int P, const Exl3MoeScratch& s, uint16_t* out, hipStream_t st,
+                          const int32_t* in_rows = nullptr);
 // Native MXFP4 experts on compact fp8 inputs (kernels::quant_remote_tokens): rows [plan->remote0,
 // plan->P) rebuilt from their tokens' codes / scale exponents, then the same GEMMs as the pair-row path.
 // With u2p: the pair outputs stay in scratch and `out` gets one combined row per token
