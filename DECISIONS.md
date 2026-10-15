@@ -819,3 +819,17 @@ order as the one-workgroup kernel (indexer test: 0 differing indices at 8k-262k 
 37). 32k / 131k / 262k keys: 224 / 727 / 1538 -> 57 / 72 / 94 us. The scratch is the score buffer past the
 pending rows (a buffer of its own moved experts in the plan: with the APU's bf16 combine, and even
 without it, a different placement changes the logits).
+
+## 2026-10-15 — fewer launches per layer; long-context decode at 20 tok/s
+
+A token ran ~63 kernels per layer on a card, ~4.5 us apart. Removed, bit-identically:
+- `gemv_w8a8_parts` / `gemv_bf16_f32out_parts`: up to three GEMVs on one input in one launch (each wave
+  finds its part, then the single GEMV's code): wq_a + wkv, wq_b + the indexer's wq_b (both on the
+  quantized qr), the shared expert's w1 + w3, each compressor's wkv + wgate. `UNHOLY_NO_GEMV_PARTS=1`
+  launches them separately: same bench, 37.5 / 60.7 / 92.5 -> 36.7 / 59.2 / 91.0 ms at batch 1 / 4 / 8.
+- the bf16 -> fp32 copies of the compressor and router inputs, which only the reference GEMMs read;
+- the per-layer memset of the MoE counts: moe_plan leaves them zero for the next layer.
+
+`unholy-curve` to 512k with tonight's kernels (the attention staging, the long-row top-k): decode 36.6 /
+38.8 / 40.8 / 44.6 / 48.9 ms per token at 4k / 32k / 128k / 256k / 512k (before tonight 56.7 / 58.4 /
+64.2 / - / 87.6): 20.4 tok/s at 512k without speculation. Prefill average 0-512k 1245 tok/s (1062).

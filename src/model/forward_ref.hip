@@ -180,6 +180,7 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) 
   s.route_hist = rt::DeviceBuffer(dev, std::max(size_t(c.n_layers + c.n_mtp), c.compress_ratios.size()) * c.n_experts * 4);
   UH_CHECK(hipMemset(s.route_hist.data(), 0, s.route_hist.size()));
   s.dispatch.count = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
+  UH_CHECK(hipMemset(s.dispatch.count.data(), 0, s.dispatch.count.size()));  // then kept zero by moe_plan
   s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   s.dispatch.fill = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   s.dispatch.plan = rt::DeviceBuffer(dev, sizeof(kernels::MoePlan));
@@ -413,6 +414,23 @@ void dense_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uin
   else if (fast_dense() && on_gfx12()) k::gemm_w8a8_wmma(a, sa, w, sw, c, ldc, M, N, K, st);
   else k::gemm_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
 }
+// Two W8A8 linears on the same quantized input: one GEMV launch for both when the GEMV applies (every
+// column computed as by its own GEMV), else the two GEMMs.
+bool gemv_parts() {
+  static const bool on = !std::getenv("UNHOLY_NO_GEMV_PARTS");
+  return on;
+}
+void dense_w8a8_2(const uint8_t* a, const uint8_t* sa, const Fp8Linear& l1, bf16* c1, int ldc1, const Fp8Linear& l2,
+                  bf16* c2, int ldc2, int M, int K, hipStream_t st) {
+  if (gemv_parts() && fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) {
+    const k::GemvPart parts[2] = {{l1.w.p<uint8_t>(), l1.s.p<uint8_t>(), c1, ldc1, l1.out},
+                                  {l2.w.p<uint8_t>(), l2.s.p<uint8_t>(), c2, ldc2, l2.out}};
+    k::gemv_w8a8_parts(a, sa, parts, 2, M, K, st);
+    return;
+  }
+  dense_w8a8(a, sa, l1.w.p<uint8_t>(), l1.s.p<uint8_t>(), c1, ldc1, M, l1.out, K, st);
+  dense_w8a8(a, sa, l2.w.p<uint8_t>(), l2.s.p<uint8_t>(), c2, ldc2, M, l2.out, K, st);
+}
 // The reference's fp32 linears on x.float() of a bf16 tensor: bf16 WMMA on the bf16 source is exact in
 // the products; the reference kernel takes the fp32 copy.
 void dense_f32(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w, float* c, int ldc, int M, int N,
@@ -420,6 +438,17 @@ void dense_f32(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w, f
   if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_bf16_f32out(a_bf16, lda, w, c, ldc, M, N, K, st);
   else if (fast_dense()) k::gemm_bf16_f32out_wmma(a_bf16, lda, w, c, ldc, M, N, K, st);
   else k::gemm_f32(a_f32, lda, w, c, ldc, M, N, K, st);
+}
+// Two fp32-output linears (bf16 weights [N, K]) on the same input: one GEMV launch when it applies.
+void dense_f32_2(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w1, float* c1, int ldc1, int N1,
+                 const bf16* w2, float* c2, int ldc2, int N2, int M, int K, hipStream_t st) {
+  if (gemv_parts() && fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) {
+    const k::GemvPart parts[2] = {{w1, nullptr, c1, ldc1, N1}, {w2, nullptr, c2, ldc2, N2}};
+    k::gemv_bf16_f32out_parts(a_bf16, lda, parts, 2, M, K, st);
+    return;
+  }
+  dense_f32(a_bf16, a_f32, lda, w1, c1, ldc1, M, N1, K, st);
+  dense_f32(a_bf16, a_f32, lda, w2, c2, ldc2, M, N2, K, st);
 }
 void dense_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
   if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_bf16(a, lda, w, c, ldc, M, N, K, st);
@@ -555,8 +584,8 @@ void compressor_proj(const Dsv4Config& c, const CompressorWeights& cw, const Scr
   const int width = cw.width();
   float* pk = B<float>(scr, kPK);
   float* ps = B<float>(scr, kPS);
-  dense_f32(B<bf16>(scr, kA), B<float>(scr, kAF), c.dim, cw.wkv.p<bf16>(), pk, width, b.T, width, c.dim, st);
-  dense_f32(B<bf16>(scr, kA), B<float>(scr, kAF), c.dim, cw.wgate.p<bf16>(), ps, width, b.T, width, c.dim, st);
+  dense_f32_2(B<bf16>(scr, kA), B<float>(scr, kAF), c.dim, cw.wkv.p<bf16>(), pk, width, width, cw.wgate.p<bf16>(), ps,
+              width, width, b.T, c.dim, st);
   for (const auto& ch : b.chunks) k::add_ape(ps + size_t(ch.t0) * width, cw.ape.p<float>(), ch.s0, ch.n, cw.ratio, width, st);
 }
 
@@ -587,14 +616,18 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   bf16* qr = B<bf16>(scr, kQR);
   bf16* q = B<bf16>(scr, kQ);
   bf16* kv = B<bf16>(scr, kKV);
+  bf16* qi = B<bf16>(scr, kQI);
+  bf16* wi = B<bf16>(scr, kWI);
+  const int IH = c.idx_heads, ID = c.idx_dim;
   k::act_quant_fp8(a, D, qb, qs, T, D, 128, st);
-  dense_w8a8(qb, qs, w.wq_a.w.p<uint8_t>(), w.wq_a.s.p<uint8_t>(), qa, c.q_lora, T, c.q_lora, D, st);
+  dense_w8a8_2(qb, qs, w.wq_a, qa, c.q_lora, w.wkv, kv, HD, T, D, st);
   dump(L, b, "wq_a_out", qa, size_t(T) * c.q_lora * 2, st);
-  dense_w8a8(qb, qs, w.wkv.w.p<uint8_t>(), w.wkv.s.p<uint8_t>(), kv, HD, T, HD, D, st);
   dump(L, b, "wkv_out", kv, size_t(T) * HD * 2, st);
   norm(qa, c.q_lora, w.q_norm.p<bf16>(), qr, c.q_lora, T, c.q_lora, c.norm_eps, st);
   k::act_quant_fp8(qr, c.q_lora, qb, qs, T, c.q_lora, 128, st);
-  dense_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
+  // wq_b and the indexer's wq_b take the same quantized qr.
+  if (w.has_indexer) dense_w8a8_2(qb, qs, w.wq_b, q, H * HD, w.idx_wq_b, qi, IH * ID, T, c.q_lora, st);
+  else dense_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
   dump(L, b, "wq_b_out", q, size_t(T) * H * HD * 2, st);
   k::head_rms_bf16(q, T, H, HD, c.norm_eps, st);
   k::rope(q, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, false, st);
@@ -602,14 +635,9 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   k::rope(kv, HD, T, 1, HD, HD - rd, rd / 2, pos, freqs, false, st);
   k::fake_quant_fp8(kv, HD, T, HD - rd, 64, st);
 
-  // Indexer inputs (token-parallel); per-chunk scores/top-k below.
-  bf16* qi = B<bf16>(scr, kQI);
-  bf16* wi = B<bf16>(scr, kWI);
-  const int IH = c.idx_heads, ID = c.idx_dim;
-  if (w.ratio) k::cast_bf16_f32(a, B<float>(scr, kAF), size_t(T) * D, st);
+  // Indexer inputs (token-parallel; qi from the wq_b launch above); per-chunk scores/top-k below.
+  if (w.ratio && !fast_dense()) k::cast_bf16_f32(a, B<float>(scr, kAF), size_t(T) * D, st);  // reference GEMMs' input
   if (w.has_indexer) {
-    dense_w8a8(qb, qs, w.idx_wq_b.w.p<uint8_t>(), w.idx_wq_b.s.p<uint8_t>(), qi, IH * ID, T, IH * ID, c.q_lora,
-                 st);
     k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
     k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
     if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
@@ -871,7 +899,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   float* lg = B<float>(scr, kLG);
   int32_t* sel = B<int32_t>(scr, kSel);
   float* wt = B<float>(scr, kWt);
-  k::cast_bf16_f32(f, af, size_t(T) * D, st);
+  if (!fast_dense()) k::cast_bf16_f32(f, af, size_t(T) * D, st);  // the reference GEMM's input
   dense_f32(f, af, D, w.gate_w.p<bf16>(), lg, E, T, E, D, st);
   (fast_dense() ? k::route_fast : k::route)(lg, w.gate_bias.p<float>(), w.hash ? w.tid2eid.p<int32_t>() : nullptr, b.ids,
                                            sel, wt, T, E, K, c.route_scale, st,
@@ -994,8 +1022,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   // not the routed path's.
   bf16* shared = B<bf16>(scr, kShared);
   k::act_quant_fp8(f, D, qb, qs, T, D, 128, st);
-  dense_w8a8(qb, qs, w.sw1.w.p<uint8_t>(), w.sw1.s.p<uint8_t>(), h1, I, T, I, D, st);
-  dense_w8a8(qb, qs, w.sw3.w.p<uint8_t>(), w.sw3.s.p<uint8_t>(), h3, I, T, I, D, st);
+  dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);
   k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
   k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
   dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);

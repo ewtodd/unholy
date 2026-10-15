@@ -18,10 +18,12 @@ struct MoePlan {
   int n_remote_tokens; // tokens with >= 1 remote pair (remote_tokens; 0 otherwise)
 };
 
-// count[e] = pairs routed to e; also accumulated into hist[e] (a running routing histogram) if given.
+// count[e] += pairs routed to e (count is zero on entry: zeroed at allocation, then by moe_plan); also
+// accumulated into hist[e] (a running routing histogram) if given.
 void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st, uint32_t* hist = nullptr);
-// `resident` [E]: 1 = this device holds the expert. Also clears `fill`. Tiles hold <= tile_rows rows.
-void moe_plan(const int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
+// `resident` [E]: 1 = this device holds the expert. Clears `fill`, and `count` for the next moe_count.
+// Tiles hold <= tile_rows rows.
+void moe_plan(int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
               Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st,
               int tile_rows = kExl3TileRows);
 void moe_scatter(const int32_t* sel, const float* wt, int T, int K, const int32_t* off, int32_t* fill, int32_t* eidx,

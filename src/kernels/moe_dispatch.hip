@@ -32,7 +32,7 @@ __global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count, uint
 // One block of 256 threads, thread e for expert e (E <= 256): block-wide scans of the pair rows and tiles
 // of the resident group and the remote group give the same offsets and tile order as walking the experts
 // in order, resident ones first.
-__global__ __launch_bounds__(256) void moe_plan_kernel(const int32_t* count, const uint8_t* resident, int E, int P,
+__global__ __launch_bounds__(256) void moe_plan_kernel(int32_t* count, const uint8_t* resident, int E, int P,
                                                        MoePlan* plan, Exl3Tile* local_tiles, Exl3Tile* remote_tiles,
                                                        int32_t* off, int32_t* fill, int max_tiles, int tile_rows) {
   __shared__ int sc[4][256];  // inclusive scans: local rows, remote rows, local tiles, remote tiles
@@ -61,6 +61,7 @@ __global__ __launch_bounds__(256) void moe_plan_kernel(const int32_t* count, con
     for (int i = 0; i < nt && tile + i < max_tiles; ++i)
       dst[tile + i] = Exl3Tile{e, row + i * tile_rows, min(tile_rows, c - i * tile_rows)};
     fill[e] = 0;
+    count[e] = 0;  // for the next moe_count (saves a memset launch per layer)
   }
   if (e == 0) {
     plan->P = P;
@@ -315,13 +316,12 @@ void stage_remote(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt,
 }
 
 void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st, uint32_t* hist) {
-  UH_CHECK(hipMemsetAsync(count, 0, size_t(E) * 4, st));
   const int n = T * K;
   moe_count_kernel<<<(n + 255) / 256, 256, 0, st>>>(sel, n, count, hist);
   UH_CHECK_LAUNCH();
 }
 
-void moe_plan(const int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
+void moe_plan(int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
               Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st, int tile_rows) {
   if (E > 256) throw std::runtime_error("moe_plan: more than 256 experts");
   if (tile_rows < 1 || tile_rows > kExl3TileRows) throw std::runtime_error("moe_plan: tile rows");
