@@ -1168,3 +1168,24 @@ at 2 / 4 / 8 vs 37.9 / 39.4 / 43.9). Verification of this commit: bench decode l
 steps) bit-identical to the previous commit's, with and without the micro-batches; unholy-resident-test
 bit-identical (both geometries, batch checks, combine off); unholy-engine-batch 48 / 48 against the original
 at concurrency 2 and 4; unholy-sched-test all ok (180 configurations, 0 bad, 0 errors).
+
+## 2026-10-15 — the outputs, run by run: majority fingerprints; the WMMA's arithmetic is not scalar-emulable
+
+Every full concurrency-1 run of the 48 GSM8K requests with logprob fingerprints today (unholy-engine-batch
+`--logprobs 1`, production flags), grouped by build, with each request's most common fingerprint (its tokens
+and every logprob bit pattern) per build (`tools/engine_batch/compare.py --modal`):
+- the 2026-10-12 build: 7 runs, one outlier (request 3 in one run);
+- this build (with and without the morning's kernels, coherent or plain staging): 19 runs, one outlier
+  (request 33 in one run);
+- majority fingerprints identical for all 48 requests (every token and every logprob).
+So the two builds compute the same outputs; what differs between runs is a rare single-request outlier that
+both builds show and that never repeats. The interleaved runs had the hardware canary on (UNHOLY_CANARY=1,
+which caught the register bit flips of 2026-10-12), 4 runs of each build alternating: all 8 runs identical to
+the majority fingerprints, and no canary event.
+
+A way past the APU's multi-stream bound, tried and closed: on 1-3-row expert tiles the 16-row WMMA wastes most
+of its work (182 GB/s of weights against the GEMV's 221), and a scalar kernel could do better if it could
+reproduce the WMMA chain's bits. A probe (one 16x16x16 bf16 WMMA on random operands against emulations: fp32
+adds in k order, fmaf, the exact sum rounded once, the exact 16-product dot then + c, a pairwise tree) matches
+none of them: at best 45% of outputs on gfx1151 and 64% on gfx1201. The instruction's internal rounding is
+something else, so the expert GEMM stays on WMMA.

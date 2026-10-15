@@ -19,7 +19,7 @@
 // their defaults are serve's. Output: one line per request in input order (index, prompt / cached /
 // completion tokens, finish reason, token ids, text), then the engine's counters on stdout. --logprobs 1 adds
 // each sampled token's logprob (bit pattern in hex): a fingerprint of the logits, finer than the tokens, for
-// checking that repeated runs compute alike.
+// checking that repeated runs compute alike (tools/engine_batch/compare.py compares runs and builds).
 #include <chrono>
 #include <cstdio>
 #include <cstring>
