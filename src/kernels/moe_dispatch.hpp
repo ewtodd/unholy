@@ -60,6 +60,29 @@ void moe_combine_partial(const uint16_t* pair_out, const int32_t* pidx, const Mo
 // value of one row per token instead of 2 bytes per value of one row per remote pair.
 void quant_remote_tokens(const uint16_t* x, int dim, const int32_t* u2t, const MoePlan* plan, uint8_t* q_dst,
                          uint8_t* s_dst, int max_tokens, hipStream_t st);
+// moe_count + moe_plan + moe_scatter (+ remote_tokens + stage_remote with a remote side) for steps of up to
+// kMoeSmallMaxTokens tokens in one single-block launch; the same outputs (count / off / fill are not used).
+constexpr int kMoeSmallMaxTokens = 32;
+struct MoeSmallArgs {
+  const int32_t* sel;
+  const float* wt;
+  int T, K;
+  uint32_t* hist;  // or null
+  const uint8_t* resident;
+  int E, P, max_tiles, tile_rows;
+  MoePlan* plan;
+  Exl3Tile *lt, *rtl;
+  int32_t* eidx;
+  float* ewt;
+  int32_t *row_expert, *pidx;
+  bool remote, qin;              // experts elsewhere; their inputs go as compact fp8 tokens (remote_tokens)
+  int32_t *tok2u, *u2t, *p2u_dst, *u2p_dst;  // remote_tokens (u2p_dst: null without combined outputs)
+  MoePlan* plan_dst;             // stage_remote
+  Exl3Tile* tiles_dst;
+  float* w_dst;
+  int32_t* e_dst;
+};
+void moe_dispatch_small(const MoeSmallArgs& a, hipStream_t st);
 void copy_remote_meta(const float* ewt, const int32_t* row_expert, float* w_dst, int32_t* e_dst, const MoePlan* plan,
                       int max_rows, hipStream_t st);
 

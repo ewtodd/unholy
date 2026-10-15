@@ -841,33 +841,49 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
   int32_t* row_expert = scr.exl3.row_expert.as<int32_t>();
   bf16* pair_in = B<bf16>(scr, kPairIn);
   bf16* pair_out = B<bf16>(scr, kPairOut);
-  k::moe_count(sel, T, K, count, E, st, scr.route_hist.as<uint32_t>() + size_t(w.layer) * E);
+  uint32_t* hist = scr.route_hist.as<uint32_t>() + size_t(w.layer) * E;
   const int tile_rows = !w.exl3_experts && k::mx_use_gemv(T) ? k::kMxGemvTileRows : k::kExl3TileRows;
-  k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st, tile_rows);
-  k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
-  k::gather_rows(f, eidx, pair_in, P, D, st);
   const bool any_remote = w.n_resident < E;
   bool qin = false, combined = false;
   if (any_remote) {
     if (!remote || !remote->can_enqueue()) throw std::runtime_error("moe: remote experts need an enqueue backend");
     if (size_t(P) > remote->capacity_rows || ds.max_tiles > remote->max_tiles)
       throw std::runtime_error("moe: remote staging too small");
-    // A kernel, not async copies: the copies were not reliably ordered after the previous layer's
-    // stream wait on the remote side's done flag (DECISIONS 2026-10-12), so they could overwrite the
-    // staging the remote side was still reading.
     // Native experts: one fp8 row per token with remote pairs instead of a bf16 row per remote pair (the
     // remote side rebuilds the same expert inputs; ~5x fewer bytes over the host link, which both cards
-    // share behind the PCIe switch). Before stage_remote: it copies the plan with the token count.
+    // share behind the PCIe switch).
     qin = !w.exl3_experts && remote->quant_in();
     combined = qin && remote->combine_out();
-    if (qin) {
-      int32_t* tok2u = B<int32_t>(scr, kRTok);
-      k::remote_tokens(pidx, eidx, T, K, plan, tok2u, tok2u + T, remote->p2u_host, combined ? remote->u2p_host : nullptr,
-                       st);
-      k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
+  }
+  // The remote side's staging is written by kernels, not async copies: the copies were not reliably
+  // ordered after the previous layer's stream wait on the remote side's done flag (DECISIONS 2026-10-12),
+  // so they could overwrite the staging the remote side was still reading.
+  int32_t* tok2u = B<int32_t>(scr, kRTok);
+  if (T <= k::kMoeSmallMaxTokens && K <= 8 && E <= 256) {  // decode-sized: one block for the bookkeeping
+    k::MoeSmallArgs ma{sel, wt, T, K, hist, w.resident.as<uint8_t>(), E, P, ds.max_tiles, tile_rows, plan, lt, rtl, eidx,
+                       ewt, row_expert, pidx, any_remote, qin, tok2u, tok2u + T,
+                       any_remote ? remote->p2u_host : nullptr, combined ? remote->u2p_host : nullptr,
+                       any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
+                       any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
+    k::moe_dispatch_small(ma, st);
+    k::gather_rows(f, eidx, pair_in, P, D, st);
+    if (qin) k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
+  } else {
+    k::moe_count(sel, T, K, count, E, st, hist);
+    k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st, tile_rows);
+    k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
+    k::gather_rows(f, eidx, pair_in, P, D, st);
+    if (any_remote) {
+      if (qin) {  // before stage_remote: it copies the plan with the token count
+        k::remote_tokens(pidx, eidx, T, K, plan, tok2u, tok2u + T, remote->p2u_host,
+                         combined ? remote->u2p_host : nullptr, st);
+        k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
+      }
+      k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host,
+                      remote->e_host, P, st);
     }
-    k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host, remote->e_host,
-                    P, st);
+  }
+  if (any_remote) {
     if (!qin) k::copy_remote_rows(pair_in, remote->in_host, plan, D, P, st);
     static const bool stats = std::getenv("UNHOLY_MOE_STATS") != nullptr;
     if (stats) {  // diagnostics only: synchronizes the stream

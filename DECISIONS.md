@@ -869,3 +869,6 @@ by the planner's difference) logits are bit-identical.
 - The routed experts' w1 and w3 (MXFP4 GEMV and GEMM, cards and APU) run in one launch (grid z picks the
   projection): bit-identical (unholy-mx-test on both architectures, resident checks); decode 35.6 / 89.9 ->
   34.9 / 88.4 ms at batch 1 / 8.
+- `moe_dispatch_small`: for steps of <= 32 tokens, moe_count + moe_plan + moe_scatter + remote_tokens +
+  stage_remote in one single-block launch (counts, offsets and fill counters in LDS; the same outputs):
+  bit-identical, decode 34.9 / 88.4 -> 34.2 / 87.7 ms at batch 1 / 8; unholy-sched-test all ok.
