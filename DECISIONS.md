@@ -866,3 +866,6 @@ before planning) for the reference one. Production plan: scratch 3.21 / 3.34 -> 
 experts 1481 / 1393 -> 1524 / 1436, predicted routing on the cards 53.3% -> 54.1%; the ~400 MB of `yp` per
 card the planner never counted is now free margin too. At the old placement (`--card-margin-bytes` raised
 by the planner's difference) logits are bit-identical.
+- The routed experts' w1 and w3 (MXFP4 GEMV and GEMM, cards and APU) run in one launch (grid z picks the
+  projection): bit-identical (unholy-mx-test on both architectures, resident checks); decode 35.6 / 89.9 ->
+  34.9 / 88.4 ms at batch 1 / 8.

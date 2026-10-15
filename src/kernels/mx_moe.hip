@@ -105,9 +105,15 @@ constexpr int MX_BM = 128, MX_BN = 128, MX_KS = 64, MX_NT = 256, MX_PAD = 8;
 
 __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__ xa, int K,
                                                         const Exl3Tile* __restrict__ tiles,
-                                                        const uint8_t* const* __restrict__ w_tab,
-                                                        const uint8_t* const* __restrict__ s_tab, bf16* out, int ldo,
-                                                        int N, const int* ntiles_dev) {
+                                                        const uint8_t* const* w_tab, const uint8_t* const* s_tab,
+                                                        bf16* out, int ldo, int N, const int* ntiles_dev,
+                                                        const uint8_t* const* w_tab2, const uint8_t* const* s_tab2,
+                                                        bf16* out2) {
+  if (blockIdx.z) {  // the second projection on the same inputs (w1 and w3 in one launch)
+    w_tab = w_tab2;
+    s_tab = s_tab2;
+    out = out2;
+  }
   constexpr int AROW = MX_KS + MX_PAD;
   __shared__ alignas(16) uint16_t sA[MX_BM][AROW];
   __shared__ alignas(16) uint16_t sB[8][16][AROW];
@@ -210,9 +216,15 @@ constexpr int MV_NT = 256, MV_MAXM = 8, MV_KC = 512;
 
 __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__ xa, int K,
                                                         const Exl3Tile* __restrict__ tiles,
-                                                        const uint8_t* const* __restrict__ w_tab,
-                                                        const uint8_t* const* __restrict__ s_tab, bf16* out, int ldo,
-                                                        int N, const int* ntiles_dev) {
+                                                        const uint8_t* const* w_tab, const uint8_t* const* s_tab,
+                                                        bf16* out, int ldo, int N, const int* ntiles_dev,
+                                                        const uint8_t* const* w_tab2, const uint8_t* const* s_tab2,
+                                                        bf16* out2) {
+  if (blockIdx.z) {  // the second projection on the same inputs (w1 and w3 in one launch)
+    w_tab = w_tab2;
+    s_tab = s_tab2;
+    out = out2;
+  }
   __shared__ alignas(16) uint16_t sX[MV_MAXM][MV_KC];
   __shared__ uint32_t sLut[256], sNz[256];
   if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
@@ -314,19 +326,22 @@ void mx_swiglu(const bf16* g, const bf16* u, const float* w, const int32_t* row_
 }
 
 void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
-                     const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev) {
+                     const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev,
+                     const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2) {
   if (ntiles <= 0) return;
   if (K % MX_KS || N % MX_BN) throw std::runtime_error("mx_grouped_gemm: K % 64 or N % 128");
-  mx_gemm_kernel<<<dim3(N / MX_BN, ntiles), MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N, ntiles_dev);
+  mx_gemm_kernel<<<dim3(N / MX_BN, ntiles, out2 ? 2 : 1), MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N,
+                                                                         ntiles_dev, w_tab2, s_tab2, out2);
   UH_CHECK_LAUNCH();
 }
 
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
-                     const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev) {
+                     const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev,
+                     const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2) {
   if (ntiles <= 0) return;
   if (K % MV_KC || N % 16) throw std::runtime_error("mx_grouped_gemv: K % 512 or N % 16");
-  mx_gemv_kernel<<<dim3((N / 16 + 7) / 8, ntiles), MV_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N,
-                                                                   ntiles_dev);
+  mx_gemv_kernel<<<dim3((N / 16 + 7) / 8, ntiles, out2 ? 2 : 1), MV_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo,
+                                                                                  N, ntiles_dev, w_tab2, s_tab2, out2);
   UH_CHECK_LAUNCH();
 }
 
