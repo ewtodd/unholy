@@ -485,13 +485,24 @@ bool Engine::submit_step(int budget0) {
       logit_rows -= logits ? 1 + k : 0;
     };
     // Decodes first (admission order), then prefill chunks in the configured order.
-    std::vector<Seq*> prefills;
+    std::vector<Seq*> prefills, decodes;
     for (auto& sp : running_) {
       Seq& s = *sp;
       if (s.awaiting_logits || s.abort_pending || s.done || rem(&s) <= 0) continue;
-      if (rem(&s) > 1) prefills.push_back(&s);
-      else if (budget > 0) take(s, budget, true);
+      (rem(&s) > 1 ? prefills : decodes).push_back(&s);
     }
+    // Two micro-batches (cfg_.decode_split): a step takes half of the decoders, counting those of the step
+    // in flight; the ones held back are not awaiting logits, so the next step takes them. Two halves that
+    // alternate (each submitted when the other's predecessor completes) keep both cards busy; groups that
+    // arrive unbalanced (one request, then seven) even out within a few steps.
+    size_t ndec = decodes.size();
+    if (cfg_.decode_split && model_.max_inflight() > 1 && ndec >= 2) {
+      size_t fly = 0;
+      for (const auto& f : inflight_)
+        for (const auto& it : f.items) fly += it.logits && it.n == 1 + it.ndraft;
+      ndec = std::min(ndec, std::max<size_t>(1, (fly + ndec + 1) / 2));
+    }
+    for (size_t i = 0; i < ndec && budget > 0; ++i) take(*decodes[i], budget, true);
     if (prefills.empty() || budget == 0) return;
     const bool shortest = cfg_.prefill_order == PrefillOrder::Shortest;
     if (shortest)  // stable: admission order among equals

@@ -28,6 +28,8 @@
 // prefill keeps a quarter of each step); `fcfs` is arrival order, vLLM's default.
 // --long-prefill-token-threshold N / --long-prefill-token-threshold-adaptive 1: vLLM's per-request cap
 // (when more than one request is running or waiting; adaptive: never below budget / requests). Off.
+// --decode-split 1 (default): decoding requests go in two alternating steps, so the two cards work on
+// different halves at once (0: every decoder in every step).
 //
 // Logging (stdout, so journald under systemd): a line per finished request (its tokens, queue time, time
 // to first token, prefill and decode tok/s, draft acceptance) and, every --log-interval seconds (default
@@ -73,7 +75,7 @@ int usage() {
                "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
                "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
                "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
-               "                    [--long-prefill-token-threshold-adaptive 0|1]\n");
+               "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n");
   return 2;
 }
 
@@ -158,6 +160,7 @@ int serve(int argc, char** argv, bool plan_only) {
   engine::PrefillOrder prefill_order = engine::PrefillOrder::Shortest;
   int long_prefill_threshold = 0;
   bool long_prefill_adaptive = false;
+  bool decode_split = true;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -188,6 +191,7 @@ int serve(int argc, char** argv, bool plan_only) {
       else return usage();
     } else if (a == "--long-prefill-token-threshold") long_prefill_threshold = std::stoi(v);
     else if (a == "--long-prefill-token-threshold-adaptive") long_prefill_adaptive = v != "0" && v != "off" && v != "false";
+    else if (a == "--decode-split") decode_split = v != "0" && v != "off" && v != "false";
     else return usage();
   }
   if (model_dir.empty()) return usage();
@@ -266,6 +270,7 @@ int serve(int argc, char** argv, bool plan_only) {
   ecfg.prefill_order = prefill_order;
   ecfg.long_prefill_threshold = long_prefill_threshold;
   ecfg.long_prefill_adaptive = long_prefill_adaptive;
+  ecfg.decode_split = decode_split;
   engine::Engine eng(model, ecfg);
   // Logs while there is traffic, plus the interval after it ends (throughput back to zero). A jthread
   // declared after the engine: stopped and joined before the engine goes away.

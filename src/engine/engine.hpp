@@ -109,6 +109,10 @@ struct EngineConfig {
   // takes more than this many tokens of a step (0: off). Adaptive: never below budget / requests.
   int long_prefill_threshold = 0;
   bool long_prefill_adaptive = false;
+  // Two decode micro-batches: a step submitted with nothing in flight takes half of the decoding
+  // sequences, the other half go into the next step, so with two steps in flight (the resident model) the
+  // cards work on different halves at once instead of taking turns on the whole batch.
+  bool decode_split = true;
 };
 
 struct EngineStats {

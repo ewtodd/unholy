@@ -766,3 +766,21 @@ Rows of steps up to 8 tokens are unchanged (logits bit-identical, both geometrie
 now get exactly the single-stream GEMV values instead of the GEMM ones: `--batch 4`'s 4 x 4-token verify
 chunks (16 rows), which matched nothing before, are bit-identical to the solo runs. Verify-6 steps at batch
 2: 171.7 -> 115.3 ms; batch 4 / 8 (24 / 48 rows): 243 / 417 -> 182 / 317 ms (MoE only).
+
+## 2026-10-14 — two decode micro-batches
+
+With every decoding sequence in every step, a pure-decode workload had one step in flight: the next step
+found all of them waiting for logits, so card 0 idled while card 1 finished and the reverse. Now
+(`--decode-split`, default on) a step takes half of the decoders, counting the ones in the step already
+in flight (ceil((in flight + eligible) / 2)); the rest are not waiting for logits, so the next step takes
+them. Two halves then alternate, each submitted when the other's predecessor completes. The count matters:
+"half when nothing is in flight" alone left a 1 + 7 split when one request started before the others
+(the server trace showed T = 4 steps once balanced). unholy-sched-test: all ok.
+
+Server, production flags, N concurrent greedy requests of 256 tokens (ignore_eos), aggregate tok/s at
+N = 1 / 2 / 4 / 8 (this build, before -> after the split):
+- no speculation: 27.2 / 49.0 / 64.5 / 80.8 -> 27.2 / 48.9 / 69.6 / 90.0
+- DSpark 5 drafts: 42.1 / 51.5 / 62.2 / 75.2 -> 41.6 / 50.6 / 66.8 / 84.7
+Under 8 streams the cards now run kernels ~40% of the time and wait for the APU ~41%; the APU is 65% busy
+and its expert GEMVs share its ~200 GB/s between the two cards' channels (385 us per call vs ~200 alone,
+unholy-mx-test --dev 2): multi-stream decode is bound by the cold experts' bytes on the APU.
