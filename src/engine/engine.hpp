@@ -111,8 +111,10 @@ struct EngineConfig {
   bool long_prefill_adaptive = false;
   // Two decode micro-batches: a step submitted with nothing in flight takes half of the decoding
   // sequences, the other half go into the next step, so with two steps in flight (the resident model) the
-  // cards work on different halves at once instead of taking turns on the whole batch.
-  bool decode_split = true;
+  // cards work on different halves at once instead of taking turns on the whole batch. Off by default: it
+  // changes which rows share a step, and a row's values depend on its step's size (GEMVs up to 8 rows, WMMA
+  // GEMMs above), so the tokens differ from the original engine's for the same requests.
+  bool decode_split = false;
 };
 
 struct EngineStats {

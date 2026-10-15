@@ -142,6 +142,11 @@ install(TARGETS unholy unholy-text-test unholy-sched-test unholy-vision-test RUN
 install(FILES data/expert_profile_dsv4engine_code32k.txt data/expert_profile_unholy_mixed.txt
               data/expert_profile_unholy_code32k.txt DESTINATION share/unholy)
 
+# Requests through the engine on one thread (no HTTP): token-for-token comparisons of builds under concurrency.
+add_executable(unholy-engine-batch tools/engine_batch/main.cpp)
+set_source_files_properties(tools/engine_batch/main.cpp PROPERTIES LANGUAGE HIP)
+target_link_libraries(unholy-engine-batch PRIVATE unholy_text unholy_sched unholy_engine)
+
 add_executable(unholy-bench tools/bench/main.hip)
 target_link_libraries(unholy-bench PRIVATE unholy_engine)
 

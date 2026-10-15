@@ -955,3 +955,41 @@ curve (1706 / 1696 hot experts; docs/bench/curve-native-1x512k-plx-2026-10-15.tx
 at 32k / 128k / 256k / 491k, 1240 average (1062). GSM8K production sweep: 29.4 / 54.0 / 56.0 / 61.4 tok/s at
 concurrency 1 / 2 / 4 / 8 (22.2 / 36.5 / 45.5 / 56.3); flexible 47 / 46 / 47 / 47 of 48. With the opt-ins
 (reclaimed scratch, 16-row GEMVs, 64-token MoE GEMVs, WMMA drafter attention) 29.9 / 55.4 / 68.6 / 82.5.
+
+## 2026-10-15 — outputs under concurrency: a deterministic check; the decode split goes opt-in
+
+A row's values depend on the size of the step it is in (the dense projections take the GEMVs up to 8 rows
+and the WMMA GEMMs above, the routed experts likewise at 8 tokens, the HC mix its small path up to 32), and
+which requests share a step depends on when they arrive and when steps complete. Under concurrency the
+2026-10-12 build's tokens are therefore not a function of the requests: its HTTP sweep at concurrency 2
+(evals/plx2) and the same 48 GSM8K requests through the batch runner below on the same build agree on 9 of
+48 answers (at concurrency 1, 48 of 48), and in the runner its tokens at concurrency 2 / 4 / 8 equal its
+concurrency-1 tokens for 16 / 6 / 4 of the 48 requests (seeded sampling at temperature 1 turns any logit
+change into another draw). No build can match that build token for token under a load test; what can be
+checked is that it forms the same steps and computes each of them alike.
+
+`unholy-engine-batch` (new, tools/engine_batch): chat requests through the serving engine with no HTTP and
+no engine thread -- the Engine constructed with start = false and driven by iterate() once every request is
+submitted, `--concurrency N` capping the running requests as a client holding N open does -- so the steps
+(which requests share one, prompt chunking, prefix hits) follow from the requests and the flags alone. The
+file builds unchanged against the 2026-10-12 tree (/scratch/unholy-orig: /scratch/unholy's source plus it).
+Its concurrency-1 answers are that build's HTTP sweep's, text for text (48 / 48), and two runs of the
+original at concurrency 8 are identical (48 / 48).
+
+The 48 GSM8K requests of the sweep (gsm8k-chat, seed 1234, temperature 1) at the production flags (DSpark
+5, vision, 8 slots, 4096-token steps), every token compared with the 2026-10-12 build:
+
+| this build | c1 | c2 | c4 | c8 |
+|---|---|---|---|---|
+| decode split off (now the default) | 48 / 48 | 48 / 48 | 48 / 48 | 48 / 48 |
+| decode split on | -- | 17 / 48 | 6 / 48 | 6 / 48 |
+
+(At c1 there is one decoder, nothing to split.) So with the defaults the engine forms the original's steps
+and computes them bit for bit, mixed prefill + verify steps of 12-48 rows included. The decode micro-batches
+put different decoders in each step by design (half of the 12-48 verify rows: GEMVs where the original ran
+GEMMs), so with them the tokens under concurrency are not the original's: `--decode-split` (serve,
+unholy-engine-batch) is now off by default, an opt-in like the others. The runner's times are not the
+sweep's beyond concurrency 1 (with every request queued up front, a newcomer's prefill always joins the
+decoders' step instead of the second in-flight slot): 22.0 / 27.6 / 33.6 / 40.2 tok/s at concurrency 1 / 2 /
+4 / 8 for the original (its c2 run shared the CPUs with a build), 29.0 / 33.6 / 37.4 / 42.7 for this build
+without the split, 37.9 / 39.4 / 43.9 at 2 / 4 / 8 with it.

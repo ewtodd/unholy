@@ -28,8 +28,9 @@
 // prefill keeps a quarter of each step); `fcfs` is arrival order, vLLM's default.
 // --long-prefill-token-threshold N / --long-prefill-token-threshold-adaptive 1: vLLM's per-request cap
 // (when more than one request is running or waiting; adaptive: never below budget / requests). Off.
-// --decode-split 1 (default): decoding requests go in two alternating steps, so the two cards work on
-// different halves at once (0: every decoder in every step).
+// --decode-split 1: decoding requests go in two alternating steps, so the two cards work on different
+// halves at once (default 0: every decoder in every step, as the 2026-10-12 build forms its steps; the
+// split changes which rows share a step and with it their values).
 // --reclaim-scratch 1: plan the hot experts with the scratch this build allocates (~0.9 GB more per card
 // for experts) instead of the 2026-10-12 build's count, which keeps that build's expert placement and so
 // its outputs (default 0). Kernel options with the same trade (faster, outputs move at the noise level):
@@ -165,7 +166,7 @@ int serve(int argc, char** argv, bool plan_only) {
   engine::PrefillOrder prefill_order = engine::PrefillOrder::Shortest;
   int long_prefill_threshold = 0;
   bool long_prefill_adaptive = false;
-  bool decode_split = true;
+  bool decode_split = false;
   bool reclaim_scratch = false;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
