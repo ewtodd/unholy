@@ -134,11 +134,13 @@ __global__ __launch_bounds__(NT) void bf16_kernel(const bf16* __restrict__ A, in
       if (n0 + r < N) {
         const size_t row = wrow0 + n0 + r;
         if constexpr (kFp8W) {
-          const uint8_t* wp = static_cast<const uint8_t*>(Wv) + row * K + k0 + c;
+          const uint2 raw = *reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(Wv) + row * K + k0 + c);
           const float s = e8m0_to_f32(sw[(row / 128) * (K / 128) + (k0 + c) / 128]);
+          float f[8];
+          e4m3x4_to_f32(raw.x, f);
+          e4m3x4_to_f32(raw.y, f + 4);
           const auto pair = [&](int j) {
-            return uint32_t(f32_to_bf16(e4m3_to_f32(wp[j]) * s)) |
-                   (uint32_t(f32_to_bf16(e4m3_to_f32(wp[j + 1]) * s)) << 16);
+            return uint32_t(f32_to_bf16(f[j] * s)) | (uint32_t(f32_to_bf16(f[j + 1] * s)) << 16);
           };
           vals = uint4{pair(0), pair(2), pair(4), pair(6)};
         } else {
