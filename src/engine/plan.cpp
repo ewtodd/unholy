@@ -103,7 +103,7 @@ size_t dspark_work_bytes(const model::Dsv4Config& c, const model::CacheGeometry&
   const size_t rows = size_t(g.max_slots) * c.dspark_block;  // draft rows
   size_t b = size_t(c.n_mtp) * g.max_slots * c.window * c.head_dim * 2;               // stage windows
   b += size_t(g.max_slots) * 128 * c.dspark_target_layers.size() * c.dim * 2;       // main-hidden capture
-  b += model::scratch_bytes(c, int(rows), 4096) + rows * size_t(c.vocab) * 4;      // draft scratch, logits
+  b += model::scratch_bytes(c, int(rows), 4096, false) + rows * size_t(c.vocab) * 4;  // draft scratch, logits
   b += rows * c.hc_mult * c.dim * 2 + (size_t(64) << 20);                            // block, backups
   return b;
 }
@@ -158,7 +158,7 @@ Plan make_plan(const PlanInput& in) {
   }
   for (int k = 0; k < 2; ++k) {
     // Scratch, plus a logits buffer on the head card.
-    pl.scratch[k] = model::scratch_bytes(c, in.max_tokens, in.max_seq) +
+    pl.scratch[k] = model::scratch_bytes(c, in.max_tokens, in.max_seq, in.exl3 != nullptr) +
                     (k == 1 ? size_t(in.max_logit_rows > 0 ? in.max_logit_rows : in.max_tokens) * c.vocab * 4 +
                                   size_t(in.max_tokens) * c.dim * 6
                             : 0) +

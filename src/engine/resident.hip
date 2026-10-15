@@ -35,7 +35,8 @@ namespace k = unholy::kernels;
 // ---------------------------------------------------------------------------------------------------
 // ApuExperts
 
-ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers)
+ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers,
+                       bool exl3)
     : c_(c), dev_(dev), layers_(std::move(layers)) {
   rt::DeviceGuard g(dev);
   UH_CHECK(hipStreamCreateWithFlags(&st_, hipStreamNonBlocking));
@@ -63,8 +64,8 @@ ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&ins_dev_), ins_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&p2u_dev_), p2u_host, 0));
   // Each job is one expert: at most every token of a step.
-  scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));
-  xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows));
+  if (model::ref_experts_needed()) scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));  // run()
+  xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows), exl3);
   max_tiles = xscratch_.max_tiles;
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&plan_host), sizeof(kernels::MoePlan), flags));
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&tiles_host), size_t(max_tiles) * sizeof(kernels::Exl3Tile), flags));
@@ -172,9 +173,10 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
   if (exl3) xup = std::make_unique<model::Uploader>(*exl3);
   {
     auto layers = std::make_shared<ApuExperts::Layers>();
-    for (auto& ch : chan_) ch = std::make_unique<ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers);
+    for (auto& ch : chan_)
+      ch = std::make_unique<ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers, exl3 != nullptr);
     if (dspark_)
-      dchan_ = std::make_unique<ApuExperts>(c, plan.apu, size_t(c.dspark_block) * geo.max_slots * c.n_active, layers);
+      dchan_ = std::make_unique<ApuExperts>(c, plan.apu, size_t(c.dspark_block) * geo.max_slots * c.n_active, layers, false);
   }
   if (const char* v = std::getenv("UNHOLY_INFLIGHT")) inflight_ = std::clamp(std::atoi(v), 1, 2);
   if (std::getenv("UNHOLY_CANARY")) {
@@ -190,7 +192,7 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     cd.dev = plan.card[k];
     rt::DeviceGuard g(cd.dev);
     UH_CHECK(hipStreamCreateWithFlags(&cd.st, hipStreamNonBlocking));
-    cd.scratch = model::make_scratch(c, cd.dev, max_tokens, max_seq);
+    cd.scratch = model::make_scratch(c, cd.dev, max_tokens, max_seq, exl3 != nullptr);
     cd.rope = model::make_rope_tables(c, cd.dev, max_seq + 128);
     cd.x = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * c.hc_mult * c.dim * 2);
     cd.ids = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
@@ -297,7 +299,7 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
       for (auto& w : apu.stages) chan_[0]->add_layer(std::move(w));
     }
     const int rows = c.dspark_block * geo.max_slots;
-    dscr_ = model::make_scratch(c, cd.dev, rows, 4096);
+    dscr_ = model::make_scratch(c, cd.dev, rows, 4096, false);  // the drafter's experts are native
     cap_max_ = geo.max_slots * 128;
     mh_ = rt::DeviceBuffer(cd.dev, size_t(cap_max_) * c.dspark_target_layers.size() * c.dim * 2);
     cap_dev_ = rt::DeviceBuffer(cd.dev, size_t(cap_max_) * 3 * 4);

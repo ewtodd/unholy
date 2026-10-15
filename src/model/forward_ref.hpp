@@ -71,7 +71,8 @@ struct Exl3MoeScratch {
   rt::DeviceBuffer xh1, xh3, h1, h3, xh2, tiles, row_expert, yp;
   int rows = 0, max_tiles = 0;
 };
-Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows);
+// exl3: the buffers only the EXL3 experts use (xh3, yp).
+Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows, bool exl3 = true);
 
 // The routed experts of `w` that are resident here, for the given tiles (runs of <= 64 pair rows of one
 // expert), over pair rows in[P, dim] with routing weights rw[P] and row_expert[P] (device-visible).
@@ -111,9 +112,13 @@ struct Scratch {
   MoeDispatchScratch dispatch;
   void* get(size_t i) const { return bufs.at(i).data(); }
 };
-Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq);
+// exl3: room for EXL3 routed experts (native MXFP4 needs less); the reference expert path's scratch only
+// when it can run (ref_experts_needed()).
+Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, bool exl3 = true);
 // Device bytes those objects take (for the planner).
-size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq);
+size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3 = true);
+size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows, bool exl3 = true);
+bool ref_experts_needed();
 size_t expert_scratch_bytes(const Dsv4Config& c, int rows);
 size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const CacheGeometry& g);
 

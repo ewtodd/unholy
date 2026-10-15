@@ -853,3 +853,16 @@ are dequantized twice per layer (on the cards and on the APU, whose grouped GEMM
 row): the APU's work grows more than the overlap hides. At long context the cards seldom wait for the APU
 (attention and the indexer dominate). Reverted; `unholy-resident-test --card-margin-bytes` (to keep the
 expert placement when a change adds scratch) stays.
+
+## 2026-10-15 — scratch the native path never touches
+
+Each card's activation scratch (3.21 GB in production, planner-counted) held buffers the native-MXFP4 fast
+path never reads: three leftovers no code used (`kYF`, `kG`, `kY2F`: 160 MB at 4096 tokens), the EXL3 path's
+second transformed input and GEMV partials (`xh3`, `yp`: 603 MB; `yp` was not even in the planner's count),
+and the reference expert path's scratch (~200 MB). They are now allocated only when their path can run:
+`make_scratch(..., exl3)` / `ApuExperts(..., exl3)` for the EXL3 buffers, `ref_experts_needed()`
+(UNHOLY_REF_EXL3 / UNHOLY_REF_MX, or a host-side expert histogram, which `unholy-bench --hist` now sets
+before planning) for the reference one. Production plan: scratch 3.21 / 3.34 -> 2.64 / 2.77 GB, hot
+experts 1481 / 1393 -> 1524 / 1436, predicted routing on the cards 53.3% -> 54.1%; the ~400 MB of `yp` per
+card the planner never counted is now free margin too. At the old placement (`--card-margin-bytes` raised
+by the planner's difference) logits are bit-identical.

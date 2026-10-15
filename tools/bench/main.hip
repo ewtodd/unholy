@@ -72,6 +72,10 @@ int main(int argc, char** argv) {
     pin.max_tokens = max_tokens;
     pin.max_seq = max_seq;
     pin.max_logit_rows = max_b * verify;
+    // Before the plan and the model: the host-side histogram needs the reference expert scratch
+    // (model::ref_experts_needed).
+    std::vector<std::vector<uint64_t>> hist;
+    if (!hist_path.empty()) model::set_expert_histogram(&hist);
     const auto plan = engine::make_plan(pin);
     std::printf("%s", plan.summary().c_str());
     engine::ResidentModel m(c, *ck, xck.get(), plan, geo, max_tokens, max_seq, max_b * verify);
@@ -91,8 +95,6 @@ int main(int argc, char** argv) {
       return int32_t(1000 + rng() % 100000);
     };
     std::vector<float> logits;
-    std::vector<std::vector<uint64_t>> hist;
-    if (!hist_path.empty()) model::set_expert_histogram(&hist);
     for (const int B : batches) {
       // Prefill: chunks of a sequence are submitted ahead (up to the model's in-flight depth); stream
       // order keeps each chunk after the one before it on every card.

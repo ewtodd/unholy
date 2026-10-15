@@ -29,7 +29,8 @@ namespace unholy::engine {
 class ApuExperts final : public model::RemoteExperts {
  public:
   using Layers = std::vector<std::unique_ptr<model::LayerWeights>>;  // [layer]
-  ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers);
+  // exl3: room for EXL3 routed experts (native MXFP4 needs less scratch).
+  ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers, bool exl3);
   ~ApuExperts() override;
   void add_layer(model::LayerWeights w);  // experts-only weights of one layer, on this device
   void run(int layer, const std::vector<Job>& jobs) override;

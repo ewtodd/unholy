@@ -64,8 +64,8 @@ namespace {
 
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
-  kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kYF, kG, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
-  kY2F, kPairIn, kHcPart, kQC, kQCS, kRTok, kNumBufs
+  kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
+  kPairIn, kHcPart, kQC, kQCS, kRTok, kNumBufs
 };
 
 template <typename T>
@@ -74,6 +74,15 @@ T* B(const Scratch& s, Buf b) {
 }
 
 }  // namespace
+
+bool exl3_fast_enabled();
+bool mx_fast_enabled();
+namespace {
+std::vector<std::vector<uint64_t>>* g_expert_hist = nullptr;
+}
+// The reference expert path (expert_forward and its scratch) runs only with UNHOLY_REF_EXL3 / UNHOLY_REF_MX
+// or a host-side expert histogram (set_expert_histogram before the scratch is made).
+bool ref_experts_needed() { return !exl3_fast_enabled() || !mx_fast_enabled() || g_expert_hist != nullptr; }
 
 namespace {
 constexpr size_t kIndexerScoreBytes = size_t(256) << 20;
@@ -113,8 +122,6 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kLG] = N * c.n_experts * 4;
   sz[kSel] = N * K * 4;
   sz[kWt] = N * K * 4;
-  sz[kYF] = N * c.dim * 4;
-  sz[kG] = N * c.dim * 2;
   sz[kH1] = N * c.moe_inter * 2;
   sz[kH3] = N * c.moe_inter * 2;
   sz[kHH] = N * c.moe_inter * 2;
@@ -123,7 +130,6 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kShared] = N * c.dim * 2;
   sz[kEIdx] = N * K * 4;
   sz[kEWt] = N * K * 4;
-  sz[kY2F] = N * c.dim * 4;
   sz[kPairIn] = N * K * c.dim * 2;
   sz[kHcPart] = size_t(32) * 32 * 25 * 4;
   sz[kRTok] = N * 2 * 4;  // remote_tokens: tok2u [T], u2t [T]
@@ -142,13 +148,15 @@ int moe_max_tiles(const Dsv4Config& c, int rows) {
   return rows / 64 + c.n_experts + 1 + std::min(rows, k::mx_gemv_max_tokens() * c.n_active) / k::kMxGemvTileRows;
 }
 
-size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows) {
+size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows, bool exl3) {
   const size_t R = size_t(std::max(rows, 1));
-  return R * c.dim * 4 + R * c.moe_inter * 6 + R * 4 + size_t(moe_max_tiles(c, rows)) * 12;
+  const size_t only_exl3 = exl3 ? R * c.dim * 2 + R * size_t(std::max(c.dim, c.moe_inter)) * 4 : 0;  // xh3, yp
+  return R * c.dim * 2 + only_exl3 + R * c.moe_inter * 6 + R * 4 + size_t(moe_max_tiles(c, rows)) * 12;
 }
 
-size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq) {
-  size_t total = expert_scratch_bytes(c, max_tokens) + exl3_moe_scratch_bytes(c, max_tokens * c.n_active);
+size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3) {
+  size_t total = (ref_experts_needed() ? expert_scratch_bytes(c, max_tokens) : 0) +
+                 exl3_moe_scratch_bytes(c, max_tokens * c.n_active, exl3);
   for (size_t b : scratch_sizes(c, max_tokens, max_seq)) total += std::max<size_t>(b, 256);
   return total;
 }
@@ -167,14 +175,14 @@ size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const Cac
   return b;
 }
 
-Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq) {
+Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, bool exl3) {
   const std::vector<size_t> sz = scratch_sizes(c, max_tokens, max_seq);
   Scratch s;
   s.max_tokens = max_tokens;
   s.max_keys = max_seq / 4 + 1;
   for (size_t i = 0; i < kNumBufs; ++i) s.bufs.emplace_back(dev, std::max<size_t>(sz[i], 256));
-  s.expert = make_expert_scratch(c, dev, max_tokens);
-  s.exl3 = make_exl3_moe_scratch(c, dev, max_tokens * c.n_active);
+  if (ref_experts_needed()) s.expert = make_expert_scratch(c, dev, max_tokens);
+  s.exl3 = make_exl3_moe_scratch(c, dev, max_tokens * c.n_active, exl3);
   s.dispatch.max_tiles = s.exl3.max_tiles;
   // Every layer the MoE runs for: the target's and the DSpark stages (n_layers + n_mtp).
   s.route_hist = rt::DeviceBuffer(dev, std::max(size_t(c.n_layers + c.n_mtp), c.compress_ratios.size()) * c.n_experts * 4);
@@ -241,19 +249,19 @@ void expert_forward(const Dsv4Config& c, const LayerWeights& w, int e, uint16_t*
   }
 }
 
-Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows) {
+Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows, bool exl3) {
   const size_t R = size_t(std::max(rows, 1));
   Exl3MoeScratch s;
   s.rows = rows;
   s.max_tiles = moe_max_tiles(c, rows);
   s.xh1 = rt::DeviceBuffer(dev, R * c.dim * 2);
-  s.xh3 = rt::DeviceBuffer(dev, R * c.dim * 2);
+  if (exl3) s.xh3 = rt::DeviceBuffer(dev, R * c.dim * 2);  // the EXL3 path's second transformed input
   s.h1 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
   s.h3 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
   s.xh2 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
   s.tiles = rt::DeviceBuffer(dev, size_t(s.max_tiles) * sizeof(kernels::Exl3Tile));
   s.row_expert = rt::DeviceBuffer(dev, R * 4);
-  s.yp = rt::DeviceBuffer(dev, R * size_t(std::max(c.dim, c.moe_inter)) * 4);
+  if (exl3) s.yp = rt::DeviceBuffer(dev, R * size_t(std::max(c.dim, c.moe_inter)) * 4);  // the EXL3 GEMV's partials
   return s;
 }
 
@@ -379,9 +387,6 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
                        st, ntiles_dev);
 }
 
-namespace {
-std::vector<std::vector<uint64_t>>* g_expert_hist = nullptr;
-}
 void set_expert_histogram(std::vector<std::vector<uint64_t>>* hist) { g_expert_hist = hist; }
 
 // ---------------------------------------------------------------------------------------------------
