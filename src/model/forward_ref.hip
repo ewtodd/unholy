@@ -347,13 +347,14 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
   k::mx_xform_in_q(q, s, p2u, plan, row_expert, tab(0, 1), xa, P, D, st);
   const bool gemv = k::mx_use_gemv(P / c.n_active);
   const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
-  lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u);  // w1, w3
+  const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
+  lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
   k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
   if (!u2p) {
-    lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev, nullptr, nullptr, nullptr);
+    lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev, nullptr, nullptr, nullptr, rows);
     return;
   }
-  lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), xa, D, D, st, ntiles_dev, nullptr, nullptr, nullptr);  // xa is free after the up GEMMs
+  lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), xa, D, D, st, ntiles_dev, nullptr, nullptr, nullptr, rows);  // xa is free after the up GEMMs
   k::remote_combine(xa, u2p, plan, out, c.n_active, D, P / c.n_active, st);
 }
 
@@ -373,9 +374,10 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
     k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st, in_rows);
     const bool gemv = k::mx_use_gemv(P / c.n_active);
     const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
-    lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u);  // w1, w3
+    const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
+    lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
     k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
-    lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev, nullptr, nullptr, nullptr);
+    lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev, nullptr, nullptr, nullptr, rows);
     return;
   }
   uint16_t* xh1 = s.xh1.as<uint16_t>();

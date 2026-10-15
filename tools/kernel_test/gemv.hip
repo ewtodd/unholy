@@ -1,5 +1,6 @@
 // unholy-gemv-test: the skinny decode GEMVs (gemv.hpp) on the model's decode shapes: outputs must not
-// depend on the columns per wave (bit for bit), and the time / weight bandwidth of each variant.
+// depend on the columns per wave (bit for bit), and the time / weight bandwidth of each variant. Likewise
+// the WMMA GEMMs' 64 x 128 tiles vs their skinny kernels for M <= 64 (gemm_wmma.hpp): bit for bit.
 //
 //   unholy-gemv-test [--dev 0] [--reps 50]
 #include <hip/hip_runtime.h>
@@ -87,7 +88,7 @@ int main(int argc, char** argv) {
       {"wq_a", 'w', 1024, 4096, 0},    {"wkv", 'w', 512, 4096, 0},     {"wq_b", 'w', 32768, 1024, 0},
       {"wo_b", 'w', 4096, 8192, 0},    {"sw1", 'w', 2048, 4096, 0},    {"sw2", 'w', 4096, 2048, 0},
       {"idx_wq_b", 'w', 8192, 1024, 0}, {"comp_wkv", 'f', 1024, 4096, 0}, {"gate", 'f', 256, 4096, 0},
-      {"head", 'f', 129280, 4096, 0},  {"wo_a", 'g', 1024, 4096, 8},
+      {"head", 'f', 129280, 4096, 0},  {"wo_a", 'g', 1024, 4096, 8},  {"idx_wproj", 'b', 64, 4096, 0},
   };
   {
     rt::DeviceBuffer bad(dev, 4);
@@ -121,7 +122,7 @@ int main(int argc, char** argv) {
     rt::DeviceBuffer ab = upload(dev, bf16v(size_t(64) * G * K));
     rt::DeviceBuffer out(dev, size_t(64) * cols * 4);
     const double wbytes = double(cols) * K * (f8w ? 1 : 2);
-    for (const int M : {1, 2, 4, 8, 12, 16, 24, 32, 48}) {
+    for (const int M : {1, 2, 4, 8, 9, 12, 16, 24, 32, 40, 48, 64}) {
       const auto run = [&]() {
         const uint8_t* wp = w.as<uint8_t>() + size_t(cur) * wsize;
         cur = (cur + 1) % copies;
@@ -157,8 +158,24 @@ int main(int argc, char** argv) {
           case 'g': k::gemm_grouped_fp8w_wmma(ab.as<uint16_t>(), wp, sw.as<uint8_t>(), out.as<uint16_t>(), M, G, N, K, st); break;
         }
       };
-      std::printf("%-9s M=%2d N=%6zu K=%5d: WMMA %7.1f us %4.0f GB/s |", s.name, M, cols, K, time(wmma),
-                  wbytes / time(wmma) * 1e-3);
+      {  // the 64 x 128 tiles vs the skinny kernels (M <= 64): bit for bit, and time
+        std::vector<uint8_t> o[2];
+        double us[2];
+        for (int sk = 0; sk < 2; ++sk) {
+          k::gemm_force_skinny(sk);
+          UH_CHECK(hipMemsetAsync(out.data(), 0, out.size(), st));
+          wmma();
+          UH_CHECK(hipStreamSynchronize(st));
+          o[sk] = download(out);
+          us[sk] = time(wmma);
+        }
+        k::gemm_force_skinny(-1);
+        const bool same = o[0] == o[1];
+        all_same &= same;
+        std::printf("%-9s M=%2d N=%6zu K=%5d: WMMA tiled %7.1f us %4.0f GB/s, skinny %7.1f us %4.0f GB/s%s |", s.name,
+                    M, cols, K, us[0], wbytes / us[0] * 1e-3, us[1], wbytes / us[1] * 1e-3,
+                    same ? "" : " DIFFERS");
+      }
       if (M > 32) {
         std::printf("\n");
         continue;
@@ -192,6 +209,6 @@ int main(int argc, char** argv) {
       std::printf("\n");
     }
   }
-  std::printf(all_same ? "outputs identical for every column count\n" : "OUTPUTS DIFFER\n");
+  std::printf(all_same ? "outputs identical for every column count and GEMM kernel\n" : "OUTPUTS DIFFER\n");
   return all_same ? 0 : 1;
 }

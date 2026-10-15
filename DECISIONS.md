@@ -993,3 +993,40 @@ sweep's beyond concurrency 1 (with every request queued up front, a newcomer's p
 decoders' step instead of the second in-flight slot): 22.0 / 27.6 / 33.6 / 40.2 tok/s at concurrency 1 / 2 /
 4 / 8 for the original (its c2 run shared the CPUs with a build), 29.0 / 33.6 / 37.4 / 42.7 for this build
 without the split, 37.9 / 39.4 / 43.9 at 2 / 4 / 8 with it.
+
+## 2026-10-15 — skinny WMMA GEMMs for steps of 9-64 rows, bit-identical
+
+With the decode split off, the steps of several streams carry 12-48 verify rows, which take the WMMA GEMMs,
+and their 64 x 128 tiles left those GEMMs few workgroups: wq_a's 1024 columns made 8 blocks (84 us for its
+4 MB, 50 GB/s). Skinny kernels with every output's arithmetic unchanged, for M <= 64:
+- `gemm_w8a8_wmma`: a block per 16 columns. Each 128-wide K block's raw WMMA chain starts from zero (its
+  scale product folds in at the block's end), so the 8 waves run different K blocks at once, park the raw
+  accumulators in LDS, and the block folds them in K order with the same `acc += raw * (asc * wsc)`;
+  the next round's weights are in flight during the fold.
+- the bf16 GEMMs (router gate, compressor, indexer weights, grouped wo_a): a wave per (16 columns, 16-row
+  fragment), the chain over all of K as before, fragments straight from global memory, the fragments of a
+  column tile neighbours in a block (the weights come from DRAM once). Not for the vocabulary head (N >
+  16384: the tiles are as fast) nor fp8 weights above 32 rows (slower).
+- `mx_grouped_gemm` (routed experts, on the cards and the APU), steps of <= 64 tokens: waves that each work
+  alone on 16 outputs -- A fragments from global memory, the slab dequantized into the wave's own LDS -- instead
+  of the block staging 128 rows of A per 64-input slab between two barriers; two slabs' codes in flight.
+  A tile of more rows than the launch planned for takes more passes (correct for any tile).
+UNHOLY_GEMM_SKINNY=0 / UNHOLY_MX_SKINNY=0 take the tiles.
+
+unholy-gemv-test (tiles vs skinny, every decode shape, M = 9-64): identical everywhere; at M = 12 / 48: wq_a
+84 -> 15 / 112 -> 22 us, wkv 77 -> 12 / 104 -> 19, wq_b 117 -> 67 / 141 -> 82, wo_b 179 -> 62 / 255 -> 88,
+sw1 88 -> 22 / 118 -> 33, sw2 50 -> 22 / 64 -> 35, comp_wkv 96 -> 34 / 91 -> 35, gate 87 -> 27 / 86 -> 27,
+idx_wproj 71 -> 26 / 75 -> 33, wo_a 268 -> 167 at 12 (tiles from 40 rows). unholy-mx-test, 64 experts of
+1-3 rows plus one of 37: identical; card 304 -> 411 GB/s of weights, APU 135 -> 163 (the GEMV, a different
+arithmetic, reaches 221 there: the 16-row WMMA on 1-3-row tiles bounds the APU). Tried: dequantizing without
+the LDS tables (same bits) was slower on both (378 / 144 GB/s); a second slab in flight changed nothing.
+
+End to end: unholy-resident-test bit-identical (both geometries, the batch-of-4 and 2 x 4-token verify
+checks, combine off); unholy-engine-batch against the 2026-10-12 build: 48 / 48 identical at concurrency 1 /
+2 / 4 / 8; its throughput 29.1 / 35.2 / 41.5 / 47.2 tok/s (29.0 / 33.6 / 37.4 / 42.7 without the skinny
+kernels; the original 22.0 / 27.6 / 33.6 / 40.2). GSM8K sweep (HTTP, production flags, the defaults: the
+2026-10-12 outputs for the same steps): 29.4 / 50.2 / 59.9 / 69.1 tok/s at concurrency 1 / 2 / 4 / 8 (2026-10-12:
+22.2 / 36.5 / 45.5 / 56.3; this morning's defaults, with the decode split: 29.4 / 54.0 / 56.0 / 61.4), flexible
+47 / 48 / 47 / 47 of 48; the concurrency-1 answers are the original's HTTP ones, text and token counts (48 / 48).
+With the opt-ins (`--decode-split 1 --reclaim-scratch 1`, UNHOLY_GEMV_ROWS=16, UNHOLY_MX_GEMV_TOKENS=64,
+UNHOLY_DSPARK_WMMA_ATTN=1): 29.9 / 55.3 / 68.2 / 83.5 (flexible 46 of 48 at each level).

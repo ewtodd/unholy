@@ -1,6 +1,8 @@
 // unholy-mx-test: native MXFP4 grouped expert kernels (mx_xform_in + mx_grouped_gemm / gemv) against the
 // reference (act_quant_fp8 per 128 + gemm_a8w4, one expert at a time) on random weights and inputs.
 // Same products, different fp32 summation order: expect rel L2 ~1e-3 (bf16 outputs), not identity.
+// Then decode-sized tiles (1-3 rows, one of 37): the 128-row GEMM against its skinny kernel (max_rows 16,
+// which takes three passes over the 37-row tile, and 64), bit for bit, and their times.
 //
 //   unholy-mx-test [--experts 16] [--rows-mean 96] [--K 4096] [--N 2048] [--dev 0]
 #include <hip/hip_runtime.h>
@@ -49,12 +51,17 @@ int main(int argc, char** argv) {
   UH_CHECK(hipSetDevice(dev));
   std::mt19937_64 rng(3);
   std::normal_distribution<float> nd(0.0f, 1.0f);
-  for (int mode = 0; mode < 2; ++mode) {  // 0: GEMM (prefill tiles), 1: GEMV (<= 8 rows)
+  bool all_same = true;
+  for (int mode = 0; mode < 3; ++mode) {  // 0: GEMM (prefill tiles), 1: GEMV (<= 8 rows), 2: GEMM, decode tiles
     std::vector<int> counts(static_cast<size_t>(E));
     int P = 0;
     for (auto& c : counts) {
-      c = mode ? 1 + int(rng() % 8) : int(rng() % uint64_t(2 * rows_mean + 1));
+      c = mode == 2 ? 1 + int(rng() % 3) : mode ? 1 + int(rng() % 8) : int(rng() % uint64_t(2 * rows_mean + 1));
       P += c;
+    }
+    if (mode == 2) {
+      P += 37 - counts[0];
+      counts[0] = 37;
     }
     std::vector<k::Exl3Tile> tiles;
     std::vector<int> row_expert;
@@ -117,6 +124,34 @@ int main(int argc, char** argv) {
     }
     // Fast path.
     k::mx_xform_in(dx.as<uint16_t>(), K, re.as<int32_t>(), stp, xa.as<uint16_t>(), P, K, nullptr);
+    if (mode == 2) {
+      std::vector<uint16_t> o[3];
+      double ms[3];
+      const int max_rows[3] = {k::kExl3TileRows, 16, 64};
+      for (int v = 0; v < 3; ++v) {
+        const auto go = [&] {
+          k::mx_grouped_gemm(xa.as<uint16_t>(), K, dt.as<k::Exl3Tile>(), int(tiles.size()), wtp, stp,
+                             out.as<uint16_t>(), N, N, nullptr, nullptr, nullptr, nullptr, nullptr, max_rows[v]);
+        };
+        UH_CHECK(hipMemset(out.data(), 0, out.size()));
+        go();
+        UH_CHECK(hipDeviceSynchronize());
+        o[v].resize(size_t(P) * N);
+        UH_CHECK(hipMemcpy(o[v].data(), out.data(), o[v].size() * 2, hipMemcpyDeviceToHost));
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 5; ++r) go();
+        UH_CHECK(hipDeviceSynchronize());
+        ms[v] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5;
+      }
+      const bool same = o[0] == o[1] && o[0] == o[2];
+      all_same &= same;
+      const double bytes = double(E) * N * K * (0.5 + 1.0 / 32);
+      std::printf("GEMM decode tiles: E=%d P=%d K=%d N=%d: 128-row tiles %.3f ms (%.0f GB/s), skinny max_rows 16 "
+                  "%.3f ms (%.0f GB/s), 64 %.3f ms (%.0f GB/s): %s\n",
+                  E, P, K, N, ms[0], bytes / (ms[0] / 1e3) / 1e9, ms[1], bytes / (ms[1] / 1e3) / 1e9, ms[2],
+                  bytes / (ms[2] / 1e3) / 1e9, same ? "bit-identical" : "OUTPUTS DIFFER");
+      continue;
+    }
     auto run = [&] {
       if (mode == 0)
         k::mx_grouped_gemm(xa.as<uint16_t>(), K, dt.as<k::Exl3Tile>(), int(tiles.size()), wtp, stp,
@@ -148,5 +183,5 @@ int main(int argc, char** argv) {
                 mode ? "GEMV" : "GEMM", E, P, K, N, ms, bytes / (ms / 1e3) / 1e9, 2.0 * P * double(K) * N / (ms / 1e3) / 1e12,
                 std::sqrt(num / std::max(den, 1e-30)), 100.0 * same / a.size());
   }
-  return 0;
+  return all_same ? 0 : 1;
 }
