@@ -53,10 +53,10 @@ Measured on that machine, behind the PCIe switch (October 2026):
 <!---->
 | | |
 |---|---|
-| prefill, one sequence, 4096-token chunks | 1861 tok/s at 32k depth, 1525 at 128k, 1092 at 256k, 896 at 491k; **1062 tok/s averaged over 0-512k** |
-| decode, one sequence, no speculation | 17.6 tok/s at 4k depth (56.7 ms/token), 11.4 tok/s at 512k |
-| decode with DSpark (5 drafts) | ~31 tok/s per stream on chat traffic; 70-90% of drafts accepted |
-| GSM8K chat sweep, production settings | 22.2 / 36.5 / 45.5 / 56.3 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
+| prefill, one sequence, 4096-token chunks | 2283 tok/s at 32k depth, 1796 at 128k, 1472 at 256k, 1013 at 491k; **1246 tok/s averaged over 0-512k** |
+| decode, one sequence, no speculation | 29.1 tok/s at 4k depth (34.4 ms/token), 21.1 tok/s at 512k |
+| decode with DSpark (5 drafts) | ~48 tok/s per stream on chat traffic (GSM8K, median); 70-90% of drafts accepted |
+| GSM8K chat sweep, production settings | 29.9 / 55.4 / 68.6 / 82.5 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
 <!---->
 Production settings: a 1.5M-token KV pool shared by up to 8 requests of up to 512k tokens each,
 DSpark with 5 drafts, 64 prefix-cache snapshots, the vision tower loaded. Depth curves are in

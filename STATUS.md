@@ -73,9 +73,18 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
 - [x] PLX switch (both cards on one Gen4 x4 uplink): compact card <-> APU expert transport (fp8 inputs per
       token, bit-identical; outputs combined per token on the APU): prefill 1062 tok/s average to 512k
       (971 before the switch), card <-> card 26 GB/s (DECISIONS 2026-10-12)
-- [ ] decode latency behind the switch (+5.7 ms/token single-stream; per-layer card <-> APU round trips)
+- [x] decode latency (DECISIONS 2026-10-14/15): single-stream 56.7 -> 33.9 ms/token at 4k, 87.6 -> ~49 ms at
+      512k (W8A8 GEMV fp8 decode, single-workgroup kernels spread, attention staging bank conflict, top-k on
+      several workgroups for long rows, fewer launches); bit-identical logits throughout
 - [ ] disk tier for the prefix cache
-- [ ] decode scaling: batch 4 gives 29.7 tok/s aggregate (7.8/stream) vs 16.4 at batch 1
+- [x] decode scaling: one attention / top-k launch for all chunks, GEMVs up to 16 rows and MoE GEMVs up to 64
+      tokens, two decode micro-batches across the cards (`--decode-split`): batch 8 step 168 -> 87 ms; GSM8K
+      sweep 22.2 / 36.5 / 45.5 / 56.3 -> 29.9 / 55.4 / 68.6 / 82.5 tok/s at 1 / 2 / 4 / 8 (DECISIONS 2026-10-15)
+- [ ] multi-stream decode and prefill are bound by the cold experts' bytes on the APU (65-82% busy): more
+      routing on the cards (scratch went 3.21 -> 2.24 GB per card; KV pool size is the other lever) or a
+      faster APU grouped GEMM (20-25 TFLOPS of ~59 at 84-280 rows per expert)
+- [ ] verify steps of more than 16 rows (3+ speculative streams) use the WMMA GEMMs: their rows are not
+      bit-identical to single-stream ones (DECISIONS 2026-10-14)
 - [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s
 - [x] routing profile from our own traffic (`data/expert_profile_unholy_mixed.txt`, default for runs)
 

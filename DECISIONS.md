@@ -879,3 +879,23 @@ by the planner's difference) logits are bit-identical.
   scratch fit; prefill takes more, smaller sub-batches). Bit-identical at the old placement; decode 34.2 ->
   33.9 ms at batch 1. Production plan now: scratch 2.24 / 2.36 GB, hot experts 1554 / 1467, routing on the
   cards 54.8% (53.3% before these three changes).
+
+## 2026-10-15 — where the night's work leaves it
+
+`unholy-curve` 1 x 512k (docs/bench/curve-native-1x512k-plx-2026-10-15.txt): decode 34.4 / 36.7 / 38.7 /
+42.0 / 47.5 ms per token at 4k / 32k / 128k / 256k / 512k (29.1 -> 21.1 tok/s; the 2026-10-12 curve: 56.7 ...
+87.6 ms), prefill 2283 / 1796 / 1472 / 1013 tok/s at 32k / 128k / 256k / 491k, 1246 average (1062).
+
+GSM8K production sweep (serve with the production flags, check-source gsm8k-chat, 48 items, seed 1234,
+temperature 1): 29.9 / 55.4 / 68.6 / 82.5 tok/s aggregate at concurrency 1 / 2 / 4 / 8 (2026-10-12: 22.2 /
+36.5 / 45.5 / 56.3), median single-stream decode 48.5 tok/s with DSpark (31.0). Flexible match 46 / 46 / 46 /
+47 of 48 (2026-10-12: 47 / 47 / 48 / 48): item 2 is wrong in all four runs here, right in the old ones; with
+12 seeds both builds get it right 11 times (the same per-request seed lands on another sample when the
+logits move by noise). 200 items at concurrency 8: flexible 0.970, strict 0.655 (2026-10-12: 0.980 /
+0.645).
+
+Kernels whose arithmetic did not change were checked bit for bit at every step (unholy-resident-test
+against the original build at the same expert placement, its batch / verify-chunk checks, combine off);
+the numerics that did change are rows of 9-16-row steps (GEMV instead of GEMM: now equal to single-stream
+rows), the expert placement (more hot experts) and the DSpark stages' attention (WMMA kernel; same drafts
+as the reference).
