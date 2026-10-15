@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "kernels/dev.hip.hpp"
+#include "kernels/elem_fast.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "rt/hip.hpp"
 
@@ -28,33 +29,46 @@ __global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count, uint
   if (hist) atomicAdd(&hist[sel[i]], 1u);
 }
 
-// One block of 256 threads (E <= 256): serial scans by thread 0 are trivial at E = 256.
-__global__ void moe_plan_kernel(const int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan,
-                                Exl3Tile* local_tiles, Exl3Tile* remote_tiles, int32_t* off, int32_t* fill,
-                                int max_tiles) {
-  if (threadIdx.x == 0) {
-    int next = 0, nl = 0, nr = 0, remote0 = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-      if (pass == 1) remote0 = next;
-      for (int e = 0; e < E; ++e) {
-        if ((resident[e] != 0) != (pass == 0)) continue;
-        const int c = count[e];
-        off[e] = next;
-        for (int i = 0; i < c; i += kExl3TileRows) {
-          const Exl3Tile t{e, next + i, min(kExl3TileRows, c - i)};
-          if (pass == 0 && nl < max_tiles) local_tiles[nl++] = t;
-          if (pass == 1 && nr < max_tiles) remote_tiles[nr++] = t;
-        }
-        next += c;
-      }
-    }
+// One block of 256 threads, thread e for expert e (E <= 256): block-wide scans of the pair rows and tiles
+// of the resident group and the remote group give the same offsets and tile order as walking the experts
+// in order, resident ones first.
+__global__ __launch_bounds__(256) void moe_plan_kernel(const int32_t* count, const uint8_t* resident, int E, int P,
+                                                       MoePlan* plan, Exl3Tile* local_tiles, Exl3Tile* remote_tiles,
+                                                       int32_t* off, int32_t* fill, int max_tiles) {
+  __shared__ int sc[4][256];  // inclusive scans: local rows, remote rows, local tiles, remote tiles
+  const int e = threadIdx.x;
+  const bool in = e < E, loc = in && resident[e] != 0;
+  const int c = in ? count[e] : 0, nt = (c + kExl3TileRows - 1) / kExl3TileRows;
+  const int v[4] = {loc ? c : 0, in && !loc ? c : 0, loc ? nt : 0, in && !loc ? nt : 0};
+#pragma unroll
+  for (int k = 0; k < 4; ++k) sc[k][e] = v[k];
+  __syncthreads();
+  for (int d = 1; d < 256; d <<= 1) {
+    int add[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) add[k] = e >= d ? sc[k][e - d] : 0;
+    __syncthreads();
+#pragma unroll
+    for (int k = 0; k < 4; ++k) sc[k][e] += add[k];
+    __syncthreads();
+  }
+  const int remote0 = sc[0][255];
+  if (in) {
+    const int row = loc ? sc[0][e] - v[0] : remote0 + sc[1][e] - v[1];
+    const int tile = loc ? sc[2][e] - v[2] : sc[3][e] - v[3];
+    Exl3Tile* dst = loc ? local_tiles : remote_tiles;
+    off[e] = row;
+    for (int i = 0; i < nt && tile + i < max_tiles; ++i)
+      dst[tile + i] = Exl3Tile{e, row + i * kExl3TileRows, min(kExl3TileRows, c - i * kExl3TileRows)};
+    fill[e] = 0;
+  }
+  if (e == 0) {
     plan->P = P;
     plan->remote0 = remote0;
-    plan->n_local_tiles = nl;
-    plan->n_remote_tiles = nr;
+    plan->n_local_tiles = min(sc[2][255], max_tiles);
+    plan->n_remote_tiles = min(sc[3][255], max_tiles);
     plan->n_remote_tokens = 0;
   }
-  for (int e = threadIdx.x; e < E; e += blockDim.x) fill[e] = 0;
 }
 
 __global__ void moe_scatter_kernel(const int32_t* sel, const float* wt, int T, int K, const int32_t* off, int32_t* fill,
@@ -207,11 +221,13 @@ __global__ void copy_remote_partial_kernel(const uint16_t* src, uint16_t* dst, c
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) d[i] = s[i];
 }
 
+// One block per (token, slice of dim): columns are independent.
 __global__ void moe_combine_partial_kernel(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan,
                                            const int32_t* tok2u, const uint16_t* shared, uint16_t* out, int K,
-                                           int dim) {
+                                           int dim, int per) {
   const int t = blockIdx.x, r0 = plan->remote0, u = tok2u[t];
-  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+  const int d1 = min(dim, int(blockIdx.y + 1) * per);
+  for (int d = blockIdx.y * per + threadIdx.x; d < d1; d += blockDim.x) {
     float acc = 0.0f;
     for (int j = 0; j < K; ++j) {
       const int p = pidx[size_t(t) * K + j];
@@ -275,7 +291,9 @@ void copy_remote_partial(const uint16_t* src, uint16_t* dst, const MoePlan* plan
 void moe_combine_partial(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan, const int32_t* tok2u,
                          const uint16_t* shared, uint16_t* out, int T, int K, int dim, hipStream_t st) {
   if (T <= 0) return;
-  moe_combine_partial_kernel<<<T, 256, 0, st>>>(pair_out, pidx, plan, tok2u, shared, out, K, dim);
+  const int sl = row_slices(T, dim);
+  moe_combine_partial_kernel<<<dim3(T, sl), 256, 0, st>>>(pair_out, pidx, plan, tok2u, shared, out, K, dim,
+                                                          (dim + sl - 1) / sl);
   UH_CHECK_LAUNCH();
 }
 
@@ -305,6 +323,7 @@ void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStrea
 
 void moe_plan(const int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
               Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st) {
+  if (E > 256) throw std::runtime_error("moe_plan: more than 256 experts");
   moe_plan_kernel<<<1, 256, 0, st>>>(count, resident, E, P, plan, local_tiles, remote_tiles, off, fill, max_tiles);
   UH_CHECK_LAUNCH();
 }

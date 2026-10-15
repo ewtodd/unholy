@@ -93,6 +93,7 @@ add_library(unholy_ref STATIC
   src/kernels/gemm_wmma.hip
   src/kernels/attn_wmma.hip
   src/kernels/hc_fast.hip
+  src/kernels/elem_fast.hip
   src/kernels/moe_dispatch.hip
   src/kernels/gemv.hip
   src/kernels/indexer.hip

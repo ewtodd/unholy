@@ -705,3 +705,18 @@ now queued between the APU request and the join (moe_device_dispatch / moe_devic
 while the APU works. Same kernels on the same inputs: logits bit-identical (code1024, both
 geometries, batch checks). Decode 52.6 / 68.7 / 101.7 / 168.4 -> 49.3 / 65.2 / 96.4 / 157.8 ms at
 batch 1 / 2 / 4 / 8; 4k prefill 1187 -> 1240 tok/s (one chunk), 1827 -> 1891 (8 sequences).
+
+## 2026-10-14 — single-workgroup decode kernels spread out
+
+At decode a token's elementwise kernels ran one workgroup per row: `hc_post` 28 us, `hc_finish` 16 us
+(a 20-iteration Sinkhorn on one thread, then the mix), `moe_combine_partial` 23 us, `rmsnorm` 7 us, and
+`moe_plan` 58 us (thread 0 walking 256 experts twice). Now:
+- `rmsnorm_slices`, `hc_post_slices` (`src/kernels/elem_fast.hip`), `moe_combine_partial` and the mix of
+  `hc_finish`: (row, slice of dim) workgroups, ~64 per launch at small T; the per-element arithmetic is
+  unchanged (rmsnorm's sum of squares is repeated per slice with the same partition; out of place only).
+- `hc_finish`'s Sinkhorn on 16 lanes of wave 0, one comb entry each, row / column sums through shuffles in
+  index order: the same operations per value as the serial loop.
+- `moe_plan`: block-wide scans (pair rows and tiles of the resident and the remote group) instead of the
+  serial walk: same offsets and tile order.
+`UNHOLY_REF_ELEM=1` keeps the reference rmsnorm / hc_post. Logits bit-identical (both geometries, batch
+checks). Decode 49.3 / 65.2 / 96.4 / 157.8 -> 42.6 / 58.1 / 89.6 / 151.0 ms at batch 1 / 2 / 4 / 8.

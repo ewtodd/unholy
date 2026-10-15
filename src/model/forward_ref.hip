@@ -9,6 +9,7 @@
 
 #include "kernels/attn_wmma.hpp"
 #include "kernels/dspark.hpp"
+#include "kernels/elem_fast.hpp"
 #include "kernels/exl3_moe.hpp"
 #include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
@@ -426,6 +427,25 @@ void dense_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16
   else k::gemm_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
 }
 
+// Elementwise kernels over (row, slice) workgroups unless UNHOLY_REF_ELEM=1 (bit-identical; a decode
+// step's rows otherwise get one workgroup each). rmsnorm only out of place.
+bool fast_elem() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_REF_ELEM");
+    return !v || std::string(v) == "0";
+  }();
+  return on;
+}
+void norm(const bf16* x, int ldx, const bf16* w, bf16* y, int ldy, int rows, int dim, float eps, hipStream_t st) {
+  if (fast_elem() && x != y) k::rmsnorm_slices(x, ldx, w, y, ldy, rows, dim, eps, st);
+  else k::rmsnorm(x, ldx, w, y, ldy, rows, dim, eps, st);
+}
+void hc_post(const bf16* x, const bf16* res, const float* post, const float* comb, bf16* out, int T, int hc, int dim,
+             hipStream_t st) {
+  if (fast_elem()) k::hc_post_slices(x, res, post, comb, out, T, hc, dim, st);
+  else k::hc_post(x, res, post, comb, out, T, hc, dim, st);
+}
+
 // Attention dispatch: WMMA kernel on gfx12 unless UNHOLY_REF_ATTN=1.
 void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sink, bf16* o, int T, int H, int D,
                float scale, hipStream_t st) {
@@ -542,7 +562,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   dump(L, b, "hcpre_attn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_attn_post", post, size_t(T) * c.hc_mult * 4, st);
   dump(L, b, "hcpre_attn_comb", comb, size_t(T) * c.hc_mult * c.hc_mult * 4, st);
-  k::rmsnorm(y, D, w.attn_norm.p<bf16>(), a, D, T, D, c.norm_eps, st);
+  norm(y, D, w.attn_norm.p<bf16>(), a, D, T, D, c.norm_eps, st);
   dump(L, b, "attn_in", a, size_t(T) * D * 2, st);
 
   // q: wq_a -> q_norm (qr) -> wq_b -> per-head rms -> rope; kv: wkv from the same quantized input.
@@ -555,7 +575,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   dump(L, b, "wq_a_out", qa, size_t(T) * c.q_lora * 2, st);
   dense_w8a8(qb, qs, w.wkv.w.p<uint8_t>(), w.wkv.s.p<uint8_t>(), kv, HD, T, HD, D, st);
   dump(L, b, "wkv_out", kv, size_t(T) * HD * 2, st);
-  k::rmsnorm(qa, c.q_lora, w.q_norm.p<bf16>(), qr, c.q_lora, T, c.q_lora, c.norm_eps, st);
+  norm(qa, c.q_lora, w.q_norm.p<bf16>(), qr, c.q_lora, T, c.q_lora, c.norm_eps, st);
   k::act_quant_fp8(qr, c.q_lora, qb, qs, T, c.q_lora, 128, st);
   dense_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
   dump(L, b, "wq_b_out", q, size_t(T) * H * HD * 2, st);
@@ -671,7 +691,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   k::act_quant_fp8(oa, G * R, qb, qs, T, G * R, 128, st);
   dense_w8a8(qb, qs, w.wo_b.w.p<uint8_t>(), w.wo_b.s.p<uint8_t>(), ao, D, T, D, G * R, st);
   dump(L, b, "attn_out", ao, size_t(T) * D * 2, st);
-  k::hc_post(ao, x, post, comb, x, T, c.hc_mult, D, st);
+  hc_post(ao, x, post, comb, x, T, c.hc_mult, D, st);
 }
 
 // Routing -> pair rows -> experts entirely on the device (EXL3 fast path). Pair rows are laid out
@@ -766,7 +786,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   dump(L, b, "hcpre_ffn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_ffn_post", post, size_t(T) * c.hc_mult * 4, st);
   dump(L, b, "hcpre_ffn_comb", comb, size_t(T) * c.hc_mult * c.hc_mult * 4, st);
-  k::rmsnorm(y, D, w.ffn_norm.p<bf16>(), f, D, T, D, c.norm_eps, st);
+  norm(y, D, w.ffn_norm.p<bf16>(), f, D, T, D, c.norm_eps, st);
   dump(L, b, "ffn_in", f, size_t(T) * D * 2, st);
 
   // Router (fp32 linear on x.float()).
@@ -911,7 +931,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   else
     k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
   dump(L, b, "ffn_out", fo, size_t(T) * D * 2, st);
-  k::hc_post(fo, x, post, comb, x, T, c.hc_mult, D, st);
+  hc_post(fo, x, post, comb, x, T, c.hc_mult, D, st);
   if (!device_path) UH_CHECK(hipStreamSynchronize(st));  // the host path's vectors
 }
 
