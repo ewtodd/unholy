@@ -34,11 +34,11 @@ __global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count, uint
 // in order, resident ones first.
 __global__ __launch_bounds__(256) void moe_plan_kernel(const int32_t* count, const uint8_t* resident, int E, int P,
                                                        MoePlan* plan, Exl3Tile* local_tiles, Exl3Tile* remote_tiles,
-                                                       int32_t* off, int32_t* fill, int max_tiles) {
+                                                       int32_t* off, int32_t* fill, int max_tiles, int tile_rows) {
   __shared__ int sc[4][256];  // inclusive scans: local rows, remote rows, local tiles, remote tiles
   const int e = threadIdx.x;
   const bool in = e < E, loc = in && resident[e] != 0;
-  const int c = in ? count[e] : 0, nt = (c + kExl3TileRows - 1) / kExl3TileRows;
+  const int c = in ? count[e] : 0, nt = (c + tile_rows - 1) / tile_rows;
   const int v[4] = {loc ? c : 0, in && !loc ? c : 0, loc ? nt : 0, in && !loc ? nt : 0};
 #pragma unroll
   for (int k = 0; k < 4; ++k) sc[k][e] = v[k];
@@ -59,7 +59,7 @@ __global__ __launch_bounds__(256) void moe_plan_kernel(const int32_t* count, con
     Exl3Tile* dst = loc ? local_tiles : remote_tiles;
     off[e] = row;
     for (int i = 0; i < nt && tile + i < max_tiles; ++i)
-      dst[tile + i] = Exl3Tile{e, row + i * kExl3TileRows, min(kExl3TileRows, c - i * kExl3TileRows)};
+      dst[tile + i] = Exl3Tile{e, row + i * tile_rows, min(tile_rows, c - i * tile_rows)};
     fill[e] = 0;
   }
   if (e == 0) {
@@ -322,9 +322,11 @@ void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStrea
 }
 
 void moe_plan(const int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
-              Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st) {
+              Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st, int tile_rows) {
   if (E > 256) throw std::runtime_error("moe_plan: more than 256 experts");
-  moe_plan_kernel<<<1, 256, 0, st>>>(count, resident, E, P, plan, local_tiles, remote_tiles, off, fill, max_tiles);
+  if (tile_rows < 1 || tile_rows > kExl3TileRows) throw std::runtime_error("moe_plan: tile rows");
+  moe_plan_kernel<<<1, 256, 0, st>>>(count, resident, E, P, plan, local_tiles, remote_tiles, off, fill, max_tiles,
+                                     tile_rows);
   UH_CHECK_LAUNCH();
 }
 

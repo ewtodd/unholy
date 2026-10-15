@@ -136,9 +136,15 @@ size_t expert_scratch_bytes(const Dsv4Config& c, int rows) {
   return R * W + R * W / 32 + 3 * R * c.moe_inter * 2 + 2 * R * W * 4;
 }
 
+// Tiles of up to `rows` pair rows: <= 128-row tiles (the GEMMs) and, for steps of up to
+// mx_gemv_max_tokens() tokens, kMxGemvTileRows-row tiles (the GEMVs).
+int moe_max_tiles(const Dsv4Config& c, int rows) {
+  return rows / 64 + c.n_experts + 1 + std::min(rows, k::mx_gemv_max_tokens() * c.n_active) / k::kMxGemvTileRows;
+}
+
 size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows) {
   const size_t R = size_t(std::max(rows, 1));
-  return R * c.dim * 4 + R * c.moe_inter * 6 + R * 4 + size_t(rows / 64 + c.n_experts + 1) * 12;
+  return R * c.dim * 4 + R * c.moe_inter * 6 + R * 4 + size_t(moe_max_tiles(c, rows)) * 12;
 }
 
 size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq) {
@@ -238,7 +244,7 @@ Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows) {
   const size_t R = size_t(std::max(rows, 1));
   Exl3MoeScratch s;
   s.rows = rows;
-  s.max_tiles = rows / 64 + c.n_experts + 1;
+  s.max_tiles = moe_max_tiles(c, rows);
   s.xh1 = rt::DeviceBuffer(dev, R * c.dim * 2);
   s.xh3 = rt::DeviceBuffer(dev, R * c.dim * 2);
   s.h1 = rt::DeviceBuffer(dev, R * c.moe_inter * 2);
@@ -311,7 +317,7 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
   bf16* g = sc.h1.as<bf16>();
   bf16* u = sc.h3.as<bf16>();
   k::mx_xform_in_q(q, s, p2u, plan, row_expert, tab(0, 1), xa, P, D, st);
-  const bool gemv = P / c.n_active <= 8;
+  const bool gemv = k::mx_use_gemv(P / c.n_active);
   const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
   lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev);
   lin(xa, D, tiles, max_tiles, tab(1, 0), tab(1, 1), u, I, I, st, ntiles_dev);
@@ -337,7 +343,7 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
     bf16* g = s.h1.as<bf16>();
     bf16* u = s.h3.as<bf16>();
     k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st);
-    const bool gemv = P / c.n_active <= 8;
+    const bool gemv = k::mx_use_gemv(P / c.n_active);
     const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
     lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev);
     lin(xa, D, tiles, max_tiles, tab(1, 0), tab(1, 1), u, I, I, st, ntiles_dev);
@@ -787,7 +793,8 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
   bf16* pair_in = B<bf16>(scr, kPairIn);
   bf16* pair_out = B<bf16>(scr, kPairOut);
   k::moe_count(sel, T, K, count, E, st, scr.route_hist.as<uint32_t>() + size_t(w.layer) * E);
-  k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st);
+  const int tile_rows = !w.exl3_experts && k::mx_use_gemv(T) ? k::kMxGemvTileRows : k::kExl3TileRows;
+  k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st, tile_rows);
   k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
   k::gather_rows(f, eidx, pair_in, P, D, st);
   const bool any_remote = w.n_resident < E;

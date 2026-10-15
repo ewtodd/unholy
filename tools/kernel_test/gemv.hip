@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kernels/dev.hip.hpp"
+#include "kernels/gemm_wmma.hpp"
 #include "kernels/gemv.hpp"
 #include "rt/hip.hpp"
 
@@ -116,11 +117,11 @@ int main(int argc, char** argv) {
     }
     int cur = 0;
     rt::DeviceBuffer sw = upload(dev, e8m0((cols + 127) / 128 * (K / 128)));
-    rt::DeviceBuffer a8 = upload(dev, fp8(size_t(8) * K)), sa = upload(dev, e8m0(size_t(8) * (K / 128)));
-    rt::DeviceBuffer ab = upload(dev, bf16v(size_t(8) * G * K));
-    rt::DeviceBuffer out(dev, size_t(8) * cols * 4);
+    rt::DeviceBuffer a8 = upload(dev, fp8(size_t(64) * K)), sa = upload(dev, e8m0(size_t(64) * (K / 128)));
+    rt::DeviceBuffer ab = upload(dev, bf16v(size_t(64) * G * K));
+    rt::DeviceBuffer out(dev, size_t(64) * cols * 4);
     const double wbytes = double(cols) * K * (f8w ? 1 : 2);
-    for (const int M : {1, 2, 4, 8}) {
+    for (const int M : {1, 2, 4, 8, 12, 16, 24, 32, 48}) {
       const auto run = [&]() {
         const uint8_t* wp = w.as<uint8_t>() + size_t(cur) * wsize;
         cur = (cur + 1) % copies;
@@ -131,9 +132,39 @@ int main(int argc, char** argv) {
           case 'g': k::gemv_grouped_fp8w(ab.as<uint16_t>(), wp, sw.as<uint8_t>(), out.as<uint16_t>(), M, G, N, K, st); break;
         }
       };
-      std::printf("%-9s M=%d N=%6zu K=%5d:", s.name, M, cols, K);
+      const auto time = [&](const auto& f) {
+        hipEvent_t e0, e1;
+        UH_CHECK(hipEventCreate(&e0));
+        UH_CHECK(hipEventCreate(&e1));
+        for (int i = 0; i < 3; ++i) f();
+        UH_CHECK(hipEventRecord(e0, st));
+        for (int i = 0; i < reps; ++i) f();
+        UH_CHECK(hipEventRecord(e1, st));
+        UH_CHECK(hipEventSynchronize(e1));
+        float ms = 0;
+        UH_CHECK(hipEventElapsedTime(&ms, e0, e1));
+        UH_CHECK(hipEventDestroy(e0));
+        UH_CHECK(hipEventDestroy(e1));
+        return 1e3 * ms / reps;
+      };
+      const auto wmma = [&]() {
+        const uint8_t* wp = w.as<uint8_t>() + size_t(cur) * wsize;
+        cur = (cur + 1) % copies;
+        switch (s.kind) {
+          case 'w': k::gemm_w8a8_wmma(a8.as<uint8_t>(), sa.as<uint8_t>(), wp, sw.as<uint8_t>(), out.as<uint16_t>(), N, M, N, K, st); break;
+          case 'b': k::gemm_bf16_wmma(ab.as<uint16_t>(), K, reinterpret_cast<const uint16_t*>(wp), out.as<uint16_t>(), N, M, N, K, st); break;
+          case 'f': k::gemm_bf16_f32out_wmma(ab.as<uint16_t>(), K, reinterpret_cast<const uint16_t*>(wp), out.as<float>(), N, M, N, K, st); break;
+          case 'g': k::gemm_grouped_fp8w_wmma(ab.as<uint16_t>(), wp, sw.as<uint8_t>(), out.as<uint16_t>(), M, G, N, K, st); break;
+        }
+      };
+      std::printf("%-9s M=%2d N=%6zu K=%5d: WMMA %7.1f us %4.0f GB/s |", s.name, M, cols, K, time(wmma),
+                  wbytes / time(wmma) * 1e-3);
+      if (M > 32) {
+        std::printf("\n");
+        continue;
+      }
       std::vector<uint8_t> ref;
-      for (const int C : {1, 2, 4}) {
+      for (const int C : M > 8 ? std::vector<int>{1} : std::vector<int>{1, 2, 4}) {
         k::gemv_force_cols(C);
         UH_CHECK(hipMemsetAsync(out.data(), 0, out.size(), st));
         run();

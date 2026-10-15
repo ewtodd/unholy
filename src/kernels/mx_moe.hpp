@@ -41,7 +41,12 @@ void mx_swiglu(const bf16* g, const bf16* u, const float* w, const int32_t* row_
 void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                      const int* ntiles_dev = nullptr);
-// The same for tiles of <= 8 rows (decode): a wave per output column, K across the lanes.
+// The same for tiles of <= kMxGemvTileRows rows (decode): a wave per output column, K across the lanes.
+// Each row's result does not depend on the tile it is in, so steps of up to mx_gemv_max_tokens() tokens
+// plan their experts in tiles of kMxGemvTileRows rows and every row gets what a one-token step gives it.
+constexpr int kMxGemvTileRows = 8;
+int mx_gemv_max_tokens();  // UNHOLY_MX_GEMV_TOKENS (default below)
+inline bool mx_use_gemv(int tokens) { return tokens <= mx_gemv_max_tokens(); }
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                      const int* ntiles_dev = nullptr);

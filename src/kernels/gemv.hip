@@ -1,10 +1,12 @@
-// Skinny GEMMs (M <= 8 rows: decode, small batches): one wave per output column, K split across the
+// Skinny GEMMs (M <= 32 rows: decode, small batches): one wave per output column, K split across the
 // 32 lanes in 16-element chunks, a wave reduction at the end. Bandwidth-bound on the weights, which
 // is the right bound at small M (the 64-row WMMA tiles leave most of the GPU idle there).
 //
 // Numerics follow the WMMA/reference kernels: fp32 accumulation; the W8A8 path scales each 16-wide
 // chunk's exact partial sum by its 128-block scale product (the reference scales whole 128-blocks; the
 // same products, summed in a different fp32 order).
+#include <type_traits>
+
 #include "kernels/dev.hip.hpp"
 #include "kernels/gemv.hpp"
 #include "rt/hip.hpp"
@@ -15,7 +17,7 @@ using namespace unholy::dev;
 
 namespace {
 
-constexpr int WAVES = 8, NT = WAVES * 32, MAXM = 8;
+constexpr int WAVES = 8, NT = WAVES * 32, MAXM = 32;  // MAXM: rows supported (kernels templated on R <= MAXM)
 
 __device__ __forceinline__ void load16_fp8(const uint8_t* p, float* v) {
   const uint4 q = *reinterpret_cast<const uint4*>(p);
@@ -46,13 +48,13 @@ __device__ __forceinline__ void store(TOut* c, size_t i, float v) {
 // the bit decode made the W8A8 GEMV ALU-bound (~380 GB/s at one row, ~85 GB/s at eight).
 
 // W8A8.
-template <int C>
+template <int C, int R>
 __global__ __launch_bounds__(NT) void gemv_w8a8_kernel(const uint8_t* a, const uint8_t* sa, const uint8_t* w,
                                                        const uint8_t* sw, bf16* c, int ldc, int M, int N, int K) {
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C, lane = threadIdx.x & 31;
   if (n0 >= N) return;
   const int nc = min(C, N - n0), nkb = K / 128;
-  float acc[C][MAXM] = {};
+  float acc[C][R] = {};
   for (int k = lane * 16; k < K; k += 512) {
     float wv[C][16], ws[C];
     const int kb = k / 128;
@@ -63,7 +65,7 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_kernel(const uint8_t* a, const u
         ws[j] = e8m0_to_f32(sw[size_t((n0 + j) / 128) * nkb + kb]);
       }
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < R; ++m) {
       if (m >= M) break;
       float av[16];
       load16_fp8(a + size_t(m) * K + k, av);
@@ -81,7 +83,7 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_kernel(const uint8_t* a, const u
 #pragma unroll
   for (int j = 0; j < C; ++j)
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < R; ++m) {
       if (j >= nc || m >= M) break;
       const float v = warp_sum(acc[j][m]);
       if (lane == 0) c[size_t(m) * ldc + n0 + j] = f32_to_bf16(v);
@@ -89,20 +91,20 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_kernel(const uint8_t* a, const u
 }
 
 // bf16 weights x bf16 activations.
-template <int C, typename TOut>
+template <int C, int R, typename TOut>
 __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M,
                                                        int N, int K) {
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C, lane = threadIdx.x & 31;
   if (n0 >= N) return;
   const int nc = min(C, N - n0);
-  float acc[C][MAXM] = {};
+  float acc[C][R] = {};
   for (int k = lane * 16; k < K; k += 512) {
     float wv[C][16];
 #pragma unroll
     for (int j = 0; j < C; ++j)
       if (j < nc) load16_bf16(w + size_t(n0 + j) * K + k, wv[j]);
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < R; ++m) {
       if (m >= M) break;
       float av[16];
       load16_bf16(a + size_t(m) * lda + k, av);
@@ -117,7 +119,7 @@ __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, c
 #pragma unroll
   for (int j = 0; j < C; ++j)
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < R; ++m) {
       if (j >= nc || m >= M) break;
       const float v = warp_sum(acc[j][m]);
       if (lane == 0) store(c, size_t(m) * ldc + n0 + j, v);
@@ -126,13 +128,13 @@ __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, c
 
 // Grouped "mgk,grk->mgr": fp8 weights x 128x128 scales (exact in bf16), bf16 activations. A wave's C
 // columns lie in one group (R % C == 0).
-template <int C>
+template <int C, int RM>
 __global__ __launch_bounds__(NT) void gemv_grouped_fp8w_kernel(const bf16* a, const uint8_t* w, const uint8_t* sw,
                                                                bf16* c, int M, int G, int R, int K) {
   const int col0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C, lane = threadIdx.x & 31;  // col over G*R
   if (col0 >= G * R) return;
   const int g = col0 / R, r0 = col0 % R;
-  float acc[C][MAXM] = {};
+  float acc[C][RM] = {};
   for (int k = lane * 16; k < K; k += 512) {
     float wv[C][16];
 #pragma unroll
@@ -143,7 +145,7 @@ __global__ __launch_bounds__(NT) void gemv_grouped_fp8w_kernel(const bf16* a, co
       for (int i = 0; i < 16; ++i) wv[j][i] *= s;  // exact (power of two)
     }
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < RM; ++m) {
       if (m >= M) break;
       float av[16];
       load16_bf16(a + (size_t(m) * G + g) * K + k, av);
@@ -156,7 +158,7 @@ __global__ __launch_bounds__(NT) void gemv_grouped_fp8w_kernel(const bf16* a, co
 #pragma unroll
   for (int j = 0; j < C; ++j)
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
+    for (int m = 0; m < RM; ++m) {
       if (m >= M) break;
       const float v = warp_sum(acc[j][m]);
       if (lane == 0) c[(size_t(m) * G + g) * R + r0 + j] = f32_to_bf16(v);
@@ -169,28 +171,44 @@ int g_force_cols = 0;
 int cols_per_wave(int) { return g_force_cols ? g_force_cols : 1; }
 int blocks_for(int cols, int C) { return (cols + WAVES * C - 1) / (WAVES * C); }
 
+// Calls f(std::integral_constant<int, R>) with the smallest row capacity R in {8, 16, 32} >= M.
+template <typename F>
+void by_rows(int M, F&& f) {
+  if (M <= 8) f(std::integral_constant<int, 8>{});
+  else if (M <= 16) f(std::integral_constant<int, 16>{});
+  else f(std::integral_constant<int, 32>{});
+}
+
 }  // namespace
 
 void gemv_force_cols(int c) { g_force_cols = c == 1 || c == 2 || c == 4 ? c : 0; }
 
 void gemv_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                int N, int K, hipStream_t st) {
-  if (M > MAXM || K % 512) throw std::runtime_error("gemv_w8a8: M > 8 or K % 512");
-  switch (cols_per_wave(N)) {
-    case 4: gemv_w8a8_kernel<4><<<blocks_for(N, 4), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K); break;
-    case 2: gemv_w8a8_kernel<2><<<blocks_for(N, 2), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K); break;
-    default: gemv_w8a8_kernel<1><<<blocks_for(N, 1), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K);
-  }
+  if (M > MAXM || K % 512) throw std::runtime_error("gemv_w8a8: M > 32 or K % 512");
+  const auto go = [&](auto r) {
+    constexpr int R = decltype(r)::value;
+    switch (cols_per_wave(N)) {
+      case 4: gemv_w8a8_kernel<4, R><<<blocks_for(N, 4), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K); break;
+      case 2: gemv_w8a8_kernel<2, R><<<blocks_for(N, 2), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K); break;
+      default: gemv_w8a8_kernel<1, R><<<blocks_for(N, 1), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K);
+    }
+  };
+  by_rows(M, go);
   UH_CHECK_LAUNCH();
 }
 template <typename TOut>
 void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K, hipStream_t st) {
-  if (M > MAXM || K % 512) throw std::runtime_error("gemv_bf16: M > 8 or K % 512");
-  switch (cols_per_wave(N)) {
-    case 4: gemv_bf16_kernel<4, TOut><<<blocks_for(N, 4), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K); break;
-    case 2: gemv_bf16_kernel<2, TOut><<<blocks_for(N, 2), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K); break;
-    default: gemv_bf16_kernel<1, TOut><<<blocks_for(N, 1), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
-  }
+  if (M > MAXM || K % 512) throw std::runtime_error("gemv_bf16: M > 32 or K % 512");
+  const auto go = [&](auto r) {
+    constexpr int R = decltype(r)::value;
+    switch (cols_per_wave(N)) {
+      case 4: gemv_bf16_kernel<4, R, TOut><<<blocks_for(N, 4), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K); break;
+      case 2: gemv_bf16_kernel<2, R, TOut><<<blocks_for(N, 2), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K); break;
+      default: gemv_bf16_kernel<1, R, TOut><<<blocks_for(N, 1), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
+    }
+  };
+  by_rows(M, go);
   UH_CHECK_LAUNCH();
 }
 void gemv_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
@@ -201,14 +219,18 @@ void gemv_bf16_f32out(const bf16* a, int lda, const bf16* w, float* c, int ldc, 
 }
 void gemv_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16* c, int M, int G, int R, int K,
                        hipStream_t st) {
-  if (M > MAXM || K % 512) throw std::runtime_error("gemv_grouped_fp8w: M > 8 or K % 512");
+  if (M > MAXM || K % 512) throw std::runtime_error("gemv_grouped_fp8w: M > 32 or K % 512");
   int C = cols_per_wave(G * R);
   while (R % C) C /= 2;
-  switch (C) {
-    case 4: gemv_grouped_fp8w_kernel<4><<<blocks_for(G * R, 4), NT, 0, st>>>(a, w, sw, c, M, G, R, K); break;
-    case 2: gemv_grouped_fp8w_kernel<2><<<blocks_for(G * R, 2), NT, 0, st>>>(a, w, sw, c, M, G, R, K); break;
-    default: gemv_grouped_fp8w_kernel<1><<<blocks_for(G * R, 1), NT, 0, st>>>(a, w, sw, c, M, G, R, K);
-  }
+  const auto go = [&](auto r) {
+    constexpr int RR = decltype(r)::value;
+    switch (C) {
+      case 4: gemv_grouped_fp8w_kernel<4, RR><<<blocks_for(G * R, 4), NT, 0, st>>>(a, w, sw, c, M, G, R, K); break;
+      case 2: gemv_grouped_fp8w_kernel<2, RR><<<blocks_for(G * R, 2), NT, 0, st>>>(a, w, sw, c, M, G, R, K); break;
+      default: gemv_grouped_fp8w_kernel<1, RR><<<blocks_for(G * R, 1), NT, 0, st>>>(a, w, sw, c, M, G, R, K);
+    }
+  };
+  by_rows(M, go);
   UH_CHECK_LAUNCH();
 }
 

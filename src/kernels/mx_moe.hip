@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cstdlib>
+
 #include "kernels/dev.hip.hpp"
 #include "kernels/mx_moe.hpp"
 #include "rt/hip.hpp"
@@ -271,6 +274,14 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
 }
 
 }  // namespace
+
+int mx_gemv_max_tokens() {
+  static const int v = [] {
+    const char* e = std::getenv("UNHOLY_MX_GEMV_TOKENS");
+    return e ? std::max(kMxGemvTileRows, std::atoi(e)) : 64;
+  }();
+  return v;
+}
 
 void mx_repack(uint8_t* w, uint8_t* s, int N, int K, uint8_t* tmp, hipStream_t st) {
   if (N % 16 || K % 64) throw std::runtime_error("mx_repack: N % 16 or K % 64");

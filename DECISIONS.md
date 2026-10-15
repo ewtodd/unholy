@@ -747,3 +747,22 @@ row and 370-420 GB/s with eight (wo_b at M = 8: 399 -> 79 us). More columns per 
 activation decode) only cost occupancy once the decode was cheap: one column per wave stays the default.
 Logits bit-identical. Decode at batch 1 / 2 / 4 / 8: 42.5 / 53.6 / 76.0 / 119.5 -> 37.8 / 45.3 / 59.0 /
 89.0 ms.
+
+## 2026-10-14 — verify steps of several streams: GEMVs up to 16 rows, MoE GEMVs up to 64 tokens
+
+Production decodes with DSpark verify chunks of up to 6 rows per stream, so two or more streams are past
+8 rows, where every projection switched to the WMMA GEMMs (64 / 128-row tiles). `unholy-bench --verify 6`
+at batch 1 / 2 / 4 / 8: 66 / 172 / 243 / 417 ms per step. At 12 rows the MoE ran `mx_grouped_gemm` on
+~45 experts of 1-2 rows each (cards 52 ms, APU 91 ms per step, 705 us per call on the APU), and the dense
+WMMA tiles are latency-bound at small M (few workgroups: wq_a / wkv / the router 76-87 us whatever M;
+unholy-gemv-test now times both).
+- MoE: steps of up to `mx_gemv_max_tokens()` tokens (64, `UNHOLY_MX_GEMV_TOKENS`) plan their experts in
+  8-row tiles (`moe_plan` tile_rows) and run `mx_grouped_gemv` on the cards and the APU (bandwidth-bound:
+  ~570 GB/s on a card, ~190 on the APU at 12 rows). A row's GEMV result does not depend on its tile.
+- Dense: the GEMVs take up to 16 rows (`kGemvMaxRows`; templated on a row capacity of 8 / 16 / 32 so small
+  M keeps its registers). At 12-16 rows they beat the WMMA tiles on every dense shape but wq_b and the
+  head (net ~240-430 us per layer); past ~24 rows the tiles win.
+Rows of steps up to 8 tokens are unchanged (logits bit-identical, both geometries). Rows of 9-16-row steps
+now get exactly the single-stream GEMV values instead of the GEMM ones: `--batch 4`'s 4 x 4-token verify
+chunks (16 rows), which matched nothing before, are bit-identical to the solo runs. Verify-6 steps at batch
+2: 171.7 -> 115.3 ms; batch 4 / 8 (24 / 48 rows): 243 / 417 -> 182 / 317 ms (MoE only).

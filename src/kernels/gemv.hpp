@@ -1,4 +1,5 @@
-// Skinny GEMMs for M <= 8 (decode). Same contracts as the WMMA GEMMs (gemm_wmma.hpp); K % 512 == 0.
+// Skinny GEMMs for M <= 32 (decode). Same contracts as the WMMA GEMMs (gemm_wmma.hpp); K % 512 == 0.
+// A row's result does not depend on M.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -9,7 +10,7 @@ namespace unholy::kernels {
 
 using bf16 = uint16_t;
 
-constexpr int kGemvMaxRows = 8;
+constexpr int kGemvMaxRows = 16;  // dense layers use the GEMVs up to here (unholy-gemv-test: faster than the WMMA tiles)
 
 void gemv_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                int N, int K, hipStream_t st);
