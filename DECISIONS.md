@@ -833,3 +833,8 @@ A token ran ~63 kernels per layer on a card, ~4.5 us apart. Removed, bit-identic
 `unholy-curve` to 512k with tonight's kernels (the attention staging, the long-row top-k): decode 36.6 /
 38.8 / 40.8 / 44.6 / 48.9 ms per token at 4k / 32k / 128k / 256k / 512k (before tonight 56.7 / 58.4 /
 64.2 / - / 87.6): 20.4 tok/s at 512k without speculation. Prefill average 0-512k 1245 tok/s (1062).
+- `rmsnorm_quant_slices`: the attention, q-LoRA and FFN norms quantize their output for the next W8A8
+  GEMV in the same launch (the 128-block amax is exact in any order; codes and scales as act_quant_fp8);
+  `kv_chain` (kv_norm in place, rope, fp8 fake quant) and `head_rms_rope` (q's per-head RMS and rope) do
+  their reference kernels' arithmetic in one launch each. 6 launches fewer per layer, bit-identical: decode
+  36.7 / 59.2 / 91.0 -> 35.7 / 58.3 / 89.9 ms at batch 1 / 4 / 8.

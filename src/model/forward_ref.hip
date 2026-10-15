@@ -475,6 +475,14 @@ void norm(const bf16* x, int ldx, const bf16* w, bf16* y, int ldy, int rows, int
   if (fast_elem() && x != y) k::rmsnorm_slices(x, ldx, w, y, ldy, rows, dim, eps, st);
   else k::rmsnorm(x, ldx, w, y, ldy, rows, dim, eps, st);
 }
+// norm() then act_quant_fp8 (block 128) of its output into q / qs: one launch when the fused kernel
+// applies (UNHOLY_REF_ELEM unset, out of place, 256-value slices).
+void norm_quant(const bf16* x, int ldx, const bf16* w, bf16* y, int ldy, uint8_t* q, uint8_t* qs, int rows, int dim,
+                float eps, hipStream_t st) {
+  if (fast_elem() && k::rmsnorm_quant_slices(x, ldx, w, y, ldy, q, qs, rows, dim, eps, st)) return;
+  norm(x, ldx, w, y, ldy, rows, dim, eps, st);
+  k::act_quant_fp8(y, ldy, q, qs, rows, dim, 128, st);
+}
 void hc_post(const bf16* x, const bf16* res, const float* post, const float* comb, bf16* out, int T, int hc, int dim,
              hipStream_t st) {
   if (fast_elem()) k::hc_post_slices(x, res, post, comb, out, T, hc, dim, st);
@@ -608,7 +616,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   dump(L, b, "hcpre_attn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_attn_post", post, size_t(T) * c.hc_mult * 4, st);
   dump(L, b, "hcpre_attn_comb", comb, size_t(T) * c.hc_mult * c.hc_mult * 4, st);
-  norm(y, D, w.attn_norm.p<bf16>(), a, D, T, D, c.norm_eps, st);
+  norm_quant(y, D, w.attn_norm.p<bf16>(), a, D, qb, qs, T, D, c.norm_eps, st);  // a and its fp8 codes
   dump(L, b, "attn_in", a, size_t(T) * D * 2, st);
 
   // q: wq_a -> q_norm (qr) -> wq_b -> per-head rms -> rope; kv: wkv from the same quantized input.
@@ -619,21 +627,24 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   bf16* qi = B<bf16>(scr, kQI);
   bf16* wi = B<bf16>(scr, kWI);
   const int IH = c.idx_heads, ID = c.idx_dim;
-  k::act_quant_fp8(a, D, qb, qs, T, D, 128, st);
   dense_w8a8_2(qb, qs, w.wq_a, qa, c.q_lora, w.wkv, kv, HD, T, D, st);
   dump(L, b, "wq_a_out", qa, size_t(T) * c.q_lora * 2, st);
   dump(L, b, "wkv_out", kv, size_t(T) * HD * 2, st);
-  norm(qa, c.q_lora, w.q_norm.p<bf16>(), qr, c.q_lora, T, c.q_lora, c.norm_eps, st);
-  k::act_quant_fp8(qr, c.q_lora, qb, qs, T, c.q_lora, 128, st);
+  norm_quant(qa, c.q_lora, w.q_norm.p<bf16>(), qr, c.q_lora, qb, qs, T, c.q_lora, c.norm_eps, st);
   // wq_b and the indexer's wq_b take the same quantized qr.
   if (w.has_indexer) dense_w8a8_2(qb, qs, w.wq_b, q, H * HD, w.idx_wq_b, qi, IH * ID, T, c.q_lora, st);
   else dense_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
   dump(L, b, "wq_b_out", q, size_t(T) * H * HD * 2, st);
-  k::head_rms_bf16(q, T, H, HD, c.norm_eps, st);
-  k::rope(q, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, false, st);
-  k::rmsnorm(kv, HD, w.kv_norm.p<bf16>(), kv, HD, T, HD, c.norm_eps, st);
-  k::rope(kv, HD, T, 1, HD, HD - rd, rd / 2, pos, freqs, false, st);
-  k::fake_quant_fp8(kv, HD, T, HD - rd, 64, st);
+  if (fast_elem()) {  // the same three-kernel chains, fused per (row, head) / row
+    k::head_rms_rope(q, T, H, HD, c.norm_eps, pos, freqs, rd / 2, st);
+    k::kv_chain(kv, w.kv_norm.p<bf16>(), T, HD, c.norm_eps, pos, freqs, rd / 2, st);
+  } else {
+    k::head_rms_bf16(q, T, H, HD, c.norm_eps, st);
+    k::rope(q, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, false, st);
+    k::rmsnorm(kv, HD, w.kv_norm.p<bf16>(), kv, HD, T, HD, c.norm_eps, st);
+    k::rope(kv, HD, T, 1, HD, HD - rd, rd / 2, pos, freqs, false, st);
+    k::fake_quant_fp8(kv, HD, T, HD - rd, 64, st);
+  }
 
   // Indexer inputs (token-parallel; qi from the wq_b launch above); per-chunk scores/top-k below.
   if (w.ratio && !fast_dense()) k::cast_bf16_f32(a, B<float>(scr, kAF), size_t(T) * D, st);  // reference GEMMs' input
@@ -891,7 +902,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   dump(L, b, "hcpre_ffn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_ffn_post", post, size_t(T) * c.hc_mult * 4, st);
   dump(L, b, "hcpre_ffn_comb", comb, size_t(T) * c.hc_mult * c.hc_mult * 4, st);
-  norm(y, D, w.ffn_norm.p<bf16>(), f, D, T, D, c.norm_eps, st);
+  norm_quant(y, D, w.ffn_norm.p<bf16>(), f, D, qb, qs, T, D, c.norm_eps, st);  // f, and its fp8 codes for the shared expert
   dump(L, b, "ffn_in", f, size_t(T) * D * 2, st);
 
   // Router (fp32 linear on x.float()).
@@ -1021,8 +1032,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   // Shared expert (fp8 weights, no routing weight), queued while the remote experts run: its buffers are
   // not the routed path's.
   bf16* shared = B<bf16>(scr, kShared);
-  k::act_quant_fp8(f, D, qb, qs, T, D, 128, st);
-  dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);
+  dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);  // qb / qs: f's codes (norm_quant)
   k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
   k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
   dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
