@@ -84,9 +84,9 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       with the opt-ins, measured before the APU kernel (two decode micro-batches `--decode-split 1`, 16-row GEMVs,
       64-token MoE GEMVs, reclaimed scratch; DECISIONS 2026-10-15). Two micro-batches within a step keep the
       outputs exactly (`UNHOLY_MICROBATCH=1`, model::ClassRows) but are slower: decode is bound by weight reads
-- [ ] both cards are power-capped at 230 W again (`/etc/lact/config.yaml`, from /etc/nixos, active since
-      2026-10-13 11:28; the 2026-10-12 register-bit-flip fault was fixed by removing that cap): rare
-      run-to-run outliers in the logits, in the 2026-10-12 build as in this one (DECISIONS 2026-10-15)
+- [ ] rare run-to-run outliers in the logits (one request in some full runs at concurrency 1), in the 2026-10-12
+      build as in this one; cause open (not the 230 W cap, which is deliberate; no PCIe AER errors; VRAM ECC off).
+      DECISIONS 2026-10-15
 - [ ] multi-stream decode and prefill are bound by the cold experts' bytes on the APU (65-82% busy): more
       routing on the cards (scratch went 3.21 -> 2.24 GB per card; KV pool size is the other lever) or a
       faster APU grouped GEMM (now 11-27 TFLOPS of ~59 at 16-256 rows per expert, B in registers)

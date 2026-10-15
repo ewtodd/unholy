@@ -1189,3 +1189,13 @@ reproduce the WMMA chain's bits. A probe (one 16x16x16 bf16 WMMA on random opera
 adds in k order, fmaf, the exact sum rounded once, the exact 16-product dot then + c, a pairwise tree) matches
 none of them: at best 45% of outputs on gfx1151 and 64% on gfx1201. The instruction's internal rounding is
 something else, so the expert GEMM stays on WMMA.
+
+## 2026-10-15 — correction: the 230 W cap is not the explanation
+
+The owner: the 2026-10-12 faults turned out to be the PEX switch, not the power cap; with the switch fixed the
+cap was put back on purpose. So the two entries above that point at the cap are wrong on that point. Since
+then: every AER counter on both cards and both switch ports reads 0 (correctable and non-fatal), and the
+kernel log has no PCIe error between 04:30 and 06:30, when the outliers happened; VRAM ECC is off ("GECC is
+disabled"), so a memory error would not be logged either. The outliers stand as measured -- one request in
+one run, 1 of 7 runs of the 2026-10-12 build and 1 of 19 of this one, majority fingerprints identical -- with
+their cause open: silent hardware (no ECC), or a race the original code already has.
