@@ -733,3 +733,17 @@ code), then the window rings. Chunks of one step are of different slots, so no c
 ring update (a step with two chunks of one slot keeps the old order; `UNHOLY_ATTN_PER_CHUNK=1` forces it).
 Logits bit-identical (both geometries, batch checks), indexer kernel test unchanged. Decode at batch
 1 / 2 / 4 / 8: 42.6 / 58.1 / 89.6 / 151.0 -> 42.5 / 53.6 / 76.0 / 119.5 ms.
+
+## 2026-10-14 — the W8A8 GEMV was ALU-bound on the fp8 decode
+
+`unholy-gemv-test` (new) times the decode GEMVs on the model's shapes with the weights streamed from DRAM
+(enough copies to defeat the 64 MB last-level cache; one 32 MB matrix repeated runs from cache at
+>1.3 TB/s) and checks that outputs do not depend on the columns per wave. The bf16 GEMVs ran at 500-630
+GB/s, the W8A8 one at ~380 GB/s with one row and ~85 GB/s with eight: every weight and (per row) every
+activation went through the bit-level e4m3 decode (~7 ALU ops each). `dev::e4m3x4_to_f32` uses gfx12's
+`v_cvt_pk_f32_fp8` instead (exact: all 254 finite codes give the bit decode's values, checked by the
+test; gfx1151 keeps the bit decode). wq_b / wo_b / wo_a (32 MB each) now stream at 540-556 GB/s with one
+row and 370-420 GB/s with eight (wo_b at M = 8: 399 -> 79 us). More columns per wave (sharing the
+activation decode) only cost occupancy once the decode was cheap: one column per wave stays the default.
+Logits bit-identical. Decode at batch 1 / 2 / 4 / 8: 42.5 / 53.6 / 76.0 / 119.5 -> 37.8 / 45.3 / 59.0 /
+89.0 ms.

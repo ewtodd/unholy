@@ -42,6 +42,22 @@ __device__ __forceinline__ float e4m3_to_f32(uint8_t v) {
   return (v & 0x80) ? -a : a;
 }
 
+// Four e4m3fn codes (the bytes of w, lowest first): gfx12's conversion instructions (exact: the values
+// of e4m3_to_f32 for every finite code; unholy-gemv-test checks all of them), the bit decode elsewhere.
+__device__ __forceinline__ void e4m3x4_to_f32(uint32_t w, float* v) {
+#if defined(UH_GFX12) && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+  const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(int(w), false);
+  const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(int(w), true);
+  v[0] = lo[0];
+  v[1] = lo[1];
+  v[2] = hi[0];
+  v[3] = hi[1];
+#else
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = e4m3_to_f32(uint8_t(w >> (8 * i)));
+#endif
+}
+
 // Round-to-nearest-even into e4m3fn; caller guarantees |x| <= 448 (the reference clamps first).
 __device__ __forceinline__ uint8_t f32_to_e4m3(float x) {
   uint32_t u = __float_as_uint(x);
