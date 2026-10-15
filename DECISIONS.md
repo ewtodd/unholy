@@ -899,3 +899,9 @@ against the original build at the same expert placement, its batch / verify-chun
 the numerics that did change are rows of 9-16-row steps (GEMV instead of GEMM: now equal to single-stream
 rows), the expert placement (more hot experts) and the DSpark stages' attention (WMMA kernel; same drafts
 as the reference).
+- The MXFP4 grouped GEMM takes two 16-column tiles per wave on gfx1201 (`mx_gemm_cols`, UNHOLY_MX_GEMM_CW):
+  every A fragment read from LDS feeds two WMMAs, each output's k order unchanged. unholy-mx-test, 64
+  experts: card 28.4 / 50.9 / 65.1 -> 30.8 / 52.7 / 71.5 TFLOPS at 32 / 96 / 256 rows per expert; on the APU
+  (gfx1151) no gain (13.0 / 19.5 / 23.9 vs 13.0 / 19.2 / 23.1), so it keeps one. Its GEMM costs ~31 us per
+  expert and projection (the weights' read is ~21 us at its ~210 GB/s) plus ~0.6 us per row. Prefill stays
+  bound by the APU. Bit-identical.

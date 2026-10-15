@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdlib>
+#include <string>
 
 #include "kernels/dev.hip.hpp"
 #include "kernels/mx_moe.hpp"
@@ -99,12 +100,14 @@ __global__ __launch_bounds__(128) void mx_swiglu_kernel(const bf16* g, const bf1
   hh[idx] = f32_to_bf16(fake_quant_fp8_block(hv, red));
 }
 
-// Grouped GEMM: block = one tile (<= 128 rows of one expert) x 128 output columns; wave w owns columns
-// [n0 + 16w, n0 + 16w + 16) and dequantizes that weight slice per 64-k slab into its own LDS (lane:
-// column lane / 2, k half lane % 2); A slabs are shared; next-slab loads are in flight during the
-// current slab.
+// Grouped GEMM: block = one tile (<= 128 rows of one expert) x 128 CW output columns; wave w owns columns
+// [n0 + 16 CW w, n0 + 16 CW (w + 1)) and dequantizes that weight slice per 64-k slab into its own LDS
+// (lane: column lane / 2, k half lane % 2, per 16-column tile); A slabs are shared; next-slab loads are in
+// flight during the current slab. CW = 2 feeds each A fragment read from LDS into two WMMAs (every output's
+// k order is the same for any CW).
 constexpr int MX_BM = 128, MX_BN = 128, MX_KS = 64, MX_NT = 256, MX_PAD = 8;
 
+template <int CW>
 __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__ xa, int K,
                                                         const Exl3Tile* __restrict__ tiles,
                                                         const uint8_t* const* w_tab, const uint8_t* const* s_tab,
@@ -118,28 +121,30 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__
   }
   constexpr int AROW = MX_KS + MX_PAD;
   __shared__ alignas(16) uint16_t sA[MX_BM][AROW];
-  __shared__ alignas(16) uint16_t sB[8][16][AROW];
+  __shared__ alignas(16) uint16_t sB[8][16 * CW][AROW];
   __shared__ uint32_t sLut[256], sNz[256];
   if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
   mx_build_lut(sLut, sNz);
   __syncthreads();
   const Exl3Tile tile = tiles[blockIdx.y];
-  const int n0 = blockIdx.x * MX_BN;
+  const int n0 = blockIdx.x * MX_BN * CW;
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
   const int col = lane >> 1, kh = (lane & 1) * 32;
   const uint8_t* wbase = w_tab[tile.expert];
   const uint8_t* sbase = s_tab[tile.expert];
-  const size_t tiles_n = size_t(N / 16), nt = size_t(n0 / 16 + wave);
+  const size_t tiles_n = size_t(N / 16), nt = size_t(n0 / 16 + wave * CW);
   const int mtiles = (tile.rows + 15) >> 4;
 
-  float8_t acc[8];
+  float8_t acc[CW][8];
 #pragma unroll
-  for (int i = 0; i < 8; ++i)
+  for (int cw = 0; cw < CW; ++cw)
 #pragma unroll
-    for (int e = 0; e < 8; ++e) acc[i][e] = 0.0f;
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+      for (int e = 0; e < 8; ++e) acc[cw][i][e] = 0.0f;
 
-  uint4 ra[4], rw;
-  uint8_t rs;
+  uint4 ra[4], rw[CW];
+  uint8_t rs[CW];
   auto load_slab = [&](int k0) {
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
@@ -147,9 +152,12 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__
       ra[q] = r < tile.rows ? *reinterpret_cast<const uint4*>(xa + size_t(tile.row0 + r) * K + k0 + c)
                             : uint4{0, 0, 0, 0};
     }
-    const size_t chunk = size_t(k0 / 64) * tiles_n + nt;  // lane: output col, input half kh
-    rw = reinterpret_cast<const uint4*>(wbase + chunk * 512)[lane];
-    rs = sbase[chunk * 32 + lane];
+#pragma unroll
+    for (int cw = 0; cw < CW; ++cw) {
+      const size_t chunk = size_t(k0 / 64) * tiles_n + nt + cw;  // lane: output col, input half kh
+      rw[cw] = reinterpret_cast<const uint4*>(wbase + chunk * 512)[lane];
+      rs[cw] = sbase[chunk * 32 + lane];
+    }
   };
   load_slab(0);
   for (int k0 = 0; k0 < K; k0 += MX_KS) {
@@ -158,10 +166,11 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__
       const int idx = tid + q * MX_NT, r = idx >> 3, c = (idx & 7) * 8;
       *reinterpret_cast<uint4*>(&sA[r][c]) = ra[q];
     }
-    {
+#pragma unroll
+    for (int cw = 0; cw < CW; ++cw) {
       uint32_t d[16];
-      mx_dequant32_lut(rw, rs, sLut, sNz, d);
-      uint4* dst = reinterpret_cast<uint4*>(&sB[wave][col][kh]);
+      mx_dequant32_lut(rw[cw], rs[cw], sLut, sNz, d);
+      uint4* dst = reinterpret_cast<uint4*>(&sB[wave][cw * 16 + col][kh]);
 #pragma unroll
       for (int j = 0; j < 4; ++j) dst[j] = uint4{d[4 * j], d[4 * j + 1], d[4 * j + 2], d[4 * j + 3]};
     }
@@ -171,41 +180,54 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__
     for (int kt = 0; kt < MX_KS / 16; ++kt) {
       const int kk = kt * 16;
 #if defined(UH_GFX12)
-      const bf16x8_t bfv = *reinterpret_cast<const bf16x8_t*>(&sB[wave][lane & 15][kk + (lane >> 4) * 8]);
+      bf16x8_t bfv[CW];
+#pragma unroll
+      for (int cw = 0; cw < CW; ++cw)
+        bfv[cw] = *reinterpret_cast<const bf16x8_t*>(&sB[wave][cw * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
 #pragma unroll
       for (int i = 0; i < 8; ++i)
         if (i < mtiles) {
           const bf16x8_t afv = *reinterpret_cast<const bf16x8_t*>(&sA[i * 16 + (lane & 15)][kk + (lane >> 4) * 8]);
-          acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(afv, bfv, acc[i]);
+#pragma unroll
+          for (int cw = 0; cw < CW; ++cw)
+            acc[cw][i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(afv, bfv[cw], acc[cw][i]);
         }
 #elif defined(UH_GFX11)
-      const uint16_t* pb = &sB[wave][lane & 15][kk];
-      const bf16x8_t b0 = *reinterpret_cast<const bf16x8_t*>(pb), b1 = *reinterpret_cast<const bf16x8_t*>(pb + 8);
-      const bf16x16_t bfv = __builtin_shufflevector(b0, b1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+      bf16x16_t bfv[CW];
+#pragma unroll
+      for (int cw = 0; cw < CW; ++cw) {
+        const uint16_t* pb = &sB[wave][cw * 16 + (lane & 15)][kk];
+        const bf16x8_t b0 = *reinterpret_cast<const bf16x8_t*>(pb), b1 = *reinterpret_cast<const bf16x8_t*>(pb + 8);
+        bfv[cw] = __builtin_shufflevector(b0, b1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+      }
 #pragma unroll
       for (int i = 0; i < 8; ++i)
         if (i < mtiles) {
           const uint16_t* pa = &sA[i * 16 + (lane & 15)][kk];
           const bf16x8_t a0 = *reinterpret_cast<const bf16x8_t*>(pa), a1 = *reinterpret_cast<const bf16x8_t*>(pa + 8);
           const bf16x16_t afv = __builtin_shufflevector(a0, a1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-          acc[i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(afv, bfv, acc[i]);
+#pragma unroll
+          for (int cw = 0; cw < CW; ++cw) acc[cw][i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(afv, bfv[cw], acc[cw][i]);
         }
 #endif
     }
     __syncthreads();  // before the next slab overwrites A and B
   }
-  const int c = n0 + wave * 16 + (lane & 15);
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    if (i >= mtiles) break;
+  for (int cw = 0; cw < CW; ++cw) {
+    const int c = n0 + (wave * CW + cw) * 16 + (lane & 15);
 #pragma unroll
-    for (int e = 0; e < 8; ++e) {
+    for (int i = 0; i < 8; ++i) {
+      if (i >= mtiles) break;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
 #if defined(UH_GFX12)
-      const int row = i * 16 + (lane >> 4) * 8 + e;
+        const int row = i * 16 + (lane >> 4) * 8 + e;
 #else
-      const int row = i * 16 + 2 * e + (lane >> 4);
+        const int row = i * 16 + 2 * e + (lane >> 4);
 #endif
-      if (row < tile.rows) out[size_t(tile.row0 + row) * ldo + c] = f32_to_bf16(acc[i][e]);
+        if (row < tile.rows) out[size_t(tile.row0 + row) * ldo + c] = f32_to_bf16(acc[cw][i][e]);
+      }
     }
   }
 }
@@ -327,13 +349,36 @@ void mx_swiglu(const bf16* g, const bf16* u, const float* w, const int32_t* row_
   UH_CHECK_LAUNCH();
 }
 
+// Column tiles per wave of the grouped GEMM on the current device: UNHOLY_MX_GEMM_CW (1 / 2) or by arch.
+int mx_gemm_cols(int N) {
+  static int by_dev[64] = {};
+  static const int forced = [] {
+    const char* v = std::getenv("UNHOLY_MX_GEMM_CW");
+    return v ? std::atoi(v) : 0;
+  }();
+  if (N % (2 * MX_BN)) return 1;
+  if (forced == 1 || forced == 2) return forced;
+  int dev = 0;
+  UH_CHECK(hipGetDevice(&dev));
+  if (!by_dev[dev]) {
+    hipDeviceProp_t p{};
+    UH_CHECK(hipGetDeviceProperties(&p, dev));
+    by_dev[dev] = std::string(p.gcnArchName).rfind("gfx12", 0) == 0 ? 2 : 1;  // unholy-mx-test: +10% on gfx1201, none on gfx1151
+  }
+  return by_dev[dev];
+}
+
 void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev,
                      const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2) {
   if (ntiles <= 0) return;
   if (K % MX_KS || N % MX_BN) throw std::runtime_error("mx_grouped_gemm: K % 64 or N % 128");
-  mx_gemm_kernel<<<dim3(N / MX_BN, ntiles, out2 ? 2 : 1), MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N,
-                                                                         ntiles_dev, w_tab2, s_tab2, out2);
+  if (mx_gemm_cols(N) == 2)
+    mx_gemm_kernel<2><<<dim3(N / (2 * MX_BN), ntiles, out2 ? 2 : 1), MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo,
+                                                                                    N, ntiles_dev, w_tab2, s_tab2, out2);
+  else
+    mx_gemm_kernel<1><<<dim3(N / MX_BN, ntiles, out2 ? 2 : 1), MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N,
+                                                                              ntiles_dev, w_tab2, s_tab2, out2);
   UH_CHECK_LAUNCH();
 }
 
