@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
       double ms[3];
       const int max_rows[3] = {k::kExl3TileRows, 16, 64};
       for (int v = 0; v < 3; ++v) {
+        k::mx_gemm_force_rb(v ? 0 : -1);  // gfx11: the skinny variants with the register-B tiles off
         const auto go = [&] {
           k::mx_grouped_gemm(xa.as<uint16_t>(), K, dt.as<k::Exl3Tile>(), int(tiles.size()), wtp, stp,
                              out.as<uint16_t>(), N, N, nullptr, nullptr, nullptr, nullptr, nullptr, max_rows[v]);
@@ -143,6 +145,7 @@ int main(int argc, char** argv) {
         UH_CHECK(hipDeviceSynchronize());
         ms[v] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5;
       }
+      k::mx_gemm_force_rb(-1);
       const bool same = o[0] == o[1] && o[0] == o[2];
       all_same &= same;
       const double bytes = double(E) * N * K * (0.5 + 1.0 / 32);
@@ -182,6 +185,44 @@ int main(int argc, char** argv) {
                 "%.1f%% bit-identical\n",
                 mode ? "GEMV" : "GEMM", E, P, K, N, ms, bytes / (ms / 1e3) / 1e9, 2.0 * P * double(K) * N / (ms / 1e3) / 1e12,
                 std::sqrt(num / std::max(den, 1e-30)), 100.0 * same / a.size());
+    if (mode == 0) {  // gfx11: the register-B tiles (default) against the LDS ones
+      std::vector<uint16_t> o[2];
+      double t[2];
+      for (int v = 0; v < 2; ++v) {
+        k::mx_gemm_force_rb(v);
+        UH_CHECK(hipMemset(out.data(), 0, out.size()));
+        run();
+        UH_CHECK(hipDeviceSynchronize());
+        o[v].resize(size_t(P) * N);
+        UH_CHECK(hipMemcpy(o[v].data(), out.data(), o[v].size() * 2, hipMemcpyDeviceToHost));
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 3; ++r) run();
+        UH_CHECK(hipDeviceSynchronize());
+        t[v] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 3;
+      }
+      k::mx_gemm_force_rb(-1);
+      all_same &= o[0] == o[1];
+      std::printf("  tiles, B in LDS / in registers (gfx11): %.3f / %.3f ms (%.1f / %.1f TFLOPS), %s\n", t[0], t[1],
+                  2.0 * P * double(K) * N / (t[0] / 1e3) / 1e12, 2.0 * P * double(K) * N / (t[1] / 1e3) / 1e12,
+                  o[0] == o[1] ? "bit-identical" : "DIFFERENT");
+    }
+    if (mode == 0 && std::getenv("MX_TEST_SKINNY")) {  // experiment: the skinny kernel on prefill tiles
+      const auto go = [&] {
+        k::mx_grouped_gemm(xa.as<uint16_t>(), K, dt.as<k::Exl3Tile>(), int(tiles.size()), wtp, stp,
+                           out.as<uint16_t>(), N, N, nullptr, nullptr, nullptr, nullptr, nullptr, 64);
+      };
+      UH_CHECK(hipMemset(out.data(), 0, out.size()));
+      go();
+      UH_CHECK(hipDeviceSynchronize());
+      std::vector<uint16_t> c(size_t(P) * N);
+      UH_CHECK(hipMemcpy(c.data(), out.data(), c.size() * 2, hipMemcpyDeviceToHost));
+      const auto t1 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 3; ++r) go();
+      UH_CHECK(hipDeviceSynchronize());
+      const double ms2 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 3;
+      std::printf("  skinny on the same tiles: %.3f ms (%.1f TFLOPS), %s\n", ms2,
+                  2.0 * P * double(K) * N / (ms2 / 1e3) / 1e12, c == b ? "bit-identical" : "DIFFERENT");
+    }
   }
   return all_same ? 0 : 1;
 }

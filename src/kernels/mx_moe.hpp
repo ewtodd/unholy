@@ -42,12 +42,18 @@ void mx_swiglu(const bf16* g, const bf16* u, const float* w, const int32_t* row_
 // With w_tab2 / s_tab2 / out2: a second projection of the same rows (w1 and w3) in the same launch.
 // max_rows: the most rows a tile can have (a step's token count; it picks the kernel, any tile is computed
 // right): <= 64 takes waves that work alone on 16 outputs each, with the same arithmetic per output
-// (bit-identical; UNHOLY_MX_SKINNY=0: the 128-row tiles regardless).
+// (bit-identical; UNHOLY_MX_SKINNY=0: the 128-row tiles regardless). Not on gfx11, where the register-B
+// tiles below are faster at every size.
 void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                      const int* ntiles_dev = nullptr, const uint8_t* const* w_tab2 = nullptr,
                      const uint8_t* const* s_tab2 = nullptr, bf16* out2 = nullptr, int max_rows = kExl3TileRows);
 bool mx_skinny_enabled();
+// gfx11: the 128-row tiles keep the weights in registers (each lane dequantizes half a slab and swaps with
+// its partner lane) instead of LDS, three blocks per CU instead of one; bit-identical (UNHOLY_MX_GEMM_RB=0:
+// the LDS kernel). Tests: 1 / 0 forces it on / off (gfx11 only), -1 restores the default.
+bool mx_gemm_rb();
+void mx_gemm_force_rb(int on);
 // The same for tiles of <= kMxGemvTileRows rows (decode): a wave per output column, K across the lanes.
 // Each row's result does not depend on the tile it is in, so steps of up to mx_gemv_max_tokens() tokens
 // plan their experts in tiles of kMxGemvTileRows rows and every row gets what a one-token step gives it.

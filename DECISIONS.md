@@ -1030,3 +1030,32 @@ kernels; the original 22.0 / 27.6 / 33.6 / 40.2). GSM8K sweep (HTTP, production 
 47 / 48 / 47 / 47 of 48; the concurrency-1 answers are the original's HTTP ones, text and token counts (48 / 48).
 With the opt-ins (`--decode-split 1 --reclaim-scratch 1`, UNHOLY_GEMV_ROWS=16, UNHOLY_MX_GEMV_TOKENS=64,
 UNHOLY_DSPARK_WMMA_ATTN=1): 29.9 / 55.3 / 68.2 / 83.5 (flexible 46 of 48 at each level).
+
+## 2026-10-15 — the APU's expert GEMM keeps the weights in registers
+
+Under several streams and in prefill the APU is the critical path (unholy-engine-batch at concurrency 4 under
+rocprofv3: the APU busy ~42 of 51 s, both cards waiting on it about half the time; its 128-row-tile expert
+GEMM alone 20 s, at 15-24 TFLOPS of its ~59). Ablations on unholy-mx-test (48 rows per expert, 2.99 ms):
+without the WMMAs 2.29 ms, without the dequantization 2.34, without the A loads 2.66, without the barriers
+2.65 -- no single cost, and more weight slabs in flight (2, 4, 8) changed nothing: the slab's dequantization,
+staging and WMMAs run back to back between two barriers, and with 38 KB of LDS (A 128 x 64 and B per wave)
+one block per CU leaves nothing to overlap them with. Double-buffering A (one barrier per slab, 57 KB) and
+sharing A fragments between the half-waves (permlanex16, half the LDS reads) were both slower.
+
+`mx_gemm_rb_kernel` (gfx11): B never goes through LDS. Each lane dequantizes half of its column's 64-input
+slab with the same LUT code (lane: column lane % 16, input half lane / 16, reading those 16 code bytes
+directly) and takes the other half from the lane 16 away (permlanex16), which is exactly the 16-input B
+fragment of every k step that the gfx11 WMMA reads from both half-waves. A stays staged (shared by the 8
+waves); 20 KB of LDS, three blocks per CU. Same A, same B values, same WMMA chain per output: unholy-mx-test
+compares it with the LDS kernel bit for bit (prefill tiles, 16-256 rows per expert, and decode tiles):
+identical, 8.5 / 15.7 / 19.2 / 24.2 -> 10.6 / 16.9 / 21.9 / 27.3 TFLOPS at 16 / 48 / 96 / 256 rows per expert,
+and on decode tiles (1-3 rows) 182 GB/s of weights against the skinny kernel's 162, so on gfx11 it takes every
+step's tiles (UNHOLY_MX_GEMM_RB=0: the LDS kernel). Both tiled kernels skip staging A rows past a tile's last
+16-row fragment (never read). The cards (gfx12, two column tiles per wave) keep the LDS kernel: unchanged
+there.
+
+End to end: unholy-resident-test bit-identical (both geometries, batch checks, combine off; its 1024-token
+prefill 1.62 -> 1.24 s); unholy-engine-batch 48 / 48 identical to the 2026-10-12 build at concurrency 1 / 2 /
+4 / 8, 30.8 / 38.1 / 45.6 / 52.4 tok/s (29.1 / 35.2 / 41.5 / 47.2 before). `unholy-curve` 1 x 512k, same plan
+(docs/bench/curve-native-1x512k-plx-2026-10-15-apu-rb.txt): prefill 2404 / 1886 / 1542 / 1048 tok/s at 32k /
+128k / 256k / 491k, 1322 average (1240); decode unchanged (34.1 ... 44.6 ms per token at 4k ... 512k).
