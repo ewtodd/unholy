@@ -53,8 +53,8 @@ Measured on that machine, behind the PCIe switch (October 2026):
 <!---->
 | | |
 |---|---|
-| prefill, one sequence, 4096-token chunks | 2404 tok/s at 32k depth, 1886 at 128k, 1542 at 256k, 1048 at 491k; **1322 tok/s averaged over 0-512k** |
-| decode, one sequence, no speculation | 29.4 tok/s at 4k depth (34.1 ms/token), 22.4 tok/s at 512k |
+| prefill, one sequence, 4096-token chunks | 2463 tok/s at 32k depth, 2012 at 128k, 1702 at 256k, 1212 at 491k; **1406 tok/s averaged over 0-512k** |
+| decode, one sequence, no speculation | 29.4 tok/s at 4k depth (34.0 ms/token), 22.4 tok/s at 512k |
 | decode with DSpark (5 drafts) | ~46 tok/s per stream on chat traffic (GSM8K, median); 70-90% of drafts accepted |
 | GSM8K chat sweep, production settings | 31.2 / 51.8 / 62.4 / 72.1 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
 <!---->

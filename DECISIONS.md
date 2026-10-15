@@ -1062,3 +1062,34 @@ prefill 1.62 -> 1.24 s); unholy-engine-batch 48 / 48 identical to the 2026-10-12
 GSM8K sweep (HTTP, production flags, defaults): 31.2 / 51.8 / 62.4 / 72.1 tok/s at concurrency 1 / 2 / 4 / 8
 (29.4 / 50.2 / 59.9 / 69.1 before; 2026-10-12: 22.2 / 36.5 / 45.5 / 56.3), flexible 47 / 47 / 47 / 46 of 48; the
 concurrency-1 answers are the original's, text and token counts (48 / 48).
+
+## 2026-10-15 — the prefill indexer keeps each query in registers
+
+rocprofv3 over a one-sequence prefill to 256k (unholy-curve), the last 30% (depth ~180k-262k): the APU ~78%
+busy, the cards 63-70%, and on the cards the fp4 indexer's scores are the largest item (27-29% of their
+kernel time, 6.6-7 ms per call of 512 queries x ~60k keys), ahead of the fp8 GEMMs (17%) and the prefill
+attention (13%). Its blocks are 4 queries x 128 keys, and a query's codes (64 heads x 128 dims, 8 KB) are
+staged from L2 again for every 128 keys: ~16 GB per layer and 4096-token chunk at 64k keys.
+
+`indexer_fp4_q_kernel` (T >= 64 queries; decode keeps the old kernel): a wave per query holds its fp8 codes
+(the A fragments of all 4 head groups x 8 k steps) and its head weights in registers, and the block (8
+queries) stages 8 key tiles of 128 one after the other with the old kernel's code. Every score is computed
+as before -- the same WMMA chain per head group, the same head-ordered bf16 reduction across the two
+half-waves. unholy-indexer-test: bit-identical to the old kernel (and the reference) at 37 x 5000, 512 x 16k,
+4096 x 16k and 4096 x 64k queries x keys, and over 300 repeats; 2.18 -> 1.02 ms at 512 x 16k, 59 -> 36 ms at
+4096 x 64k. UNHOLY_INDEXER_Q=0 takes the old kernel.
+
+End to end: unholy-resident-test bit-identical (both geometries, batch checks, combine off); unholy-engine-batch
+at concurrency 4 48 / 48 identical to the 2026-10-12 build. `unholy-curve` 1 x 512k, same plan
+(docs/bench/curve-native-1x512k-plx-2026-10-15-indexer.txt): prefill 2463 / 2012 / 1702 / 1212 tok/s at 32k /
+128k / 256k / 491k, 1406 average (1322); decode unchanged.
+
+A run at concurrency 1 differed from the original in one answer (request 42 from its 16th token). That turned
+out not to be this change: `unholy-engine-batch --logprobs 1` (new) writes every sampled token's logprob bit
+pattern, a fingerprint of the logits finer than the tokens, and repeated full runs at concurrency 1 show that
+the 2026-10-12 build itself is not repeatable there -- two of its three runs agree, the third differs in
+request 3's prefill logits (first logprob -0.0303 vs -0.0313, and later tokens). This build, with or without
+the new kernel (UNHOLY_INDEXER_Q=0), gives exactly the original's fingerprints in every run that does not show
+such an outlier (all 48 requests, every logprob), and its outliers are of the same kind (request 33's prefill
+logits in one of three runs with the kernel). The same 48 prompts prefilled alone (max_tokens 1) were
+identical over 10 runs: the variation needs decoding with the drafter in the run. Being chased (next entry).

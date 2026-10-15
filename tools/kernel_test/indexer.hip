@@ -102,11 +102,46 @@ int main(int argc, char** argv) {
   // Fast path.
   k::quant_q_fp4(dq2.as<uint16_t>(), T, H, qc.as<uint8_t>(), qs.as<uint8_t>(), nullptr);
   UH_CHECK(hipDeviceSynchronize());
-  const auto t0 = std::chrono::steady_clock::now();
-  k::indexer_scores_fp4(qc.as<uint8_t>(), qs.as<uint8_t>(), dw.as<uint16_t>(), keys, dpos.as<int32_t>(),
-                        sfast.as<uint16_t>(), T, H, nkeys, 4, nullptr);
-  UH_CHECK(hipDeviceSynchronize());
-  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  // Both score kernels (per 128 keys / queries in registers, the latter from kIndexerQMinRows rows): the
+  // same bits, and their times.
+  double ms_kern[2];
+  std::vector<uint16_t> s_kern[2];
+  for (int v = 0; v < 2; ++v) {
+    k::indexer_force_q(v);
+    UH_CHECK(hipMemset(sfast.data(), 0, sfast.size()));
+    const auto t0 = std::chrono::steady_clock::now();
+    k::indexer_scores_fp4(qc.as<uint8_t>(), qs.as<uint8_t>(), dw.as<uint16_t>(), keys, dpos.as<int32_t>(),
+                          sfast.as<uint16_t>(), T, H, nkeys, 4, nullptr);
+    UH_CHECK(hipDeviceSynchronize());
+    ms_kern[v] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    s_kern[v].resize(size_t(T) * nkeys);
+    UH_CHECK(hipMemcpy(s_kern[v].data(), sfast.data(), s_kern[v].size() * 2, hipMemcpyDeviceToHost));
+  }
+  k::indexer_force_q(-1);
+  bool kern_same = s_kern[0] == s_kern[1];
+  // REPEAT=n: both kernels n more times on the same inputs, every output against the first (races).
+  if (const char* rep = std::getenv("REPEAT")) {
+    const int n = std::atoi(rep);
+    int bad[2] = {0, 0};
+    std::vector<uint16_t> o(size_t(T) * nkeys);
+    for (int i = 0; i < n; ++i)
+      for (int v = 0; v < 2; ++v) {
+        k::indexer_force_q(v);
+        UH_CHECK(hipMemset(sfast.data(), 0x5a, sfast.size()));
+        k::indexer_scores_fp4(qc.as<uint8_t>(), qs.as<uint8_t>(), dw.as<uint16_t>(), keys, dpos.as<int32_t>(),
+                              sfast.as<uint16_t>(), T, H, nkeys, 4, nullptr);
+        UH_CHECK(hipMemcpy(o.data(), sfast.data(), o.size() * 2, hipMemcpyDeviceToHost));
+        bad[v] += o != s_kern[v];
+      }
+    k::indexer_force_q(-1);
+    std::printf("repeats: %d runs each, differing from the first: per-128-key %d, queries in registers %d\n", n, bad[0],
+                bad[1]);
+    kern_same &= bad[0] == 0 && bad[1] == 0;
+  }
+  std::printf("score kernels: per-128-key tiles %.3f ms, queries in registers %.3f ms%s: %s\n", ms_kern[0], ms_kern[1],
+              T >= k::kIndexerQMinRows ? "" : " (below its row threshold: the same kernel)",
+              kern_same ? "bit-identical" : "DIFFERENT");
+  const double ms = ms_kern[T >= k::kIndexerQMinRows ? 1 : 0];
   // Top-k as the model runs it: one group of T rows, with scratch (several workgroups per row for a few
   // long rows, k::kTopkSplitMinKeys).
   k::TopkBatch tb;
@@ -150,5 +185,5 @@ int main(int argc, char** argv) {
   std::printf("T=%d keys=%d: scores %zu / %zu differ (max rel %.3g; %zu finite), top-%d indices %zu / %zu differ; "
               "fast scores %.3f ms (%.1f TOPS), top-k %.1f us\n",
               T, nkeys, sdiff, a.size(), maxrel, finite, topk, idiff, ia.size(), ms, gop / ms, topk_us);
-  return sdiff || idiff ? 1 : 0;
+  return sdiff || idiff || !kern_same ? 1 : 0;
 }

@@ -44,8 +44,13 @@ void quant_q_fp4(const bf16* q, int T, int H, uint8_t* q8, uint8_t* qe, hipStrea
 // 128-dim head of q [T, H, 128]), hadamard128, then quant_q_fp4 into q8 / qe; q keeps the rotated bf16 values.
 void index_q_chain(bf16* q, int T, int H, const int32_t* pos, const float2* freqs, int npair, uint8_t* q8, uint8_t* qe,
                    hipStream_t st);
+// From kIndexerQMinRows queries (prefill) each query's codes stay in a wave's registers across 1024 keys
+// instead of being re-staged per 128 keys; the same scores bit for bit (UNHOLY_INDEXER_Q=0: off).
 void indexer_scores_fp4(const uint8_t* q8, const uint8_t* qe, const bf16* w, PagedFp4 keys, const int32_t* pos,
                         uint16_t* scores, int T, int H, int nkeys, int ratio, hipStream_t st);
+constexpr int kIndexerQMinRows = 64;
+bool indexer_q();
+void indexer_force_q(int on);  // tests: 1 / 0 forces it on / off, -1 restores the default
 
 // Top-k per row of bf16 scores, ordered (score desc, index asc); -1 padded; -inf never selected.
 void topk_bf16(const uint16_t* scores, int T, int n, int k, int32_t* idx, hipStream_t st);

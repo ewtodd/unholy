@@ -10,15 +10,19 @@
 //                       [--profile FILE] [--exl3 DIR] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]
 //                       [--max-batch-tokens N] [--prefix-snapshots N] [--spec-drafts N] [--spec-min-conf C]
 //                       [--card-margin-gb G] [--vision 0|1] [--decode-split 0|1] [--reclaim-scratch 0|1]
+//                       [--logprobs 0|1]
 //
 // FILE.jsonl: one chat-completions request body per line (messages, chat_template_kwargs, temperature,
 // top_p, top_k, min_p, penalties, seed, max_tokens, ignore_eos, stop_token_ids; text only), rendered and
 // tokenized as the server does. --concurrency caps the requests running at once (default --max-num-seqs);
 // the rest wait and are admitted as others finish, like a client holding N requests open. Model flags and
 // their defaults are serve's. Output: one line per request in input order (index, prompt / cached /
-// completion tokens, finish reason, token ids, text), then the engine's counters on stdout.
+// completion tokens, finish reason, token ids, text), then the engine's counters on stdout. --logprobs 1 adds
+// each sampled token's logprob (bit pattern in hex): a fingerprint of the logits, finer than the tokens, for
+// checking that repeated runs compute alike.
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -98,7 +102,7 @@ int main(int argc, char** argv) {
   long long kv_tokens = 0;
   float spec_min_conf = 0.5f;
   double card_margin_gb = 2.0;
-  bool vision = true;
+  bool vision = true, logprobs = false;
   std::optional<bool> decode_split, reclaim_scratch;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -124,6 +128,7 @@ int main(int argc, char** argv) {
     else if (a == "--vision") vision = flag(v);
     else if (a == "--decode-split") decode_split = flag(v);
     else if (a == "--reclaim-scratch") reclaim_scratch = flag(v);
+    else if (a == "--logprobs") logprobs = flag(v);
     else {
       std::fprintf(stderr, "unknown option %s (see the header of tools/engine_batch/main.cpp)\n", a.c_str());
       return 2;
@@ -140,7 +145,10 @@ int main(int argc, char** argv) {
       std::ifstream f(requests_path);
       if (!f) throw std::runtime_error("cannot read " + requests_path);
       for (std::string line; std::getline(f, line);)
-        if (line.find_first_not_of(" \t\r") != std::string::npos) reqs.push_back(gen_request(json::parse(line), tok));
+        if (line.find_first_not_of(" \t\r") != std::string::npos) {
+          reqs.push_back(gen_request(json::parse(line), tok));
+          if (logprobs) reqs.back().sampling.logprobs = true;
+        }
     }
     auto ck = model::Checkpoint::open(model_dir);
     std::unique_ptr<model::Checkpoint> xck;
@@ -187,6 +195,7 @@ int main(int argc, char** argv) {
 
     struct Result {
       std::vector<int32_t> tokens;
+      std::vector<float> logprobs;
       engine::GenOutput last;
       bool done = false;
     };
@@ -197,6 +206,7 @@ int main(int argc, char** argv) {
       eng.submit(std::move(reqs[i]), [&res, &finished, i](engine::GenOutput&& o) {
         Result& r = res[i];
         r.tokens.insert(r.tokens.end(), o.tokens.begin(), o.tokens.end());
+        for (const auto& sm : o.samples) r.logprobs.push_back(sm.logprob);
         if (o.finished) {
           r.done = true;
           ++finished;
@@ -221,6 +231,17 @@ int main(int argc, char** argv) {
       Value ids = Value::array();
       for (int32_t t : r.tokens) ids.push_back(Value(t));
       line.set("tokens", std::move(ids));
+      if (logprobs) {
+        std::string hex;
+        char buf[16];
+        for (float f : r.logprobs) {
+          uint32_t u;
+          std::memcpy(&u, &f, 4);
+          std::snprintf(buf, sizeof buf, "%08x", u);
+          hex += buf;
+        }
+        line.set("logprobs", Value(hex));
+      }
       line.set("text", Value(tok.decode(r.tokens)));
       out << line.dump() << "\n";
       completion += r.tokens.size();

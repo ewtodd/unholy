@@ -283,6 +283,104 @@ __global__ __launch_bounds__(NT) void indexer_fp4_kernel(const uint8_t* __restri
 #endif
 }
 
+// indexer_fp4_kernel for many queries (prefill): a wave per query, its fp8 codes held in registers for the
+// whole block (they were re-staged from L2 for every 128 keys, 8 KB per query), the block's KQ key tiles
+// staged one after the other exactly as there. Every score's arithmetic is the same (its WMMA chain over the
+// 8 k steps per head group, the same head-ordered bf16 reduction).
+constexpr int KQ = 8;  // key tiles per block
+__global__ __launch_bounds__(NT) void indexer_fp4_q_kernel(const uint8_t* __restrict__ q8, const uint8_t* __restrict__ qe,
+                                                           const bf16* __restrict__ w, PagedFp4 keys,
+                                                           const int32_t* __restrict__ pos, uint16_t* __restrict__ out,
+                                                           int T, int nkeys, int ratio) {
+#if defined(UH_GFX12)
+  __shared__ alignas(16) uint8_t sK[KT][ID + PAD];
+  __shared__ float sKf[KT];
+  __shared__ uint8_t sLut[9][16];
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
+  const int t = blockIdx.y * 8 + wave;
+  const bool live = t < T;
+  if (tid < 9 * 16) sLut[tid / 16][tid % 16] = f32_to_e4m3(e2m1_to_f32(tid % 16) * ldexpf(1.0f, -(tid / 16)));
+  const int kofs = (lane >> 4) * 8;
+  int2_t afrag[4][8];
+  float wq[4][8];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const uint8_t* qr = q8 + (size_t(live ? t : 0) * IH + r * 16 + (lane & 15)) * ID + kofs;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) afrag[r][s] = live ? *reinterpret_cast<const int2_t*>(qr + s * 16) : int2_t{0, 0};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int h = r * 16 + (lane >> 4) * 8 + i;
+      wq[r][i] = live ? bf16_to_f32(w[size_t(t) * IH + h]) * e8m0_to_f32(qe[size_t(t) * IH + h]) : 0.0f;
+    }
+  }
+  const int visible = live ? (pos[t] + 1) / ratio : 0;
+  for (int kt = 0; kt < KQ; ++kt) {
+    const int k0 = (blockIdx.x * KQ + kt) * KT;
+    if (k0 >= nkeys) break;  // uniform
+    __syncthreads();  // the LUT (first tile); the previous tile's reads (others)
+    for (int i = tid; i < KT * 4; i += NT) {
+      const int rr = i / 4, b = i % 4, key = k0 + rr;
+      uint32_t* dst = reinterpret_cast<uint32_t*>(&sK[rr][b * 32]);
+      float kf = 0.0f;
+      if (key < nkeys) {
+        const uint8_t* sc = fp4_scales(keys, key);
+        const int emax = max(max(sc[0], sc[1]), max(sc[2], sc[3]));
+        kf = e8m0_to_f32(uint8_t(emax));
+        const uint8_t* lut = sLut[min(emax - int(sc[b]), 8)];
+        const uint4 codes = *reinterpret_cast<const uint4*>(fp4_codes(keys, key) + b * 16);
+        const uint32_t cw[4] = {codes.x, codes.y, codes.z, codes.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t v = cw[j / 2] >> (16 * (j % 2));
+          dst[j] = uint32_t(lut[v & 15]) | uint32_t(lut[(v >> 4) & 15]) << 8 | uint32_t(lut[(v >> 8) & 15]) << 16 |
+                   uint32_t(lut[(v >> 12) & 15]) << 24;
+        }
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) dst[j] = 0;
+      }
+      if (b == 0) sKf[rr] = kf;
+    }
+    __syncthreads();
+    if (!live) continue;
+    for (int sub = 0; sub < KT / 16; ++sub) {
+      const int kc = sub * 16 + (lane & 15);
+      int2_t bfrag[8];
+#pragma unroll
+      for (int s = 0; s < 8; ++s) bfrag[s] = *reinterpret_cast<const int2_t*>(&sK[kc][s * 16 + kofs]);
+      const float kf = sKf[kc];
+      float8_t acc[4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[r][i] = 0.0f;
+#pragma unroll
+      for (int s = 0; s < 8; ++s)
+#pragma unroll
+        for (int r = 0; r < 4; ++r) acc[r] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(afrag[r][s], bfrag[s], acc[r]);
+      float total = 0.0f;
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        float term[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) term[i] = round_bf16_finite(round_bf16_finite(fmaxf(acc[r][i], 0.0f)) * wq[r][i]);
+        float a = total;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a += term[i];
+        float b = __shfl_up(a, 16, 32);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) b += term[i];
+        total = __shfl_down(b, 16, 32);
+      }
+      const int key = k0 + kc;
+      if (lane < 16 && key < nkeys)
+        out[size_t(t) * nkeys + key] = key < visible ? f32_to_bf16(total * kf) : kBf16NegInf;
+    }
+  }
+#endif
+}
+
 // Order-preserving 16-bit key of a bf16 bit pattern.
 __device__ __forceinline__ uint32_t key16(uint16_t b) { return (b & 0x8000u) ? (~uint32_t(b) & 0xffffu) : (b | 0x8000u); }
 
@@ -672,12 +770,29 @@ void index_q_chain(bf16* q, int T, int H, const int32_t* pos, const float2* freq
   UH_CHECK_LAUNCH();
 }
 
+namespace {
+int g_q = -1;
+}
+void indexer_force_q(int on) { g_q = on; }
+bool indexer_q() {
+  static const bool env = [] {
+    const char* v = std::getenv("UNHOLY_INDEXER_Q");
+    return !v || std::string(v) != "0";
+  }();
+  return g_q < 0 ? env : g_q > 0;
+}
+
 void indexer_scores_fp4(const uint8_t* q8, const uint8_t* qe, const bf16* w, PagedFp4 keys, const int32_t* pos,
                         uint16_t* scores, int T, int H, int nkeys, int ratio, hipStream_t st) {
   if (H != IH) throw std::runtime_error("indexer_scores_fp4: 64 heads expected");
   if (T <= 0 || nkeys <= 0) return;
-  indexer_fp4_kernel<<<dim3(cdiv(size_t(nkeys), KT), cdiv(size_t(T), QG)), NT, 0, st>>>(q8, qe, w, keys, pos, scores,
-                                                                                      T, nkeys, ratio);
+  if (T >= kIndexerQMinRows && indexer_q()) {
+    indexer_fp4_q_kernel<<<dim3(cdiv(size_t(nkeys), size_t(KT) * KQ), cdiv(size_t(T), 8)), NT, 0, st>>>(
+        q8, qe, w, keys, pos, scores, T, nkeys, ratio);
+  } else {
+    indexer_fp4_kernel<<<dim3(cdiv(size_t(nkeys), KT), cdiv(size_t(T), QG)), NT, 0, st>>>(q8, qe, w, keys, pos, scores,
+                                                                                        T, nkeys, ratio);
+  }
   UH_CHECK_LAUNCH();
 }
 
