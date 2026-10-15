@@ -677,9 +677,14 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
 // Routing -> pair rows -> experts entirely on the device (EXL3 fast path). Pair rows are laid out
 // resident experts first, then remote ones; the remote block goes to the remote side through pinned
 // memory with stream-ordered flags, so the host only enqueues.
-// Returns true when the remote experts' outputs came back combined per token (moe_combine_partial).
-bool moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, const bf16* f,
-                         const int32_t* sel, const float* wt, int T, hipStream_t st, RemoteExperts* remote) {
+// The remote experts are only joined by moe_device_join, so the card can queue independent work (the
+// shared expert) while they run.
+struct MoeDispatch {
+  bool remote = false;    // remote experts were enqueued
+  bool combined = false;  // their outputs come back combined per token (moe_combine_partial)
+};
+MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, const bf16* f,
+                                const int32_t* sel, const float* wt, int T, hipStream_t st, RemoteExperts* remote) {
   const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
   const auto& ds = scr.dispatch;
   int32_t* count = ds.count.as<int32_t>();
@@ -733,12 +738,18 @@ bool moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scrat
   }
   exl3_moe_forward_dev(c, w, pair_in, ewt, row_expert, lt, ds.max_tiles, &plan->n_local_tiles, P, scr.exl3, pair_out,
                        st);
-  if (any_remote) {
-    remote->join(st);
-    if (combined) k::copy_remote_partial(remote->out_host, pair_out, plan, D, T, st);
-    else k::copy_remote_rows(remote->out_host, pair_out, plan, D, P, st);
-  }
-  return combined;
+  return {any_remote, combined};
+}
+
+// The card stream waits for the remote experts and takes their outputs into the pair-output rows.
+void moe_device_join(const Dsv4Config& c, const Scratch& scr, const MoeDispatch& md, int T, hipStream_t st,
+                     RemoteExperts* remote) {
+  if (!md.remote) return;
+  const auto* plan = scr.dispatch.plan.as<k::MoePlan>();
+  bf16* pair_out = B<bf16>(scr, kPairOut);
+  remote->join(st);
+  if (md.combined) k::copy_remote_partial(remote->out_host, pair_out, plan, c.dim, T, st);
+  else k::copy_remote_rows(remote->out_host, pair_out, plan, c.dim, T * c.n_active, st);
 }
 
 void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
@@ -775,9 +786,9 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
                            (w.n_resident == E || (remote && remote->can_enqueue()));
   int32_t* dpidx = B<int32_t>(scr, kPairIdx);
   bf16* pair_out = B<bf16>(scr, kPairOut);
-  bool combined = false;
+  MoeDispatch md;
   if (device_path) {
-    combined = moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote);
+    md = moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote);
   } else {
     // Expert-major pairs (ascending expert id): pair p computes expert e on token t into row p of the
     // pair-output buffer; pidx[t][j] lists token t's pairs in ascending expert order for the combine.
@@ -882,7 +893,8 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   bf16* h1 = B<bf16>(scr, kH1);
   bf16* h3 = B<bf16>(scr, kH3);
   bf16* hh = B<bf16>(scr, kHH);
-  // Shared expert (fp8 weights, no routing weight).
+  // Shared expert (fp8 weights, no routing weight), queued while the remote experts run: its buffers are
+  // not the routed path's.
   bf16* shared = B<bf16>(scr, kShared);
   k::act_quant_fp8(f, D, qb, qs, T, D, 128, st);
   dense_w8a8(qb, qs, w.sw1.w.p<uint8_t>(), w.sw1.s.p<uint8_t>(), h1, I, T, I, D, st);
@@ -891,8 +903,9 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
   dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
   dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
+  moe_device_join(c, scr, md, T, st, remote);
   bf16* fo = B<bf16>(scr, kAO);
-  if (combined)
+  if (md.combined)
     k::moe_combine_partial(pair_out, dpidx, scr.dispatch.plan.as<k::MoePlan>(), B<int32_t>(scr, kRTok), shared, fo, T, K,
                            D, st);
   else

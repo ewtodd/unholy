@@ -678,3 +678,30 @@ are vLLM's knobs with vLLM's semantics. A prefill chunk that gets less than its 
 page boundary (snapshots are only taken there). unholy-sched-test runs the whole matrix in all three
 modes and races a 2000-token prompt against a 20-token one a step later (64-token steps): shortest
 31 / 1 (finish steps, long / short), fcfs 31 / 31, fcfs + threshold 16 32 / 2.
+
+## 2026-10-14 — decode profile; the shared expert overlaps the APU
+
+rocprofv3 kernel traces (`unholy-bench`, 4k context, native experts, mixed profile; the profiler adds
+8-15%) of where a decode step goes. Batch 1, 60 ms profiled (52.6 unprofiled): each card ~30 ms, of
+which ~22 ms kernels: dense GEMVs 20 ms per token (wq_b / wo_a / wo_b, 32 MB each, at 370-400 GB/s of
+the 595 measured), single-workgroup kernels 15.4 ms (sparse_attn 87 us avg, 145 us on CSA layers;
+moe_plan 58 us x 43; hc_post 28 us x 86; hc_finish 16 us x 86; rmsnorm 7 us x 181; moe_combine_partial
+23 us x 43; topk 38 us x 21), ~1350 launches per card per token with a median 4.6 us gap between
+kernels (~13 ms per token). Host enqueue is ~2 ms per card (UNHOLY_STEP_TIMING), so the step is
+GPU-side latency, not launch submission. Batch 1/2/4/8 steps: 52.6 / 68.7 / 101.7 / 168.4 ms; at batch
+8 the per-chunk attention alone is 344 single-workgroup launches (28.8 ms) and top-k 168 (6 ms). The
+APU's MXFP4 GEMV at decode runs 16-32 workgroups (~100-135 GB/s). Single-stream DSpark (serve, greedy):
+a cycle is ~100 ms profiled: verify 87 (43 + 44 on the cards), draft 10.5 (3 of it waiting for the
+APU), host ~2. Prefill at 48-64k: the cards are busy 48-57% and wait for the APU 6.3 / 7.1 s of a 16.8 s
+window; the APU is 57% busy (its MXFP4 GEMM ~11 TFLOPS).
+
+`unholy-resident-test --batch N` now checks batching bit-exactly: N sequences decoded alone, then
+together, then two as 4-token verify chunks. Baseline: identical in both; with 4 x 4-token chunks
+(16 rows, past kGemvMaxRows) the GEMM kernels sum in another order than the GEMVs and nothing matches,
+so verify steps of several streams are not bit-identical to single-stream ones (pre-existing).
+
+First change: the shared expert was computed after the card stream joined the APU's experts; it is
+now queued between the APU request and the join (moe_device_dispatch / moe_device_join), so it runs
+while the APU works. Same kernels on the same inputs: logits bit-identical (code1024, both
+geometries, batch checks). Decode 52.6 / 68.7 / 101.7 / 168.4 -> 49.3 / 65.2 / 96.4 / 157.8 ms at
+batch 1 / 2 / 4 / 8; 4k prefill 1187 -> 1240 tok/s (one chunk), 1827 -> 1891 (8 sequences).
