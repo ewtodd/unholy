@@ -905,3 +905,11 @@ as the reference).
   (gfx1151) no gain (13.0 / 19.5 / 23.9 vs 13.0 / 19.2 / 23.1), so it keeps one. Its GEMM costs ~31 us per
   expert and projection (the weights' read is ~21 us at its ~210 GB/s) plus ~0.6 us per row. Prefill stays
   bound by the APU. Bit-identical.
+
+End-to-end check of the server (vision on, DSpark off, greedy, logprobs with top 3): the two image
+requests of /scratch/vl-test through the original build and through this one with `--card-margin-gb`
+raised by exactly the scratch freed (973,602,240 bytes per card, so the plan holds the same 1481 / 1450 hot
+experts): every token, logprob and top logprob bit-identical (2 / 2 and 40 / 40). At the production plan
+the outputs move as any placement change moves them (the original build with --card-margin-gb 1.1 shows
+the same kind of spread). The EXL3 experts' path: bit-identical to the original at its placement too
+(unholy-resident-test --exl3 with the margin lowered by the 8,257,536 bytes the planner now counts more).
