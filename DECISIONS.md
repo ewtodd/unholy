@@ -1093,3 +1093,33 @@ the new kernel (UNHOLY_INDEXER_Q=0), gives exactly the original's fingerprints i
 such an outlier (all 48 requests, every logprob), and its outliers are of the same kind (request 33's prefill
 logits in one of three runs with the kernel). The same 48 prompts prefilled alone (max_tokens 1) were
 identical over 10 runs: the variation needs decoding with the drafter in the run. Being chased (next entry).
+
+## 2026-10-15 — run-to-run variation at concurrency 1: the cards are capped at 230 W again
+
+The rare outliers of the entry above, chased with logprob fingerprints (`unholy-engine-batch --logprobs 1`,
+48 GSM8K requests, concurrency 1, production flags):
+- Size: request 33's second-token logprob -0.288 in two runs, -0.432 in the third; request 3's first
+  -0.0303 vs -0.0313. Not summation-order noise: some value in the computation was wrong.
+- Frequency: about one request in one of three full runs, with the 2026-10-12 build (1 of 3 runs) as with this
+  one (with and without the new indexer kernel); every run without an outlier gives exactly the same
+  fingerprint across builds.
+- Not reproducible: the same request alone, or the same run repeated, comes out right.
+- Prefill-only runs (max_tokens 1): 0 outliers in 10 runs (480 prefills) -- but those are 10 GPU-minutes
+  against ~40 for the full runs that showed 3, so not a significant difference.
+- Coherent pinned staging (HIP_HOST_COHERENT=1, which would rule out stale cached lines of the card <-> APU
+  buffers): 0 outliers in 4 runs -- and 0 in 4 plain runs alongside; all three outliers of the night fell
+  between 05:45 and 06:10 (token-level comparisons of some 25 runs since 03:00 were all consistent, and the 8
+  fingerprinted runs after were too).
+
+No race in the engine or the card <-> APU handoff was found by reading it (per-card APU channels and staging,
+event-ordered flights, the drafter on its own stream and synchronized before the next step). What was found
+instead: `/etc/lact/config.yaml` (from /etc/nixos, active since 2026-10-13 11:28) sets `power_cap: 230.0` on
+both cards, and the sysfs caps read 230 W -- the setting under which c7 flipped register bits on 2026-10-12
+(DECISIONS: "the fault"), which that entry records as removed. At 230 W the failure then was a fault within
+2-25 requests; silent corruption of single values is the milder form of the same timing-margin problem and
+fits everything above (random, rare, moderate, both builds). Not changed here (the system configuration is
+the owner's): to confirm, run the fingerprint comparison at 300 W.
+
+Also tried this morning, not kept: the MXFP4 dequantization from one {pair, nonzero mask} table with a
+packed 16-bit add (exactly the same values over every (code byte, scale) pair, checked exhaustively) was
+8-20% slower on both chips than the two 4-byte table reads (the 8-byte entries conflict more in LDS).
