@@ -82,7 +82,8 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       45.5 / 56.3 -> 31.2 / 51.8 / 62.4 / 72.1 tok/s at 1 / 2 / 4 / 8 with the defaults, token for token the
       2026-10-12 outputs for the same requests (unholy-engine-batch, all four levels); 29.9 / 55.3 / 68.2 / 83.5
       with the opt-ins, measured before the APU kernel (two decode micro-batches `--decode-split 1`, 16-row GEMVs,
-      64-token MoE GEMVs, reclaimed scratch; DECISIONS 2026-10-15)
+      64-token MoE GEMVs, reclaimed scratch; DECISIONS 2026-10-15). Two micro-batches within a step keep the
+      outputs exactly (`UNHOLY_MICROBATCH=1`, model::ClassRows) but are slower: decode is bound by weight reads
 - [ ] both cards are power-capped at 230 W again (`/etc/lact/config.yaml`, from /etc/nixos, active since
       2026-10-13 11:28; the 2026-10-12 register-bit-flip fault was fixed by removing that cap): rare
       run-to-run outliers in the logits, in the 2026-10-12 build as in this one (DECISIONS 2026-10-15)
