@@ -523,6 +523,16 @@ void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sin
   else k::sparse_attn(q, pos, kv, sink, o, T, H, D, scale, st);
 }
 
+// Decode-sized attention calls on the split path (k::sparse_attn_wmma_batch_split: bit-identical, more
+// workgroups) unless UNHOLY_ATTN_SPLIT=0.
+bool split_attention() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_ATTN_SPLIT");
+    return !v || std::string(v) != "0";
+  }();
+  return on;
+}
+
 bool dspark_wmma_attention() {
   static const bool on = [] {
     const char* v = std::getenv("UNHOLY_DSPARK_WMMA_ATTN");
@@ -815,12 +825,22 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
     ab.ratio = w.ratio;
     ab.comp_idx = w.has_indexer ? idx : nullptr;
     ab.vis = b.vis;
+    int queries = 0, max_total = 0;  // of the launch being built
     for (size_t i = 0; i < b.chunks.size(); ++i) {
       const auto& ch = b.chunks[i];
       ab.c[ab.nchunks++] = {ch.t0, ch.n, ch.s0, ch.slot, w.has_indexer ? topk_of(ch) : 0, int(size_t(ch.t0) * c.idx_topk)};
+      queries += ch.n;
+      const int comp = w.ratio ? (w.has_indexer ? topk_of(ch) : (ch.s0 + ch.n) / w.ratio) : 0;
+      max_total = std::max(max_total, (b.vis ? 512 : 128) + comp);
       if (ab.nchunks == k::AttnBatch::kMax || i + 1 == b.chunks.size()) {
-        k::sparse_attn_wmma_batch(q, pos, ab, w.sink.p<float>(), o, scale, st);
+        // Decode-sized: the split path (same results, more workgroups), its scores in the indexer's score
+        // buffer (free again: the top-k has read it).
+        const bool split = split_attention() && queries <= 16 && max_total >= 256 &&
+                           k::sparse_attn_wmma_batch_split(q, pos, ab, w.sink.p<float>(), o, scale, max_total,
+                                                           B<float>(scr, kISc), scr.bufs[kISc].size() / 4, st);
+        if (!split) k::sparse_attn_wmma_batch(q, pos, ab, w.sink.p<float>(), o, scale, st);
         ab.nchunks = 0;
+        queries = max_total = 0;
       }
     }
     for (const auto& ch : b.chunks)

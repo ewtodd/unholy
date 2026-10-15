@@ -933,3 +933,18 @@ geometries, batch checks, combine off); `unholy plan` with the production flags 
 end to end, the production server (DSpark 5, vision, seeded sampling at temperature 1) answers the 48 GSM8K
 questions of the single-stream sweep with identical text and token counts on both builds (48 / 48;
 flexible 47 / 48 on both), at 29.4 vs 22.1 tok/s aggregate (decode median 46.5 vs 30.8 tok/s).
+
+## 2026-10-15 — attention split across workgroups, bit-exactly
+
+A query's attention ran in one workgroup because its online softmax is a chain over 16-key blocks; splitting
+the keys with an LSE merge changes the roundings. But only the softmax state and P V are a chain: the scores
+are not. `sparse_attn_wmma_split` / `_batch_split`: phase 1, workgroups over (query, 8 key blocks) compute
+every head's score of every entry exactly as the fused kernel (its two half-dim WMMA chains, their sum, the
+scale, -inf when masked) into scratch; phase 2, four workgroups per query, one per quarter of the output
+dims, each walk the 16-key blocks with the fused kernel's softmax code on those scores (identical state in
+all four) and do P V for their quarter (a quarter of V staged per block). unholy-attn-test: 32768 / 32768
+outputs (1, 6 and 48 queries, window / CSA / HCA, 4k-512k) identical to the fused kernel; one query: CSA
+81.6 -> 69.2 us, HCA at 128k 117 -> 91, at 512k 435 -> 310 us; 48 queries: slower (the fused grid is wide
+enough). Used for launches of <= 16 queries with >= 256 entries (`UNHOLY_ATTN_SPLIT=0`: off), scores in the
+indexer's score buffer (read by the top-k before). Resident checks bit-identical; 40k-context decode logits
+(bench --out) with and without it identical. Decode 33.9 -> 33.6 ms at batch 1 and 4k.

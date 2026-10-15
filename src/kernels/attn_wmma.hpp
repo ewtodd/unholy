@@ -32,4 +32,14 @@ struct AttnBatch {
 void sparse_attn_wmma_batch(const bf16* q, const int32_t* pos, const AttnBatch& b, const float* sink, bf16* o,
                             float scale, hipStream_t st);
 
+// The same results split across more workgroups (decode-sized calls): every head's scores of every key
+// block in parallel (into S: [queries][64][ldS] floats, ldS = max_total rounded up to 16), then per query
+// four workgroups, one per quarter of the output dims, each running the softmax state of all heads and P V
+// for its quarter. Bit-identical to the fused kernel. max_total: the most entries of any query (window +
+// compressed rows). false (nothing launched) when S is too small or for DSpark calls.
+bool sparse_attn_wmma_split(const bf16* q, const int32_t* pos, AttnKv kv, const float* sink, bf16* o, int T, float scale,
+                            int max_total, float* S, size_t s_floats, hipStream_t st);
+bool sparse_attn_wmma_batch_split(const bf16* q, const int32_t* pos, const AttnBatch& b, const float* sink, bf16* o,
+                                  float scale, int max_total, float* S, size_t s_floats, hipStream_t st);
+
 }  // namespace unholy::kernels

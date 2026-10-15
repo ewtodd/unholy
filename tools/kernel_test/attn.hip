@@ -12,6 +12,7 @@
 #include <cstring>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,7 @@ int main(int argc, char** argv) {
   const Case cases[] = {{"window", 0, 4096, false}, {"csa 4k", 4, 4096, true},       {"csa 512k", 4, 524288, true},
                         {"hca 4k", 128, 4096, false}, {"hca 128k", 128, 131072, false}, {"hca 512k", 128, 524288, false}};
   const float scale = 1.0f / std::sqrt(float(D));
+  bool all_same = true;
   for (const Case& c : cases) {
     const int depth = c.depth, s0 = depth - T;  // the call feeds positions [s0, depth)
     const int rpp = c.ratio ? PT / c.ratio : 1, nrows = c.ratio ? depth / c.ratio : 0;
@@ -129,9 +131,37 @@ int main(int argc, char** argv) {
       UH_CHECK(hipEventSynchronize(e1));
       float ms = 0;
       UH_CHECK(hipEventElapsedTime(&ms, e0, e1));
-      std::printf(" %8.1f us per call", 1e3 * ms / reps);
+      std::printf(" fused %7.1f us", 1e3 * ms / reps);
+    }
+    {  // the split path: bit for bit the fused kernel's output, and its time
+      const int max_total = keys;
+      const size_t s_floats = size_t(T) * H * ((max_total + 15) / 16 * 16);
+      rt::DeviceBuffer sbuf(dev, s_floats * 4), o_split(dev, size_t(T) * H * D * 2);
+      const auto run = [&]() {
+        if (!k::sparse_attn_wmma_split(q.as<uint16_t>(), pos.as<int32_t>(), kv, sink.as<float>(), o_split.as<uint16_t>(), T,
+                                       scale, max_total, sbuf.as<float>(), s_floats, st))
+          throw std::runtime_error("split refused");
+      };
+      run();
+      UH_CHECK(hipStreamSynchronize(st));
+      std::vector<uint16_t> c2(b.size());
+      UH_CHECK(hipMemcpy(c2.data(), o_split.data(), c2.size() * 2, hipMemcpyDeviceToHost));
+      size_t same = 0;
+      for (size_t i = 0; i < c2.size(); ++i) same += c2[i] == b[i];
+      hipEvent_t e0, e1;
+      UH_CHECK(hipEventCreate(&e0));
+      UH_CHECK(hipEventCreate(&e1));
+      UH_CHECK(hipEventRecord(e0, st));
+      for (int i = 0; i < reps; ++i) run();
+      UH_CHECK(hipEventRecord(e1, st));
+      UH_CHECK(hipEventSynchronize(e1));
+      float ms = 0;
+      UH_CHECK(hipEventElapsedTime(&ms, e0, e1));
+      std::printf(", split %7.1f us (%zu / %zu outputs identical to fused)", 1e3 * ms / reps, same, c2.size());
+      all_same &= same == c2.size();
     }
     std::printf("\n");
   }
-  return 0;
+  std::printf(all_same ? "split path bit-identical to the fused kernel\n" : "SPLIT PATH DIFFERS\n");
+  return all_same ? 0 : 1;
 }
