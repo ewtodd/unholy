@@ -29,10 +29,9 @@ __device__ __forceinline__ const bf16* paged_row(const PagedRows& p, int r) {
 
 constexpr int H = 64, D = 512, KB = 16, NT = 256;
 
-__global__ __launch_bounds__(NT) void sparse_attn_wmma_kernel(const bf16* __restrict__ q,
-                                                              const int32_t* __restrict__ pos, AttnKv kv,
-                                                              const float* __restrict__ sink, bf16* __restrict__ o,
-                                                              float scale) {
+// Query t of one call (AttnKv and the q / pos / o pointers relative to the call).
+__device__ __forceinline__ void attn_query(const bf16* __restrict__ q, const int32_t* __restrict__ pos, const AttnKv& kv,
+                                           const float* __restrict__ sink, bf16* __restrict__ o, float scale, int t) {
 #if defined(UH_GFX12)
   __shared__ alignas(16) uint16_t sK[KB][D + 8];   // [key][dim]
   __shared__ alignas(16) uint16_t sVt[D][KB + 8];  // [dim][key]
@@ -40,7 +39,7 @@ __global__ __launch_bounds__(NT) void sparse_attn_wmma_kernel(const bf16* __rest
   __shared__ alignas(16) uint16_t sP[H][KB + 8];
   __shared__ float sF[H], sM[H], sL[H];
   __shared__ const bf16* rows[KB];
-  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int hg = wave >> 1, dh = wave & 1;
   const int p_t = pos[t];
   const int visible = kv.ratio ? (p_t + 1) / kv.ratio : 0;
@@ -171,7 +170,45 @@ __global__ __launch_bounds__(NT) void sparse_attn_wmma_kernel(const bf16* __rest
 #endif
 }
 
+__global__ __launch_bounds__(NT) void sparse_attn_wmma_kernel(const bf16* __restrict__ q,
+                                                              const int32_t* __restrict__ pos, AttnKv kv,
+                                                              const float* __restrict__ sink, bf16* __restrict__ o,
+                                                              float scale) {
+  attn_query(q, pos, kv, sink, o, scale, blockIdx.x);
+}
+
+// Every query of up to AttnBatch::kMax chunks: block -> (chunk, query), then the single-call path.
+__global__ __launch_bounds__(NT) void sparse_attn_wmma_batch_kernel(const bf16* __restrict__ q,
+                                                                    const int32_t* __restrict__ pos, AttnBatch b,
+                                                                    const float* __restrict__ sink,
+                                                                    bf16* __restrict__ o, float scale) {
+  int c = 0, first = 0;
+  while (c + 1 < b.nchunks && int(blockIdx.x) >= first + b.c[c].n) first += b.c[c++].n;
+  const AttnChunk ch = b.c[c];
+  AttnKv kv;
+  kv.chunk_kv = b.kv + size_t(ch.t0) * D;
+  kv.ring = b.ring + size_t(ch.slot) * b.ring_stride;
+  kv.s0 = ch.s0;
+  kv.comp = PagedRows{b.comp_pool, b.tables + size_t(ch.slot) * b.max_pages, b.rows_per_page, b.row_stride};
+  kv.comp_idx = b.comp_idx ? b.comp_idx + ch.idx_off : nullptr;
+  kv.ncomp = ch.ncomp;
+  kv.ratio = b.ratio;
+  kv.vis = b.vis ? b.vis + size_t(ch.t0) * 2 : nullptr;
+  attn_query(q + size_t(ch.t0) * H * D, pos + ch.t0, kv, sink, o + size_t(ch.t0) * H * D, scale,
+             int(blockIdx.x) - first);
+}
+
 }  // namespace
+
+void sparse_attn_wmma_batch(const bf16* q, const int32_t* pos, const AttnBatch& b, const float* sink, bf16* o,
+                            float scale, hipStream_t st) {
+  if (b.nchunks <= 0 || b.nchunks > AttnBatch::kMax) throw std::runtime_error("sparse_attn_wmma_batch: chunk count");
+  int n = 0;
+  for (int i = 0; i < b.nchunks; ++i) n += b.c[i].n;
+  if (n == 0) return;
+  sparse_attn_wmma_batch_kernel<<<n, NT, 0, st>>>(q, pos, b, sink, o, scale);
+  UH_CHECK_LAUNCH();
+}
 
 void sparse_attn_wmma(const bf16* q, const int32_t* pos, AttnKv kv, const float* sink, bf16* o, int T, int heads,
                       int dim, float scale, hipStream_t st) {

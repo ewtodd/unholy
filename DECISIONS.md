@@ -720,3 +720,16 @@ At decode a token's elementwise kernels ran one workgroup per row: `hc_post` 28 
   serial walk: same offsets and tile order.
 `UNHOLY_REF_ELEM=1` keeps the reference rmsnorm / hc_post. Logits bit-identical (both geometries, batch
 checks). Decode 49.3 / 65.2 / 96.4 / 157.8 -> 42.6 / 58.1 / 89.6 / 151.0 ms at batch 1 / 2 / 4 / 8.
+
+## 2026-10-14 — one attention launch per layer for all chunks
+
+A step's chunks ran attention (one workgroup per query) and the indexer's top-k (one workgroup per row)
+chunk by chunk: at batch 8, 344 serialized single-workgroup attention launches (28.8 ms of the step) and
+168 top-k launches (6 ms). Now each layer runs the indexer for every chunk first (score rows of several
+chunks share the score buffer; `topk_bf16_batch` takes up to 32 row groups with their own n and k, chunk
+c's top-k at idx + t0 * idx_topk), then one `sparse_attn_wmma_batch` launch over all chunks (a table of
+up to 32 chunks in the kernel arguments; each block finds its chunk and runs exactly the single-call
+code), then the window rings. Chunks of one step are of different slots, so no chunk reads another's
+ring update (a step with two chunks of one slot keeps the old order; `UNHOLY_ATTN_PER_CHUNK=1` forces it).
+Logits bit-identical (both geometries, batch checks), indexer kernel test unchanged. Decode at batch
+1 / 2 / 4 / 8: 42.6 / 58.1 / 89.6 / 151.0 -> 42.5 / 53.6 / 76.0 / 119.5 ms.

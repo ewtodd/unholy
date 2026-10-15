@@ -45,5 +45,17 @@ void indexer_scores_fp4(const uint8_t* q8, const uint8_t* qe, const bf16* w, Pag
 
 // Top-k per row of bf16 scores, ordered (score desc, index asc); -1 padded; -inf never selected.
 void topk_bf16(const uint16_t* scores, int T, int n, int k, int32_t* idx, hipStream_t st);
+// Several score blocks in one launch (e.g. the decode chunks of a step): group g's rows [rows][n] at
+// scores + off, its top-k rows [rows][k] at idx + idx_off; per row the same as topk_bf16.
+struct TopkRows {
+  size_t off;
+  int rows, n, k, idx_off;
+};
+struct TopkBatch {
+  static constexpr int kMax = 32;
+  int ngroups = 0;
+  TopkRows g[kMax];
+};
+void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, hipStream_t st);
 
 }  // namespace unholy::kernels

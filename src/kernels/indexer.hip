@@ -218,12 +218,11 @@ __device__ __forceinline__ uint32_t key16(uint16_t b) { return (b & 0x8000u) ? (
 
 // One block per row: radix select on the 16-bit key (two 8-bit passes), then collect keys above the
 // threshold plus threshold ties by lowest index, and sort (key desc, index asc).
-__global__ __launch_bounds__(256) void topk_bf16_kernel(const uint16_t* scores, int n, int k, int32_t* idx) {
+__device__ __forceinline__ void topk_row(const uint16_t* __restrict__ row, int n, int k, int32_t* __restrict__ out) {
   __shared__ uint32_t hist[256];
   __shared__ uint32_t prefix_sel, need_sel, nvalid, count_above;
   __shared__ uint32_t sel_keys[1024];
   __shared__ int32_t sel_idx[1024];
-  const uint16_t* row = scores + size_t(blockIdx.x) * n;
   const uint32_t neg_inf_key = key16(kBf16NegInf);
   if (threadIdx.x == 0) nvalid = count_above = 0;
   __syncthreads();
@@ -311,8 +310,20 @@ __global__ __launch_bounds__(256) void topk_bf16_kernel(const uint16_t* scores, 
       }
       __syncthreads();
     }
-  for (int i = threadIdx.x; i < k; i += blockDim.x)
-    idx[size_t(blockIdx.x) * k + i] = uint32_t(i) < want ? sel_idx[i] : -1;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) out[i] = uint32_t(i) < want ? sel_idx[i] : -1;
+}
+
+__global__ __launch_bounds__(256) void topk_bf16_kernel(const uint16_t* scores, int n, int k, int32_t* idx) {
+  topk_row(scores + size_t(blockIdx.x) * n, n, k, idx + size_t(blockIdx.x) * k);
+}
+
+// Rows of up to TopkBatch::kMax groups (each its own n and k) in one launch: block -> (group, row).
+__global__ __launch_bounds__(256) void topk_bf16_batch_kernel(const uint16_t* scores, TopkBatch b, int32_t* idx) {
+  int g = 0, first = 0;
+  while (g + 1 < b.ngroups && int(blockIdx.x) >= first + b.g[g].rows) first += b.g[g++].rows;
+  const TopkRows r = b.g[g];
+  const int i = int(blockIdx.x) - first;
+  topk_row(scores + r.off + size_t(i) * r.n, r.n, r.k, idx + r.idx_off + size_t(i) * r.k);
 }
 
 }  // namespace
@@ -342,6 +353,18 @@ void indexer_scores_fp4(const uint8_t* q8, const uint8_t* qe, const bf16* w, Pag
   if (T <= 0 || nkeys <= 0) return;
   indexer_fp4_kernel<<<dim3(cdiv(size_t(nkeys), KT), cdiv(size_t(T), QG)), NT, 0, st>>>(q8, qe, w, keys, pos, scores,
                                                                                       T, nkeys, ratio);
+  UH_CHECK_LAUNCH();
+}
+
+void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, hipStream_t st) {
+  if (b.ngroups <= 0 || b.ngroups > TopkBatch::kMax) throw std::runtime_error("topk_bf16_batch: group count");
+  int rows = 0;
+  for (int i = 0; i < b.ngroups; ++i) {
+    if (b.g[i].k > 1024) throw std::runtime_error("topk_bf16_batch: k > 1024");
+    rows += b.g[i].rows;
+  }
+  if (rows == 0) return;
+  topk_bf16_batch_kernel<<<rows, 256, 0, st>>>(scores, b, idx);
   UH_CHECK_LAUNCH();
 }
 

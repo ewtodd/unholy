@@ -457,6 +457,17 @@ void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sin
   else k::sparse_attn(q, pos, kv, sink, o, T, H, D, scale, st);
 }
 
+// All chunks of a layer in one attention launch (the WMMA kernel; same per-query computation) unless
+// UNHOLY_REF_ATTN=1 or UNHOLY_ATTN_PER_CHUNK=1.
+bool batched_attention() {
+  static const bool on = [] {
+    const char* r = std::getenv("UNHOLY_REF_ATTN");
+    const char* v = std::getenv("UNHOLY_ATTN_PER_CHUNK");
+    return (!r || std::string(r) == "0") && (!v || std::string(v) == "0");
+  }();
+  return on && on_gfx12();
+}
+
 // Hyper-Connection pre-mix dispatch: token-tiled kernel unless UNHOLY_REF_HC=1.
 void hc_pre(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post, float* comb,
             float* part, int T, int hc, int dim, int iters, float norm_eps, float hc_eps, hipStream_t st) {
@@ -635,49 +646,105 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
                      st);
     }
   }
-  for (const auto& ch : b.chunks) {
-    const int32_t* cpos = pos + ch.t0;
-    bf16* window = cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD;
+  // Indexer top-k of every chunk (chunk c's rows at idx + t0 * idx_topk, stride kk), then the attention of
+  // all chunks, then their window rings. Chunks are of different slots, so no chunk reads another's ring
+  // update; a step with two chunks of one slot keeps the chunk-by-chunk order.
+  int32_t* idx = B<int32_t>(scr, kIdx);
+  const auto topk_of = [&](const ChunkDesc& ch) { return std::min(c.idx_topk, (ch.s0 + ch.n) / 4); };
+  bool distinct = true;
+  for (size_t i = 0; i < b.chunks.size() && distinct; ++i)
+    for (size_t j = 0; j < i; ++j) distinct &= b.chunks[i].slot != b.chunks[j].slot;
+  const auto indexer = [&](const ChunkDesc* only) {
+    // Score rows of several chunks (or sub-batches of one) share the score buffer; their top-k runs in
+    // one launch when it is full and at the end.
+    const bool fast = fast_indexer();
+    const size_t cap = scr.bufs[kISc].size();
+    k::TopkBatch tb;
+    size_t used = 0;
+    const auto flush = [&]() {
+      if (tb.ngroups) k::topk_bf16_batch(B<uint16_t>(scr, kISc), tb, idx, st);
+      tb.ngroups = 0;
+      used = 0;
+    };
+    for (const auto& ch : b.chunks) {
+      if (only && &ch != only) continue;
+      const int nkeys = (ch.s0 + ch.n) / 4, kk = topk_of(ch);
+      if (kk <= 0) continue;
+      int32_t* cidx = idx + size_t(ch.t0) * c.idx_topk;
+      const size_t row_bytes = size_t(nkeys) * (fast ? 2 : 4);
+      const int sub = int(std::max<size_t>(1, std::min<size_t>(size_t(ch.n), cap / row_bytes)));
+      const k::PagedFp4 keys = paged_fp4(cache.idx, b, ch.slot);
+      for (int t = 0; t < ch.n; t += sub) {
+        const int nt = std::min(sub, ch.n - t), tt = ch.t0 + t;
+        if (fast) {
+          const size_t bytes = (size_t(nt) * row_bytes + 255) / 256 * 256;
+          if (used + bytes > cap || tb.ngroups == k::TopkBatch::kMax) flush();
+          k::indexer_scores_fp4(B<uint8_t>(scr, kQC) + size_t(tt) * IH * ID, B<uint8_t>(scr, kQCS) + size_t(tt) * IH,
+                                wi + size_t(tt) * IH, keys, pos + tt, B<uint16_t>(scr, kISc) + used / 2, nt, IH, nkeys,
+                                4, st);
+          tb.g[tb.ngroups++] = {used / 2, nt, nkeys, kk, int(size_t(ch.t0) * c.idx_topk + size_t(t) * kk)};
+          used += bytes;
+        } else {
+          float* sc = B<float>(scr, kISc);
+          k::indexer_scores(qi + size_t(tt) * IH * ID, wi + size_t(tt) * IH, keys, pos + tt, sc, nt, IH, ID, nkeys,
+                            4, st);
+          k::topk_rows(sc, nt, nkeys, kk, cidx + size_t(t) * kk, st);
+        }
+      }
+    }
+    flush();
+    if (b.chunks.size() == 1 && topk_of(b.chunks[0]) > 0)
+      dump(L, b, "indexer_out", idx, size_t(b.chunks[0].n) * topk_of(b.chunks[0]) * 4, st);
+  };
+  const auto chunk_kv = [&](const ChunkDesc& ch) {
     k::AttnKv akv;
     akv.chunk_kv = kv + size_t(ch.t0) * HD;
-    akv.ring = window;
+    akv.ring = cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD;
     akv.s0 = ch.s0;
     akv.ratio = w.ratio;
     if (b.vis) akv.vis = b.vis + size_t(ch.t0) * 2;
     if (w.ratio) akv.comp = paged(cache.comp, b, ch.slot, kPageTokens / w.ratio, HD);
     if (w.has_indexer) {
-      const int nkeys = (ch.s0 + ch.n) / 4;
-      const int kk = std::min(c.idx_topk, nkeys);
-      int32_t* idx = B<int32_t>(scr, kIdx);
-      if (kk > 0) {
-        // The chunk's queries in sub-batches that fit the score buffer.
-        const bool fast = fast_indexer();
-        const size_t row_bytes = size_t(nkeys) * (fast ? 2 : 4);
-        const int sub = int(std::max<size_t>(1, std::min<size_t>(size_t(ch.n), scr.bufs[kISc].size() / row_bytes)));
-        const k::PagedFp4 keys = paged_fp4(cache.idx, b, ch.slot);
-        for (int t = 0; t < ch.n; t += sub) {
-          const int nt = std::min(sub, ch.n - t), tt = ch.t0 + t;
-          if (fast) {
-            uint16_t* sc = B<uint16_t>(scr, kISc);
-            k::indexer_scores_fp4(B<uint8_t>(scr, kQC) + size_t(tt) * IH * ID, B<uint8_t>(scr, kQCS) + size_t(tt) * IH,
-                                  wi + size_t(tt) * IH, keys,
-                                  pos + tt, sc, nt, IH, nkeys, 4, st);
-            k::topk_bf16(sc, nt, nkeys, kk, idx + size_t(t) * kk, st);
-          } else {
-            float* sc = B<float>(scr, kISc);
-            k::indexer_scores(qi + size_t(tt) * IH * ID, wi + size_t(tt) * IH, keys, pos + tt, sc, nt, IH, ID, nkeys,
-                              4, st);
-            k::topk_rows(sc, nt, nkeys, kk, idx + size_t(t) * kk, st);
-          }
-        }
-        if (b.chunks.size() == 1) dump(L, b, "indexer_out", idx, size_t(ch.n) * kk * 4, st);
-      }
-      akv.comp_idx = idx;
-      akv.ncomp = kk;
+      akv.comp_idx = idx + size_t(ch.t0) * c.idx_topk;
+      akv.ncomp = topk_of(ch);
     }
-    attention(q + size_t(ch.t0) * H * HD, cpos, akv, w.sink.p<float>(), o + size_t(ch.t0) * H * HD, ch.n, H, HD,
-                   scale, st);
-    k::window_update(kv + size_t(ch.t0) * HD, window, ch.s0, ch.n, HD, st);
+    return akv;
+  };
+  if (distinct && batched_attention()) {
+    if (w.has_indexer) indexer(nullptr);
+    k::AttnBatch ab;
+    ab.kv = kv;
+    ab.ring = cache.window_rows.as<bf16>();
+    ab.ring_stride = size_t(c.window) * HD;
+    if (w.ratio) {
+      ab.comp_pool = cache.comp.as<bf16>();
+      ab.rows_per_page = kPageTokens / w.ratio;
+      ab.row_stride = HD;
+    }
+    ab.tables = b.block_tables;
+    ab.max_pages = b.max_pages_per_seq;
+    ab.ratio = w.ratio;
+    ab.comp_idx = w.has_indexer ? idx : nullptr;
+    ab.vis = b.vis;
+    for (size_t i = 0; i < b.chunks.size(); ++i) {
+      const auto& ch = b.chunks[i];
+      ab.c[ab.nchunks++] = {ch.t0, ch.n, ch.s0, ch.slot, w.has_indexer ? topk_of(ch) : 0, int(size_t(ch.t0) * c.idx_topk)};
+      if (ab.nchunks == k::AttnBatch::kMax || i + 1 == b.chunks.size()) {
+        k::sparse_attn_wmma_batch(q, pos, ab, w.sink.p<float>(), o, scale, st);
+        ab.nchunks = 0;
+      }
+    }
+    for (const auto& ch : b.chunks)
+      k::window_update(kv + size_t(ch.t0) * HD, cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD, ch.s0,
+                       ch.n, HD, st);
+  } else {
+    for (const auto& ch : b.chunks) {
+      if (w.has_indexer) indexer(&ch);
+      attention(q + size_t(ch.t0) * H * HD, pos + ch.t0, chunk_kv(ch), w.sink.p<float>(), o + size_t(ch.t0) * H * HD,
+                ch.n, H, HD, scale, st);
+      k::window_update(kv + size_t(ch.t0) * HD, cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD, ch.s0,
+                       ch.n, HD, st);
+    }
   }
   dump(L, b, "sa_o", o, size_t(T) * H * HD * 2, st);
   k::rope(o, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, true, st);
