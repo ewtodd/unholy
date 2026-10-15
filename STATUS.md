@@ -78,13 +78,14 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       across workgroups, top-k on several workgroups for long rows, fewer launches); bit-identical logits
 - [ ] disk tier for the prefix cache
 - [x] decode scaling: one attention / top-k launch for all chunks, skinny WMMA GEMMs for verify steps of 9-64
-      rows (bit-identical; e.g. wq_a 84 -> 15 us at 12 rows): GSM8K sweep 22.2 / 36.5 / 45.5 / 56.3 -> 29.4 /
-      50.2 / 59.9 / 69.1 tok/s at 1 / 2 / 4 / 8 with the defaults, token for token the 2026-10-12 outputs for the
-      same requests (unholy-engine-batch, all four levels); 29.9 / 55.3 / 68.2 / 83.5 with the opt-ins (two decode
-      micro-batches `--decode-split 1`, 16-row GEMVs, 64-token MoE GEMVs, reclaimed scratch; DECISIONS 2026-10-15)
+      rows and the APU's expert GEMM with the weights in registers (all bit-identical): GSM8K sweep 22.2 / 36.5 /
+      45.5 / 56.3 -> 31.2 / 51.8 / 62.4 / 72.1 tok/s at 1 / 2 / 4 / 8 with the defaults, token for token the
+      2026-10-12 outputs for the same requests (unholy-engine-batch, all four levels); 29.9 / 55.3 / 68.2 / 83.5
+      with the opt-ins, measured before the APU kernel (two decode micro-batches `--decode-split 1`, 16-row GEMVs,
+      64-token MoE GEMVs, reclaimed scratch; DECISIONS 2026-10-15)
 - [ ] multi-stream decode and prefill are bound by the cold experts' bytes on the APU (65-82% busy): more
       routing on the cards (scratch went 3.21 -> 2.24 GB per card; KV pool size is the other lever) or a
-      faster APU grouped GEMM (20-25 TFLOPS of ~59 at 84-280 rows per expert)
+      faster APU grouped GEMM (now 11-27 TFLOPS of ~59 at 16-256 rows per expert, B in registers)
 - [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s
 - [x] routing profile from our own traffic (`data/expert_profile_unholy_mixed.txt`, default for runs)
 

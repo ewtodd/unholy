@@ -53,10 +53,10 @@ Measured on that machine, behind the PCIe switch (October 2026):
 <!---->
 | | |
 |---|---|
-| prefill, one sequence, 4096-token chunks | 2259 tok/s at 32k depth, 1784 at 128k, 1462 at 256k, 1003 at 491k; **1240 tok/s averaged over 0-512k** |
-| decode, one sequence, no speculation | 29.2 tok/s at 4k depth (34.2 ms/token), 22.3 tok/s at 512k |
+| prefill, one sequence, 4096-token chunks | 2404 tok/s at 32k depth, 1886 at 128k, 1542 at 256k, 1048 at 491k; **1322 tok/s averaged over 0-512k** |
+| decode, one sequence, no speculation | 29.4 tok/s at 4k depth (34.1 ms/token), 22.4 tok/s at 512k |
 | decode with DSpark (5 drafts) | ~46 tok/s per stream on chat traffic (GSM8K, median); 70-90% of drafts accepted |
-| GSM8K chat sweep, production settings | 29.4 / 50.2 / 59.9 / 69.1 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
+| GSM8K chat sweep, production settings | 31.2 / 51.8 / 62.4 / 72.1 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
 <!---->
 These are the defaults, whose outputs are those of the 2026-10-12 build for the same steps: token for token
 under concurrency too when the requests reach the engine alike (`unholy-engine-batch`, DECISIONS 2026-10-15).

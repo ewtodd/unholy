@@ -1059,3 +1059,6 @@ prefill 1.62 -> 1.24 s); unholy-engine-batch 48 / 48 identical to the 2026-10-12
 4 / 8, 30.8 / 38.1 / 45.6 / 52.4 tok/s (29.1 / 35.2 / 41.5 / 47.2 before). `unholy-curve` 1 x 512k, same plan
 (docs/bench/curve-native-1x512k-plx-2026-10-15-apu-rb.txt): prefill 2404 / 1886 / 1542 / 1048 tok/s at 32k /
 128k / 256k / 491k, 1322 average (1240); decode unchanged (34.1 ... 44.6 ms per token at 4k ... 512k).
+GSM8K sweep (HTTP, production flags, defaults): 31.2 / 51.8 / 62.4 / 72.1 tok/s at concurrency 1 / 2 / 4 / 8
+(29.4 / 50.2 / 59.9 / 69.1 before; 2026-10-12: 22.2 / 36.5 / 45.5 / 56.3), flexible 47 / 47 / 47 / 46 of 48; the
+concurrency-1 answers are the original's, text and token counts (48 / 48).
