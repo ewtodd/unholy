@@ -121,6 +121,10 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, 
 size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3 = true);
 size_t exl3_moe_scratch_bytes(const Dsv4Config& c, int rows, bool exl3 = true);
 bool ref_experts_needed();
+// What the 2026-10-12 build counted for the same shapes (it allocated buffers the native path never reads).
+// The planner plans with it unless asked to reclaim the difference (PlanInput::reclaim_scratch): the same
+// expert placement, so the same outputs.
+size_t scratch_bytes_legacy(const Dsv4Config& c, int max_tokens, int max_seq);
 size_t expert_scratch_bytes(const Dsv4Config& c, int rows);
 size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const CacheGeometry& g);
 

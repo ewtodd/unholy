@@ -5,6 +5,8 @@
 // Numerics follow the WMMA/reference kernels: fp32 accumulation; the W8A8 path scales each 16-wide
 // chunk's exact partial sum by its 128-block scale product (the reference scales whole 128-blocks; the
 // same products, summed in a different fp32 order).
+#include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 
 #include "kernels/dev.hip.hpp"
@@ -209,6 +211,14 @@ void by_rows(int M, F&& f) {
 }
 
 }  // namespace
+
+int gemv_max_rows() {
+  static const int v = [] {
+    const char* e = std::getenv("UNHOLY_GEMV_ROWS");
+    return e ? std::clamp(std::atoi(e), 1, int(kGemvRowsCap)) : 8;
+  }();
+  return v;
+}
 
 void gemv_force_cols(int c) { g_force_cols = c == 1 || c == 2 || c == 4 ? c : 0; }
 

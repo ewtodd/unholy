@@ -30,6 +30,10 @@
 // (when more than one request is running or waiting; adaptive: never below budget / requests). Off.
 // --decode-split 1 (default): decoding requests go in two alternating steps, so the two cards work on
 // different halves at once (0: every decoder in every step).
+// --reclaim-scratch 1: plan the hot experts with the scratch this build allocates (~0.9 GB more per card
+// for experts) instead of the 2026-10-12 build's count, which keeps that build's expert placement and so
+// its outputs (default 0). Kernel options with the same trade (faster, outputs move at the noise level):
+// UNHOLY_GEMV_ROWS=16, UNHOLY_MX_GEMV_TOKENS=64 (verify steps of several streams), UNHOLY_DSPARK_WMMA_ATTN=1.
 //
 // Logging (stdout, so journald under systemd): a line per finished request (its tokens, queue time, time
 // to first token, prefill and decode tok/s, draft acceptance) and, every --log-interval seconds (default
@@ -75,7 +79,8 @@ int usage() {
                "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
                "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
                "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
-               "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n");
+               "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n"
+               "                    [--reclaim-scratch 0|1]\n");
   return 2;
 }
 
@@ -161,6 +166,7 @@ int serve(int argc, char** argv, bool plan_only) {
   int long_prefill_threshold = 0;
   bool long_prefill_adaptive = false;
   bool decode_split = true;
+  bool reclaim_scratch = false;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -192,6 +198,7 @@ int serve(int argc, char** argv, bool plan_only) {
     } else if (a == "--long-prefill-token-threshold") long_prefill_threshold = std::stoi(v);
     else if (a == "--long-prefill-token-threshold-adaptive") long_prefill_adaptive = v != "0" && v != "off" && v != "false";
     else if (a == "--decode-split") decode_split = v != "0" && v != "off" && v != "false";
+    else if (a == "--reclaim-scratch") reclaim_scratch = v != "0" && v != "off" && v != "false";
     else return usage();
   }
   if (model_dir.empty()) return usage();
@@ -229,6 +236,7 @@ int serve(int argc, char** argv, bool plan_only) {
   pin.dspark = spec_drafts > 0;
   vision = vision && c.vision_layers > 0;
   pin.vision = vision;
+  pin.reclaim_scratch = reclaim_scratch;
   // A verify chunk wants logits for its token and every draft.
   pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
   // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). 2 GB: the

@@ -99,11 +99,12 @@ size_t dspark_expert_bytes(const model::Checkpoint& ck) {
   return b;
 }
 
-size_t dspark_work_bytes(const model::Dsv4Config& c, const model::CacheGeometry& g) {
+size_t dspark_work_bytes(const model::Dsv4Config& c, const model::CacheGeometry& g, bool reclaim) {
   const size_t rows = size_t(g.max_slots) * c.dspark_block;  // draft rows
   size_t b = size_t(c.n_mtp) * g.max_slots * c.window * c.head_dim * 2;               // stage windows
   b += size_t(g.max_slots) * 128 * c.dspark_target_layers.size() * c.dim * 2;       // main-hidden capture
-  b += model::scratch_bytes(c, int(rows), 4096, false) + rows * size_t(c.vocab) * 4;  // draft scratch, logits
+  b += (reclaim ? model::scratch_bytes(c, int(rows), 4096, false) : model::scratch_bytes_legacy(c, int(rows), 4096)) +
+       rows * size_t(c.vocab) * 4;  // draft scratch, logits
   b += rows * c.hc_mult * c.dim * 2 + (size_t(64) << 20);                            // block, backups
   return b;
 }
@@ -152,13 +153,14 @@ Plan make_plan(const PlanInput& in) {
     pl.vision_apu += size_t(256) << 20;  // scratch for the largest image, the output rows
   }
   if (in.dspark) {
-    pl.dspark_card = dspark_dense_bytes(*in.dense) + dspark_work_bytes(c, in.geo);
+    pl.dspark_card = dspark_dense_bytes(*in.dense) + dspark_work_bytes(c, in.geo, in.reclaim_scratch);
     pl.dspark_apu = dspark_expert_bytes(*in.dense);
     pl.dense[1] += pl.dspark_card;
   }
   for (int k = 0; k < 2; ++k) {
     // Scratch, plus a logits buffer on the head card.
-    pl.scratch[k] = model::scratch_bytes(c, in.max_tokens, in.max_seq, in.exl3 != nullptr) +
+    pl.scratch[k] = (in.reclaim_scratch ? model::scratch_bytes(c, in.max_tokens, in.max_seq, in.exl3 != nullptr)
+                                        : model::scratch_bytes_legacy(c, in.max_tokens, in.max_seq)) +
                     (k == 1 ? size_t(in.max_logit_rows > 0 ? in.max_logit_rows : in.max_tokens) * c.vocab * 4 +
                                   size_t(in.max_tokens) * c.dim * 6
                             : 0) +

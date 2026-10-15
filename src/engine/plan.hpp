@@ -45,6 +45,9 @@ struct PlanInput {
   size_t apu_margin = size_t(4) << 30;
   bool dspark = false;  // the DSpark drafter: dense parts and windows on card 1, routed experts on the APU
   bool vision = false;  // the vision tower on the APU
+  // Plan with the scratch this build allocates instead of the 2026-10-12 build's count (~0.9 GB more per card
+  // for hot experts in production): a different expert placement, so outputs move at the noise level.
+  bool reclaim_scratch = false;
 };
 
 struct Plan {

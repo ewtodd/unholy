@@ -12,9 +12,9 @@
 // adds to the scratch keeps the expert placement, so logits stay comparable bit for bit with --ref.
 //
 // --batch N adds a batch-invariance check: N sequences (prompts of P - 61 s tokens) decode the oracle's
-// continuation alone, then in fresh slots all together (one token each per step), then up to four of
-// them as verify chunks of 4 tokens with every row's logits (<= 16 rows: the GEMV regime,
-// kGemvMaxRows); every logit must equal the solo run's. (Past that the GEMM kernels sum in another order.)
+// continuation alone, then in fresh slots all together (one token each per step), then as many as stay in
+// the GEMV regime (kernels::gemv_max_rows(): 8 rows by default) as verify chunks of 4 tokens with every
+// row's logits; every logit must equal the solo run's. (Past that the GEMM kernels sum in another order.)
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -32,6 +32,7 @@
 #include "engine/plan.hpp"
 #include "engine/resident.hpp"
 #include "gufo/json.hpp"
+#include "kernels/gemv.hpp"
 #include "model/dsv4.hpp"
 #include "model/safetensors.hpp"
 
@@ -223,7 +224,7 @@ int main(int argc, char** argv) {
       for (int s = 0; s < N; ++s) prefill(1 + N + s, len(s));
       const auto [s1, t1] = together(1 + N, 1, N, solo);
       std::printf("batch of %d, one token each: %zu / %zu logits bit-identical to the solo runs\n", N, s1, t1);
-      const int nv = std::min(N, 4);
+      const int nv = std::max(1, std::min(N, kernels::gemv_max_rows() / 4));
       for (int s = 0; s < nv; ++s) prefill(1 + 2 * N + s, len(s));
       const auto [s4, t4] = together(1 + 2 * N, 4, nv, solo);
       std::printf("batch of %d, 4-token verify chunks: %zu / %zu logits bit-identical to the solo runs\n", nv, s4, t4);

@@ -48,7 +48,9 @@ void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, c
 // Each row's result does not depend on the tile it is in, so steps of up to mx_gemv_max_tokens() tokens
 // plan their experts in tiles of kMxGemvTileRows rows and every row gets what a one-token step gives it.
 constexpr int kMxGemvTileRows = 8;
-int mx_gemv_max_tokens();  // UNHOLY_MX_GEMV_TOKENS (default below)
+// UNHOLY_MX_GEMV_TOKENS: default 8 (the 2026-10-12 build's threshold: every step's rows as before); 64 is
+// faster for several streams' verify steps and gives their rows the single-stream values.
+int mx_gemv_max_tokens();
 inline bool mx_use_gemv(int tokens) { return tokens <= mx_gemv_max_tokens(); }
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,

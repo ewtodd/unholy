@@ -97,7 +97,7 @@ bool pair_rows_needed(bool exl3) {
   }();
   return exl3 || remote_bf16 || ref_experts_needed();
 }
-std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3) {
+std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3, bool legacy = false) {
   const size_t N = size_t(max_tokens);
   const size_t rows = N / 4 + 2;
   const size_t keys = size_t(max_seq / 4 + 1);
@@ -123,7 +123,7 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kWI] = N * c.idx_heads * 2;
   // Indexer scores for a sub-batch of a chunk's queries (fp32 rows on the reference path, bf16 on the
   // fast one): capped, the chunk's queries go through it in turns.
-  sz[kISc] = std::max(keys * 4, std::min(N * keys * 4, kIndexerScoreBytes));
+  sz[kISc] = std::max(keys * 4, std::min(N * keys * 4, legacy ? size_t(256) << 20 : kIndexerScoreBytes));
   sz[kQC] = N * c.idx_heads * c.idx_dim;
   sz[kQCS] = N * c.idx_heads;
   sz[kIdx] = N * c.idx_topk * 4;
@@ -141,7 +141,7 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kShared] = N * c.dim * 2;
   sz[kEIdx] = N * K * 4;
   sz[kEWt] = N * K * 4;
-  sz[kPairIn] = pair_rows_needed(exl3) ? N * K * c.dim * 2 : 0;
+  sz[kPairIn] = legacy || pair_rows_needed(exl3) ? N * K * c.dim * 2 : 0;
   sz[kHcPart] = size_t(32) * 32 * 25 * 4;
   sz[kRTok] = N * 2 * 4;  // remote_tokens: tok2u [T], u2t [T]
   return sz;
@@ -170,6 +170,14 @@ size_t scratch_bytes(const Dsv4Config& c, int max_tokens, int max_seq, bool exl3
                  exl3_moe_scratch_bytes(c, max_tokens * c.n_active, exl3);
   for (size_t b : scratch_sizes(c, max_tokens, max_seq, exl3)) total += std::max<size_t>(b, 256);
   return total;
+}
+
+size_t scratch_bytes_legacy(const Dsv4Config& c, int max_tokens, int max_seq) {
+  const size_t N = size_t(max_tokens), R = N * c.n_active;
+  size_t total = expert_scratch_bytes(c, max_tokens) + R * c.dim * 4 + R * c.moe_inter * 6 + R * 4 +
+                 size_t(R / 64 + c.n_experts + 1) * 12;
+  for (size_t b : scratch_sizes(c, max_tokens, max_seq, true, true)) total += std::max<size_t>(b, 256);
+  return total + N * c.dim * 4 + N * c.dim * 2 + N * c.dim * 4;  // three buffers no code used, since removed
 }
 
 size_t layer_cache_bytes(const Dsv4Config& c, int ratio, bool indexer, const CacheGeometry& g) {
@@ -425,7 +433,7 @@ bool on_gfx12() {
 }
 void dense_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                 int N, int K, hipStream_t st) {
-  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
+  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
   else if (fast_dense() && on_gfx12()) k::gemm_w8a8_wmma(a, sa, w, sw, c, ldc, M, N, K, st);
   else k::gemm_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
 }
@@ -437,7 +445,7 @@ bool gemv_parts() {
 }
 void dense_w8a8_2(const uint8_t* a, const uint8_t* sa, const Fp8Linear& l1, bf16* c1, int ldc1, const Fp8Linear& l2,
                   bf16* c2, int ldc2, int M, int K, hipStream_t st) {
-  if (gemv_parts() && fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) {
+  if (gemv_parts() && fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) {
     const k::GemvPart parts[2] = {{l1.w.p<uint8_t>(), l1.s.p<uint8_t>(), c1, ldc1, l1.out},
                                   {l2.w.p<uint8_t>(), l2.s.p<uint8_t>(), c2, ldc2, l2.out}};
     k::gemv_w8a8_parts(a, sa, parts, 2, M, K, st);
@@ -450,14 +458,14 @@ void dense_w8a8_2(const uint8_t* a, const uint8_t* sa, const Fp8Linear& l1, bf16
 // the products; the reference kernel takes the fp32 copy.
 void dense_f32(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w, float* c, int ldc, int M, int N,
                int K, hipStream_t st) {
-  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_bf16_f32out(a_bf16, lda, w, c, ldc, M, N, K, st);
+  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_bf16_f32out(a_bf16, lda, w, c, ldc, M, N, K, st);
   else if (fast_dense()) k::gemm_bf16_f32out_wmma(a_bf16, lda, w, c, ldc, M, N, K, st);
   else k::gemm_f32(a_f32, lda, w, c, ldc, M, N, K, st);
 }
 // Two fp32-output linears (bf16 weights [N, K]) on the same input: one GEMV launch when it applies.
 void dense_f32_2(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w1, float* c1, int ldc1, int N1,
                  const bf16* w2, float* c2, int ldc2, int N2, int M, int K, hipStream_t st) {
-  if (gemv_parts() && fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) {
+  if (gemv_parts() && fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) {
     const k::GemvPart parts[2] = {{w1, nullptr, c1, ldc1, N1}, {w2, nullptr, c2, ldc2, N2}};
     k::gemv_bf16_f32out_parts(a_bf16, lda, parts, 2, M, K, st);
     return;
@@ -466,13 +474,13 @@ void dense_f32_2(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w1
   dense_f32(a_bf16, a_f32, lda, w2, c2, ldc2, M, N2, K, st);
 }
 void dense_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
-  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_bf16(a, lda, w, c, ldc, M, N, K, st);
+  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_bf16(a, lda, w, c, ldc, M, N, K, st);
   else if (fast_dense()) k::gemm_bf16_wmma(a, lda, w, c, ldc, M, N, K, st);
   else k::gemm_bf16(a, lda, w, c, ldc, M, N, K, st);
 }
 void dense_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16* c, int M, int G, int R, int K,
                         hipStream_t st) {
-  if (fast_dense() && M <= k::kGemvMaxRows && K % 512 == 0) k::gemv_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
+  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
   else if (fast_dense()) k::gemm_grouped_fp8w_wmma(a, w, sw, c, M, G, R, K, st);
   else k::gemm_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
 }
@@ -513,6 +521,14 @@ void attention(const bf16* q, const int32_t* pos, k::AttnKv kv, const float* sin
   }();
   if (fast && on_gfx12()) k::sparse_attn_wmma(q, pos, kv, sink, o, T, H, D, scale, st);
   else k::sparse_attn(q, pos, kv, sink, o, T, H, D, scale, st);
+}
+
+bool dspark_wmma_attention() {
+  static const bool on = [] {
+    const char* v = std::getenv("UNHOLY_DSPARK_WMMA_ATTN");
+    return v && std::string(v) != "0";
+  }();
+  return on;
 }
 
 // All chunks of a layer in one attention launch (the WMMA kernel; same per-query computation) unless
@@ -706,7 +722,13 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       akv.ring = cache.window_rows.as<bf16>() + size_t(draft->slots[r]) * c.window * HD;
       akv.dspark_slots = std::min(c.window, draft->start[r] + 1);
       akv.dspark_chunk = B;
-      attention(q + r * B * H * HD, pos + r * B, akv, w.sink.p<float>(), o + r * B * H * HD, B, H, HD, scale, st);
+      // The reference kernel, as the 2026-10-12 build (its drafts, so seeded sampling draws the same tokens);
+      // UNHOLY_DSPARK_WMMA_ATTN=1: the WMMA kernel (~1 ms less per draft, drafts may differ in near-ties).
+      if (dspark_wmma_attention())
+        attention(q + r * B * H * HD, pos + r * B, akv, w.sink.p<float>(), o + r * B * H * HD, B, H, HD, scale, st);
+      else
+        k::sparse_attn(q + r * B * H * HD, pos + r * B, akv, w.sink.p<float>(), o + r * B * H * HD, B, H, HD, scale,
+                       st);
     }
   }
   // Indexer top-k of every chunk (chunk c's rows at idx + t0 * idx_topk, stride kk), then the attention of
@@ -1150,7 +1172,7 @@ void dspark_head(const Dsv4Config& c, const DSparkWeights& d, const Scratch& scr
   k::hc_head(x, d.hc_head_fn.p<float>(), d.hc_head_scale.p<float>(), d.hc_head_base.p<float>(), xh, T, c.hc_mult, D,
              c.norm_eps, c.hc_eps, st);
   k::rmsnorm(xh, D, d.norm.p<bf16>(), xn, D, T, D, c.norm_eps, st);
-  if (T <= k::kGemvMaxRows) k::gemv_bf16_f32out(xn, D, head_w, logits, V, T, V, D, st);
+  if (T <= k::gemv_max_rows()) k::gemv_bf16_f32out(xn, D, head_w, logits, V, T, V, D, st);
   else k::gemm_bf16_f32out_wmma(xn, D, head_w, logits, V, T, V, D, st);
   for (int i = 0; i < Bk; ++i)
     k::markov_step(d.markov_w1.p<bf16>(), d.markov_w2.p<bf16>(), V, K, logits, Bk, tok, emb, R, i, part, st);

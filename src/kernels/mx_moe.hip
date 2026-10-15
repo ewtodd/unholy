@@ -314,7 +314,7 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
 int mx_gemv_max_tokens() {
   static const int v = [] {
     const char* e = std::getenv("UNHOLY_MX_GEMV_TOKENS");
-    return e ? std::max(kMxGemvTileRows, std::atoi(e)) : 64;
+    return e ? std::max(kMxGemvTileRows, std::atoi(e)) : kMxGemvTileRows;
   }();
   return v;
 }

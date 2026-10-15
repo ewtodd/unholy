@@ -916,3 +916,20 @@ the same kind of spread). The EXL3 experts' path: bit-identical to the original 
 The several-workgroup top-k end to end: `unholy-bench --out` (decode logits) at 40k context, 2 sequences,
 3-token verify steps (rows of 10k keys: the split path), with and without it (`UNHOLY_TOPK_SPLIT=0`): all
 18.6 MB of logits bit-identical.
+
+## 2026-10-15 — defaults keep the 2026-10-12 outputs; the rest is opt-in
+
+Three of the night's changes moved outputs (at the noise level), so they are now opt-in and the defaults
+give that build's outputs for the same batches:
+- the planner plans with that build's scratch count (`scratch_bytes_legacy`), so the expert placement is
+  the same (production: 1481 / 1393 hot experts, 53.3% routing on the cards); `--reclaim-scratch 1` (serve,
+  plan) uses the ~0.9 GB per card the native path never touches for hot experts (54.8%);
+- the dense GEMVs take up to 8 rows (`UNHOLY_GEMV_ROWS=16` opts into 16) and the MoE GEMVs up to 8 tokens
+  (`UNHOLY_MX_GEMV_TOKENS=64`): steps of 9-16 rows keep the GEMM values;
+- the DSpark stages keep the reference attention (`UNHOLY_DSPARK_WMMA_ATTN=1` for the WMMA kernel), so the
+  drafts, and with them which random draws seeded sampling makes, are the same.
+Checked without any margin adjustment: unholy-resident-test bit-identical to the original build (both
+geometries, batch checks, combine off); `unholy plan` with the production flags prints the same plan; and
+end to end, the production server (DSpark 5, vision, seeded sampling at temperature 1) answers the 48 GSM8K
+questions of the single-stream sweep with identical text and token counts on both builds (48 / 48;
+flexible 47 / 48 on both), at 29.4 vs 22.1 tok/s aggregate (decode median 46.5 vs 30.8 tok/s).
