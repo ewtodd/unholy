@@ -31,10 +31,13 @@
 // --decode-split 1: decoding requests go in two alternating steps, so the two cards work on different
 // halves at once (default 0: every decoder in every step, as the 2026-10-12 build forms its steps; the
 // split changes which rows share a step and with it their values).
-// --reclaim-scratch 1: plan the hot experts with the scratch this build allocates (~0.9 GB more per card
-// for experts) instead of the 2026-10-12 build's count, which keeps that build's expert placement and so
-// its outputs (default 0). Kernel options with the same trade (faster, outputs move at the noise level):
-// UNHOLY_GEMV_ROWS=16, UNHOLY_MX_GEMV_TOKENS=64 (verify steps of several streams), UNHOLY_DSPARK_WMMA_ATTN=1.
+// --exact 1: the 2026-10-12 build's outputs for the same steps (bit for bit). By default serve trades that
+// for speed, with changes at the noise level (DECISIONS 2026-10-15): --reclaim-scratch 1 (plan the hot
+// experts with the scratch this build allocates, ~0.9 GB more per card for experts, instead of that build's
+// count), UNHOLY_MX_GEMV_TOKENS=64 (the experts' GEMVs for steps of up to 64 tokens: verify steps of several
+// streams) and UNHOLY_DSPARK_WMMA_ATTN=1 (the drafter's attention on the WMMA kernel). Each can be set on its
+// own (--reclaim-scratch 0, UNHOLY_MX_GEMV_TOKENS=8, UNHOLY_DSPARK_WMMA_ATTN=0). Other options with the same
+// trade, off: --decode-split 1, UNHOLY_GEMV_ROWS=16 (slower than this build's GEMMs at 9-16 rows).
 //
 // Logging (stdout, so journald under systemd): a line per finished request (its tokens, queue time, time
 // to first token, prefill and decode tok/s, draft acceptance) and, every --log-interval seconds (default
@@ -49,6 +52,7 @@
 #include <stop_token>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -81,7 +85,7 @@ int usage() {
                "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
                "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
                "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n"
-               "                    [--reclaim-scratch 0|1]\n");
+               "                    [--reclaim-scratch 0|1] [--exact 0|1]\n");
   return 2;
 }
 
@@ -167,7 +171,8 @@ int serve(int argc, char** argv, bool plan_only) {
   int long_prefill_threshold = 0;
   bool long_prefill_adaptive = false;
   bool decode_split = false;
-  bool reclaim_scratch = false;
+  int reclaim_scratch = -1;  // -1: !exact
+  bool exact = false;
   for (int i = 2; i < argc; ++i) {
     const std::string a = argv[i];
     if (i + 1 >= argc) return usage();
@@ -200,9 +205,16 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--long-prefill-token-threshold-adaptive") long_prefill_adaptive = v != "0" && v != "off" && v != "false";
     else if (a == "--decode-split") decode_split = v != "0" && v != "off" && v != "false";
     else if (a == "--reclaim-scratch") reclaim_scratch = v != "0" && v != "off" && v != "false";
+    else if (a == "--exact") exact = v != "0" && v != "off" && v != "false";
     else return usage();
   }
   if (model_dir.empty()) return usage();
+  // The kernel options of the default (not --exact) trade; an explicit environment setting wins. Before
+  // anything reads them (they are read once).
+  if (!exact) {
+    setenv("UNHOLY_MX_GEMV_TOKENS", "64", 0);
+    setenv("UNHOLY_DSPARK_WMMA_ATTN", "1", 0);
+  }
   if (scfg.api_key.empty())
     if (const char* k = std::getenv("UNHOLY_API_KEY")) scfg.api_key = k;
 
@@ -237,7 +249,7 @@ int serve(int argc, char** argv, bool plan_only) {
   pin.dspark = spec_drafts > 0;
   vision = vision && c.vision_layers > 0;
   pin.vision = vision;
-  pin.reclaim_scratch = reclaim_scratch;
+  pin.reclaim_scratch = reclaim_scratch < 0 ? !exact : reclaim_scratch > 0;
   // A verify chunk wants logits for its token and every draft.
   pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
   // VRAM left free on each card for the HIP runtime (kernel scratch, kernarg pools, staging). 2 GB: the

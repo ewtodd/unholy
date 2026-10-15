@@ -56,14 +56,14 @@ Measured on that machine, behind the PCIe switch (October 2026):
 | prefill, one sequence, 4096-token chunks | 2463 tok/s at 32k depth, 2012 at 128k, 1702 at 256k, 1212 at 491k; **1406 tok/s averaged over 0-512k** |
 | decode, one sequence, no speculation | 29.4 tok/s at 4k depth (34.0 ms/token), 22.4 tok/s at 512k |
 | decode with DSpark (5 drafts) | ~46 tok/s per stream on chat traffic (GSM8K, median); 70-90% of drafts accepted |
-| GSM8K chat sweep, production settings | 31.2 / 51.8 / 62.4 / 72.1 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
+| GSM8K chat sweep, production settings | 31.6 / 54.3 / 69.9 / 85.5 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
 <!---->
-These are the defaults, whose outputs are those of the 2026-10-12 build for the same steps: token for token
-under concurrency too when the requests reach the engine alike (`unholy-engine-batch`, DECISIONS 2026-10-15).
-Four options trade that for speed (outputs move at the noise level, like any change of expert placement):
-`--decode-split 1` (two decode micro-batches, one per card), `--reclaim-scratch 1` (more hot experts),
-`UNHOLY_GEMV_ROWS=16` and `UNHOLY_MX_GEMV_TOKENS=64` (verify steps of several streams on the GEMVs) and
-`UNHOLY_DSPARK_WMMA_ATTN=1`; with them the GSM8K sweep gives 29.9 / 55.3 / 68.2 / 83.5 tok/s.
+`unholy serve` trades bit-identical outputs for speed by default: more hot experts on the cards (the scratch
+the native path never touches), the experts' GEMVs for verify steps of up to 64 tokens and the drafter's
+attention on the WMMA kernel; outputs move at the noise level, like any change of expert placement.
+`--exact 1` gives the 2026-10-12 build's outputs for the same steps instead -- token for token under
+concurrency too when the requests reach the engine alike (`unholy-engine-batch`) -- at 31.2 / 51.8 / 62.4 /
+72.1 tok/s on the same sweep. Prefill and single-stream decode are the same either way. (DECISIONS 2026-10-15)
 <!---->
 Production settings: a 1.5M-token KV pool shared by up to 8 requests of up to 512k tokens each,
 DSpark with 5 drafts, 64 prefix-cache snapshots, the vision tower loaded. Depth curves are in

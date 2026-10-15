@@ -1199,3 +1199,18 @@ kernel log has no PCIe error between 04:30 and 06:30, when the outliers happened
 disabled"), so a memory error would not be logged either. The outliers stand as measured -- one request in
 one run, 1 of 7 runs of the 2026-10-12 build and 1 of 19 of this one, majority fingerprints identical -- with
 their cause open: silent hardware (no ECC), or a race the original code already has.
+
+## 2026-10-15 — serve's defaults: the noise-level options on, `--exact 1` for the 2026-10-12 outputs
+
+The owner: noise-level output changes are fine for production. `unholy serve` now turns on, unless `--exact 1`:
+`--reclaim-scratch 1` (1554 / 1467 hot experts instead of 1481 / 1393, 54.8% of routing on the cards instead
+of 53.3%: less for the APU, the multi-stream bound), the experts' GEMVs for steps of up to 64 tokens
+(UNHOLY_MX_GEMV_TOKENS=64: on the APU's 1-3-row decode tiles the GEMV moves 221 GB/s of weights where the
+register-B WMMA kernel moves 182) and the drafter's attention on the WMMA kernel (UNHOLY_DSPARK_WMMA_ATTN=1,
+~1 ms less per draft). Each can still be set alone (an explicit environment setting wins). Left off: the
+16-row dense GEMVs (this build's skinny GEMMs are faster at 9-16 rows: wq_a 15 vs 43 us at 12 rows) and both
+kinds of decode micro-batches (entry above). Tests and tools keep the exact defaults.
+
+GSM8K sweep, production flags: 31.6 / 54.3 / 69.9 / 85.5 tok/s at concurrency 1 / 2 / 4 / 8 (flexible 46 / 47 /
+46 / 47 of 48), against 31.2 / 51.8 / 62.4 / 72.1 with `--exact 1` and 29.9 / 55.3 / 68.2 / 83.5 for the earlier
+opt-in set (which had the split and the 16-row GEMVs, before the APU kernel).

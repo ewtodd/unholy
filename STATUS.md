@@ -78,12 +78,12 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       across workgroups, top-k on several workgroups for long rows, fewer launches); bit-identical logits
 - [ ] disk tier for the prefix cache
 - [x] decode scaling: one attention / top-k launch for all chunks, skinny WMMA GEMMs for verify steps of 9-64
-      rows and the APU's expert GEMM with the weights in registers (all bit-identical): GSM8K sweep 22.2 / 36.5 /
-      45.5 / 56.3 -> 31.2 / 51.8 / 62.4 / 72.1 tok/s at 1 / 2 / 4 / 8 with the defaults, token for token the
-      2026-10-12 outputs for the same requests (unholy-engine-batch, all four levels); 29.9 / 55.3 / 68.2 / 83.5
-      with the opt-ins, measured before the APU kernel (two decode micro-batches `--decode-split 1`, 16-row GEMVs,
-      64-token MoE GEMVs, reclaimed scratch; DECISIONS 2026-10-15). Two micro-batches within a step keep the
-      outputs exactly (`UNHOLY_MICROBATCH=1`, model::ClassRows) but are slower: decode is bound by weight reads
+      rows and the APU's expert GEMM with the weights in registers (all bit-identical); serve's defaults add
+      more hot experts, 64-token expert GEMVs and the drafter's WMMA attention (noise-level changes): GSM8K
+      sweep 22.2 / 36.5 / 45.5 / 56.3 -> 31.6 / 54.3 / 69.9 / 85.5 tok/s at 1 / 2 / 4 / 8; `--exact 1`
+      (2026-10-12 outputs token for token, unholy-engine-batch) 31.2 / 51.8 / 62.4 / 72.1. Two decode
+      micro-batches: across steps (`--decode-split 1`) or exactly within a step (`UNHOLY_MICROBATCH=1`), both
+      off: no gain on this build (DECISIONS 2026-10-15)
 - [ ] rare run-to-run outliers in the logits (one request in some full runs at concurrency 1), in the 2026-10-12
       build as in this one; cause open (not the 230 W cap, which is deliberate; no PCIe AER errors; VRAM ECC off).
       DECISIONS 2026-10-15
