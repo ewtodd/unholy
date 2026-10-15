@@ -784,3 +784,23 @@ N = 1 / 2 / 4 / 8 (this build, before -> after the split):
 Under 8 streams the cards now run kernels ~40% of the time and wait for the APU ~41%; the APU is 65% busy
 and its expert GEMVs share its ~200 GB/s between the two cards' channels (385 us per call vs ~200 alone,
 unholy-mx-test --dev 2): multi-stream decode is bound by the cold experts' bytes on the APU.
+
+## 2026-10-14 — attention: a bank conflict in the V transpose; DSpark stages on the WMMA kernel
+
+`unholy-attn-test` (new): the WMMA attention against the reference kernel on decode-sized calls over a
+paged pool (window, CSA top-512, HCA all rows, at 4k / 128k / 512k), time per call. A query's keys go
+through the workgroup 16 at a time, ~3 us per block whatever the pointer loads (prefetching the next
+block's rows during the current one, kept, changed nothing measurable): the staging wrote V transposed
+(`sVt[dim][key]`, 2-byte stores) from lanes holding one key and dims 32 apart, so the 16 lanes of a
+half-wave hit one LDS bank on each of their 32 stores. Lanes now hold the 16 keys of one dim range (same
+LDS contents): CSA 134 -> 81 us, window 40 -> 26, HCA at 128k 205 -> 117, at 512k 812 -> 434 us per call.
+Packing two keys per 4-byte store through a lane shuffle was slower (95 us CSA). Four workgroups per query
+(one per 16-head group, each reading every key) was no faster: the block loop is latency-bound, not
+compute-bound.
+
+DSpark stages used the reference attention (one block per head per query: 350 us per stage); the WMMA
+kernel now has the stage key order (ring slots in order, then the draft block): unholy-dspark-test 7/7
+drafts identical to the reference, logits rel L2 1-4% as before.
+
+Logits bit-identical (both geometries, batch checks). Decode at batch 1 / 8: 38.1 / 89.2 -> 36.4 / 87.3 ms;
+4k prefill 1303 -> 1371 tok/s (one sequence), 1948 -> 2046 (eight).

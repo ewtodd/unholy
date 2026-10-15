@@ -648,8 +648,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       akv.ring = cache.window_rows.as<bf16>() + size_t(draft->slots[r]) * c.window * HD;
       akv.dspark_slots = std::min(c.window, draft->start[r] + 1);
       akv.dspark_chunk = B;
-      k::sparse_attn(q + r * B * H * HD, pos + r * B, akv, w.sink.p<float>(), o + r * B * H * HD, B, H, HD, scale,
-                     st);
+      attention(q + r * B * H * HD, pos + r * B, akv, w.sink.p<float>(), o + r * B * H * HD, B, H, HD, scale, st);
     }
   }
   // Indexer top-k of every chunk (chunk c's rows at idx + t0 * idx_topk, stride kk), then the attention of

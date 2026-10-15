@@ -38,15 +38,16 @@ __device__ __forceinline__ void attn_query(const bf16* __restrict__ q, const int
   __shared__ float sS[4][2][16][KB + 1];
   __shared__ alignas(16) uint16_t sP[H][KB + 8];
   __shared__ float sF[H], sM[H], sL[H];
-  __shared__ const bf16* rows[KB];
+  __shared__ const bf16* rowbuf[2][KB];  // the block's rows, and the next block's being looked up
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int hg = wave >> 1, dh = wave & 1;
   const int p_t = pos[t];
-  const int visible = kv.ratio ? (p_t + 1) / kv.ratio : 0;
-  const int ncomp = kv.ratio == 0 ? 0 : (kv.ncomp > 0 ? kv.ncomp : visible);
+  const bool dspark = kv.dspark_slots >= 0;  // DSpark stage: ring slots in order, then the draft block
+  const int visible = kv.ratio && !dspark ? (p_t + 1) / kv.ratio : 0;
+  const int ncomp = kv.ratio == 0 || dspark ? 0 : (kv.ncomp > 0 ? kv.ncomp : visible);
   const int W = kv.vis ? 512 : 128;  // window entries: positions [lo, hi] from lo up (image spans: 512)
   const int lo = kv.vis ? kv.vis[2 * t] : max(0, p_t - 127), hi = kv.vis ? kv.vis[2 * t + 1] : p_t;
-  const int total = W + ncomp;
+  const int total = dspark ? kv.dspark_slots + kv.dspark_chunk : W + ncomp;
 
   // Q fragments: head hg*16 + lane%16, dims dh*256 + ks*16 + (lane/16)*8 .. +7.
   bf16x8_t qf[16];
@@ -65,24 +66,37 @@ __device__ __forceinline__ void attn_query(const bf16* __restrict__ q, const int
     sL[tid] = 0.0f;
   }
 
-  for (int e0 = 0; e0 < total; e0 += KB) {
-    if (tid < KB) {
-      const int e = e0 + tid;
-      const bf16* r = nullptr;
-      if (e < W) {
-        const int wp = lo + e;
-        if (wp <= hi) r = wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;
-      } else if (e < total) {
-        const int ci = e - W;
-        const int row = kv.ncomp > 0 ? kv.comp_idx[size_t(t) * kv.ncomp + ci] : ci;
-        if (row >= 0 && row < visible) r = paged_row(kv.comp, row);
-      }
-      rows[tid] = r;
+  // Entry e's row (null: masked). Block b's rows are looked up (top-k index, block table) during block
+  // b - 1, by threads 32..47 (wave 1), so the dependent loads overlap the previous block's work.
+  const auto row_of = [&](int e) -> const bf16* {
+    if (dspark) {
+      if (e < kv.dspark_slots) return kv.ring + size_t(e) * D;
+      if (e < total) return kv.chunk_kv + size_t(e - kv.dspark_slots) * D;
+      return nullptr;
     }
-    __syncthreads();
-    // Stage 16 rows x 512 dims: thread -> key tid/16, 32 dims at (tid%16)*32.
+    if (e < W) {
+      const int wp = lo + e;
+      if (wp <= hi) return wp >= kv.s0 ? kv.chunk_kv + size_t(wp - kv.s0) * D : kv.ring + size_t(wp % 128) * D;
+      return nullptr;
+    }
+    if (e < total) {
+      const int ci = e - W;
+      const int row = kv.ncomp > 0 ? kv.comp_idx[size_t(t) * kv.ncomp + ci] : ci;
+      if (row >= 0 && row < visible) return paged_row(kv.comp, row);
+    }
+    return nullptr;
+  };
+  if (tid < KB) rowbuf[0][tid] = row_of(tid);
+  __syncthreads();
+  for (int e0 = 0, buf = 0; e0 < total; e0 += KB, buf ^= 1) {
+    const bf16* const* rows = rowbuf[buf];
+    const bool look = tid >= 32 && tid < 32 + KB && e0 + KB < total;  // stored at the end of the block
+    const bf16* next = look ? row_of(e0 + KB + tid - 32) : nullptr;
+    // Stage 16 rows x 512 dims: unit u -> key u%16, 32 dims at (u/16)*32. Lanes of a half-wave take the 16
+    // keys of one dim range, so the transposed 2-byte stores into sVt fall in different banks (with keys
+    // per lane and dims 32 apart, all 16 lanes hit one bank: a 16-way conflict on each of the 32 stores).
     {
-      const int key = tid >> 4, d0 = (tid & 15) * 32;
+      const int key = tid & 15, d0 = (tid >> 4) * 32;
       const bf16* r = rows[key];
       uint4 v[4];
 #pragma unroll
@@ -156,6 +170,7 @@ __device__ __forceinline__ void attn_query(const bf16* __restrict__ q, const int
         acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(pf, vf, acc[n]);
       }
     }
+    if (look) rowbuf[buf ^ 1][tid - 32] = next;
     __syncthreads();
   }
   // Normalise with the sink and store: element (head hg*16 + (lane/16)*8 + e, dim dh*256 + n*16 + lane%16).
