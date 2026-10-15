@@ -59,6 +59,24 @@ struct BatchDesc {
   const int32_t* vis = nullptr;
 };
 
+// The kernel paths whose arithmetic depends on how many rows a launch has -- the dense GEMVs up to 8 rows
+// (WMMA GEMMs above), the routed experts' GEMVs up to 8 tokens, the small HC pre-mix up to 32 tokens --
+// choose by class_rows(rows): the rows themselves, or, while a ClassRows is alive on this thread, the
+// count it names. A part of a step run with ClassRows(whole step's rows) takes every path the whole step
+// would, and since within a path a row's arithmetic does not depend on the other rows, it computes every
+// row exactly as the whole step does (two decode micro-batches across the cards, resident.hip).
+int class_rows(int rows);
+class ClassRows {
+ public:
+  explicit ClassRows(int rows);
+  ~ClassRows();
+  ClassRows(const ClassRows&) = delete;
+  ClassRows& operator=(const ClassRows&) = delete;
+
+ private:
+  int prev_;
+};
+
 // Scratch for computing one routed expert over up to `rows` tokens (any device).
 struct ExpertScratch {
   rt::DeviceBuffer qb, qs, h1, h3, hh, xf, y2;

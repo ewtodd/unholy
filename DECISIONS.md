@@ -1123,3 +1123,48 @@ the owner's): to confirm, run the fingerprint comparison at 300 W.
 Also tried this morning, not kept: the MXFP4 dequantization from one {pair, nonzero mask} table with a
 packed 16-bit add (exactly the same values over every (code byte, scale) pair, checked exhaustively) was
 8-20% slower on both chips than the two 4-byte table reads (the 8-byte entries conflict more in LDS).
+
+## 2026-10-15 — per-change attribution; two decode micro-batches, exactly, within a step (opt-in)
+
+`unholy-bench` at 4k context, batches 1 / 2 / 4 / 8 of 6-token verify steps (6-48 rows), with each of this
+morning's kernel changes switched off by its variable, every decode step's logits written (`--out`, 558 MB
+per run): all five runs bit-identical. Step medians (ms):
+
+| | B=1 | B=2 | B=4 | B=8 |
+|---|---|---|---|---|
+| all on (HEAD) | 63.4 | 116.3 | 174.6 | 331.0 |
+| UNHOLY_INDEXER_Q=0 | 63.5 | 116.3 | 174.7 | 331.5 |
+| UNHOLY_MX_GEMM_RB=0 | 63.6 | 121.9 | 184.4 | 348.0 |
+| UNHOLY_GEMM_SKINNY=0 UNHOLY_MX_SKINNY=0 | 63.8 | 143.6 | 203.0 | 358.1 |
+| all three off | 63.7 | 163.4 | 236.8 | 418.9 |
+
+So one stream's 6-row steps are untouched (the GEMV paths; single-stream decode's 34.0 vs 34.2 ms per token
+in the curves is run-to-run spread), the skinny GEMMs take ~27 ms off every multi-stream verify step and the
+APU kernel 6-17 ms; the indexer kernel only runs for prefill rows (curve: 1322 -> 1406 tok/s).
+
+Two decode micro-batches pipelined across the cards, the last item of the night's list, in the two forms
+it can take:
+- Across steps (`--decode-split 1`, 2026-10-14): each step takes half of the decoders and two steps are in
+  flight. It cannot keep the outputs: the halves are different steps from the original's, a row's kernel
+  path (GEMV up to 8 rows, the small HC path up to 32, the experts' GEMV up to 8 tokens) follows its step's
+  size, and the size of the step the original would have formed is not known when a half is submitted (it
+  needs the other half's next draft count, decided only when that half's step completes); the drafter's
+  batches change too. Measured on this build (unholy-engine-batch, its tokens differ so wall time compares):
+  c2 146.2 -> 137.9 s, c4 123.0 -> 120.8 s, c8 103.8 -> 107.5 s. Stays opt-in.
+- Within a step (new, `UNHOLY_MICROBATCH=1`): a step of decode / verify chunks of distinct sequences runs
+  as two halves of its chunks; card 0 hands the first half to card 1 (its own event, `handoff2` for the
+  second) before computing the second, so card 1 works on the first half meanwhile. `model::ClassRows`
+  (new) makes every size-dependent kernel choice in the forward use the whole step's rows while a half
+  runs, and since a row's arithmetic within a path does not depend on the other rows, the halves compute
+  every row exactly as the whole step: bench decode logits at B = 1-8 bit-identical with and without it, and
+  unholy-engine-batch at concurrency 4 with it 48 / 48 identical to the 2026-10-12 build (124.4 -> 130.8 s).
+  It is slower: 131.5 / 198.4 / 399.2 ms at B = 2 / 4 / 8 against 116.7 / 175.0 / 332.0. Decode here is bound by weight
+  reads, each half reads all the dense weights and most of the experts' again, and the fill and drain of a
+  two-stage pipeline inside one step outweigh the overlap. Kept as an option (off).
+
+With the other kernel work the default (whole steps, original composition) is now ahead of what the
+cross-step split gave on the old kernels at every concurrency (unholy-engine-batch: 38.0 / 45.6 / 51.7 tok/s
+at 2 / 4 / 8 vs 37.9 / 39.4 / 43.9). Verification of this commit: bench decode logits (B = 1-8, 6-token verify
+steps) bit-identical to the previous commit's, with and without the micro-batches; unholy-resident-test
+bit-identical (both geometries, batch checks, combine off); unholy-engine-batch 48 / 48 against the original
+at concurrency 2 and 4; unholy-sched-test all ok (180 configurations, 0 bad, 0 errors).

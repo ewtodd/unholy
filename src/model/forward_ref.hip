@@ -331,6 +331,13 @@ void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t
   k::exl3_grouped_gemm(xh2, I, dt, nt, w.exl3_ptrs(2, 0, E), w.exl3_ptrs(2, 2, E), w.exl3_bits[2], out, D, D, st);
 }
 
+namespace {
+thread_local int g_class_rows = 0;
+}
+int class_rows(int rows) { return g_class_rows > 0 ? g_class_rows : rows; }
+ClassRows::ClassRows(int rows) : prev_(g_class_rows) { g_class_rows = rows; }
+ClassRows::~ClassRows() { g_class_rows = prev_; }
+
 void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint8_t* q, const uint8_t* s,
                           const int32_t* p2u, const kernels::MoePlan* plan, const float* rw, const int32_t* row_expert,
                           const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev, int P,
@@ -345,7 +352,7 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
   bf16* g = sc.h1.as<bf16>();
   bf16* u = sc.h3.as<bf16>();
   k::mx_xform_in_q(q, s, p2u, plan, row_expert, tab(0, 1), xa, P, D, st);
-  const bool gemv = k::mx_use_gemv(P / c.n_active);
+  const bool gemv = k::mx_use_gemv(class_rows(P / c.n_active));
   const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
   const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
   lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
@@ -372,7 +379,7 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
     bf16* g = s.h1.as<bf16>();
     bf16* u = s.h3.as<bf16>();
     k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st, in_rows);
-    const bool gemv = k::mx_use_gemv(P / c.n_active);
+    const bool gemv = k::mx_use_gemv(class_rows(P / c.n_active));
     const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
     const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
     lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
@@ -435,7 +442,7 @@ bool on_gfx12() {
 }
 void dense_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                 int N, int K, hipStream_t st) {
-  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
+  if (fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) k::gemv_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
   else if (fast_dense() && on_gfx12()) k::gemm_w8a8_wmma(a, sa, w, sw, c, ldc, M, N, K, st);
   else k::gemm_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
 }
@@ -447,7 +454,7 @@ bool gemv_parts() {
 }
 void dense_w8a8_2(const uint8_t* a, const uint8_t* sa, const Fp8Linear& l1, bf16* c1, int ldc1, const Fp8Linear& l2,
                   bf16* c2, int ldc2, int M, int K, hipStream_t st) {
-  if (gemv_parts() && fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) {
+  if (gemv_parts() && fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) {
     const k::GemvPart parts[2] = {{l1.w.p<uint8_t>(), l1.s.p<uint8_t>(), c1, ldc1, l1.out},
                                   {l2.w.p<uint8_t>(), l2.s.p<uint8_t>(), c2, ldc2, l2.out}};
     k::gemv_w8a8_parts(a, sa, parts, 2, M, K, st);
@@ -460,14 +467,14 @@ void dense_w8a8_2(const uint8_t* a, const uint8_t* sa, const Fp8Linear& l1, bf16
 // the products; the reference kernel takes the fp32 copy.
 void dense_f32(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w, float* c, int ldc, int M, int N,
                int K, hipStream_t st) {
-  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_bf16_f32out(a_bf16, lda, w, c, ldc, M, N, K, st);
+  if (fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) k::gemv_bf16_f32out(a_bf16, lda, w, c, ldc, M, N, K, st);
   else if (fast_dense()) k::gemm_bf16_f32out_wmma(a_bf16, lda, w, c, ldc, M, N, K, st);
   else k::gemm_f32(a_f32, lda, w, c, ldc, M, N, K, st);
 }
 // Two fp32-output linears (bf16 weights [N, K]) on the same input: one GEMV launch when it applies.
 void dense_f32_2(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w1, float* c1, int ldc1, int N1,
                  const bf16* w2, float* c2, int ldc2, int N2, int M, int K, hipStream_t st) {
-  if (gemv_parts() && fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) {
+  if (gemv_parts() && fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) {
     const k::GemvPart parts[2] = {{w1, nullptr, c1, ldc1, N1}, {w2, nullptr, c2, ldc2, N2}};
     k::gemv_bf16_f32out_parts(a_bf16, lda, parts, 2, M, K, st);
     return;
@@ -476,13 +483,13 @@ void dense_f32_2(const bf16* a_bf16, const float* a_f32, int lda, const bf16* w1
   dense_f32(a_bf16, a_f32, lda, w2, c2, ldc2, M, N2, K, st);
 }
 void dense_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
-  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_bf16(a, lda, w, c, ldc, M, N, K, st);
+  if (fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) k::gemv_bf16(a, lda, w, c, ldc, M, N, K, st);
   else if (fast_dense()) k::gemm_bf16_wmma(a, lda, w, c, ldc, M, N, K, st);
   else k::gemm_bf16(a, lda, w, c, ldc, M, N, K, st);
 }
 void dense_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16* c, int M, int G, int R, int K,
                         hipStream_t st) {
-  if (fast_dense() && M <= k::gemv_max_rows() && K % 512 == 0) k::gemv_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
+  if (fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) k::gemv_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
   else if (fast_dense()) k::gemm_grouped_fp8w_wmma(a, w, sw, c, M, G, R, K, st);
   else k::gemm_grouped_fp8w(a, w, sw, c, M, G, R, K, st);
 }
@@ -561,7 +568,7 @@ void hc_pre(const bf16* x, const float* fn, const float* scale, const float* bas
     const char* v = std::getenv("UNHOLY_REF_HC");
     return !v || std::string(v) == "0";
   }();
-  if (fast && T <= k::kHcSmallMaxTokens)
+  if (fast && class_rows(T) <= k::kHcSmallMaxTokens)
     k::hc_pre_small(x, fn, scale, base, y, post, comb, part, T, hc, dim, iters, norm_eps, hc_eps, st);
   else if (fast) k::hc_pre_tiled(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
   else k::hc_pre(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
@@ -898,7 +905,7 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
   bf16* pair_in = B<bf16>(scr, kPairIn);
   bf16* pair_out = B<bf16>(scr, kPairOut);
   uint32_t* hist = scr.route_hist.as<uint32_t>() + size_t(w.layer) * E;
-  const int tile_rows = !w.exl3_experts && k::mx_use_gemv(T) ? k::kMxGemvTileRows : k::kExl3TileRows;
+  const int tile_rows = !w.exl3_experts && k::mx_use_gemv(class_rows(T)) ? k::kMxGemvTileRows : k::kExl3TileRows;
   const bool any_remote = w.n_resident < E;
   bool qin = false, combined = false;
   if (any_remote) {

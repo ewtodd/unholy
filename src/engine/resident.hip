@@ -179,6 +179,7 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
       dchan_ = std::make_unique<ApuExperts>(c, plan.apu, size_t(c.dspark_block) * geo.max_slots * c.n_active, layers, false);
   }
   if (const char* v = std::getenv("UNHOLY_INFLIGHT")) inflight_ = std::clamp(std::atoi(v), 1, 2);
+  if (const char* v = std::getenv("UNHOLY_MICROBATCH")) microbatch_ = std::string(v) == "1";
   if (std::getenv("UNHOLY_CANARY")) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&canary_), sizeof(*canary_), hipHostMallocPortable | hipHostMallocMapped));
     std::memset(canary_, 0, sizeof(*canary_));
@@ -356,6 +357,7 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     {
       rt::DeviceGuard g(card_[0].dev);
       UH_CHECK(hipEventCreateWithFlags(&f.handoff, hipEventDisableTiming));
+      UH_CHECK(hipEventCreateWithFlags(&f.handoff2, hipEventDisableTiming));
     }
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventCreateWithFlags(&f.consumed, hipEventDisableTiming));
@@ -556,7 +558,7 @@ ResidentModel::~ResidentModel() {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.ids_host),
                     static_cast<void*>(f.tables_host), static_cast<void*>(f.vis_host), static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
-    for (hipEvent_t e : {f.handoff, f.consumed, f.done})
+    for (hipEvent_t e : {f.handoff, f.handoff2, f.consumed, f.done})
       if (e) (void)hipEventDestroy(e);
   }
 }
@@ -688,10 +690,33 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     k::copy_kernel(cap_dev_.data(), cap, size_t(cap_max_) * 3 * 4, card_[1].st);
   }
   if (!in.backup.empty() && !dspark_) throw std::runtime_error("step: verify chunks without a drafter");
-  model::BatchDesc b;
-  for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0});
-  b.T = T;
-  b.max_pages_per_seq = geo_.max_pages_per_seq;
+  // Two decode micro-batches within a step (UNHOLY_MICROBATCH=1; off by default): a step of decode / verify
+  // chunks of distinct sequences runs as two halves of its chunks, and card 0 hands the first half to card 1
+  // before computing the second, so the cards work on different halves at once. Every kernel path is chosen
+  // by the whole step's rows (model::ClassRows) and a row's arithmetic within a path does not depend on the
+  // other rows, so each row is computed exactly as in the unsplit step (bench --out: bit-identical). Slower
+  // here, though: decode reads weights, each half reads all of them again (DECISIONS 2026-10-15).
+  struct Part {
+    int c0, c1, r0, r1, cap0, cap1;  // chunks, rows, DSpark capture entries
+  };
+  std::vector<Part> parts;
+  {
+    bool split = microbatch_ && in.chunks.size() >= 2 && in.image_rows.empty() && in.image_spans.empty();
+    for (size_t i = 0; split && i < in.chunks.size(); ++i) {
+      split = in.chunks[i].n <= c_.dspark_block + 1;
+      for (size_t j = 0; split && j < i; ++j) split = in.chunks[j].slot != in.chunks[i].slot;
+    }
+    const int nch = int(in.chunks.size());
+    if (split) {
+      const int ca = (nch + 1) / 2, ra = in.chunks[size_t(ca)].t0;
+      int capa = 0;
+      while (capa < ncap && cap_host_[ticket % 2][capa] < ra) ++capa;
+      parts.push_back({0, ca, 0, ra, 0, capa});
+      parts.push_back({ca, nch, ra, T, capa, ncap});
+    } else {
+      parts.push_back({0, nch, 0, T, 0, ncap});
+    }
+  }
   std::chrono::steady_clock::time_point t_enq[2];
   for (int k = 0; k < 2; ++k) {
     Card& cd = card_[k];
@@ -705,36 +730,49 @@ uint64_t ResidentModel::submit(const StepInput& in) {
         k::put_rows_hc(f.img_host + off, im.n, cd.x.as<uint16_t>(), im.t0, c_.dim, c_.hc_mult, cd.st);
         off += size_t(im.n) * c_.dim;
       }
-    } else {  // residual from card 0 through this flight's pinned buffer, ordered by events
-      UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));
-      k::copy_kernel(cd.x.data(), f.x_host, size_t(T) * row * 2, cd.st);
-      UH_CHECK(hipEventRecord(f.consumed, cd.st));
     }
-    b.ids = cd.ids.as<int32_t>();
-    b.pos = cd.pos.as<int32_t>();
-    b.block_tables = cd.tables.as<int32_t>();
-    b.vis = in.image_spans.empty() ? nullptr : cd.vis.as<int32_t>();
     state_copies(k, in.restore, false);
     if (!in.backup.empty()) ring_ops(k, cd.st, &in.backup, nullptr);
     const int nt = int(c_.dspark_target_layers.size());
     const auto* cap_rows = cap_dev_.as<int32_t>();
-    for (size_t i = 0; i < cd.layers.size(); ++i) {
-      model::layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, cd.x.as<uint16_t>(), b, cd.st,
-                           chan_[k].get());
-      for (int j = 0; dspark_ && ncap > 0 && j < nt; ++j)
-        if (cd.layers[i] == c_.dspark_target_layers[size_t(j)])
-          k::hc_mean_rows(cd.x.as<uint16_t>(), c_.hc_mult, c_.dim, cap_rows, ncap, mh_.as<uint16_t>() + size_t(j) * c_.dim,
-                          nt * c_.dim, cd.st);
+    for (size_t pi = 0; pi < parts.size(); ++pi) {
+      const Part& pt = parts[pi];
+      const size_t xoff = size_t(pt.r0) * row;
+      if (k == 1) {  // residual from card 0 through this flight's pinned buffer, ordered by events
+        UH_CHECK(hipStreamWaitEvent(cd.st, pi == 0 ? f.handoff : f.handoff2, 0));
+        k::copy_kernel(cd.x.as<uint16_t>() + xoff, f.x_host + xoff, size_t(pt.r1 - pt.r0) * row * 2, cd.st);
+        if (pi + 1 == parts.size()) UH_CHECK(hipEventRecord(f.consumed, cd.st));
+      }
+      model::BatchDesc b;
+      for (int c = pt.c0; c < pt.c1; ++c) {
+        const Chunk& ch = in.chunks[size_t(c)];
+        b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0 - pt.r0});
+      }
+      b.T = pt.r1 - pt.r0;
+      b.max_pages_per_seq = geo_.max_pages_per_seq;
+      b.ids = cd.ids.as<int32_t>() + pt.r0;
+      b.pos = cd.pos.as<int32_t>() + pt.r0;
+      b.block_tables = cd.tables.as<int32_t>();
+      b.vis = in.image_spans.empty() ? nullptr : cd.vis.as<int32_t>() + 2 * pt.r0;
+      const model::ClassRows whole_step(parts.size() > 1 ? T : 0);  // 0: no override
+      for (size_t i = 0; i < cd.layers.size(); ++i) {
+        model::layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, cd.x.as<uint16_t>() + xoff, b, cd.st,
+                             chan_[k].get());
+        for (int j = 0; dspark_ && pt.cap1 > pt.cap0 && j < nt; ++j)
+          if (cd.layers[i] == c_.dspark_target_layers[size_t(j)])
+            k::hc_mean_rows(cd.x.as<uint16_t>(), c_.hc_mult, c_.dim, cap_rows + pt.cap0, pt.cap1 - pt.cap0,
+                            mh_.as<uint16_t>() + size_t(pt.cap0) * nt * c_.dim + size_t(j) * c_.dim, nt * c_.dim, cd.st);
+      }
+      if (k == 0) {
+        // The flight's buffer may still be read by card 1 for the step two tickets back.
+        if (pi == 0) UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));
+        k::copy_kernel(f.x_host + xoff, cd.x.as<uint16_t>() + xoff, size_t(pt.r1 - pt.r0) * row * 2, cd.st);
+        UH_CHECK(hipEventRecord(pi == 0 ? f.handoff : f.handoff2, cd.st));
+      }
     }
     if (dspark_ && k == 1)
       model::dspark_main_kv(c_, dw_, dcache_, cd.scratch, cd.rope, mh_.as<uint16_t>(), cap_rows + cap_max_,
                             cap_rows + 2 * cap_max_, ncap, cd.st);
-    if (k == 0) {
-      // The flight's buffer may still be read by card 1 for the step two tickets back.
-      UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));
-      k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);
-      UH_CHECK(hipEventRecord(f.handoff, cd.st));
-    }
     state_copies(k, in.save, true);
     if (timing) t_enq[k] = std::chrono::steady_clock::now();
   }

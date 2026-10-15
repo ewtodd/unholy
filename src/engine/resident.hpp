@@ -134,7 +134,8 @@ class ResidentModel final : public StepModel {
     int32_t* tables_host = nullptr;
     int32_t* vis_host = nullptr;    // [max_tokens][2]
     uint16_t* img_host = nullptr;   // image rows of the step [max_tokens][dim]
-    hipEvent_t handoff = nullptr;   // card 0: x_host written
+    hipEvent_t handoff = nullptr;   // card 0: x_host written (the first micro-batch's rows)
+    hipEvent_t handoff2 = nullptr;  // card 0: the second micro-batch's rows written
     hipEvent_t consumed = nullptr;  // card 1: x_host read
     hipEvent_t done = nullptr;      // card 1: logits_host written
     uint64_t ticket = 0;
@@ -187,6 +188,7 @@ class ResidentModel final : public StepModel {
   std::vector<const void*> layer_ptrs(int k) const;
   uint64_t next_ticket_ = 1;
   int inflight_ = 2;
+  bool microbatch_ = false;  // two decode micro-batches within a step (UNHOLY_MICROBATCH=1)
   std::vector<int32_t> tables_;
   bool tables_dirty_ = false;
 };
