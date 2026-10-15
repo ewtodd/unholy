@@ -8,6 +8,9 @@
 // --out writes this run's logits (fp32 [steps, vocab]) for a later --ref: e.g. the same placement with
 // UNHOLY_REMOTE_Q=0 (bf16 pair rows to the APU) as the reference for the compact fp8 transport.
 //
+// --card-margin-bytes N: the planner's card margin (default 2 GiB). Lowering it by exactly what a change
+// adds to the scratch keeps the expert placement, so logits stay comparable bit for bit with --ref.
+//
 // --batch N adds a batch-invariance check: N sequences (prompts of P - 61 s tokens) decode the oracle's
 // continuation alone, then in fresh slots all together (one token each per step), then up to four of
 // them as verify chunks of 4 tokens with every row's logits (<= 16 rows: the GEMV regime,
@@ -64,6 +67,7 @@ double kl_row(const float* a, const float* b, int V) {
 int main(int argc, char** argv) {
   std::string ckpt = "/scratch/dsv4-ve", oracle, exl3_dir, profile, ref_path, out_path;
   int batch = 0;
+  long long card_margin = -1;  // bytes; -1: the planner's default
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() { return std::string(argv[++i]); };
@@ -74,6 +78,7 @@ int main(int argc, char** argv) {
     else if (a == "--ref") ref_path = next();
     else if (a == "--out") out_path = next();
     else if (a == "--batch") batch = std::stoi(next());
+    else if (a == "--card-margin-bytes") card_margin = std::stoll(next());
     else {
       std::fprintf(stderr, "usage: %s --oracle DIR --profile FILE [--exl3 DIR] [--ref logits.bin] [--out FILE] [--batch N]\n", argv[0]);
       return 2;
@@ -100,6 +105,7 @@ int main(int argc, char** argv) {
     pin.geo = geo;
     pin.max_tokens = max_tokens;
     pin.max_seq = max_seq;
+    if (card_margin >= 0) pin.card_margin = size_t(card_margin);
     const auto plan = engine::make_plan(pin);
     std::printf("%s", plan.summary().c_str());
     std::fflush(stdout);

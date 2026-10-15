@@ -842,3 +842,14 @@ A token ran ~63 kernels per layer on a card, ~4.5 us apart. Removed, bit-identic
   kernels' arithmetic: bit-identical, 35.7 -> 35.6 ms at batch 1. The launches left at decode are mostly
   the MoE dispatch chain and the HC split-K pair, where a fused kernel would serialize work that now runs
   across workgroups.
+
+## 2026-10-15 — tried: two-batch overlap within a prefill step (not adopted)
+
+Splitting a >= 512-row step into two halves and interleaving them per layer (one half's attention on the
+card while the other's remote experts run on the APU; MoE half split into begin / end with its own HC
+buffers) was bit-identical to the whole-batch step, but slower: 16k prefill 1885 -> 1744 tok/s, the
+1024-token prefill 1.37 -> 1.54 s. Each half carries half of every expert's rows, so every expert's weights
+are dequantized twice per layer (on the cards and on the APU, whose grouped GEMM pays per tile, not per
+row): the APU's work grows more than the overlap hides. At long context the cards seldom wait for the APU
+(attention and the indexer dominate). Reverted; `unholy-resident-test --card-margin-bytes` (to keep the
+expert placement when a change adds scratch) stays.
