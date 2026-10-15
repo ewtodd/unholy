@@ -53,10 +53,15 @@ Measured on that machine, behind the PCIe switch (October 2026):
 <!---->
 | | |
 |---|---|
-| prefill, one sequence, 4096-token chunks | 2283 tok/s at 32k depth, 1796 at 128k, 1472 at 256k, 1013 at 491k; **1246 tok/s averaged over 0-512k** |
-| decode, one sequence, no speculation | 29.1 tok/s at 4k depth (34.4 ms/token), 21.1 tok/s at 512k |
-| decode with DSpark (5 drafts) | ~48 tok/s per stream on chat traffic (GSM8K, median); 70-90% of drafts accepted |
-| GSM8K chat sweep, production settings | 29.9 / 55.4 / 68.6 / 82.5 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
+| prefill, one sequence, 4096-token chunks | 2259 tok/s at 32k depth, 1784 at 128k, 1462 at 256k, 1003 at 491k; **1240 tok/s averaged over 0-512k** |
+| decode, one sequence, no speculation | 29.2 tok/s at 4k depth (34.2 ms/token), 22.3 tok/s at 512k |
+| decode with DSpark (5 drafts) | ~46 tok/s per stream on chat traffic (GSM8K, median); 70-90% of drafts accepted |
+| GSM8K chat sweep, production settings | 29.4 / 54.0 / 56.0 / 61.4 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests |
+<!---->
+These are the defaults, whose outputs are those of the 2026-10-12 build for the same batches. Three options trade
+that for speed (outputs move at the noise level, like any change of expert placement): `--reclaim-scratch 1`
+(more hot experts), `UNHOLY_GEMV_ROWS=16` and `UNHOLY_MX_GEMV_TOKENS=64` (verify steps of several streams on
+the GEMVs) and `UNHOLY_DSPARK_WMMA_ATTN=1`; with them the GSM8K sweep gives 29.9 / 55.4 / 68.6 / 82.5 tok/s.
 <!---->
 Production settings: a 1.5M-token KV pool shared by up to 8 requests of up to 512k tokens each,
 DSpark with 5 drafts, 64 prefix-cache snapshots, the vision tower loaded. Depth curves are in

@@ -948,3 +948,10 @@ outputs (1, 6 and 48 queries, window / CSA / HCA, 4k-512k) identical to the fuse
 enough). Used for launches of <= 16 queries with >= 256 entries (`UNHOLY_ATTN_SPLIT=0`: off), scores in the
 indexer's score buffer (read by the top-k before). Resident checks bit-identical; 40k-context decode logits
 (bench --out) with and without it identical. Decode 33.9 -> 33.6 ms at batch 1 and 4k.
+
+Measured with the defaults (outputs as 2026-10-12): `unholy-curve` 1 x 512k on the same plan as that day's
+curve (1706 / 1696 hot experts; docs/bench/curve-native-1x512k-plx-2026-10-15.txt): decode 34.2 / 36.6 / 38.1
+/ 41.2 / 44.8 ms at 4k / 32k / 128k / 256k / 512k (56.7 ... 87.6 before), prefill 2259 / 1784 / 1462 / 1003 tok/s
+at 32k / 128k / 256k / 491k, 1240 average (1062). GSM8K production sweep: 29.4 / 54.0 / 56.0 / 61.4 tok/s at
+concurrency 1 / 2 / 4 / 8 (22.2 / 36.5 / 45.5 / 56.3); flexible 47 / 46 / 47 / 47 of 48. With the opt-ins
+(reclaimed scratch, 16-row GEMVs, 64-token MoE GEMVs, WMMA drafter attention) 29.9 / 55.4 / 68.6 / 82.5.
