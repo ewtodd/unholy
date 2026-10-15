@@ -1,5 +1,7 @@
 #include "kernels/dev.hip.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 #include "kernels/indexer.hpp"
 #include "rt/hip.hpp"
@@ -691,8 +693,12 @@ void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, h
     maxn = std::max(maxn, b.g[i].n);
   }
   if (rows == 0) return;
-  // A few long rows (decode): several workgroups per row; otherwise one per row.
-  if (scratch && maxn >= kTopkSplitMinKeys && maxn <= TK_SLICE * TK_MAXS && rows <= kTopkSplitMaxRows &&
+  // A few long rows (decode): several workgroups per row; otherwise one per row (UNHOLY_TOPK_SPLIT=0: always).
+  static const bool split = [] {
+    const char* v = std::getenv("UNHOLY_TOPK_SPLIT");
+    return !v || std::string(v) != "0";
+  }();
+  if (split && scratch && maxn >= kTopkSplitMinKeys && maxn <= TK_SLICE * TK_MAXS && rows <= kTopkSplitMaxRows &&
       topk_split_scratch_words(rows) <= scratch_words) {
     const dim3 grid(rows, tk_slices(maxn));
     tk_hi_kernel<<<grid, 256, 0, st>>>(scores, b, idx, scratch);

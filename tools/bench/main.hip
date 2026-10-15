@@ -5,7 +5,7 @@
 // time / aggregate rate. Token ids are drawn from --ids (a raw int32 file) or are random.
 //
 //   unholy-bench --model DIR [--exl3 DIR] --profile FILE [--batch 1,2,4,8] [--ctx 1024] [--chunk 1024]
-//                [--steps 16] [--ids FILE] [--verify N]
+//                [--steps 16] [--ids FILE] [--verify N] [--hist FILE] [--out FILE]
 //
 // --verify N: every decode step gives each sequence N tokens with N logit rows (a speculative-decoding
 // verification step of N - 1 drafts), so the step time is what verifying N - 1 drafts costs.
@@ -30,7 +30,7 @@
 using namespace unholy;
 
 int main(int argc, char** argv) {
-  std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path, hist_path;
+  std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path, hist_path, out_path;
   std::vector<int> batches = {1, 2, 4, 8};
   int ctx = 1024, chunk = 1024, steps = 16, verify = 1;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     else if (a == "--profile") profile = v;
     else if (a == "--ids") ids_path = v;
     else if (a == "--hist") hist_path = v;  // routing histogram of the prefills -> FILE (profile format)
+    else if (a == "--out") out_path = v;    // every decode step's logits (fp32, in order) -> FILE
     else if (a == "--ctx") ctx = std::stoi(v);
     else if (a == "--chunk") chunk = std::stoi(v);
     else if (a == "--steps") steps = std::stoi(v);
@@ -144,6 +145,10 @@ int main(int argc, char** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         m.step(in, logits);
         ts.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (!out_path.empty()) {
+          std::ofstream f(out_path, std::ios::binary | std::ios::app);
+          f.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * 4));
+        }
       }
       std::sort(ts.begin(), ts.end());
       double mean = 0;

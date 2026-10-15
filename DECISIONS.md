@@ -913,3 +913,6 @@ experts): every token, logprob and top logprob bit-identical (2 / 2 and 40 / 40)
 the outputs move as any placement change moves them (the original build with --card-margin-gb 1.1 shows
 the same kind of spread). The EXL3 experts' path: bit-identical to the original at its placement too
 (unholy-resident-test --exl3 with the margin lowered by the 8,257,536 bytes the planner now counts more).
+The several-workgroup top-k end to end: `unholy-bench --out` (decode logits) at 40k context, 2 sequences,
+3-token verify steps (rows of 10k keys: the split path), with and without it (`UNHOLY_TOPK_SPLIT=0`): all
+18.6 MB of logits bit-identical.
