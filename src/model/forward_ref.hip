@@ -667,7 +667,11 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
     k::TopkBatch tb;
     size_t used = 0;
     const auto flush = [&]() {
-      if (tb.ngroups) k::topk_bf16_batch(B<uint16_t>(scr, kISc), tb, idx, st);
+      // The score buffer past the pending rows is the top-k's scratch (several workgroups per row for a
+      // few long rows: decode at long context).
+      if (tb.ngroups)
+        k::topk_bf16_batch(B<uint16_t>(scr, kISc), tb, idx, st, reinterpret_cast<uint32_t*>(B<uint8_t>(scr, kISc) + used),
+                           (cap - used) / 4);
       tb.ngroups = 0;
       used = 0;
     };

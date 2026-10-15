@@ -56,6 +56,11 @@ struct TopkBatch {
   int ngroups = 0;
   TopkRows g[kMax];
 };
-void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, hipStream_t st);
+// With scratch (topk_split_scratch_words(rows) uint32), up to kTopkSplitMaxRows rows of which the longest
+// has >= kTopkSplitMinKeys keys run on several workgroups per row (decode at long context): same output.
+constexpr int kTopkSplitMinKeys = 8192, kTopkSplitMaxRows = 64;
+size_t topk_split_scratch_words(int rows);
+void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, hipStream_t st,
+                     uint32_t* scratch = nullptr, size_t scratch_words = 0);
 
 }  // namespace unholy::kernels

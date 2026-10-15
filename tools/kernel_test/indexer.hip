@@ -107,8 +107,26 @@ int main(int argc, char** argv) {
                         sfast.as<uint16_t>(), T, H, nkeys, 4, nullptr);
   UH_CHECK(hipDeviceSynchronize());
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  k::topk_bf16(sfast.as<uint16_t>(), T, nkeys, topk, ifast.as<int32_t>(), nullptr);
+  // Top-k as the model runs it: one group of T rows, with scratch (several workgroups per row for a few
+  // long rows, k::kTopkSplitMinKeys).
+  k::TopkBatch tb;
+  tb.ngroups = 1;
+  tb.g[0] = {0, T, nkeys, topk, 0};
+  const size_t tk_words = k::topk_split_scratch_words(std::min(T, k::kTopkSplitMaxRows));
+  rt::DeviceBuffer tk_scr(dev, tk_words * 4);
+  const auto run_topk = [&]() {
+    k::topk_bf16_batch(sfast.as<uint16_t>(), tb, ifast.as<int32_t>(), nullptr, tk_scr.as<uint32_t>(), tk_words);
+  };
+  run_topk();
   UH_CHECK(hipDeviceSynchronize());
+  double topk_us = 0;
+  {
+    const int reps = 20;
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) run_topk();
+    UH_CHECK(hipDeviceSynchronize());
+    topk_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() / reps;
+  }
 
   std::vector<float> a(size_t(T) * nkeys);
   std::vector<uint16_t> b(size_t(T) * nkeys);
@@ -130,7 +148,7 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < ia.size(); ++i) idiff += ia[i] != ib[i];
   const double gop = 2.0 * T * H * D * double(nkeys) / 1e9;
   std::printf("T=%d keys=%d: scores %zu / %zu differ (max rel %.3g; %zu finite), top-%d indices %zu / %zu differ; "
-              "fast scores %.3f ms (%.1f TOPS)\n",
-              T, nkeys, sdiff, a.size(), maxrel, finite, topk, idiff, ia.size(), ms, gop / ms);
+              "fast scores %.3f ms (%.1f TOPS), top-k %.1f us\n",
+              T, nkeys, sdiff, a.size(), maxrel, finite, topk, idiff, ia.size(), ms, gop / ms, topk_us);
   return sdiff || idiff ? 1 : 0;
 }

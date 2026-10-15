@@ -1,4 +1,6 @@
 #include "kernels/dev.hip.hpp"
+#include <algorithm>
+
 #include "kernels/indexer.hpp"
 #include "rt/hip.hpp"
 
@@ -326,6 +328,252 @@ __global__ __launch_bounds__(256) void topk_bf16_batch_kernel(const uint16_t* sc
   topk_row(scores + r.off + size_t(i) * r.n, r.n, r.k, idx + r.idx_off + size_t(i) * r.k);
 }
 
+// ---- Top-k for a few long rows (decode): several workgroups per row --------------------------------
+// Exactly topk_row's selection (the same threshold, the lowest-index ties, the same order), in five
+// launches of (row, slice) workgroups over TK_SLICE-key slices: high-byte histograms per slice; their
+// sum -> the high byte of the threshold, then low-byte histograms of that bin; the threshold and the
+// slice's counts above / at it; the candidates (ties ranked by index through the slices' prefix); the
+// sort of each row's candidates. Per-row scratch (uint32): hi [TK_MAXS][256], lo [TK_MAXS][256], valid,
+// above and tie counts [TK_MAXS] each, state [8], candidate keys and indices [1024] each.
+constexpr int TK_SLICE = 2048, TK_MAXS = 128, TK_ROW_WORDS = 2 * TK_MAXS * 256 + 3 * TK_MAXS + 8 + 2 * 1024;
+
+struct TkRow {
+  const uint16_t* row;
+  int n, k;
+  int32_t* out;
+  uint32_t *hi, *lo, *valid, *above, *ties, *state, *ckey;
+  int32_t* cidx;
+};
+__device__ __forceinline__ TkRow tk_row(const uint16_t* scores, const TopkBatch& b, int32_t* idx, uint32_t* scr) {
+  int g = 0, first = 0;
+  while (g + 1 < b.ngroups && int(blockIdx.x) >= first + b.g[g].rows) first += b.g[g++].rows;
+  const TopkRows& r = b.g[g];
+  const int i = int(blockIdx.x) - first;
+  TkRow t;
+  t.row = scores + r.off + size_t(i) * r.n;
+  t.n = r.n;
+  t.k = r.k;
+  t.out = idx + r.idx_off + size_t(i) * r.k;
+  uint32_t* p = scr + size_t(blockIdx.x) * TK_ROW_WORDS;
+  t.hi = p;
+  t.lo = p + TK_MAXS * 256;
+  t.valid = t.lo + TK_MAXS * 256;
+  t.above = t.valid + TK_MAXS;
+  t.ties = t.above + TK_MAXS;
+  t.state = t.ties + TK_MAXS;  // want, b1, need1, thr, need
+  t.ckey = t.state + 8;
+  t.cidx = reinterpret_cast<int32_t*>(t.ckey + 1024);
+  return t;
+}
+__host__ __device__ __forceinline__ int tk_slices(int n) { return (n + TK_SLICE - 1) / TK_SLICE; }
+
+// Sum of the slices' histograms into h[256] (LDS), then topk_row's bin search: the highest bin b >= 1
+// whose suffix sum reaches `need`, else 0; returns b and sets *above to the count in bins above it.
+__device__ int tk_select_bin(const uint32_t* hists, int ns, uint32_t need, uint32_t* h, uint32_t* above) {
+  __shared__ uint32_t suf[257];
+  __shared__ int sel;
+  const int b = threadIdx.x;
+  uint32_t v = 0;
+  for (int s = 0; s < ns; ++s) v += hists[size_t(s) * 256 + b];
+  h[b] = v;
+  suf[b] = v;
+  if (b == 0) {
+    suf[256] = 0;
+    sel = 0;
+  }
+  __syncthreads();
+  for (int d = 1; d < 256; d <<= 1) {  // inclusive suffix sums
+    const uint32_t add = b + d < 256 ? suf[b + d] : 0;
+    __syncthreads();
+    suf[b] += add;
+    __syncthreads();
+  }
+  if (b >= 1 && suf[b] >= need && suf[b + 1] < need) sel = b;
+  __syncthreads();
+  *above = suf[sel + 1];
+  return sel;
+}
+
+__global__ __launch_bounds__(256) void tk_hi_kernel(const uint16_t* scores, TopkBatch bt, int32_t* idx, uint32_t* scr) {
+  const TkRow r = tk_row(scores, bt, idx, scr);
+  const int s = blockIdx.y;
+  if (s >= tk_slices(r.n)) return;
+  __shared__ uint32_t hist[256], nv;
+  hist[threadIdx.x] = 0;
+  if (threadIdx.x == 0) nv = 0;
+  __syncthreads();
+  const uint32_t neg = key16(kBf16NegInf);
+  uint32_t c = 0;
+  for (int i = s * TK_SLICE + threadIdx.x; i < min(r.n, (s + 1) * TK_SLICE); i += 256) {
+    const uint32_t key = key16(r.row[i]);
+    if (key > neg) {
+      atomicAdd(&hist[key >> 8], 1u);
+      ++c;
+    }
+  }
+  atomicAdd(&nv, c);
+  __syncthreads();
+  r.hi[size_t(s) * 256 + threadIdx.x] = hist[threadIdx.x];
+  if (threadIdx.x == 0) r.valid[s] = nv;
+}
+
+__global__ __launch_bounds__(256) void tk_lo_kernel(const uint16_t* scores, TopkBatch bt, int32_t* idx, uint32_t* scr) {
+  const TkRow r = tk_row(scores, bt, idx, scr);
+  const int s = blockIdx.y, ns = tk_slices(r.n);
+  if (s >= ns) return;
+  __shared__ uint32_t h[256], hist[256], nvalid;
+  if (threadIdx.x == 0) nvalid = 0;
+  __syncthreads();
+  if (threadIdx.x < ns) atomicAdd(&nvalid, r.valid[threadIdx.x]);
+  __syncthreads();
+  const uint32_t want = min(uint32_t(r.k), nvalid);
+  uint32_t above = 0;
+  const int b1 = tk_select_bin(r.hi, ns, want, h, &above);
+  if (s == 0 && threadIdx.x == 0) {
+    r.state[0] = want;
+    r.state[1] = uint32_t(b1);
+    r.state[2] = want - above;
+  }
+  hist[threadIdx.x] = 0;
+  __syncthreads();
+  const uint32_t neg = key16(kBf16NegInf);
+  if (want > 0)
+    for (int i = s * TK_SLICE + threadIdx.x; i < min(r.n, (s + 1) * TK_SLICE); i += 256) {
+      const uint32_t key = key16(r.row[i]);
+      if (key > neg && int(key >> 8) == b1) atomicAdd(&hist[key & 0xff], 1u);
+    }
+  __syncthreads();
+  r.lo[size_t(s) * 256 + threadIdx.x] = hist[threadIdx.x];
+}
+
+__global__ __launch_bounds__(256) void tk_count_kernel(const uint16_t* scores, TopkBatch bt, int32_t* idx,
+                                                      uint32_t* scr) {
+  const TkRow r = tk_row(scores, bt, idx, scr);
+  const int s = blockIdx.y, ns = tk_slices(r.n);
+  if (s >= ns) return;
+  __shared__ uint32_t h[256], na, nt;
+  const uint32_t want = r.state[0], b1 = r.state[1], need1 = r.state[2];
+  uint32_t above = 0;
+  const int b0 = tk_select_bin(r.lo, ns, need1, h, &above);
+  const uint32_t thr = (b1 << 8) | uint32_t(b0), need = need1 - above;
+  if (s == 0 && threadIdx.x == 0) {
+    r.state[3] = thr;
+    r.state[4] = need;
+  }
+  if (threadIdx.x == 0) na = nt = 0;
+  __syncthreads();
+  const uint32_t neg = key16(kBf16NegInf);
+  uint32_t a = 0, t = 0;
+  if (want > 0)
+    for (int i = s * TK_SLICE + threadIdx.x; i < min(r.n, (s + 1) * TK_SLICE); i += 256) {
+      const uint32_t key = key16(r.row[i]);
+      a += key > thr && key > neg;
+      t += key == thr;
+    }
+  atomicAdd(&na, a);
+  atomicAdd(&nt, t);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    r.above[s] = na;
+    r.ties[s] = nt;
+  }
+}
+
+__global__ __launch_bounds__(256) void tk_emit_kernel(const uint16_t* scores, TopkBatch bt, int32_t* idx, uint32_t* scr) {
+  const TkRow r = tk_row(scores, bt, idx, scr);
+  const int s = blockIdx.y, ns = tk_slices(r.n);
+  if (s >= ns) return;
+  const uint32_t want = r.state[0], thr = r.state[3], need = r.state[4];
+  if (want == 0) return;
+  __shared__ uint32_t pa, pt, cnt, wties[8], wpre[8];
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  if (threadIdx.x == 0) {
+    uint32_t x = 0, y = 0;
+    for (int j = 0; j < s; ++j) {
+      x += r.above[j];
+      y += r.ties[j];
+    }
+    pa = x;
+    pt = y;
+    cnt = 0;
+  }
+  __syncthreads();
+  const uint32_t neg = key16(kBf16NegInf);
+  const int i0 = s * TK_SLICE, i1 = min(r.n, (s + 1) * TK_SLICE);
+  for (int i = i0 + threadIdx.x; i < i1; i += 256) {
+    const uint32_t key = key16(r.row[i]);
+    if (key > thr && key > neg) {
+      const uint32_t p = pa + atomicAdd(&cnt, 1u);
+      r.ckey[p] = key;
+      r.cidx[p] = i;
+    }
+  }
+  if (pt >= need) return;
+  // Ties in index order: wave w takes keys [i0 + w * 256, i0 + (w + 1) * 256) in 32-key steps.
+  const int w0 = i0 + wave * 256, w1 = min(i1, w0 + 256);
+  uint32_t c = 0;
+  for (int b = w0; b < w1; b += 32) c += __popcll(__ballot(b + lane < w1 && key16(r.row[b + lane]) == thr));
+  if (lane == 0) wties[wave] = c;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    uint32_t x = 0;
+    for (int w = 0; w < 8; ++w) {
+      wpre[w] = x;
+      x += wties[w];
+    }
+  }
+  __syncthreads();
+  const uint32_t base = want - need;  // the candidates above the threshold come first
+  uint32_t rank = pt + wpre[wave];
+  for (int b = w0; b < w1 && rank < need; b += 32) {
+    const int i = b + lane;
+    const bool tie = i < w1 && key16(r.row[i]) == thr;
+    const uint64_t m = __ballot(tie);
+    const uint32_t mine = rank + __popcll(m & ((1ull << lane) - 1));
+    if (tie && mine < need) {
+      r.ckey[base + mine] = thr;
+      r.cidx[base + mine] = i;
+    }
+    rank += __popcll(m);
+  }
+}
+
+__global__ __launch_bounds__(256) void tk_sort_kernel(const uint16_t* scores, TopkBatch bt, int32_t* idx, uint32_t* scr) {
+  const TkRow r = tk_row(scores, bt, idx, scr);
+  __shared__ uint32_t sel_keys[1024];
+  __shared__ int32_t sel_idx[1024];
+  const uint32_t want = r.state[0];
+  const int k = r.k;
+  int size = 1;
+  while (size < k) size <<= 1;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    const bool in = uint32_t(i) < want;
+    sel_keys[i] = in ? r.ckey[i] : 0;
+    sel_idx[i] = in ? r.cidx[i] : 0x7fffffff;
+  }
+  __syncthreads();
+  for (int len = 2; len <= size; len <<= 1)
+    for (int stride = len >> 1; stride > 0; stride >>= 1) {
+      for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        const int j = i ^ stride;
+        if (j > i) {
+          const bool desc = (i & len) == 0;
+          const bool i_first = sel_keys[i] > sel_keys[j] || (sel_keys[i] == sel_keys[j] && sel_idx[i] < sel_idx[j]);
+          if (desc ? !i_first : i_first) {
+            const uint32_t tk = sel_keys[i];
+            sel_keys[i] = sel_keys[j];
+            sel_keys[j] = tk;
+            const int32_t ti = sel_idx[i];
+            sel_idx[i] = sel_idx[j];
+            sel_idx[j] = ti;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  for (int i = threadIdx.x; i < k; i += blockDim.x) r.out[i] = uint32_t(i) < want ? sel_idx[i] : -1;
+}
+
 }  // namespace
 
 void store_rows_fp4(const bf16* rows, int n, PagedFp4 dst, int row0, hipStream_t st) {
@@ -356,14 +604,30 @@ void indexer_scores_fp4(const uint8_t* q8, const uint8_t* qe, const bf16* w, Pag
   UH_CHECK_LAUNCH();
 }
 
-void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, hipStream_t st) {
+size_t topk_split_scratch_words(int rows) { return size_t(rows) * TK_ROW_WORDS; }
+
+void topk_bf16_batch(const uint16_t* scores, const TopkBatch& b, int32_t* idx, hipStream_t st, uint32_t* scratch,
+                     size_t scratch_words) {
   if (b.ngroups <= 0 || b.ngroups > TopkBatch::kMax) throw std::runtime_error("topk_bf16_batch: group count");
-  int rows = 0;
+  int rows = 0, maxn = 0;
   for (int i = 0; i < b.ngroups; ++i) {
     if (b.g[i].k > 1024) throw std::runtime_error("topk_bf16_batch: k > 1024");
     rows += b.g[i].rows;
+    maxn = std::max(maxn, b.g[i].n);
   }
   if (rows == 0) return;
+  // A few long rows (decode): several workgroups per row; otherwise one per row.
+  if (scratch && maxn >= kTopkSplitMinKeys && maxn <= TK_SLICE * TK_MAXS && rows <= kTopkSplitMaxRows &&
+      topk_split_scratch_words(rows) <= scratch_words) {
+    const dim3 grid(rows, tk_slices(maxn));
+    tk_hi_kernel<<<grid, 256, 0, st>>>(scores, b, idx, scratch);
+    tk_lo_kernel<<<grid, 256, 0, st>>>(scores, b, idx, scratch);
+    tk_count_kernel<<<grid, 256, 0, st>>>(scores, b, idx, scratch);
+    tk_emit_kernel<<<grid, 256, 0, st>>>(scores, b, idx, scratch);
+    tk_sort_kernel<<<rows, 256, 0, st>>>(scores, b, idx, scratch);
+    UH_CHECK_LAUNCH();
+    return;
+  }
   topk_bf16_batch_kernel<<<rows, 256, 0, st>>>(scores, b, idx);
   UH_CHECK_LAUNCH();
 }

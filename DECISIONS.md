@@ -804,3 +804,18 @@ drafts identical to the reference, logits rel L2 1-4% as before.
 
 Logits bit-identical (both geometries, batch checks). Decode at batch 1 / 8: 38.1 / 89.2 -> 36.4 / 87.3 ms;
 4k prefill 1303 -> 1371 tok/s (one sequence), 1948 -> 2046 (eight).
+
+## 2026-10-14 — top-k for a few long rows on several workgroups
+
+At decode the indexer's top-512 ran one workgroup per row: four serial passes over the row with 256
+threads, then the threshold ties collected by one wave walking the row in order. `unholy-indexer-test`
+(now timing it, as the model calls it): 224 us at 32k keys (128k context), 727 at 131k (512k), 1538 at
+262k (1M) per row: at 512k, ~15 ms of each token across the 21 CSA layers. `topk_bf16_batch` now takes
+scratch and, for up to 64 rows of which the longest has >= 8192 keys, runs five launches of (row,
+2048-key slice) workgroups: per-slice high-byte histograms; their sum -> the threshold's high byte and
+per-slice low-byte histograms of that bin; the threshold and per-slice counts above / at it; the
+candidates, ties ranked by index through the slices' prefix; a sort per row. Same selection, ties and
+order as the one-workgroup kernel (indexer test: 0 differing indices at 8k-262k keys, T = 1 / 2 / 3 / 6 /
+37). 32k / 131k / 262k keys: 224 / 727 / 1538 -> 57 / 72 / 94 us. The scratch is the score buffer past the
+pending rows (a buffer of its own moved experts in the plan: with the APU's bf16 combine, and even
+without it, a different placement changes the logits).
