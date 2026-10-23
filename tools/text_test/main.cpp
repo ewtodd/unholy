@@ -6,14 +6,18 @@
 //   unholy-text-test chat <cases.json>                          array of encode cases -> array of prompts
 //   unholy-text-test request <requests.json>                    array of OpenAI requests -> array of prompts
 //   unholy-text-test parse <cases.json>                         array of {text, thinking, chunk} -> parsed
+//   unholy-text-test glm-request <requests.json>                GLM-5.3-Flash: OpenAI requests -> prompts
+//   unholy-text-test glm-parse <cases.json>                     GLM-5.3-Flash: {text, chunk, tools} -> parsed
 //   unholy-text-test bench <tokenizer.json> <file>              tokenization throughput on a text file
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 
 #include "text/chat.hpp"
+#include "text/glm_chat.hpp"
 #include "text/json.hpp"
 #include "text/tokenizer.hpp"
 
@@ -105,16 +109,18 @@ int main(int argc, char** argv) {
           out.push_back(error_value(e));
         }
       }
-    } else if (cmd == "parse" && argc == 3) {
+    } else if ((cmd == "parse" || cmd == "glm-parse") && argc == 3) {
       const Value in = json::parse(slurp(argv[2]));
       for (const Value& c : in.items()) {
         const std::string& t = c.at("text").str();
         const auto chunk = size_t(std::max<long long>(1, c.contains("chunk") ? c.at("chunk").as_int() : 1 << 30));
         const Value* tools = c.find("tools");
-        text::OutputParser p(c.at("thinking").truthy(), tools);
+        std::unique_ptr<text::ChatParser> p;
+        if (cmd == "parse") p = std::make_unique<text::OutputParser>(c.at("thinking").truthy(), tools);
+        else p = std::make_unique<text::Glm5OutputParser>(tools);
         text::ParsedDelta d;
-        for (size_t i = 0; i < t.size(); i += chunk) p.feed(std::string_view(t).substr(i, chunk), d);
-        p.finish(d);
+        for (size_t i = 0; i < t.size(); i += chunk) p->feed(std::string_view(t).substr(i, chunk), d);
+        p->finish(d);
         Value r = Value::object();
         r.set("reasoning", Value(d.reasoning));
         r.set("content", Value(d.content));
@@ -127,6 +133,15 @@ int main(int argc, char** argv) {
         }
         r.set("tool_calls", std::move(calls));
         out.push_back(std::move(r));
+      }
+    } else if (cmd == "glm-request" && argc == 3) {
+      const Value in = json::parse(slurp(argv[2]));
+      for (const Value& r : in.items()) {
+        try {
+          out.push_back(Value(text::glm5_render_request(r).prompt));
+        } catch (const std::exception& e) {
+          out.push_back(error_value(e));
+        }
       }
     } else if (cmd == "bench" && argc == 4) {
       const auto t0 = std::chrono::steady_clock::now();

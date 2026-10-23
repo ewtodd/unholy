@@ -100,6 +100,17 @@ environment on `/work`: teacher-forced logits on the code prompt and mixed promp
 floor (the oracle against itself with reordered arithmetic), and a router histogram (the first GLM routing
 profile). Exit: the oracle reproduces HF generation; noise floor measured.
 
+**G3 status (2026-10-23):** the scheduler already only sees `StepModel`, so DSV4's step model, kernels and
+scheduler stay untouched; the model-specific wiring moved instead: `serve` / `plan` dispatch on the checkpoint's
+family (`model/family`), the OpenAI server takes a `ChatFormat`, the tokenizer handles GLM's `ignore_merges`, and
+`text/glm_chat` ports GLM's chat template and vLLM's GLM-4.7 completion parser. CPU checks pass: DSV4 chat
+format and tokenizer unchanged against their references; GLM tokenizer vs HF tokenizers 28439/28440 (the miss: a
+code point newer than HF's Oniguruma tables); GLM rendering vs transformers' apply_chat_template 10,000/10,000
+random conversations; GLM parsing vs vLLM 8,791/8,791 (870 up to the content's leading whitespace before a call,
+which a stream cannot take back). Pending a service window: DSV4 bit-identity (`validate.sh`), the 512k curve and
+engine-batch against the M0 baselines. The cache-manager pieces listed below belong to the GLM step model (G4/G5):
+the scheduler's interface already covers pages, per-slot state, snapshots and verify backups.
+
 **G3: Model-agnostic engine (2-3 days).** A model-family interface for the loader and layer types, the planner
 sizes, the cache manager (per-sequence recurrent state, double-buffered for speculative decoding; latent KV pages;
 pooled indexer rows with a per-sequence tail carry), and the tokenizer / chat template / output parser. Exit:

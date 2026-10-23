@@ -54,6 +54,7 @@ add_library(unholy_text STATIC
   src/text/json.cpp
   src/text/tokenizer.cpp
   src/text/chat.cpp
+  src/text/glm_chat.cpp
 )
 target_include_directories(unholy_text PUBLIC src)
 target_link_libraries(unholy_text PUBLIC PkgConfig::PCRE2)
