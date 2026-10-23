@@ -1,0 +1,38 @@
+# tools/box: dev scripts for son-of-anton
+
+The scripts behind the numbers in STATUS / DECISIONS, kept in the repo so a cleanup of the box can't lose
+them. Everything they write goes under `/work` (the SATA dev array); `/scratch` holds model weights only.
+
+| path on the box | what |
+|---|---|
+| `/work/unholy-perf` | this checkout, synced and built by `sync.sh` (`.synced-rev` says which commit) |
+| `/work/data` | inputs made once: `ids_code32768.bin` (+ `code-corpus.txt`), `gsm48.jsonl`, `oracle/code1024`, `base/` |
+| `/work/runs/<date>-<label>` | one directory per run: logs, logits, outputs |
+| `/work/env/py` | python with ROCm torch for the oracle (a GC root to a pinned env) |
+
+Every script that needs the GPUs stops the llm-mode services first and restores the mode that was serving
+when it exits, also on failure or Ctrl-C (`with_gpus` in `env.sh`). Paths and flags can be overridden through
+the variables at the top of `env.sh`.
+
+## Setup
+
+```sh
+tools/box/sync.sh                              # on the dev machine: rsync to /work/unholy-perf, build
+ssh son-of-anton /work/unholy-perf/tools/box/setup.sh     # python env, token ids, request set
+ssh son-of-anton /work/unholy-perf/tools/box/oracle.sh    # DSV4 oracle on the code prompt (GPU)
+ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
+```
+
+## Scripts
+
+| script | does |
+|---|---|
+| `sync.sh [--no-build]` | (dev machine) copy the checkout to the box and build it |
+| `setup.sh` | one-time inputs: `/work/env/py`, the code token ids (`mkids.py`), the GSM8K request set (`mkgsm.py`) |
+| `oracle.sh [DIR]` | DeepSeek's model.py, layer-streamed on one R9700: 1024 prefill + 8 decode, logits + hidden states |
+| `validate.sh [--baseline]` | resident-model logits vs the baseline (bit-identical expected) and vs the oracle; keep `MARGIN` fixed so the expert placement matches |
+| `curve.sh LABEL` | `unholy-curve` to 512k: prefill by depth, decode probes |
+| `bench.sh LABEL [flags]` | `unholy-bench` |
+| `serve.sh [flags]` | the perf tree's server with the production flags on port 8300, foreground |
+| `sweep.sh LABEL [flags]` | that server + check-source `gsm8k-chat` at 1 / 2 / 4 / 8 requests (check-source pinned in `env.sh`) |
+| `eb.sh LABEL CONC [flags]` | `unholy-engine-batch` on `gsm48.jsonl` with logprobs; `REF=...jsonl` compares with an earlier run |
