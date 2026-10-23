@@ -4,7 +4,8 @@
         --corpus /work/data/code-corpus.txt --out /work/data/ids_code32768.bin
 
 The corpus is the tree's C++/HIP sources in sorted path order. It is written next to the ids and reused
-when it exists, so the ids can be regenerated exactly after the tree has changed. Output: uint32, BOS first.
+when it exists, so the ids can be regenerated exactly after the tree has changed. Output: uint32, BOS first
+(DSV4); for GLM pass --bos -1 --prefix '[gMASK]<sop>', the start its chat template uses.
 """
 import argparse
 import os
@@ -18,7 +19,8 @@ ap.add_argument("--src", required=True, help="tree whose src/ and tools/ sources
 ap.add_argument("--corpus", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--count", type=int, default=32768)
-ap.add_argument("--bos", type=int, default=0)
+ap.add_argument("--bos", type=int, default=0, help="BOS id put first; -1 for none")
+ap.add_argument("--prefix", default="", help="text (special tokens allowed) encoded before the corpus")
 args = ap.parse_args()
 
 if not os.path.exists(args.corpus):
@@ -35,7 +37,9 @@ if not os.path.exists(args.corpus):
 
 with open(args.corpus, encoding="utf-8") as f:
     text = f.read()
-ids = [args.bos] + Tokenizer.from_file(args.tokenizer).encode(text, add_special_tokens=False).ids
+tok = Tokenizer.from_file(args.tokenizer)
+ids = ([args.bos] if args.bos >= 0 else []) + (tok.encode(args.prefix, add_special_tokens=False).ids if args.prefix
+                                               else []) + tok.encode(text, add_special_tokens=False).ids
 if len(ids) < args.count:
     raise SystemExit(f"corpus has only {len(ids)} tokens, need {args.count}")
 np.array(ids[: args.count], dtype=np.uint32).tofile(args.out)

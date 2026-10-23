@@ -11,6 +11,12 @@
 : "${ORACLE:=$BOX_DATA/oracle/code1024}"
 : "${REF_PY:=/work/env/py}"              # python with ROCm torch (tools/box/setup.sh makes it)
 : "${CHECK_SOURCE:=github:ewtodd/check-source/38c265876c47d25c288851c6bc6838caff81a118}"
+# GLM-5.3-Flash (docs/PLAN-glm-dsv41.md, G2): FP8 release, its token ids, the transformers oracle and its venv
+: "${GLM_MODEL:=/scratch/models/glm53-flash-fp8}"
+: "${GLM_IDS:=$BOX_DATA/glm/ids_code32768.bin}"
+: "${GLM_ORACLE:=$BOX_DATA/glm/oracle/code1024}"
+: "${GLM_PY:=/work/env/glm/bin/python}"
+: "${TRANSFORMERS_REV:=50e35cc0ca18ec19b80653690de553e6decf74f5}"   # transformers main with glm5_next
 BUILD=$BOX_TREE/build
 
 # The production server's flags (the NixOS module's, without host / port / name).

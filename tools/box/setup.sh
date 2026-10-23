@@ -20,4 +20,16 @@ fi
 [ -f "$IDS" ] || "$REF_PY" "$BOX_TREE/tools/box/mkids.py" --tokenizer "$MODEL/tokenizer.json" --src "$BOX_TREE" \
   --corpus "$BOX_DATA/code-corpus.txt" --out "$IDS"
 [ -f "$BOX_DATA/gsm48.jsonl" ] || "$REF_PY" "$BOX_TREE/tools/box/mkgsm.py" --out "$BOX_DATA/gsm48.jsonl"
+
+# GLM: transformers main (glm5_next) in a venv over the pinned env's torch, and the same corpus through GLM's
+# tokenizer, starting the way its chat template does.
+if [ ! -x "$GLM_PY" ]; then
+  /work/env/pyenv/bin/python3 -m venv --system-site-packages "$(dirname "$(dirname "$GLM_PY")")"
+  "$GLM_PY" -m pip install -q "transformers @ https://codeload.github.com/huggingface/transformers/tar.gz/$TRANSFORMERS_REV"
+fi
+if [ ! -f "$GLM_IDS" ] && [ -f "$GLM_MODEL/tokenizer.json" ]; then
+  mkdir -p "$(dirname "$GLM_IDS")"
+  "$REF_PY" "$BOX_TREE/tools/box/mkids.py" --tokenizer "$GLM_MODEL/tokenizer.json" --src "$BOX_TREE" \
+    --corpus "$BOX_DATA/code-corpus.txt" --out "$GLM_IDS" --bos -1 --prefix '[gMASK]<sop>'
+fi
 ls -la "$BOX_DATA"

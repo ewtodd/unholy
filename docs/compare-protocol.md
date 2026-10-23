@@ -30,7 +30,8 @@ All through check-source, one item set per bench, identical for every subject.
 | longctx | 10 documents per depth: 32k, 128k, 512k (256k for the qwen models) | 1 / 1 | keyed-fact retrieval |
 
 - **Reasoning:** every model at its "high" thinking level: `reasoning_effort: high` for DSV4 (unholy's
-  template), GLM and V4.1 (plus `thinking: {type: enabled}` on the DeepSeek API), and the closest Qwen3.8
+  template), GLM and V4.1 (plus `thinking: {type: enabled}` on the DeepSeek API; GLM's chat template uses
+  max unless `low` or `high` is passed, so it must always be explicit), and the closest Qwen3.8
   template level (open: confirm which check-source level that is). One thinking-off run of gsm8k-chat per
   model for reference.
 - **Sampling:** each model at its vendor's recommended settings, recorded in every result file; explicit

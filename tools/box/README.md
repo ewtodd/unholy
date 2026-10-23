@@ -30,6 +30,7 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `sync.sh [--no-build]` | (dev machine) copy the checkout to the box and build it |
 | `setup.sh` | one-time inputs: `/work/env/py`, the code token ids (`mkids.py`), the GSM8K request set (`mkgsm.py`) |
 | `oracle.sh [DIR]` | DeepSeek's model.py, layer-streamed on one R9700: 1024 prefill + 8 decode, logits + hidden states |
+| `glm-oracle.sh [DIR] [flags]` | the same for GLM-5.3-Flash: transformers' glm5_next on the FP8 release, layer-streamed; also writes the routing counts |
 | `validate.sh [--baseline]` | resident-model logits vs the baseline (bit-identical expected) and vs the oracle; keep `MARGIN` fixed so the expert placement matches |
 | `curve.sh LABEL` | `unholy-curve` to 512k: prefill by depth, decode probes |
 | `bench.sh LABEL [flags]` | `unholy-bench` |

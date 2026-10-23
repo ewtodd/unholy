@@ -85,6 +85,15 @@ evals run from there (the local engines listen on all interfaces).
 If it beats DSV4-VE, also run Maya-L (Project Maya's ~3.9 bpw quant, built under `/work`, in a window) on the same
 evals as a local-quant proxy before the port. **Decision:** go / no-go.
 
+**G2 status (2026-10-23, started before G1 at the owner's request):** FP8 checkpoint in
+`/scratch/models/glm53-flash-fp8`, EXL3 3.05 / 4.05 downloading. Oracle `tools/ref/glm_oracle/run.py`
+(`tools/box/glm-oracle.sh`): transformers 5.21.0.dev0 at `50e35cc` in a venv over the pinned ROCm torch
+(`/work/env/glm`; torch fallbacks for the KDA kernels), 45 layers in ~3 min. On the code corpus: next-token
+top-1 86.0%, mean NLL 0.585 nats (DSV4's oracle 85.2% / 0.583). Noise floor, eager vs SDPA attention: mean KL
+3.4e-3, median 6.0e-5, p99 4.6e-2, top-1 97.9%. Routing on that one document (hindsight placement, so an upper
+bound for a static profile): the top 32.5% of experts take 75% of the picks (A/C break-even 49%), the top
+22-24% take 63-66% (B/D break-even 62%).
+
 **G2: Weights and oracle (2 days).** FP8 checkpoint (328 GB) and EXL3 3.05 + 4.05 (290 GB) to `/scratch/models`.
 Oracle: HF transformers `glm5_next` on the FP8 checkpoint, one layer at a time on one R9700, from a pinned
 environment on `/work`: teacher-forced logits on the code prompt and mixed prompts, per-layer dumps, the noise

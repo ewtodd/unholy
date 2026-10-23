@@ -1,3 +1,4 @@
 build*/
 result*
 *.json.tmp
+__pycache__/
