@@ -1,0 +1,26 @@
+card 0 (dev 0): layers 0-21  dense 4.48 GB  cache 1.48 GB  scratch 3.21 GB  hot experts 1706 (22.81 GB of 22.82 GB budget)
+card 1 (dev 1): layers 22-42  dense 4.36 GB  cache 1.63 GB  scratch 3.32 GB  hot experts 1696 (22.67 GB of 22.69 GB budget)
+apu (dev 2): cold experts 101.69 GB of 129.53 GB free; predicted routing on cards 58.5%
+experts native MXFP4; loaded in 37.7 s; in-flight depth 2
+     depth   chunk_ms prefill_tok/s
+decode at depth 4104: median 34.5 ms/token (29.0 tok/s), min 33.6, max 38.0
+     32776       1555         2635
+decode at depth 32784: median 35.5 ms/token (28.2 tok/s), min 34.4, max 38.1
+     65552       2471         1657
+     98320       2559         1601
+    131088       2030         2018
+decode at depth 131096: median 38.8 ms/token (25.7 tok/s), min 37.7, max 40.3
+    163864       2672         1533
+    196632       2724         1504
+    229400       2770         1479
+    262168       2845         1440
+    294936       2958         1385
+    327704       3034         1350
+    360472       3033         1350
+    393240       3088         1327
+    426008       3242         1263
+    458776       3321         1233
+    491544       3430         1194
+    524288       3119         1305
+decode at depth 524296: median 44.2 ms/token (22.6 tok/s), min 42.9, max 47.2
+prefill 524264 tokens in 368.3 s: 1423 tok/s average (wall 369.6 s incl. decode probes)

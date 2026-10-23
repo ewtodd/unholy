@@ -59,8 +59,12 @@ evals run from there (the local engines listen on all interfaces).
    the serving provider and returned `model` logged per item, and a **coding bench**: code generation with
    hidden tests (LiveCodeBench's recent problems, to limit contamination), executed in a bubblewrap sandbox
    without network. No tool-call bench for now.
-3. **Dev setup, committed this time:** `tools/box/` (validate, bench, curve, serve-load, sweep, engine-batch
-   helpers); on `/work`: the perf tree, the DSV4 oracle on the 1024-token code prompt, token ids, baselines.
+3. **Dev setup, committed this time** (done 2026-10-23): `tools/box/` (sync, setup, oracle, validate, curve,
+   bench, serve, sweep, engine-batch); on `/work`: the perf tree, the DSV4 oracle on a new 1024-token code
+   prompt (our own sources, `mkids.py`), the GSM8K request set, baselines. Resident model vs the oracle:
+   KL 4.19e-3, top-1 98.26%, a rerun bit-identical. Curve (`docs/bench/curve-native-1x512k-plx-2026-10-23.txt`):
+   decode 29.0 / 28.2 / 25.7 / 22.6 tok/s at 4k / 32k / 128k / 512k, prefill 1423 tok/s averaged to 512k.
+   Engine-batch, 48 requests at concurrency 8: 63.4 tok/s, 77% of drafts accepted.
 4. **Comparison protocol** (`docs/compare-protocol.md`):
    - Intelligence: Knoll (once active), the coding bench, gsm8k-chat (200), math500 (200), AIME 24/25/26,
      longctx at 32k / 128k / 512k (256k cap for the qwen models). Fixed seeds, reasoning levels mapped between
