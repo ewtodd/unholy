@@ -260,6 +260,9 @@ struct Tokenizer::Impl {
   std::vector<Regex> splits;
   std::unordered_map<std::string, int32_t> added_ids;
   int32_t bos = -1, eos = -1;
+  // ignore_merges (GLM): a pre-tokenized word that is itself a model token is that token, merges unused.
+  bool ignore_merges = false;
+  std::unordered_map<std::string, int32_t> word_ids;  // raw bytes -> model token, when ignore_merges
 
   static uint64_t key(int32_t a, int32_t b) { return (uint64_t(uint32_t(a)) << 32) | uint32_t(b); }
 
@@ -336,7 +339,15 @@ struct Tokenizer::Impl {
       }
       pieces.swap(next);
     }
-    for (const auto& [off, len] : pieces) bpe(text.substr(off, len), out);
+    for (const auto& [off, len] : pieces) {
+      const std::string_view word = text.substr(off, len);
+      if (ignore_merges)
+        if (const auto it = word_ids.find(std::string(word)); it != word_ids.end()) {
+          out.push_back(it->second);
+          continue;
+        }
+      bpe(word, out);
+    }
   }
 };
 
@@ -355,9 +366,9 @@ Tokenizer Tokenizer::load(const std::string& path) {
 
   const json::Value& model = root.at("model");
   if (model.get_str("type") != "BPE") throw std::runtime_error("tokenizer: only BPE models are supported");
-  for (const char* flag : {"byte_fallback", "ignore_merges"})
-    if (const json::Value* v = model.find(flag); v && v->truthy())
-      throw std::runtime_error(std::string("tokenizer: unsupported BPE option ") + flag);
+  if (const json::Value* v = model.find("byte_fallback"); v && v->truthy())
+    throw std::runtime_error("tokenizer: unsupported BPE option byte_fallback");
+  if (const json::Value* v = model.find("ignore_merges"); v && v->truthy()) impl->ignore_merges = true;
   if (const json::Value* v = model.find("continuing_subword_prefix"); v && !v->is_null())
     throw std::runtime_error("tokenizer: unsupported continuing_subword_prefix");
   if (const json::Value* v = model.find("end_of_word_suffix"); v && !v->is_null())
@@ -382,6 +393,7 @@ Tokenizer Tokenizer::load(const std::string& path) {
     if (unmap_bytes(k, c2b, bytes)) {
       impl->pieces[size_t(id)] = bytes;
       impl->kind[size_t(id)] = 1;
+      if (impl->ignore_merges) impl->word_ids.emplace(bytes, id);
     }
   }
   for (int b = 0; b < 256; ++b) {

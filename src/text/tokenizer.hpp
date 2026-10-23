@@ -1,4 +1,4 @@
-// Byte-level BPE tokenizer reproducing HF `tokenizers` for the DSV4 tokenizer.json.
+// Byte-level BPE tokenizer reproducing HF `tokenizers` for the DSV4 and GLM-5.3-Flash tokenizer.json.
 //
 // Pipeline (as HF runs it with split_special_tokens off): added tokens are cut out first, special and
 // non-normalized ones in one leftmost-longest pass, normalized ones in a second pass over what is left

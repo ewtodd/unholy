@@ -3,7 +3,7 @@
 //
 // Each HTTP request runs on its own server thread: it renders and tokenizes the prompt, submits it,
 // and turns the engine's token deliveries into text (streaming detokenizer -> stop strings -> the
-// DSV4 output parser for chat). A client that disconnects or a matched stop string aborts the
+// model's chat parser). A client that disconnects or a matched stop string aborts the
 // engine request.
 #pragma once
 
@@ -15,6 +15,7 @@
 
 #include "engine/engine.hpp"
 #include "vision/image.hpp"
+#include "text/chat_format.hpp"
 #include "text/tokenizer.hpp"
 
 namespace unholy::server {
@@ -37,7 +38,8 @@ struct ServerConfig {
 
 class OpenAIServer {
  public:
-  OpenAIServer(engine::Engine& eng, const text::Tokenizer& tok, ServerConfig cfg);
+  // fmt: the model family's chat template and completion parser (outlives the server).
+  OpenAIServer(engine::Engine& eng, const text::Tokenizer& tok, const text::ChatFormat& fmt, ServerConfig cfg);
   ~OpenAIServer();
   // Blocks until stop().
   void run();

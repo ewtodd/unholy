@@ -741,3 +741,22 @@ void OutputParser::step(ParsedDelta& out, bool final) {
 }
 
 }  // namespace unholy::text
+
+namespace unholy::text {
+
+namespace {
+class Dsv4ChatFormat final : public ChatFormat {
+ public:
+  RenderedChat render(const json::Value& request) const override { return render_request(request); }
+  std::unique_ptr<ChatParser> parser(bool thinking, const json::Value* tools) const override {
+    return std::make_unique<OutputParser>(thinking, tools);
+  }
+};
+}  // namespace
+
+const ChatFormat& dsv4_chat_format() {
+  static const Dsv4ChatFormat format;
+  return format;
+}
+
+}  // namespace unholy::text

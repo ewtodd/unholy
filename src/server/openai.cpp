@@ -12,7 +12,7 @@
 #include <optional>
 #include <random>
 
-#include "text/chat.hpp"
+#include "text/chat_format.hpp"
 #include "text/json.hpp"
 
 namespace unholy::server {
@@ -193,20 +193,23 @@ std::string sse(const Value& v) { return "data: " + v.dump() + "\n\n"; }
 struct OpenAIServer::Impl {
   engine::Engine& eng;
   const text::Tokenizer& tok;
+  const text::ChatFormat& fmt;
   ServerConfig cfg;
   httplib::Server svr;
   std::atomic<uint64_t> requests{0}, errors{0};
 
-  Impl(engine::Engine& e, const text::Tokenizer& t, ServerConfig c) : eng(e), tok(t), cfg(std::move(c)) {}
+  Impl(engine::Engine& e, const text::Tokenizer& t, const text::ChatFormat& f, ServerConfig c)
+      : eng(e), tok(t), fmt(f), cfg(std::move(c)) {}
 
   // Per request text state: detokenizer -> stop strings -> (chat) output parser.
   struct TextState {
     text::Detokenizer detok;
     StopMatcher stop;
-    std::optional<text::OutputParser> parser;
-    TextState(const text::Tokenizer& t, std::vector<std::string> stops, bool chat, bool thinking, const Value* tools)
+    std::unique_ptr<text::ChatParser> parser;  // chat only
+    TextState(const text::Tokenizer& t, const text::ChatFormat& f, std::vector<std::string> stops, bool chat, bool thinking,
+              const Value* tools)
         : detok(t, true), stop(std::move(stops)) {
-      if (chat) parser.emplace(thinking, tools);
+      if (chat) parser = f.parser(thinking, tools);
     }
     // Feeds tokens; returns new raw text (completions) or fills the parsed delta (chat).
     void push(const std::vector<int32_t>& toks, std::string& raw, text::ParsedDelta& d) {
@@ -314,7 +317,7 @@ struct OpenAIServer::Impl {
       throw HttpError(400, "this model's maximum context length is " + std::to_string(ctx) +
                                " tokens; the prompt has " + std::to_string(gen.prompt.size()));
     const uint64_t rid = eng.submit(std::move(gen), [ch](engine::GenOutput&& o) { ch->push(std::move(o)); });
-    auto state = std::make_shared<TextState>(tok, job->p.stop, job->chat, job->thinking,
+    auto state = std::make_shared<TextState>(tok, fmt, job->p.stop, job->chat, job->thinking,
                                              job->tools.is_null() ? nullptr : &job->tools);
     if (job->p.stream) stream(job, ch, state, rid, res);
     else collect(job, ch, state, rid, req, res);
@@ -590,7 +593,7 @@ struct OpenAIServer::Impl {
     job->p = parse_params(body, true, cfg.default_max_tokens);
     if (const Value* tc = body.find("tool_choice"); tc && tc->is_string() && tc->str() == "none") body.erase("tools");
     if (const Value* t = body.find("tools"); t && t->is_array()) job->tools = *t;
-    const text::RenderedChat r = text::render_request(body);
+    const text::RenderedChat r = fmt.render(body);
     job->thinking = r.thinking;
     job->prompt = tok.encode(r.prompt);
     if (!r.images.empty()) {
@@ -681,7 +684,7 @@ struct OpenAIServer::Impl {
                check_auth(req);
                const Value body = parse_body(req);
                std::vector<int32_t> ids;
-               if (body.contains("messages")) ids = tok.encode(text::render_request(body).prompt);
+               if (body.contains("messages")) ids = tok.encode(fmt.render(body).prompt);
                else ids = tok.encode(body.get_str("prompt"));
                Value arr = Value::array();
                for (const int32_t t : ids) arr.push_back(Value(int(t)));
@@ -731,8 +734,8 @@ struct OpenAIServer::Impl {
   }
 };
 
-OpenAIServer::OpenAIServer(engine::Engine& eng, const text::Tokenizer& tok, ServerConfig cfg)
-    : impl_(std::make_unique<Impl>(eng, tok, std::move(cfg))) {
+OpenAIServer::OpenAIServer(engine::Engine& eng, const text::Tokenizer& tok, const text::ChatFormat& fmt, ServerConfig cfg)
+    : impl_(std::make_unique<Impl>(eng, tok, fmt, std::move(cfg))) {
   impl_->setup();
 }
 

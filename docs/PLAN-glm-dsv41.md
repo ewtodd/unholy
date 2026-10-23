@@ -21,8 +21,8 @@ a 543.6B-parameter quantization run of our own and an SSD streaming tier, and it
 - **No clutter on the box:** build trees, profiles, oracle dumps, eval outputs and logs live under `/work`;
   scripts worth keeping are committed to this repo (`tools/box/`); `/scratch` holds model weights only.
 - **Service windows:** GPU work that needs the serving mode stopped (speed curves, oracle runs on a card,
-  resident tests, quantization, the qwen baselines) may run at any time for now (owner, 2026-10-23), until
-  the owner announces constraints; the previous `llm-mode` is always restored afterwards.
+  resident tests, quantization, the qwen baselines) only runs when the owner says the service is free (since
+  2026-10-23 15:00 it is in use); the previous `llm-mode` is always restored afterwards.
 - **Each milestone ends** with a commit, a DECISIONS entry with its numbers, and a short report. Decision
   points for the owner are marked **Decision**.
 - **Implementation:** self-contained coding goes to the local model (delegate-local) while the service is up;

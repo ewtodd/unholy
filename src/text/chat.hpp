@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "text/chat_format.hpp"
 #include "text/json.hpp"
 
 namespace unholy::text {
@@ -24,10 +25,6 @@ inline constexpr std::string_view kBos = "<｜begin▁of▁sentence｜>";
 inline constexpr std::string_view kEos = "<｜end▁of▁sentence｜>";
 inline constexpr std::string_view kThinkStart = "<think>";
 inline constexpr std::string_view kThinkEnd = "</think>";
-
-struct ChatError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
 
 struct EncodeOptions {
   bool thinking = false;          // thinking_mode "thinking" vs "chat"
@@ -44,33 +41,15 @@ std::string encode_messages(const json::Value& messages, const EncodeOptions& op
                             const json::Value* context = nullptr, std::vector<std::string>* images = nullptr);
 
 // An OpenAI chat-completions request body, interpreted as vLLM does for DeepSeek-V4.
-struct RenderedChat {
-  std::string prompt;
-  bool thinking = false;  // the completion starts inside <think>
-  std::vector<std::string> images;  // image URLs, one per placeholder token in the prompt, in order
-};
 RenderedChat render_request(const json::Value& request);
 
-struct ToolCall {
-  std::string name;
-  std::string arguments;  // JSON object text
-};
-
-struct ParsedDelta {
-  std::string reasoning;
-  std::string content;
-  std::vector<ToolCall> tool_calls;
-  bool empty() const { return reasoning.empty() && content.empty() && tool_calls.empty(); }
-};
-
-class OutputParser {
+class OutputParser final : public ChatParser {
  public:
   // tools: the request's tool list (for unwrapping {"arguments": {...}} wrappers); may be null.
   OutputParser(bool thinking, const json::Value* tools = nullptr);
-  void feed(std::string_view text, ParsedDelta& out);
-  // End of stream: releases held-back text and any tool call cut off by the length limit.
-  void finish(ParsedDelta& out);
-  bool saw_tool_calls() const { return n_calls_ > 0; }
+  void feed(std::string_view text, ParsedDelta& out) override;
+  void finish(ParsedDelta& out) override;
+  bool saw_tool_calls() const override { return n_calls_ > 0; }
 
  private:
   enum class State { Reasoning, Content, ToolPreamble, ToolName, ToolArgs, ToolBetween };
@@ -88,5 +67,8 @@ class OutputParser {
 // _unwrap_wrapper_args). Exposed for tests.
 std::string dsml_args_to_json(std::string_view raw_args, bool partial, const json::Value* tools,
                               std::string_view tool_name);
+
+// render_request + OutputParser behind the server's ChatFormat interface.
+const ChatFormat& dsv4_chat_format();
 
 }  // namespace unholy::text

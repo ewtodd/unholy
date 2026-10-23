@@ -35,6 +35,7 @@ add_compile_options(-Wno-unused-command-line-argument)
 add_library(unholy_host STATIC
   src/hw/pci.cpp
   src/model/safetensors.cpp
+  src/model/family.cpp
   src/model/exl3.cpp
   src/model/native.cpp
 )
@@ -48,7 +49,7 @@ add_executable(unholy-probe tools/probe/probe.hip)
 set_source_files_properties(tools/probe/probe.hip PROPERTIES LANGUAGE HIP)
 target_link_libraries(unholy-probe PRIVATE unholy_host hip::host)
 
-# Serving text layer: JSON, tokenizer (PCRE2 pre-tokenizer), DSV4 chat format. No device code.
+# Serving text layer: JSON, tokenizer (PCRE2 pre-tokenizer), the chat formats. No device code.
 add_library(unholy_text STATIC
   src/text/json.cpp
   src/text/tokenizer.cpp
