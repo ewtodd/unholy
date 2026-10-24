@@ -39,6 +39,8 @@ so the first measurements decide whether to do it at all:
 | **C** | EXL3 3.05 | native FP8, KDA projections re-quantized to fp8 | 129.36 GB | 12.58 GB (1.12x) | +43.6 GB | 2.84e-2 / 1.34e-1 |
 | **D** | EXL3 4.05 | native FP8, KDA projections re-quantized to fp8 | 168.32 GB | 13.63 GB (1.22x) | +4.6 GB | 1.33e-2 / 6.57e-2 |
 
+**Chosen (owner, 2026-10-24): B.**
+
 - **A leads on the numbers**: the lightest per token, ~32% of experts on the cards (served
   DSV4: 26%), ~48 GB of headroom at 4 x 512k, and 4 x 1M fits. Experts at 3.01 bits meet the
   >= 3 bpw requirement with little margin.

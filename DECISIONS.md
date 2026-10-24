@@ -1256,3 +1256,12 @@ Builds (KL code / chat, top-1 code / chat): A (EXL3 3.05 everywhere) 2.72e-2 / 1
 1.51e-2. So the expert width decides (4.05 halves the KL on both prompts), the dense format is quality-neutral
 within a few percent, and a weight-only fp8 path avoids the activation cost. Decision for the owner: 3.05 vs 4.05
 experts, EXL3 vs fp8 dense.
+
+## 2026-10-24 — GLM build: B (EXL3 4.05 everywhere)
+
+The owner chose build B from the G4 table: turboderp's 4.05 branch for the routed experts and the dense weights
+alike (165.05 GB; 10.98 GB read per decode token, 0.98x DSV4; KL 1.27e-2 code / 7.06e-2 chat against the FP8
+oracle, half of the 3.05 builds'). Consequences for G5: an EXL3 dense GEMV / GEMM path (the expert kernels are
+the start), no fp8 path for GLM; 4 x 512k fits with +7.9 GB of headroom on paper (GLM's scratch is not measured
+yet; A is the fallback if it does not fit), and placement needs ~62% of the routing on the cards to keep the
+APU's load at DSV4's level.

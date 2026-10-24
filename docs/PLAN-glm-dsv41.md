@@ -128,7 +128,7 @@ re-quantization of C / D and an fp8-activation option. Against the oracle: code 
 prefill and two batched sequences bit-identical; indexer selection checked on a 4096-token oracle. KL table for
 A-D in `docs/glm53-flash-quant.md` ("Measured quality"): A 2.72e-2 / 1.37e-1 (code / chat), B 1.27e-2 / 7.06e-2,
 C 2.84e-2 / 1.34e-1, D 1.33e-2 / 6.57e-2. The expert width decides (4.05 halves the KL), the dense format does not
-measurably; fp8 activations cost +2.4e-3 on the release. Open: the owner's decision below; long-context KL.
+measurably; fp8 activations cost +2.4e-3 on the release. **Decision (owner, 2026-10-24): build B**, EXL3 4.05 for experts and dense alike. Open: long-context KL.
 
 **G4: Reference forward (3-4 days).** Reference kernels for KDA (conv, lower-bounded gate, chunked + recurrent
 delta rule, gated norm), DSA (pooled indexer, top-2048 + tail, absorbed NoPE MLA), the sigmoid router (bias,
@@ -201,3 +201,4 @@ Days of active work, judged against DSV4's pace (first commit 2026-10-11 to the 
 - check-source additions: Claude, on a branch.
 - Service downtime: fixed windows (times to be set by the owner).
 - Hosted references: OpenRouter for GLM and the DSV4-VE calibration row, the DeepSeek API for V4.1.
+- GLM build (2026-10-24): B, EXL3 4.05 for experts and dense (G4 KL table; DECISIONS 2026-10-24).
