@@ -12,9 +12,10 @@
 // (--max-slots, --max-seq and --num-pages are the older names of the same three settings.)
 //
 // Prefix caching keeps finished requests' pages in the pool until they are needed and --prefix-snapshots
-// (default 128, ~7 MB of pinned host memory each; 0 turns prefix caching off) slot-state snapshots at
-// page boundaries, so a request that repeats an earlier one's prefix (the next turn of a chat, a shared
-// system prompt) starts from the deepest matching boundary instead of position 0.
+// (default 128, ~7 MB of pinned host memory each; GLM: 32 of ~148 MB, as many as fit beside the APU's experts;
+// 0 turns prefix caching off) slot-state snapshots at page boundaries, so a request that repeats an earlier
+// one's prefix (the next turn of a chat, a shared system prompt) starts from the deepest matching boundary
+// instead of position 0.
 //
 // --spec-drafts N (default 0: off) turns on speculative decoding with the checkpoint's DSpark drafter
 // (its mtp.* stages: dense parts on card 1, ~10 GB of routed experts on the APU): each decode step
@@ -168,7 +169,7 @@ struct Options {
   server::ServerConfig scfg;
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
   long long kv_tokens = 0;
-  int prefix_snapshots = 128;
+  int prefix_snapshots = -1;  // -1: the model's default (DSV4 128, GLM 32)
   int spec_drafts = 0;
   bool vision = true;
   float spec_min_conf = 0.5f;
@@ -298,7 +299,7 @@ int serve_dsv4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 
   const auto t0 = std::chrono::steady_clock::now();
   engine::ResidentModel model(c, *ck, xck.get(), plan, geo, o.max_batch, max_seq, pin.max_logit_rows,
-                              o.prefix_snapshots, o.spec_drafts > 0, vision);
+                              o.prefix_snapshots < 0 ? 128 : o.prefix_snapshots, o.spec_drafts > 0, vision);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);
@@ -325,14 +326,15 @@ int serve_dsv4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 }
 
 // GLM-5.3-Flash, an EXL3 quant (build B, docs/PLAN-glm-dsv41.md): make_glm5_plan places the layers and experts,
-// Glm5ResidentModel runs them, text::glm5_chat_format(). No prefix snapshots, drafts or images yet.
+// Glm5ResidentModel runs them, text::glm5_chat_format(). Prefix snapshots hold a slot's KDA states (~148 MB each,
+// pinned host memory beside the APU's experts: as many of --prefix-snapshots as fit, default 32). No images.
 int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
   const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
   const auto c = model::Glm5Config::from_hf(ck->config());
   // MTP drafting proposes one token per step (--spec-drafts > 0: 1).
   const bool mtp = o.spec_drafts > 0 && c.n_mtp > 0;
   o.spec_drafts = mtp ? 1 : 0;
-  o.prefix_snapshots = 0;
+  if (o.prefix_snapshots < 0) o.prefix_snapshots = 32;
   if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_glm53_mixed.txt";
 
   const int max_seq = (o.max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
@@ -353,6 +355,7 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   pin.max_logit_rows = std::max(o.max_slots * (mtp ? 2 : 1), 8);  // a verify chunk wants its token's and its draft's
   pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
   pin.mtp = mtp;
+  pin.snapshots = o.prefix_snapshots;
   if (plan_only) {
     std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
                 "tokens; GLM-5.3-Flash EXL3%s\n",
@@ -368,9 +371,12 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   }
   const auto plan = engine::make_glm5_plan(pin);
   std::printf("%s", plan.summary().c_str());
+  if (plan.snapshots < o.prefix_snapshots)
+    std::printf("prefix snapshots: %d of %d fit beside the APU's experts\n", plan.snapshots,
+                o.prefix_snapshots);
   std::fflush(stdout);
   const auto t0 = std::chrono::steady_clock::now();
-  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows, mtp);
+  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows, mtp, plan.snapshots);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);

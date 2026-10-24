@@ -9,7 +9,8 @@
 // MTP drafting (mtp = true): the nextn layer's dense part and DSA rows on card 1, its experts on the APU (a third
 // channel); every step writes its cache rows from the trunk's final-normed hidden states, draft() runs it for one draft per
 // request on card 1's draft stream; a verify chunk backs up the KDA states after its first token, restored when the
-// draft is rejected. Not yet: prefix snapshots (a slot's KDA state is 152.6 MB), images.
+// draft is rejected. Prefix snapshots (snapshots > 0): a slot's KDA conv tails and states (148 MB) and its
+// MTP hidden row, in pinned host memory (TTM pages, under the limit the APU's memory comes from). Not yet: images.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -64,14 +65,17 @@ struct Glm5PlanInput {
   int max_tokens = 0, max_seq = 0, max_logit_rows = 0;
   size_t card_margin = size_t(2) << 30, apu_margin = size_t(4) << 30;
   bool mtp = false;  // MTP drafting: its layer on card 1 / the APU, the KDA state backups
+  int snapshots = 0;  // prefix snapshots in pinned host memory (taken from the APU's RAM)
 };
 Plan make_glm5_plan(const Glm5PlanInput& in);
+// Pinned host bytes of one prefix snapshot (every KDA layer's slot state; with MTP, the slot's last hidden state).
+size_t glm5_snapshot_bytes(const model::Glm5Config& c, bool mtp);
 
 class Glm5ResidentModel final : public StepModel {
  public:
   Glm5ResidentModel(const model::Glm5Config& c, const model::Checkpoint& ck, const Plan& plan,
                     const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows = 0,
-                    bool mtp = false);
+                    bool mtp = false, int snapshots = 0);
   ~Glm5ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -82,6 +86,7 @@ class Glm5ResidentModel final : public StepModel {
   int num_pages() const override { return geo_.num_pages; }
   int page_tokens() const override { return kernels::kGlmPageRows; }
   int max_inflight() const override { return 2; }
+  int num_snapshots() const override { return snapshots_; }
   int draft_block() const override { return mtp_ ? 1 : 0; }
   int max_verify() const override { return mtp_ ? 2 : 0; }
   void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs, std::vector<int32_t>& tokens,
@@ -141,6 +146,17 @@ class Glm5ResidentModel final : public StepModel {
     bool busy = false;
   };
   Flight flight_[2];
+  // Prefix snapshots: per card, the slot slices of the per-slot state (KDA conv / recurrent, card 1: the MTP hidden
+  // row), packed per snapshot in pinned host memory.
+  struct SnapSeg {
+    uint8_t* dev;       // the buffer; a slot's slice at dev + slot * bytes
+    size_t bytes, off;  // per slot; offset in the snapshot
+  };
+  int snapshots_ = 0;
+  std::vector<SnapSeg> snap_segs_[2];
+  size_t snap_bytes_[2] = {0, 0};
+  uint8_t* snap_host_[2] = {nullptr, nullptr};
+  void state_copies(int k, const std::vector<StateOp>& ops, bool save);
   uint64_t next_ticket_ = 1;
   std::vector<int32_t> tables_;
   bool tables_dirty_ = false;

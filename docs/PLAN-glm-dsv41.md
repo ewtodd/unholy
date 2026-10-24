@@ -136,16 +136,23 @@ x2.5), dense layers 0-2, mHC, EXL3 experts (288, top-8) and both dense formats. 
 full-model KL / top-1. Exit: native path at the noise floor; KL table for builds A-D
 (`docs/glm53-flash-quant.md`). **Decision:** 3.05 vs 4.05 experts, EXL3 vs fp8 dense.
 
-**G5 status (2026-10-24, in progress):** `model/glm5_fast` + `kernels/glm_fast` (EXL3 linears on the grouped EXL3
-kernels, paged DSA rows with an fp8 latent and bf16 pooled keys, WMMA index scores and absorbed-MLA attention, a
-two-pass KDA recurrence, device-side MoE dispatch with 288 experts) keep the reference's KL (build B 1.329e-2 on code
-vs 1.326e-2); `engine/glm5_resident` places build B (2,606 hot experts on the cards, 119.8 GB cold on the APU, 51%
-of routing on the cards predicted) and `unholy serve` serves it. Curve (no drafts,
-`docs/bench/curve-glm53-b-1x512k-2026-10-24.txt`): decode 21.4 / 19.2 / 17.2 / 16.2 tok/s at 4k / 32k / 128k / 512k
-(DSV4 29.0 / 28.3 / 25.8 / 22.5), prefill 768 tok/s averaged to 512k (target >= 500 met; decode target >= 20 at
-512k not yet). MTP drafting (one draft per step, KDA state rollback on rejection) accepts 88-96% of drafts, 1.9
-tokens per step, 25-27 tok/s at short context; it needs `--max-batch-tokens 3072` to fit. Open: decode overheads
-(launches, the draft path), prefix snapshots (G6).
+**G5 status (2026-10-24):** `model/glm5_fast` + `kernels/glm_fast` (EXL3 linears on the grouped EXL3 kernels, paged
+DSA rows with an fp8 latent and bf16 pooled keys, WMMA index scores and absorbed-MLA attention, a two-pass KDA
+recurrence, device-side MoE dispatch with 288 experts) keep the reference's KL (build B 1.329e-2 on code vs
+1.326e-2); `engine/glm5_resident` places build B and `unholy serve` serves it. Decode kernels (two-stage top-k, compact
+selection lists, split-key attention, sliced MoE combine) took the curve from 21.4 / 19.2 / 17.2 / 16.2 to 23.0 /
+20.4 / 18.7 / 19.0 tok/s at 4k / 32k / 128k / 512k (`docs/bench/curve-glm53-b-1x512k-2026-10-24{,-kernels}.txt`;
+DSV4 29.0 / 28.3 / 25.8 / 22.5), prefill 782 tok/s averaged to 512k. Served one request at a time
+(`docs/bench/serve-glm53-b-long-2026-10-24.txt`): decode 21.6 / 21.3 / 20.4 tok/s at 32k / 128k / 512k, prefill 891 /
+869 / 799 tok/s; with MTP drafting (one draft per step, KDA state rollback on rejection, logits bit-identical to
+plain decoding on a forced rejection) 25.8 / 26.2 / 24.8 tok/s, 83-86% of drafts accepted. Both exit targets are
+met (>= 500 prefill, >= 20 decode at 512k, without MTP too). MTP needs `--max-batch-tokens 3072` to fit. Prefix
+snapshots (a slot's KDA conv and recurrent state plus its MTP hidden row, 148 MB of pinned host memory each) count
+against the APU's free bytes (pinned memory is TTM pages under the same limit: 8 GiB pinned took 8.6 GB off them);
+in the production geometry 57 fit without MTP, 16 with. Reuse is bit-identical (tokens and logprobs, with and without
+MTP) and cut an 11.7k-token prompt's TTFT from 14 s to 1.0 s. Open: the RAM trade-off between MTP, snapshots and the
+KV pool; prefill profile (the depth-dependent indexer scores and top-k; the token-recurrent KDA); launch count in
+decode.
 
 **G5: Fast path (4-6 days).** WMMA kernels for KDA prefill and decode, the DSA indexer and attention, and the
 chosen dense format (EXL3 dense GEMV, or fp8 KDA weights); placement from the GLM profile; two steps in flight;

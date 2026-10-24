@@ -237,6 +237,11 @@ std::string Plan::summary() const {
   std::snprintf(buf, sizeof buf, "apu (dev %d): cold experts %.2f GB of %.2f GB free; predicted routing on cards %.1f%%\n",
                 apu, gb(apu_experts), gb(apu_free), 100.0 * routed_on_cards);
   s << buf;
+  if (snapshots > 0) {
+    std::snprintf(buf, sizeof buf, "prefix snapshots: %d x %.3f GB pinned host (%.2f GB)\n", snapshots,
+                  gb(snapshot_bytes), gb(snapshot_bytes * size_t(snapshots)));
+    s << buf;
+  }
   if (vision_apu > 0) {
     std::snprintf(buf, sizeof buf, "vision tower: %.2f GB on the APU\n", gb(vision_apu));
     s << buf;

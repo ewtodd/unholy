@@ -1265,3 +1265,24 @@ oracle, half of the 3.05 builds'). Consequences for G5: an EXL3 dense GEMV / GEM
 the start), no fp8 path for GLM; 4 x 512k fits with +7.9 GB of headroom on paper (GLM's scratch is not measured
 yet; A is the fallback if it does not fit), and placement needs ~62% of the routing on the cards to keep the
 APU's load at DSV4's level.
+
+## 2026-10-24 — G5: GLM-5.3-Flash fast path serves build B; both speed targets met
+
+`model/glm5_fast` + `kernels/glm_fast` + `engine/glm5_resident` serve build B through `unholy serve` (card 0: the
+embedding and layers 0-22, card 1: layers 23-44 and the head, cold experts on the APU, two steps in flight). The fast
+path keeps the reference's KL (code 1.329e-2 vs 1.326e-2). Decode kernels (two-stage top-k, compact selection lists,
+split-key attention, sliced MoE combine) took the curve from 21.4 / 19.2 / 17.2 / 16.2 to 23.0 / 20.4 / 18.7 / 19.0
+tok/s at 4k / 32k / 128k / 512k; prefill 782 tok/s averaged to 512k. Served one request at a time: decode 21.6 /
+21.3 / 20.4 tok/s at 32k / 128k / 512k, prefill 891 / 869 / 799; with MTP drafting 25.8 / 26.2 / 24.8 tok/s, 83-86%
+of drafts accepted (`docs/bench/serve-glm53-b-long-2026-10-24.txt`). The exit targets (>= 500 prefill, >= 20 decode
+at 512k) hold without MTP. MTP rolls back a rejected draft's KDA states from a backup taken after the verify chunk's
+first token; a rejected draft used to leave its row in the pool tail (fixed: the tail always takes the chunk's last
+<= 4 positions), and a forced rejection now gives logits bit-identical to plain decoding.
+
+Prefix snapshots hold a slot's KDA conv and recurrent state and its MTP hidden row (148 MB, pinned host memory; the
+DSA rows are paged and their tails empty at page boundaries). Pinned memory is TTM pages under the same limit as the
+APU's GTT (8 GiB pinned took 8.6 GB off the APU's free bytes), so the planner gives snapshots what is left beside the
+cold experts and the 4 GB margin: 57 in the production geometry without MTP, 16 with. MemAvailable is no guide on
+this box: `ttm.page_pool_size` lets TTM keep freed pages, which it reports as used. Reuse is bit-identical to a run
+without snapshots, with and without MTP. With 57 snapshots the host has ~2 GB available (no swapping), so MTP,
+snapshots and the KV pool now compete for the same RAM.

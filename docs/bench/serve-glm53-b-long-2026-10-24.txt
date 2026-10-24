@@ -1,0 +1,20 @@
+# GLM-5.3-Flash build B served (tools/box/glm-serve.sh, production geometry, --max-batch-tokens 3072), 2026-10-24
+# one request at a time: /work/data/glm/long_{32k,128k,512k}.json (unholy sources), greedy, up to 400 tokens
+
+## --spec-drafts 0
+card 0 (dev 0): layers 0-22  dense 5.09 GB  cache 5.22 GB  scratch 3.10 GB  hot experts 1472 (18.58 GB of 18.58 GB budget)
+card 1 (dev 1): layers 23-44  dense 4.01 GB  cache 6.07 GB  scratch 3.10 GB  hot experts 1490 (18.80 GB of 18.80 GB budget)
+apu (dev 2): cold experts 115.27 GB of 129.53 GB free; predicted routing on cards 54.8%
+loaded in 28.4 s; kv pool 1572864 tokens, up to 786432 per request, 8 requests at once
+15:21:55 request: stop | prompt 32592, completion 394 | queue 0.00 s, ttft 36.58 s, prefill 891.1 tok/s, decode 21.6 tok/s
+15:24:43 request: stop | prompt 130897, completion 375 | queue 0.00 s, ttft 150.67 s, prefill 868.7 tok/s, decode 21.3 tok/s
+15:35:58 request: stop | prompt 524113, completion 380 | queue 0.00 s, ttft 656.36 s, prefill 798.5 tok/s, decode 20.4 tok/s
+
+## --spec-drafts 1
+card 0 (dev 0): layers 0-22  dense 5.09 GB  cache 5.84 GB  scratch 3.10 GB  hot experts 1422 (17.95 GB of 17.96 GB budget)
+card 1 (dev 1): layers 23-44  dense 4.45 GB  cache 7.54 GB  scratch 3.11 GB  hot experts 1338 (16.89 GB of 16.89 GB budget)
+apu (dev 2): cold experts 121.45 GB of 129.53 GB free; predicted routing on cards 52.7%
+loaded in 30.5 s; kv pool 1572864 tokens, up to 786432 per request, 8 requests at once
+15:38:07 request: stop | prompt 32592, completion 373 | queue 0.00 s, ttft 37.15 s, prefill 877.2 tok/s, decode 25.8 tok/s | drafts 157/186 accepted (84.4%), 1.84 tok/step
+15:40:54 request: length | prompt 130897, completion 400 | queue 0.00 s, ttft 151.56 s, prefill 863.6 tok/s, decode 26.2 tok/s | drafts 173/202 accepted (85.6%), 1.86 tok/step
+15:52:18 request: stop | prompt 524113, completion 350 | queue 0.00 s, ttft 669.58 s, prefill 782.7 tok/s, decode 24.8 tok/s | drafts 148/179 accepted (82.7%), 1.83 tok/step

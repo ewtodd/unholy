@@ -214,7 +214,21 @@ Plan make_glm5_plan(const Glm5PlanInput& in) {
                   "%.2f GB free)", pl.apu_experts / 1e9, apu_work / 1e9, in.apu_margin / 1e9, pl.apu_free / 1e9);
     throw std::runtime_error(msg);
   }
+  // Prefix snapshots: pinned host memory is TTM pages too, under the same page limit as the APU's (the limit its free
+  // bytes report; MemAvailable is no guide, TTM's pool keeps freed pages); as many as fit beside the margin.
+  if (in.snapshots > 0) {
+    pl.snapshot_bytes = glm5_snapshot_bytes(c, in.mtp);
+    const size_t left = pl.apu_free - (pl.apu_experts + apu_work + in.apu_margin);
+    pl.snapshots = int(std::min<size_t>(size_t(in.snapshots), left / pl.snapshot_bytes));
+  }
   return pl;
+}
+
+size_t glm5_snapshot_bytes(const model::Glm5Config& c, bool mtp) {
+  size_t b = mtp ? size_t(c.dim) * 2 : 0;  // the slot's last hidden state (the next MTP cache row's)
+  for (int L = 0; L < c.n_layers; ++L)
+    if (c.is_kda(L)) b += model::glm5_paged_cache_bytes(c, true, 1, 0);
+  return b;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -222,9 +236,10 @@ Plan make_glm5_plan(const Glm5PlanInput& in) {
 
 Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Checkpoint& ck, const Plan& plan,
                                      const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows,
-                                     bool mtp)
+                                     bool mtp, int snapshots)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
-      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), mtp_(mtp) {
+      max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), mtp_(mtp),
+      snapshots_(snapshots) {
   if (geo.max_pages_per_seq * k::kGlmPageRows < max_seq) throw std::runtime_error("glm5: block table too narrow");
   model::Uploader up(ck);
   const int draft_rows = std::max(geo.max_slots, 8);
@@ -346,6 +361,23 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
     UH_CHECK(hipEventCreateWithFlags(&f.consumed, hipEventDisableTiming));
     UH_CHECK(hipEventCreateWithFlags(&f.done, hipEventDisableTiming));
   }
+  if (snapshots_ > 0) {  // a slot's state at a page boundary: the DSA tails hold only complete pools there
+    for (int k = 0; k < 2; ++k) {
+      size_t off = 0;
+      const auto add = [&](const rt::DeviceBuffer& b, size_t per_slot) {
+        snap_segs_[k].push_back({static_cast<uint8_t*>(const_cast<void*>(b.data())), per_slot, off});
+        off += per_slot;
+      };
+      for (const model::Glm5PagedCache& pc : card_[k].cache)
+        if (pc.kda) {
+          add(pc.conv, pc.conv.size() / size_t(geo.max_slots));
+          add(pc.state, pc.state.size() / size_t(geo.max_slots));
+        }
+      if (k == 1 && mtp_) add(h_last_, size_t(c.dim) * 2);
+      snap_bytes_[k] = off;
+      pinned(&snap_host_[k], off * size_t(snapshots_));
+    }
+  }
 }
 
 Glm5ResidentModel::~Glm5ResidentModel() {
@@ -355,6 +387,8 @@ Glm5ResidentModel::~Glm5ResidentModel() {
   }
   if (drafted_) (void)hipEventDestroy(drafted_);
   for (void* p : {static_cast<void*>(d_emb_host_), static_cast<void*>(d_tok_host_)})
+    if (p) (void)hipHostFree(p);
+  for (uint8_t* p : snap_host_)
     if (p) (void)hipHostFree(p);
   for (auto& cd : card_)
     if (cd.st) {
@@ -396,12 +430,29 @@ void Glm5ResidentModel::set_block_tables(const std::vector<int32_t>& tables) {
   tables_dirty_ = true;
 }
 
+// Restores (before the step's layers) or saves (after them; card 1: after the hidden states) slot states on card k's
+// stream.
+void Glm5ResidentModel::state_copies(int k, const std::vector<StateOp>& ops, bool save) {
+  Card& cd = card_[k];
+  for (const StateOp& op : ops) {
+    uint8_t* snap = snap_host_[k] + size_t(op.snapshot) * snap_bytes_[k];
+    for (const SnapSeg& s : snap_segs_[k]) {
+      uint8_t* slot = s.dev + size_t(op.slot) * s.bytes;
+      if (save) k::copy_kernel(snap + s.off, slot, s.bytes, cd.st);
+      else k::copy_kernel(slot, snap + s.off, s.bytes, cd.st);
+    }
+  }
+}
+
 uint64_t Glm5ResidentModel::submit(const StepInput& in) {
   const int T = int(in.ids.size()), R = int(in.logit_rows.size()), D = c_.dim;
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
   if (R > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
-  if (!in.restore.empty() || !in.save.empty() || !in.image_rows.empty() || !in.image_spans.empty())
-    throw std::runtime_error("step: GLM serves without prefix snapshots or images");
+  if (!in.image_rows.empty() || !in.image_spans.empty()) throw std::runtime_error("step: GLM serves without images");
+  for (const auto* ops : {&in.restore, &in.save})
+    for (const StateOp& op : *ops)
+      if (op.snapshot < 0 || op.snapshot >= snapshots_ || op.slot < 0 || op.slot >= geo_.max_slots)
+        throw std::runtime_error("step: bad state op");
   if (!in.backup.empty() && !mtp_) throw std::runtime_error("step: verify chunks without a drafter");
   const uint64_t ticket = next_ticket_;
   Flight& f = flight_[ticket % 2];
@@ -462,6 +513,7 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
       k::copy_kernel(cd.x.data(), f.x_host, size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.consumed, cd.st));
     }
+    state_copies(k, in.restore, false);
     for (size_t i = 0; i < cd.w.size(); ++i)
       model::glm5_layer_forward_fast(c_, cd.w[i], cd.cache[i], cd.scratch, cd.x.as<uint16_t>(), b, cd.st,
                                      chan_[k].get());
@@ -469,6 +521,7 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
       UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));  // card 1 may still read it for the step two back
       k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.handoff, cd.st));
+      state_copies(0, in.save, true);  // after the handoff: card 1 need not wait for it
     }
   }
   Card& cd = card_[1];
@@ -506,6 +559,7 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
                               cd.st));
     }
   }
+  state_copies(1, in.save, true);
   if (R > 0) {
     k::copy_kernel(rows_idx_.data(), f.io_host + 2 * max_tokens_, size_t(R) * 4, cd.st);
     if (mtp_) {  // the normed rows are at hand

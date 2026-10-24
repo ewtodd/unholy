@@ -60,6 +60,8 @@ struct Plan {
   size_t dspark_card = 0, dspark_apu = 0;
   size_t vision_apu = 0;  // vision tower weights + scratch  // the drafter's bytes on card 1 / the APU
   double routed_on_cards = 0;  // predicted share of routing served by card-resident experts
+  int snapshots = 0;           // GLM: prefix snapshots that fit beside the APU's share (of those asked for)
+  size_t snapshot_bytes = 0;   // pinned host bytes of each
   std::string summary() const;
 };
 
