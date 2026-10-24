@@ -29,13 +29,14 @@ __global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count, uint
   if (hist) atomicAdd(&hist[sel[i]], 1u);
 }
 
-// One block of 256 threads, thread e for expert e (E <= 256): block-wide scans of the pair rows and tiles
-// of the resident group and the remote group give the same offsets and tile order as walking the experts
+// One block of NE threads (256 or 512), thread e for expert e (E <= NE): block-wide scans of the pair rows and
+// tiles of the resident group and the remote group give the same offsets and tile order as walking the experts
 // in order, resident ones first.
-__global__ __launch_bounds__(256) void moe_plan_kernel(int32_t* count, const uint8_t* resident, int E, int P,
+template <int NE>
+__global__ __launch_bounds__(NE) void moe_plan_kernel(int32_t* count, const uint8_t* resident, int E, int P,
                                                        MoePlan* plan, Exl3Tile* local_tiles, Exl3Tile* remote_tiles,
                                                        int32_t* off, int32_t* fill, int max_tiles, int tile_rows) {
-  __shared__ int sc[4][256];  // inclusive scans: local rows, remote rows, local tiles, remote tiles
+  __shared__ int sc[4][NE];  // inclusive scans: local rows, remote rows, local tiles, remote tiles
   const int e = threadIdx.x;
   const bool in = e < E, loc = in && resident[e] != 0;
   const int c = in ? count[e] : 0, nt = (c + tile_rows - 1) / tile_rows;
@@ -43,7 +44,7 @@ __global__ __launch_bounds__(256) void moe_plan_kernel(int32_t* count, const uin
 #pragma unroll
   for (int k = 0; k < 4; ++k) sc[k][e] = v[k];
   __syncthreads();
-  for (int d = 1; d < 256; d <<= 1) {
+  for (int d = 1; d < NE; d <<= 1) {
     int add[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) add[k] = e >= d ? sc[k][e - d] : 0;
@@ -52,7 +53,7 @@ __global__ __launch_bounds__(256) void moe_plan_kernel(int32_t* count, const uin
     for (int k = 0; k < 4; ++k) sc[k][e] += add[k];
     __syncthreads();
   }
-  const int remote0 = sc[0][255];
+  const int remote0 = sc[0][NE - 1];
   if (in) {
     const int row = loc ? sc[0][e] - v[0] : remote0 + sc[1][e] - v[1];
     const int tile = loc ? sc[2][e] - v[2] : sc[3][e] - v[3];
@@ -66,8 +67,8 @@ __global__ __launch_bounds__(256) void moe_plan_kernel(int32_t* count, const uin
   if (e == 0) {
     plan->P = P;
     plan->remote0 = remote0;
-    plan->n_local_tiles = min(sc[2][255], max_tiles);
-    plan->n_remote_tiles = min(sc[3][255], max_tiles);
+    plan->n_local_tiles = min(sc[2][NE - 1], max_tiles);
+    plan->n_remote_tiles = min(sc[3][NE - 1], max_tiles);
     plan->n_remote_tokens = 0;
   }
 }
@@ -267,18 +268,19 @@ __global__ __launch_bounds__(256) void quant_remote_tokens_kernel(const uint16_t
 }
 
 // moe_count + moe_plan + moe_scatter + remote_tokens + stage_remote for a step of <= 32 tokens, in one
-// block of 256 threads: the counts, offsets and fill counters live in LDS (count / off / fill are left
-// untouched), every output is what the five kernels write (the rows within an expert in another arrival
-// order, as with their atomics).
-__global__ __launch_bounds__(256) void moe_dispatch_small_kernel(MoeSmallArgs a) {
-  __shared__ int scnt[256], soff[256], sfill[256];
-  __shared__ int sc[4][256];
+// block of NE threads (256 or 512, NE >= E): the counts, offsets and fill counters live in LDS (count / off /
+// fill are left untouched), every output is what the five kernels write (the rows within an expert in another
+// arrival order, as with their atomics).
+template <int NE>
+__global__ __launch_bounds__(NE) void moe_dispatch_small_kernel(MoeSmallArgs a) {
+  __shared__ int scnt[NE], soff[NE], sfill[NE];
+  __shared__ int sc[4][NE];
   __shared__ int stok[32];
   const int tid = threadIdx.x, lane = tid & 31;
   const int E = a.E, K = a.K, T = a.T;
   scnt[tid] = 0;
   __syncthreads();
-  for (int i = tid; i < T * K; i += 256) {
+  for (int i = tid; i < T * K; i += NE) {
     const int e = a.sel[i];
     atomicAdd(&scnt[e], 1);
     if (a.hist) atomicAdd(&a.hist[e], 1u);
@@ -292,7 +294,7 @@ __global__ __launch_bounds__(256) void moe_dispatch_small_kernel(MoeSmallArgs a)
 #pragma unroll
   for (int k = 0; k < 4; ++k) sc[k][e] = v[k];
   __syncthreads();
-  for (int d = 1; d < 256; d <<= 1) {
+  for (int d = 1; d < NE; d <<= 1) {
     int add[4];
 #pragma unroll
     for (int k = 0; k < 4; ++k) add[k] = e >= d ? sc[k][e - d] : 0;
@@ -301,7 +303,7 @@ __global__ __launch_bounds__(256) void moe_dispatch_small_kernel(MoeSmallArgs a)
     for (int k = 0; k < 4; ++k) sc[k][e] += add[k];
     __syncthreads();
   }
-  const int remote0 = sc[0][255];
+  const int remote0 = sc[0][NE - 1];
   if (in) {
     const int row = loc ? sc[0][e] - v[0] : remote0 + sc[1][e] - v[1];
     const int tile = loc ? sc[2][e] - v[2] : sc[3][e] - v[3];
@@ -314,8 +316,8 @@ __global__ __launch_bounds__(256) void moe_dispatch_small_kernel(MoeSmallArgs a)
   if (tid == 0) {
     a.plan->P = a.P;
     a.plan->remote0 = remote0;
-    a.plan->n_local_tiles = min(sc[2][255], a.max_tiles);
-    a.plan->n_remote_tiles = min(sc[3][255], a.max_tiles);
+    a.plan->n_local_tiles = min(sc[2][NE - 1], a.max_tiles);
+    a.plan->n_remote_tiles = min(sc[3][NE - 1], a.max_tiles);
     a.plan->n_remote_tokens = 0;
   }
   __syncthreads();
@@ -374,12 +376,12 @@ __global__ __launch_bounds__(256) void moe_dispatch_small_kernel(MoeSmallArgs a)
   }
   __syncthreads();
   if (a.qin)
-    for (int p = remote0 + tid; p < a.P; p += 256) a.p2u_dst[p] = stok[a.eidx[p]];
+    for (int p = remote0 + tid; p < a.P; p += NE) a.p2u_dst[p] = stok[a.eidx[p]];
   // stage_remote_kernel
   const MoePlan pl = *a.plan;
   if (tid == 0) *a.plan_dst = pl;
-  for (int i = tid; i < pl.n_remote_tiles; i += 256) a.tiles_dst[i] = a.rtl[i];
-  for (int p = pl.remote0 + tid; p < pl.P; p += 256) {
+  for (int i = tid; i < pl.n_remote_tiles; i += NE) a.tiles_dst[i] = a.rtl[i];
+  for (int p = pl.remote0 + tid; p < pl.P; p += NE) {
     a.w_dst[p] = a.ewt[p];
     a.e_dst[p] = a.row_expert[p];
   }
@@ -436,8 +438,9 @@ void stage_remote(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt,
 }
 
 void moe_dispatch_small(const MoeSmallArgs& a, hipStream_t st) {
-  if (a.T > kMoeSmallMaxTokens || a.K > 8 || a.E > 256) throw std::runtime_error("moe_dispatch_small: shape");
-  moe_dispatch_small_kernel<<<1, 256, 0, st>>>(a);
+  if (a.T > kMoeSmallMaxTokens || a.K > 8 || a.E > 512) throw std::runtime_error("moe_dispatch_small: shape");
+  if (a.E <= 256) moe_dispatch_small_kernel<256><<<1, 256, 0, st>>>(a);
+  else moe_dispatch_small_kernel<512><<<1, 512, 0, st>>>(a);
   UH_CHECK_LAUNCH();
 }
 
@@ -449,10 +452,14 @@ void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStrea
 
 void moe_plan(int32_t* count, const uint8_t* resident, int E, int P, MoePlan* plan, Exl3Tile* local_tiles,
               Exl3Tile* remote_tiles, int32_t* off, int32_t* fill, int max_tiles, hipStream_t st, int tile_rows) {
-  if (E > 256) throw std::runtime_error("moe_plan: more than 256 experts");
+  if (E > 512) throw std::runtime_error("moe_plan: more than 512 experts");
   if (tile_rows < 1 || tile_rows > kExl3TileRows) throw std::runtime_error("moe_plan: tile rows");
-  moe_plan_kernel<<<1, 256, 0, st>>>(count, resident, E, P, plan, local_tiles, remote_tiles, off, fill, max_tiles,
-                                     tile_rows);
+  if (E <= 256)
+    moe_plan_kernel<256><<<1, 256, 0, st>>>(count, resident, E, P, plan, local_tiles, remote_tiles, off, fill,
+                                            max_tiles, tile_rows);
+  else
+    moe_plan_kernel<512><<<1, 512, 0, st>>>(count, resident, E, P, plan, local_tiles, remote_tiles, off, fill,
+                                            max_tiles, tile_rows);
   UH_CHECK_LAUNCH();
 }
 

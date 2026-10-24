@@ -84,6 +84,7 @@ __global__ __launch_bounds__(128) void xform_in_kernel(const bf16* x, int ldx, c
   xh[size_t(r) * K + seg * 128 + i] = __half_as_ushort(__float2half(b[i] * 0.08838834764831845f));
 }
 
+template <bool FQ>
 __global__ __launch_bounds__(128) void swiglu_xform_kernel(const bf16* g, const bf16* u, const float* w,
                                                            const int32_t* row_expert, const uint16_t* const* suh_tab,
                                                            uint16_t* xh, int I, float limit) {
@@ -101,7 +102,7 @@ __global__ __launch_bounds__(128) void swiglu_xform_kernel(const bf16* g, const 
   float hv = (gv / (1.0f + expf(-gv))) * uv;
   if (w) hv = w[r] * hv;
   hv = round_bf16(hv);  // the reference's swiglu output is a bf16 tensor
-  hv = fake_quant_fp8_block(hv, red);
+  if constexpr (FQ) hv = fake_quant_fp8_block(hv, red);
   b[i] = hv * __half2float(__ushort_as_half(suh[seg * 128 + i]));
   __syncthreads();
   fwht128_lds(b, i);
@@ -413,9 +414,12 @@ void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint
 }
 
 void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
-                       const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st) {
+                       const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st,
+                       bool fake_quant) {
   if (P <= 0) return;
-  swiglu_xform_kernel<<<dim3(I / 128, P), 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit);
+  const dim3 grid(I / 128, P);
+  if (fake_quant) swiglu_xform_kernel<true><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit);
+  else swiglu_xform_kernel<false><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit);
   UH_CHECK_LAUNCH();
 }
 

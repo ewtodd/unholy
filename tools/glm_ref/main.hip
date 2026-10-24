@@ -4,7 +4,8 @@
 // then the head, compared with the oracle's logits by KL divergence and top-1 agreement.
 //
 //   unholy-glm-ref --oracle DIR [--ckpt FP8_DIR] [--dense DIR] [--experts DIR] [--chunk C] [--device D]
-//                  [--isolate] [--kda-fp8] [--a8] [--slots N] [--layers N] [--out logits.bin]
+//                  [--isolate] [--kda-fp8] [--a8] [--kv-fp8] [--idx-fp8] [--fast] [--slots N] [--layers N]
+//                  [--out logits.bin]
 //
 // --dense / --experts take the dense weights / the routed experts from another checkpoint (an EXL3 quant: builds
 // A-D of docs/glm53-flash-quant.md); --ckpt (the FP8 release) still supplies what EXL3 checkpoints leave out.
@@ -13,6 +14,8 @@
 // fp8 too). --a8 quantizes the activations of every fp8 linear dynamically, per 128 columns (as fp8 serving
 // stacks run the release). --slots N runs N copies of the sequence in different slots of the same batches;
 // the reference's per-row arithmetic does not depend on the other rows, so every copy must match slot 0 bit for bit.
+// --kv-fp8 / --idx-fp8 store the MLA latent rows / the indexer's pooled keys in fp8 (fake-quantized on write).
+// --fast runs the fast path (model/glm5.hpp) instead of the reference.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -28,6 +31,7 @@
 
 #include "gufo/json.hpp"
 #include "kernels/ref.hpp"
+#include "kernels/glm_fast.hpp"
 #include "model/glm5.hpp"
 #include "model/safetensors.hpp"
 #include "rt/hip.hpp"
@@ -120,7 +124,7 @@ void compare_selection(int L, const std::vector<int32_t>& ours, const std::vecto
 int main(int argc, char** argv) {
   std::string ckpt = "/scratch/models/glm53-flash-fp8", oracle, dense_dir, experts_dir, out_path;
   int chunk = 0, dev = 0, n_layers = -1, slots = 1;
-  bool isolate = false, kda_fp8 = false;
+  bool isolate = false, kda_fp8 = false, kv_fp8 = false, idx_fp8 = false, fast = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() { return std::string(argv[++i]); };
@@ -135,11 +139,15 @@ int main(int argc, char** argv) {
     else if (a == "--kda-fp8") kda_fp8 = true;
     else if (a == "--slots") slots = std::stoi(next());
     else if (a == "--a8") model::set_glm5_a8(true);
+    else if (a == "--kv-fp8") kv_fp8 = true;
+    else if (a == "--fast") fast = true;
+    else if (a == "--idx-fp8") idx_fp8 = true;
     else if (a == "--out") out_path = next();
     else {
       std::fprintf(stderr,
                    "usage: %s --oracle DIR [--ckpt DIR] [--dense DIR] [--experts DIR] [--chunk C] [--device D] "
-                   "[--isolate] [--kda-fp8] [--a8] [--slots N] [--layers N] [--out F]\n",
+                   "[--isolate] [--kda-fp8] [--a8] [--kv-fp8] [--idx-fp8] [--fast] [--slots N] [--layers N] "
+                   "[--out F]\n",
                    argv[0]);
       return 2;
     }
@@ -152,6 +160,7 @@ int main(int argc, char** argv) {
     const model::Checkpoint& dense = dck ? *dck : *ck;
     const model::Checkpoint& experts = eck ? *eck : dense;
     const auto c = model::Glm5Config::from_hf(ck->config());
+    model::set_glm5_cache_fp8(kv_fp8, idx_fp8);
     const auto meta = gufo::json::parse(read_text(oracle + "/meta.json"));
     const int S = int(meta.member_size("S")), P = int(meta.member_size("prompt"));
     std::vector<int32_t> ids;
@@ -169,6 +178,14 @@ int main(int argc, char** argv) {
     const size_t xslot = size_t(S) * row;
     rt::DeviceBuffer x(dev, slots * xslot * 2), dpos(dev, size_t(S) * 4), dids(dev, size_t(S) * 4);
     rt::DeviceBuffer xb(dev, slots > 1 ? size_t(slots) * chunk * row * 2 : 16), bpos(dev, size_t(slots) * chunk * 4);
+    // Fast path: paged DSA rows, slot i's pages [i * pps, (i + 1) * pps) (identity block tables).
+    const int pps = (max_seq + kernels::kGlmPageRows - 1) / kernels::kGlmPageRows;
+    rt::DeviceBuffer dtables(dev, size_t(slots) * pps * 4);
+    {
+      std::vector<int32_t> tab(size_t(slots) * pps);
+      for (size_t i = 0; i < tab.size(); ++i) tab[i] = int32_t(i);
+      UH_CHECK(hipMemcpy(dtables.data(), tab.data(), tab.size() * 4, hipMemcpyHostToDevice));
+    }
     std::vector<int32_t> pos(static_cast<size_t>(S));
     for (int t = 0; t < S; ++t) pos[size_t(t)] = t;
     UH_CHECK(hipMemcpy(dpos.data(), pos.data(), size_t(S) * 4, hipMemcpyHostToDevice));
@@ -185,6 +202,7 @@ int main(int argc, char** argv) {
     const int width = c.idx_topk + c.idx_pool - 1;  // indexer selection per query
     std::vector<int32_t> sel(size_t(S) * width), sel_ref(size_t(S) * width);
     const auto t0 = std::chrono::steady_clock::now();
+    double t_prefill = 0, t_decode = 0;  // forward time summed over layers (no loading)
     for (int L = 0; L < n_layers; ++L) {
       char name[64];
       if (isolate && L > 0) {
@@ -200,14 +218,24 @@ int main(int argc, char** argv) {
       lo.aux = ck.get();
       lo.kda_fp8 = kda_fp8;
       auto w = model::load_glm5_layer(dense, c, L, dev, st, lo);
-      auto cache = model::make_glm5_cache(c, L, slots, max_seq, dev, st);
+      if (fast) model::prepare_glm5_fast(c, w, dev, st);
+      model::Glm5Cache cache;
+      model::Glm5PagedCache pcache;
+      if (fast) pcache = model::make_glm5_paged_cache(c, L, slots, slots * pps, dev, st);
+      else cache = model::make_glm5_cache(c, L, slots, max_seq, dev, st);
+      auto fwd = [&](model::Glm5Batch& b, uint16_t* xp) {
+        b.tables = dtables.as<int32_t>();
+        b.max_pages = pps;
+        if (fast) model::glm5_layer_forward_fast(c, w, pcache, scr, xp, b, st);
+        else model::glm5_layer_forward(c, w, cache, scr, xp, b, st);
+      };
       auto run = [&](int s0, int n) {
         model::Glm5Batch b;
         b.T = n * slots;
         if (slots == 1) {
           b.chunks = {{0, s0, n, 0}};
           b.pos = dpos.as<int32_t>() + s0;
-          model::glm5_layer_forward(c, w, cache, scr, x.as<uint16_t>() + size_t(s0) * row, b, st);
+          fwd(b, x.as<uint16_t>() + size_t(s0) * row);
         } else {  // slot i's rows at batch rows [i n, i n + n)
           for (int i = 0; i < slots; ++i) {
             b.chunks.push_back({i, s0, n, i * n});
@@ -218,7 +246,7 @@ int main(int argc, char** argv) {
                                     hipMemcpyDeviceToDevice, st));
           }
           b.pos = bpos.as<int32_t>();
-          model::glm5_layer_forward(c, w, cache, scr, xb.as<uint16_t>(), b, st);
+          fwd(b, xb.as<uint16_t>());
           for (int i = 0; i < slots; ++i)
             UH_CHECK(hipMemcpyAsync(x.as<uint16_t>() + i * xslot + size_t(s0) * row,
                                     xb.as<uint16_t>() + size_t(i) * n * row, size_t(n) * row * 2,
@@ -228,9 +256,19 @@ int main(int argc, char** argv) {
           UH_CHECK(hipMemcpyAsync(sel.data() + size_t(s0) * width, scr.at<int32_t>(model::kIdxSel),
                                   size_t(n) * width * 4, hipMemcpyDeviceToHost, st));
       };
+      UH_CHECK(hipStreamSynchronize(st));
+      const auto tp = std::chrono::steady_clock::now();
       for (int s0 = 0; s0 < P; s0 += chunk) run(s0, std::min(chunk, P - s0));
+      UH_CHECK(hipStreamSynchronize(st));
+      const auto td = std::chrono::steady_clock::now();
       for (int t = P; t < S; ++t) run(t, 1);
       UH_CHECK(hipStreamSynchronize(st));
+      const double pre_s = std::chrono::duration<double>(td - tp).count();
+      const double dec_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - td).count();
+      t_prefill += pre_s;
+      t_decode += dec_s;
+      std::printf("layer %2d: prefill %.1f ms (%d tokens), decode %.2f ms/token\n", L, pre_s * 1e3, P,
+                  S > P ? dec_s * 1e3 / (S - P) : 0.0);
       const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count();
       std::snprintf(name, sizeof name, "/h_%03d.bin", L);
       if (read_file(oracle + name, ref.data(), ref.size() * 2)) {
@@ -254,13 +292,17 @@ int main(int argc, char** argv) {
         std::printf("layer %2d: %d of %d slot copies differ from slot 0\n", L, differ, slots - 1);
       }
     }
+    std::printf("layers: prefill %.2f s for %d tokens (%.0f tok/s), decode %.1f ms/token\n", t_prefill, P,
+                P / std::max(t_prefill, 1e-9), S > P ? t_decode * 1e3 / (S - P) : 0.0);
     if (n_layers < c.n_layers) return 0;
 
     const int V = c.vocab;
     rt::DeviceBuffer logits(dev, size_t(S) * V * 4);
     {
       auto hw = model::load_glm5_head(dense, dev, st, false, true);
-      model::glm5_head_forward(c, hw, scr, x.as<uint16_t>(), S, logits.as<float>(), st);
+      if (fast) model::prepare_glm5_fast_head(hw, dev, st);
+      (fast ? model::glm5_head_forward_fast : model::glm5_head_forward)(c, hw, scr, x.as<uint16_t>(), S,
+                                                                        logits.as<float>(), st);
       UH_CHECK(hipStreamSynchronize(st));
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

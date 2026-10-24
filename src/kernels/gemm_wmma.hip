@@ -18,6 +18,7 @@
 // (each block's raw chain starts from zero, so they are independent) and folds them in order; the bf16
 // one runs a wave per (16 columns, 16 rows). unholy-gemv-test checks them bit for bit against the tiles.
 #include "kernels/gemm_wmma.hpp"
+#include "kernels/glm_fast.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -399,6 +400,11 @@ void gemm_grouped_fp8w_wmma(const bf16* a, const uint8_t* w, const uint8_t* sw, 
   if (K % 128) throw std::runtime_error("gemm_grouped_fp8w_wmma: K % 128");
   // a [M, G, K]: row m of group g at a + m*G*K + g*K; c [M, G, R]: row m at c + m*G*R + g*R.
   launch_bf16<true, bf16>(a, G * K, size_t(K), w, sw, c, G * R, size_t(R), M, R, K, G, use_skinny(M), st);
+}
+
+void gemm_grouped_bf16_wmma(const bf16* a, const bf16* w, bf16* c, int M, int G, int R, int K, hipStream_t st) {
+  if (K % 32) throw std::runtime_error("gemm_grouped_bf16_wmma: K % 32");
+  launch_bf16<false, bf16>(a, G * K, size_t(K), w, nullptr, c, G * R, size_t(R), M, R, K, G, use_skinny(M), st);
 }
 
 }  // namespace unholy::kernels

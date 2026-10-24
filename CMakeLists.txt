@@ -124,6 +124,8 @@ add_library(unholy_glm STATIC
   src/kernels/ref_glm.hip
   src/model/glm5.hip
   src/model/glm5_forward.hip
+  src/model/glm5_fast.hip
+  src/kernels/glm_fast.hip
 )
 target_include_directories(unholy_glm PUBLIC src third_party)
 target_link_libraries(unholy_glm PUBLIC unholy_ref)

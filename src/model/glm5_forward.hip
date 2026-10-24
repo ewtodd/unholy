@@ -17,6 +17,7 @@ namespace {
 
 std::vector<std::vector<uint64_t>>* g_hist = nullptr;
 bool g_a8 = false;
+bool g_kv_fp8 = false, g_idx_fp8 = false;
 
 template <typename T>
 T* slot_rows(const rt::DeviceBuffer& b, int slot, size_t per_slot) {
@@ -78,6 +79,7 @@ void dsa_forward(const Glm5Config& c, const Glm5LayerWeights& w, Glm5Cache& cach
   bf16* lat = s.at<bf16>(kLatent);
   glm5_linear(w.kv_a, hn, D, lat, R, T, s, st);
   k::rmsnorm_hf(lat, R, w.kv_a_norm.p<bf16>(), lat, R, T, R, c.norm_eps, st);
+  if (g_kv_fp8) k::fake_quant_fp8(lat, R, T, R, 64, st);
   // Indexer rows.
   bf16* iq = s.at<bf16>(kIdxQ);
   bf16* ik = s.at<bf16>(kIdxK);
@@ -113,6 +115,7 @@ void dsa_forward(const Glm5Config& c, const Glm5LayerWeights& w, Glm5Cache& cach
     // Pools completed by this chunk, then the selection: the top pools among those complete by each query.
     const int p0 = ch.s0 / pool, p1 = (ch.s0 + ch.n) / pool;
     k::idx_pool(ck, cg, w.idx_ape.p<float>(), pk, p0, p1 - p0, pool, ID, st);
+    if (g_idx_fp8 && p1 > p0) k::fake_quant_fp8(pk + size_t(p0) * ID, ID, p1 - p0, ID, 128, st);
     int32_t* cpools = pools + size_t(ch.t0) * kpools;
     if (p1 == 0) {
       UH_CHECK(hipMemsetAsync(cpools, 0xff, size_t(ch.n) * kpools * 4, st));
@@ -215,6 +218,12 @@ void moe_forward(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scrat
 
 void set_glm5_expert_histogram(std::vector<std::vector<uint64_t>>* hist) { g_hist = hist; }
 void set_glm5_a8(bool on) { g_a8 = on; }
+void set_glm5_cache_fp8(bool latent, bool pooled) {
+  g_kv_fp8 = latent;
+  g_idx_fp8 = pooled;
+}
+bool glm5_cache_fp8_latent() { return g_kv_fp8; }
+bool glm5_cache_fp8_pooled() { return g_idx_fp8; }
 
 void glm5_linear(const GLinear& l, const uint16_t* x, int ldx, uint16_t* out, int ldo, int rows,
                  const Glm5Scratch& s, hipStream_t st) {

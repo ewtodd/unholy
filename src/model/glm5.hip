@@ -6,6 +6,9 @@
 #include <stdexcept>
 
 #include "core/half.hpp"
+#include "kernels/exl3_moe.hpp"
+#include "kernels/hc_fast.hpp"
+#include "kernels/moe_dispatch.hpp"
 #include "kernels/ref.hpp"
 #include "model/exl3.hpp"
 #include "model/loader.hpp"
@@ -400,6 +403,7 @@ Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int 
   const size_t wide_out = std::max({3 * W, H * c.nope_dim, size_t(c.inter), D});
   s.head_rows = int(std::min<size_t>(T, 64));
   const size_t ffn = std::max(P * c.moe_inter, T * c.inter);
+  const size_t E = c.n_experts, max_tiles = P / k::kExl3TileRows + E + 1;
   const size_t sizes[kGlm5ScratchBufs] = {
       T * D * 2,                                  // h
       T * D * 2,                                  // hn
@@ -443,8 +447,24 @@ Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int 
       T * wide_in * 4,                            // EXL3 x side
       std::max(T * wide_out, size_t(s.head_rows) * c.vocab) * 4,  // EXL3 y side
       size_t(s.head_rows) * c.vocab * 2,          // head bf16 logits
+      (T / k::kExl3TileRows + 2) * sizeof(k::Exl3Tile),  // dense tiles
+      std::max(P, T) * 4,                         // zero rows (row_expert of a dense linear)
+      std::min<size_t>(T, k::kHcSmallMaxTokens) * 32 * 25 * 4,  // hc_pre_small partial sums
+      E * 4, E * 4, E * 4,                        // MoE count, offsets, fill
+      sizeof(k::MoePlan),                         // MoE plan
+      max_tiles * sizeof(k::Exl3Tile),            // local tiles
+      max_tiles * sizeof(k::Exl3Tile),            // remote tiles
+      P * 4, P * 4, P * 4,                        // pair -> token, weight, expert
+      P * D * 2, P * D * 2,                       // fp16 expert inputs (gate, up)
+      std::max(P * c.moe_inter, T * c.inter) * 2,  // fp16 down inputs
+      std::max(std::min<size_t>(P, 64) * std::max(D, size_t(c.moe_inter)),
+               8 * std::max(3 * W, size_t(c.vocab))) * 4,  // GEMV fp32 sides
   };
-  for (size_t b : sizes) s.bufs.emplace_back(dev, std::max<size_t>(b, 16));
+  rt::DeviceGuard g(dev);
+  for (size_t b : sizes) {
+    s.bufs.emplace_back(dev, std::max<size_t>(b, 16));
+    UH_CHECK(hipMemset(s.bufs.back().data(), 0, s.bufs.back().size()));  // MoE counts and zero rows start at 0
+  }
   return s;
 }
 

@@ -55,6 +55,7 @@ struct Glm5Config {
 struct GLinear {
   DevTensor w, s;
   Exl3Weights x;
+  rt::DeviceBuffer tab;  // fast path, EXL3: device [trellis, suh, svh] (one-expert tables for the grouped kernels)
   int out = 0, in = 0;
   bool exl3() const { return bool(x.trellis); }
   explicit operator bool() const { return bool(w) || exl3(); }
@@ -82,6 +83,15 @@ struct Glm5LayerWeights {
   DevTensor router_bias;
   GLinear sh_gate, sh_up, sh_down;
   std::vector<GLinear> e_gate, e_up, e_down;
+  DevTensor w_ukT, w_uv;  // fast path: kv_b split per head, bf16 [H][kv_lora][nope] (transposed) and [H][v][kv_lora]
+  // Fast path: the routed experts' tables [gate, up, down] x [trellis, suh, svh] x E (null where the expert is not
+  // on this device), their bit widths, and which experts this device holds.
+  rt::DeviceBuffer exl3_tab, resident;
+  int exl3_bits[3] = {0, 0, 0};
+  int n_resident = 0;
+  const uint16_t* const* tab(int m, int f, int n_experts) const {
+    return exl3_tab.as<const uint16_t* const>() + size_t(m * 3 + f) * n_experts;
+  }
 };
 
 struct Glm5LoadOptions {
@@ -124,6 +134,8 @@ struct Glm5Batch {
   std::vector<Glm5Chunk> chunks;
   int T = 0;
   const int32_t* pos = nullptr;  // device [T]
+  const int32_t* tables = nullptr;  // fast path: device block tables [slots][max_pages] (kernels/glm_fast.hpp)
+  int max_pages = 0;
 };
 
 // Working memory for batches of up to max_tokens tokens of sequences up to max_seq long.
@@ -135,6 +147,8 @@ enum Glm5Buf : int {
   kF32Rows, kF32Hn, kSel, kRouteW, kPairTok, kPairW, kPairIdx,            // MoE
   kExpIn, kExpGate, kExpUp, kExpAct, kExpOut, kShared,
   kExl3X, kExl3Y, kHeadOut,                                               // EXL3 sides, head
+  kDenseTiles, kZeroRows, kHcPart,                                        // fast path
+  kMoeCount, kMoeOff, kMoeFill, kMoePlan, kMoeLTiles, kMoeRTiles, kEIdx, kEWt, kRowExpert, kXh1, kXh3, kXh2, kYp,
   kGlm5ScratchBufs
 };
 constexpr int kIdxBlock = 64;  // queries per index-score pass
@@ -164,9 +178,40 @@ void glm5_head_forward(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5
 // Dynamic fp8 activations (kernels::fake_quant_fp8_group) ahead of every block-fp8 linear, as fp8 serving stacks run
 // the release; off by default (the oracle keeps activations in bf16).
 void set_glm5_a8(bool on);
+// fp8 storage of the cache (kernels::fake_quant_fp8, power-of-two scales as DSV4's KV): the MLA latent rows (per 64
+// values) and / or the indexer's pooled keys (per row of 128), quantized as they are written. Off by default.
+void set_glm5_cache_fp8(bool latent, bool pooled);
+bool glm5_cache_fp8_latent();
+bool glm5_cache_fp8_pooled();
 
 // out [rows, l.out] bf16 = x [rows, l.in] (row stride ldx) through `l`; EXL3 uses scratch for its fp32 sides.
 void glm5_linear(const GLinear& l, const uint16_t* x, int ldx, uint16_t* out, int ldo, int rows,
                  const Glm5Scratch& scr, hipStream_t st);
 
+// ---- fast path (docs/PLAN-glm-dsv41.md, G5) --------------------------------------------------------------------
+// The same layer on the fast kernels: EXL3 linears on the grouped EXL3 GEMM / GEMV kernels (no activation fake
+// quantization), small projections on the bf16 WMMA GEMM / GEMV, the routed experts dispatched on the device
+// (kernels/moe_dispatch), the Hyper-Connection and norm kernels of the DSV4 fast path. Arithmetic differs from the
+// reference at the bf16-rounding level; the check is KL against the oracle (tools/glm_ref --fast).
+
+// Fast path state of one layer: KDA's per-slot conv tail and recurrent state (as Glm5Cache), or the DSA layer's
+// paged rows (kernels/glm_fast.hpp: fp8 latent, bf16 pooled keys) and per-slot pool tails.
+struct Glm5PagedCache {
+  int layer = 0, slots = 0, num_pages = 0;
+  bool kda = false;
+  rt::DeviceBuffer conv, state;
+  rt::DeviceBuffer lat, lat_s, pk, tail_k, tail_g;
+};
+Glm5PagedCache make_glm5_paged_cache(const Glm5Config& c, int layer, int slots, int num_pages, int dev,
+                                     hipStream_t st);
+size_t glm5_paged_cache_bytes(const Glm5Config& c, bool kda, int slots, int num_pages);
+
+// After load_glm5_layer: EXL3 pointer tables, fp16 small weights converted to bf16 (exllamav3 stored the release's
+// bf16 values as fp16; converting back is exact for them), the routed experts' grouped tables.
+void prepare_glm5_fast(const Glm5Config& c, Glm5LayerWeights& w, int dev, hipStream_t st);
+void prepare_glm5_fast_head(Glm5HeadWeights& h, int dev, hipStream_t st);
+void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache,
+                             const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st);
+void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* x,
+                            int T, float* logits, hipStream_t st);
 }  // namespace unholy::model
