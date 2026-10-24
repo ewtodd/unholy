@@ -153,9 +153,9 @@ in the production geometry 57 fit without MTP, 16 with. Reuse is bit-identical (
 MTP) and cut an 11.7k-token prompt's TTFT from 14 s to 1.0 s. Prefill is bound by the host link the cards share with
 the APU, not by kernels (DECISIONS 2026-10-24, GLM prefill): compact token inputs and row-ranged transforms took a
 served 11.7k-token prompt from 857 to 1007 tok/s, bit-identical. Throughput on the GSM8K set (engine-batch, MTP):
-24.0 / 29.0 / 32.6 / 44.6 tok/s at concurrency 1 / 2 / 4 / 8 (DSV4 37.9 / 48.1 / 55.3 / 63.6). Open: the RAM
-trade-off between MTP, snapshots and the KV pool; combined outputs (branch `glm-combined-outputs`, +4% served
-prefill, not bit-identical); the APU's share growing with depth; launch count in decode.
+24.0 / 29.0 / 32.6 / 44.6 tok/s at concurrency 1 / 2 / 4 / 8 (DSV4 37.9 / 48.1 / 55.3 / 63.6). Combined remote
+outputs (+4% served prefill, not bit-identical) are in. Service configuration for G6: MTP, `--kv-tokens 1048576`,
+~40 snapshots. Open: the APU's share growing with depth; launch count in decode.
 
 **G5: Fast path (4-6 days).** WMMA kernels for KDA prefill and decode, the DSA indexer and attention, and the
 chosen dense format (EXL3 dense GEMV, or fp8 KDA weights); placement from the GLM profile; two steps in flight;

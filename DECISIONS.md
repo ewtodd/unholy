@@ -1301,11 +1301,14 @@ before the trace, are ~0.3 s and 0.2 s per card per step even at 250k.
   fewer bytes; the APU reads pair row p from token row p2u[p]); the transforms loop over a device row range with a
   capped grid. Same values, same arithmetic: GLM tokens and logprobs bit-identical with and without MTP, DSV4
   validate bit-identical. Traced step 3.39 -> 2.99 s; served 11.7k-token prompt 857 -> 1007 tok/s.
-- Combined outputs (branch `glm-combined-outputs`, not merged): the APU sums each token's remote pairs into one fp32
-  row (0.56x the output bytes). The combine's fp32 sum is regrouped, so outputs move: logprobs by up to 0.075 (0.27
-  with MTP) on the prefix pair, 4 of 16 greedy GSM8K requests token-identical (all 16 final answers the same). +4%
-  served prefill (+8% traced) is not worth giving up bit-exactness, which a GLM resident-vs-reference check (like
-  DSV4's validate) would need.
+- Combined outputs (ed7347e): the APU sums each token's remote pairs into one fp32 row (0.56x the output bytes).
+  The combine's fp32 sum is regrouped, so outputs move: logprobs by up to 0.075 (0.27 with MTP) on the prefix pair,
+  4 of 16 greedy GSM8K requests token-identical (all 16 final answers the same); +4% served prefill (+8% traced).
+  Parked at first (a GLM resident-vs-reference check like DSV4's validate needs bit-exactness); the owner chose to
+  take it. GLM's resident outputs now depend on the expert placement, as DSV4's do.
+
+GLM service configuration (owner, for G6): MTP drafting on, `--kv-tokens 1048576` (room for one 786k request and
+smaller ones), about 40 prefix snapshots in the RAM that frees on the APU.
 - At depth the APU's expert time grows (1.8 -> 3.1 s per step at 250k) while the cards' shrinks, on a curve that
   repeats a 32k-token file: a routing shift toward cold experts, to be checked on real long prompts.
 
