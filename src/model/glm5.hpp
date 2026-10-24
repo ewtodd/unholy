@@ -74,8 +74,8 @@ struct Glm5LayerWeights {
   GLinear q_a, q_b, kv_a, kv_b;
   DevTensor q_a_norm, kv_a_norm;
   GLinear idx_wq_b, idx_wk, idx_wproj, idx_gate;
-  DevTensor idx_knorm_w, idx_knorm_b, idx_ape;
-  bool idx_f16 = false;  // k_norm / ape stored as fp16
+  DevTensor idx_knorm_w, idx_knorm_b, idx_ape;  // ape as f32
+  bool idx_f16 = false;  // k_norm stored as fp16
   // MLP: dense, or router + shared expert + routed experts.
   GLinear gate, up, down;
   GLinear router;
@@ -89,6 +89,7 @@ struct Glm5LoadOptions {
   const Checkpoint* aux = nullptr;      // tensors the dense checkpoint lacks (exllamav3 leaves out the
                                         // indexer's pooling weights): the FP8 release
   bool load_experts = true;
+  bool kda_fp8 = false;  // re-quantize the KDA q / k / v / o projections (bf16 in the release) to 128x128 block fp8
 };
 // Loads one layer to `dev` (synchronously).
 Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int layer, int dev, hipStream_t st,
@@ -159,6 +160,10 @@ void glm5_layer_forward(const Glm5Config& c, const Glm5LayerWeights& w, Glm5Cach
 // in groups of the scratch's max_tokens.
 void glm5_head_forward(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* x,
                        int T, float* logits, hipStream_t st);
+
+// Dynamic fp8 activations (kernels::fake_quant_fp8_group) ahead of every block-fp8 linear, as fp8 serving stacks run
+// the release; off by default (the oracle keeps activations in bf16).
+void set_glm5_a8(bool on);
 
 // out [rows, l.out] bf16 = x [rows, l.in] (row stride ldx) through `l`; EXL3 uses scratch for its fp32 sides.
 void glm5_linear(const GLinear& l, const uint16_t* x, int ldx, uint16_t* out, int ldo, int rows,

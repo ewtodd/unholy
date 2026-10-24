@@ -1231,3 +1231,28 @@ GPU checks against the M0 baselines of 2026-10-23 (same expert placement): `unho
 decode 29.0 / 28.3 / 25.8 / 22.5 tok/s at 4k / 32k / 128k / 512k and prefill 1438 tok/s averaged to 512k, against
 29.0 / 28.2 / 25.7 / 22.6 and 1423 (`docs/bench/curve-native-1x512k-plx-2026-10-24-g3.txt`); `unholy-engine-batch`
 at concurrency 8: 48 / 48 requests token- and logprob-identical, 63.9 tok/s against 63.4.
+
+## 2026-10-24 — G4: GLM-5.3-Flash reference forward at the oracle's noise floor; KL of builds A-D
+
+docs/PLAN-glm-dsv41.md G4. `src/kernels/ref_glm.*` + `src/model/glm5*` implement transformers' glm5_next layer by
+layer with its bf16 rounding points (fp32 inside KDA and attention): KDA (conv + SiLU, lower-bounded forget gate,
+token-recurrent delta rule, gated output norm), DSA (absorbed NoPE MLA over the 512-wide latent, pooled indexer:
+softmax-weighted 4-token pool keys, top-512 complete pools + the query's incomplete pool), sigmoid router with
+selection bias and x2.5, clamped SwiGLU, mHC (DSV4's pre-mix kernel, a bf16 post-mix, mean head). Weights from
+the FP8 release (fp8 with fp32 128x128 block scales, dequantized to bf16 as transformers does) or exllamav3
+quants (EXL3 linears; fp16 small projections; the indexer's pooling weights from the release when the quant
+lacks them). `unholy-glm-ref` streams the layers on one R9700 (~90 s per pass) and compares with the oracle.
+
+Against the oracle (1024 + 8 positions): code KL 3.10e-3, top-1 98.64% (oracle eager vs SDPA: 3.42e-3, 97.87%);
+math chat 2.55e-2, 96.03% (2.25e-2, 96.41%). Single layers from the oracle's input: rel. error ~2e-3. Prefill in
+256-token chunks and two sequences batched in 512-token chunks: logits bit-identical to one 1024-token chunk.
+Indexer on a 4096-token oracle (`run.py --dump-topk --prefill-chunk 1024`): every query that sees all keys picks
+the oracle's set; past 2048 keys mean Jaccard 0.9996, worst query 2 of 512 pools swapped (near-ties).
+
+Builds (KL code / chat, top-1 code / chat): A (EXL3 3.05 everywhere) 2.72e-2 / 1.37e-1, 95.06 / 91.18%; B (EXL3
+4.05) 1.27e-2 / 7.06e-2, 96.71 / 93.22%; C (3.05 experts, fp8 dense with our fp8 KDA) 2.84e-2 / 1.34e-1, 95.83 /
+91.38%; D (4.05 experts, same dense) 1.33e-2 / 6.57e-2, 96.61 / 93.31%. With the release's bf16 KDA instead
+(E3 / E4): 2.70e-2 / 1.25e-2 on code. Dynamic fp8 activations (W8A8): release 3.10e-3 -> 5.50e-3, D 1.33e-2 ->
+1.51e-2. So the expert width decides (4.05 halves the KL on both prompts), the dense format is quality-neutral
+within a few percent, and a weight-only fp8 path avoids the activation cost. Decision for the owner: 3.05 vs 4.05
+experts, EXL3 vs fp8 dense.

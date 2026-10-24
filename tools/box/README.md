@@ -6,7 +6,7 @@ them. Everything they write goes under `/work` (the SATA dev array); `/scratch` 
 | path on the box | what |
 |---|---|
 | `/work/unholy-perf` | this checkout, synced and built by `sync.sh` (`.synced-rev` says which commit) |
-| `/work/data` | inputs made once: `ids_code32768.bin` (+ `code-corpus.txt`), `gsm48.jsonl`, `oracle/code1024`, `base/` |
+| `/work/data` | inputs made once: `ids_code32768.bin` (+ `code-corpus.txt`), `gsm48.jsonl`, `oracle/code1024`, `base/`; GLM: `glm/` (code and chat ids, oracles `code1024` / `chat1024` and their `-sdpa` twins, `code4096`: 8 layers with top-k dumps) |
 | `/work/runs/<date>-<label>` | one directory per run: logs, logits, outputs |
 | `/work/env/py` | python with ROCm torch for the oracle (a GC root to a pinned env) |
 
@@ -29,12 +29,14 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 |---|---|
 | `sync.sh [--no-build]` | (dev machine) copy the checkout to the box and build it |
 | `setup.sh` | one-time inputs: `/work/env/py`, the code token ids (`mkids.py`), the GSM8K request set (`mkgsm.py`) |
+| `mkchat.py` | a multi-turn GSM8K math chat through a model's chat template (`$GLM_PY`): the second oracle prompt |
 | `oracle.sh [DIR]` | DeepSeek's model.py, layer-streamed on one R9700: 1024 prefill + 8 decode, logits + hidden states |
-| `glm-oracle.sh [DIR] [flags]` | the same for GLM-5.3-Flash: transformers' glm5_next on the FP8 release, layer-streamed; also writes the routing counts |
+| `glm-oracle.sh [DIR] [flags]` | the same for GLM-5.3-Flash: transformers' glm5_next on the FP8 release, layer-streamed; also writes the routing counts; `--dump-topk` saves the DSA selections, `--prefill-chunk N` splits long prompts |
 | `validate.sh [--baseline]` | resident-model logits vs the baseline (bit-identical expected) and vs the oracle; keep `MARGIN` fixed so the expert placement matches |
 | `curve.sh LABEL` | `unholy-curve` to 512k: prefill by depth, decode probes |
 | `bench.sh LABEL [flags]` | `unholy-bench` |
 | `serve.sh [flags]` | the perf tree's server with the production flags on port 8300, foreground |
 | `sweep.sh LABEL [flags]` | that server + check-source `gsm8k-chat` at 1 / 2 / 4 / 8 requests (check-source pinned in `env.sh`) |
 | `eb.sh LABEL CONC [flags]` | `unholy-engine-batch` on `gsm48.jsonl` with logprobs; `REF=...jsonl` compares with an earlier run |
+| `glm-ref.sh LABEL [flags]` | `unholy-glm-ref`: the GLM reference forward against `glm-oracle.sh`'s dumps, layer by layer, then KL / top-1 |
 | `hold.sh CMD...` | run CMD (e.g. `bash -c 'a.sh && b.sh'`) with the services stopped once, not once per script |

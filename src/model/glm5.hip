@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 
+#include "core/half.hpp"
 #include "kernels/ref.hpp"
 #include "model/exl3.hpp"
 #include "model/loader.hpp"
@@ -63,7 +64,8 @@ Glm5Config Glm5Config::from_hf(const gufo::json::Value& top) {
   c.hc_eps = float(num(j, "hc_eps"));
   c.n_mtp = int(j.member_double("num_nextn_predict_layers"));
   for (const auto& t : strs("layer_types")) {
-    if (t != "linear_attention" && t != "deepseek_sparse_attention") throw std::runtime_error("config: layer type " + t);
+    if (t != "linear_attention" && t != "deepseek_sparse_attention")
+      throw std::runtime_error("config: layer type " + t);
     c.kda.push_back(t == "linear_attention");
   }
   for (const auto& t : strs("mlp_layer_types")) {
@@ -129,11 +131,21 @@ struct LoadCtx {
     items.push_back({&t, alloc(d, t.nbytes)});
     return d;
   }
-  // An fp32 tensor that a checkpoint may store as bf16 (converted after the pass).
+  // An fp32 tensor that a checkpoint may store as bf16 (converted after the pass) or fp16 (converted here).
   void upload_f32(const std::string& name, DevTensor& dst) {
     const TensorInfo& t = ck.at(name);
     if (t.dtype == DType::F32) {
       dst = upload(name);
+      return;
+    }
+    if (t.dtype == DType::F16) {
+      const auto src = ck.as<uint16_t>(t);
+      std::vector<float> host(src.size());
+      for (size_t i = 0; i < src.size(); ++i) host[i] = half_to_float(src[i]);
+      dst.dtype = DType::F32;
+      dst.shape = t.shape;
+      rt::DeviceGuard g(dev);
+      UH_CHECK(hipMemcpy(alloc(dst, host.size() * 4), host.data(), host.size() * 4, hipMemcpyHostToDevice));
       return;
     }
     if (t.dtype != DType::BF16) throw std::runtime_error(name + ": expected F32 or BF16");
@@ -185,6 +197,26 @@ GLinear glinear(LoadCtx& lc, const std::string& prefix) {
     throw std::runtime_error(prefix + ": unsupported dtype " + dtype_name(l.w.dtype));
   }
   return l;
+}
+
+// A bf16 linear -> 128x128 block fp8 with fp32 scales (kernels::quant_fp8_block).
+void requant_fp8(GLinear& l, int dev, hipStream_t st) {
+  if (l.exl3() || l.w.dtype != DType::BF16) return;
+  DevTensor q, s;
+  q.buf = rt::DeviceBuffer(dev, size_t(l.out) * l.in);
+  q.ptr = q.buf.data();
+  q.dtype = DType::F8_E4M3;
+  q.shape = l.w.shape;
+  const size_t nb = size_t((l.out + 127) / 128) * ((l.in + 127) / 128);
+  s.buf = rt::DeviceBuffer(dev, nb * 4);
+  s.ptr = s.buf.data();
+  s.dtype = DType::F32;
+  s.shape = {(l.out + 127) / 128, (l.in + 127) / 128};
+  rt::DeviceGuard g(dev);
+  k::quant_fp8_block(l.w.p<uint16_t>(), q.p<uint8_t>(), s.p<float>(), l.out, l.in, st);
+  UH_CHECK(hipStreamSynchronize(st));
+  l.w = std::move(q);
+  l.s = std::move(s);
 }
 
 }  // namespace
@@ -240,7 +272,8 @@ Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int 
     w.dt_bias = lc.upload(a + "dt_bias");
     w.a_log = lc.upload(a + "A_log");
     w.o_norm = lc.upload(a + "o_norm.weight");
-    if (w.dt_bias.dtype != DType::F32 || w.a_log.dtype != DType::F32) throw std::runtime_error(a + ": gate params not f32");
+    if (w.dt_bias.dtype != DType::F32 || w.a_log.dtype != DType::F32)
+      throw std::runtime_error(a + ": gate params not f32");
   } else {
     w.q_a = glinear(lc, a + "q_a_proj");
     w.q_b = glinear(lc, a + "q_b_proj");
@@ -256,19 +289,20 @@ Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int 
     w.idx_knorm_w = lc.upload(ip + "k_norm.weight");
     w.idx_knorm_b = lc.upload(ip + "k_norm.bias");
     w.idx_f16 = w.idx_knorm_w.dtype == DType::F16;
-    // The pooling weights (bf16 everywhere they exist): exllamav3 keeps them out of its index.
+    // The pooling weights: bf16 in the release, fp16 / fp32 in exllamav3 4.05, left out of 3.05's index.
     LoadCtx* pc = &lc;
     if (!ck.find(ip + "index_kpool_compress_gate.weight") && !ck.find(ip + "index_kpool_compress_gate")) {
-      if (!opt.aux) throw std::runtime_error(ip + "index_kpool_compress_*: not in the checkpoint (pass the FP8 release as aux)");
+      if (!opt.aux)
+        throw std::runtime_error(ip + "index_kpool_compress_*: not in the checkpoint (pass the FP8 release as aux)");
       ax = std::make_unique<LoadCtx>(LoadCtx{*opt.aux, dev, {}, {}, {}});
       pc = ax.get();
     }
     w.idx_gate.w = pc->upload(ip + "index_kpool_compress_gate");
     w.idx_gate.out = int(w.idx_gate.w.shape[0]);
     w.idx_gate.in = int(w.idx_gate.w.shape[1]);
-    w.idx_ape = pc->upload(ip + "index_kpool_compress_ape");
-    if (w.idx_gate.w.dtype != DType::BF16 || w.idx_ape.dtype != DType::BF16)
-      throw std::runtime_error(ip + "index_kpool_compress_*: expected bf16");
+    pc->upload_f32(ip + "index_kpool_compress_ape", w.idx_ape);
+    if (w.idx_gate.w.dtype != DType::BF16 && w.idx_gate.w.dtype != DType::F16)
+      throw std::runtime_error(ip + "index_kpool_compress_gate: expected bf16 or fp16");
   }
 
   const std::string m = p + "mlp.";
@@ -286,6 +320,8 @@ Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int 
   }
   lc.run(st);
   if (ax) ax->run(st);
+  if (w.kda && opt.kda_fp8)
+    for (GLinear* l : {&w.q, &w.k, &w.v, &w.o}) requant_fp8(*l, dev, st);
 
   if (!w.dense && opt.load_experts) {
     LoadCtx ex{opt.experts ? *opt.experts : ck, dev, {}, {}, {}};

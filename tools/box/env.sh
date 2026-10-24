@@ -36,9 +36,20 @@ in_nix() { (cd "$BOX_TREE" && exec nix develop -c "$@"); }
 
 # with_gpus CMD...: stop every llm-mode service, run CMD, then restore the mode that was serving, also
 # when CMD fails or is interrupted. son-of-anton may manage these units without sudo (polkit).
-# Inside tools/box/hold.sh the services are already down and stay down: CMD just runs.
+# Inside tools/box/hold.sh the services are already down and stay down: CMD just runs, once no unit is still
+# starting or stopping (a unit winding down still holds its device memory).
 with_gpus() {
-  if [ -n "${BOX_GPUS_HELD:-}" ]; then "$@"; return; fi
+  if [ -n "${BOX_GPUS_HELD:-}" ]; then
+    local u
+    for u in unholy radiance gufo-strix; do
+      if [ "$(systemctl is-active "$u.service")" != inactive ] && [ "$(systemctl is-active "$u.service")" != failed ]; then
+        echo "with_gpus: $u.service is $(systemctl is-active "$u.service"), not stopped" >&2
+        return 1
+      fi
+    done
+    "$@"
+    return
+  fi
   local mode rc=0
   mode=$(cat /var/lib/llm-mode/mode 2>/dev/null || echo ds4)
   trap 'llm-mode "'"$mode"'" >/dev/null' EXIT

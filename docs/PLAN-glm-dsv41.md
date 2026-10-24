@@ -119,6 +119,17 @@ sizes, the cache manager (per-sequence recurrent state, double-buffered for spec
 pooled indexer rows with a per-sequence tail carry), and the tokenizer / chat template / output parser. Exit:
 DSV4 bit-identical to the M0 baselines, no speed regression.
 
+**G4 status (2026-10-24):** reference path done (`src/kernels/ref_glm.*`, `src/model/glm5*`, `unholy-glm-ref` /
+`tools/box/glm-ref.sh`): KDA with a token-recurrent delta rule (the definition the chunked WMMA kernels of G5 will be
+checked against), the pooled indexer with top-512 pools + tail, absorbed NoPE MLA, the sigmoid router, dense and
+MoE MLPs, mHC with transformers' bf16 post-mix, fp8 (fp32 block scales) / bf16 / fp16 / EXL3 weights, the KDA fp8
+re-quantization of C / D and an fp8-activation option. Against the oracle: code prompt KL 3.10e-3 / top-1 98.64%
+(eager vs SDPA 3.42e-3 / 97.87%), chat prompt 2.55e-2 / 96.03% (2.25e-2 / 96.41%), so at the noise floor; chunked
+prefill and two batched sequences bit-identical; indexer selection checked on a 4096-token oracle. KL table for
+A-D in `docs/glm53-flash-quant.md` ("Measured quality"): A 2.72e-2 / 1.37e-1 (code / chat), B 1.27e-2 / 7.06e-2,
+C 2.84e-2 / 1.34e-1, D 1.33e-2 / 6.57e-2. The expert width decides (4.05 halves the KL), the dense format does not
+measurably; fp8 activations cost +2.4e-3 on the release. Open: the owner's decision below; long-context KL.
+
 **G4: Reference forward (3-4 days).** Reference kernels for KDA (conv, lower-bounded gate, chunked + recurrent
 delta rule, gated norm), DSA (pooled indexer, top-2048 + tail, absorbed NoPE MLA), the sigmoid router (bias,
 x2.5), dense layers 0-2, mHC, EXL3 experts (288, top-8) and both dense formats. Per-layer vs the oracle, then

@@ -119,6 +119,19 @@ install(TARGETS unholy-ref-run RUNTIME DESTINATION bin)
 add_executable(unholy-batch-test tools/batch_test/main.hip)
 target_link_libraries(unholy-batch-test PRIVATE unholy_ref)
 
+# GLM-5.3-Flash reference path (docs/PLAN-glm-dsv41.md, G4).
+add_library(unholy_glm STATIC
+  src/kernels/ref_glm.hip
+  src/model/glm5.hip
+  src/model/glm5_forward.hip
+)
+target_include_directories(unholy_glm PUBLIC src third_party)
+target_link_libraries(unholy_glm PUBLIC unholy_ref)
+
+add_executable(unholy-glm-ref tools/glm_ref/main.hip)
+target_link_libraries(unholy-glm-ref PRIVATE unholy_glm)
+install(TARGETS unholy-glm-ref RUNTIME DESTINATION bin)
+
 # Engine: placement, resident multi-device model.
 add_library(unholy_engine STATIC
   src/engine/plan.cpp

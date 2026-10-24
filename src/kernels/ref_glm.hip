@@ -35,7 +35,8 @@ __global__ void rmsnorm_hf_kernel(const bf16* x, int ldx, const bf16* w, bf16* y
   ss = block_sum(ss, red);
   const float r = rsqrtf(ss / float(dim) + eps);
   bf16* yr = y + size_t(blockIdx.x) * ldy;
-  for (int i = threadIdx.x; i < dim; i += blockDim.x) yr[i] = f32_to_bf16(bf16_to_f32(w[i]) * round_bf16(bf16_to_f32(xr[i]) * r));
+  for (int i = threadIdx.x; i < dim; i += blockDim.x)
+    yr[i] = f32_to_bf16(bf16_to_f32(w[i]) * round_bf16(bf16_to_f32(xr[i]) * r));
 }
 
 __global__ void layernorm_kernel(const bf16* x, const void* w, const void* b, bool f16, bf16* y, int dim, float eps) {
@@ -176,18 +177,19 @@ __global__ void kda_out_norm_kernel(const bf16* x, const bf16* gate, const bf16*
   }
   const float r = rsqrtf(block_sum(ss, red) / float(D) + eps);
   for (int i = threadIdx.x; i < D; i += blockDim.x)
-    o[base + i] = f32_to_bf16(bf16_to_f32(w[i]) * (bf16_to_f32(x[base + i]) * r) * sigmoidf(bf16_to_f32(gate[base + i])));
+    o[base + i] =
+        f32_to_bf16(bf16_to_f32(w[i]) * (bf16_to_f32(x[base + i]) * r) * sigmoidf(bf16_to_f32(gate[base + i])));
 }
 
 // ---- indexer ----
-__global__ void idx_pool_kernel(const bf16* k, const bf16* gs, const void* ape, bool f16, bf16* out, int p0, int np,
-                                int pool, int D) {
+__global__ void idx_pool_kernel(const bf16* k, const bf16* gs, const float* ape, bf16* out, int p0, int np, int pool,
+                                int D) {
   const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i >= size_t(np) * D) return;
   const int p = p0 + int(i / D), d = int(i % D);
   float l[8], mx = -INFINITY;
   for (int j = 0; j < pool; ++j) {
-    l[j] = bf16_to_f32(gs[(size_t(p) * pool + j) * D + d]) + load_h(ape, f16, size_t(j) * D + d);
+    l[j] = bf16_to_f32(gs[(size_t(p) * pool + j) * D + d]) + ape[size_t(j) * D + d];
     mx = fmaxf(mx, l[j]);
   }
   float sum = 0.0f;
@@ -196,7 +198,8 @@ __global__ void idx_pool_kernel(const bf16* k, const bf16* gs, const void* ape, 
     sum += l[j];
   }
   float acc = 0.0f;
-  for (int j = 0; j < pool; ++j) acc += round_bf16(round_bf16(l[j] / sum) * bf16_to_f32(k[(size_t(p) * pool + j) * D + d]));
+  for (int j = 0; j < pool; ++j)
+    acc += round_bf16(round_bf16(l[j] / sum) * bf16_to_f32(k[(size_t(p) * pool + j) * D + d]));
   out[size_t(p) * D + d] = f32_to_bf16(acc);
 }
 
@@ -206,7 +209,8 @@ __global__ void idx_scores_kernel(const bf16* q, const bf16* w, const bf16* pk, 
   extern __shared__ float qsh[];  // [H * D + H]
   const int t = blockIdx.y;
   for (int i = threadIdx.x; i < H * D; i += blockDim.x) qsh[i] = bf16_to_f32(q[size_t(t) * H * D + i]);
-  for (int i = threadIdx.x; i < H; i += blockDim.x) qsh[H * D + i] = bf16_to_f32(w[size_t(t) * H + i]) * rsqrtf(float(H));
+  for (int i = threadIdx.x; i < H; i += blockDim.x)
+    qsh[H * D + i] = bf16_to_f32(w[size_t(t) * H + i]) * rsqrtf(float(H));
   __syncthreads();
   const int p = blockIdx.x * blockDim.x + threadIdx.x;
   if (p >= npool) return;
@@ -273,6 +277,44 @@ __global__ __launch_bounds__(256) void mla_attn_kernel(const float* qa, const bf
   for (int i = 0; i < P; ++i) orow[threadIdx.x + 256 * i] = l > 0.0f ? acc[i] / l : 0.0f;
 }
 
+// ---- weights ----
+// One block of 256 threads per 128x128 tile.
+__global__ void quant_fp8_block_kernel(const bf16* w, uint8_t* q, float* s, int N, int K) {
+  __shared__ float red[32];
+  const int nb = blockIdx.y, kb = blockIdx.x, kbs = (K + 127) / 128;
+  const int r0 = nb * 128, c0 = kb * 128, rows = min(128, N - r0), cols = min(128, K - c0);
+  float amax = 0.0f;
+  for (int i = threadIdx.x; i < rows * cols; i += blockDim.x)
+    amax = fmaxf(amax, fabsf(bf16_to_f32(w[size_t(r0 + i / cols) * K + c0 + i % cols])));
+  amax = warp_max(amax);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+  __syncthreads();
+  amax = 0.0f;
+  for (int i = 0; i < int(blockDim.x / 32); ++i) amax = fmaxf(amax, red[i]);
+  const float sc = fmaxf(amax, 1e-12f) / 448.0f;
+  if (threadIdx.x == 0) s[size_t(nb) * kbs + kb] = sc;
+  for (int i = threadIdx.x; i < rows * cols; i += blockDim.x) {
+    const size_t at = size_t(r0 + i / cols) * K + c0 + i % cols;
+    q[at] = f32_to_e4m3(fminf(fmaxf(bf16_to_f32(w[at]) / sc, -448.0f), 448.0f));
+  }
+}
+
+// One wave per (row, 128-column group); each lane holds four values.
+__global__ void fake_quant_fp8_group_kernel(bf16* x, int ldx, int rows, int cols) {
+  const int ng = cols / 128;
+  const int wid = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x & 31;
+  if (wid >= rows * ng) return;
+  bf16* p = x + size_t(wid / ng) * ldx + size_t(wid % ng) * 128 + lane * 4;
+  float v[4], amax = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    v[i] = bf16_to_f32(p[i]);
+    amax = fmaxf(amax, fabsf(v[i]));
+  }
+  const float sc = fmaxf(warp_max(amax), 1e-10f) / 448.0f;
+  for (int i = 0; i < 4; ++i)
+    p[i] = f32_to_bf16(e4m3_to_f32(f32_to_e4m3(fminf(fmaxf(v[i] / sc, -448.0f), 448.0f))) * sc);
+}
+
 // ---- MoE ----
 // One thread per token (E <= 512, K <= 16).
 __global__ void route_sigmoid_kernel(const float* logits, const float* bias, int32_t* sel, float* weights, int T,
@@ -318,8 +360,8 @@ __global__ void swiglu_hf_kernel(const bf16* gate, const bf16* up, bf16* h, size
   }
 }
 
-__global__ void moe_combine_hf_kernel(const bf16* y, const float* rw, const int32_t* pidx, const bf16* shared, bf16* out,
-                                      int K, int dim) {
+__global__ void moe_combine_hf_kernel(const bf16* y, const float* rw, const int32_t* pidx, const bf16* shared,
+                                      bf16* out, int K, int dim) {
   const int t = blockIdx.x;
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
     float acc = 0.0f;
@@ -402,11 +444,11 @@ void kda_out_norm(const bf16* x, const bf16* gate, const bf16* w, bf16* o, int r
   UH_CHECK_LAUNCH();
 }
 
-void idx_pool(const bf16* k, const bf16* gs, const void* ape, bool f16, bf16* out, int p0, int np, int pool, int D,
+void idx_pool(const bf16* k, const bf16* gs, const float* ape, bf16* out, int p0, int np, int pool, int D,
               hipStream_t st) {
   if (pool > 8) throw std::runtime_error("idx_pool: pool > 8");
   if (np <= 0) return;
-  idx_pool_kernel<<<cdiv(size_t(np) * D, 256), 256, 0, st>>>(k, gs, ape, f16, out, p0, np, pool, D);
+  idx_pool_kernel<<<cdiv(size_t(np) * D, 256), 256, 0, st>>>(k, gs, ape, out, p0, np, pool, D);
   UH_CHECK_LAUNCH();
 }
 
@@ -431,6 +473,19 @@ void mla_attn(const float* qa, const bf16* kv, const int32_t* idx, int w, const 
   if (r != 512) throw std::runtime_error("mla_attn: latent rank must be 512");
   if (n <= 0) return;
   mla_attn_kernel<512><<<n * H, 256, 0, st>>>(qa, kv, idx, w, pos, ol, H, scale);
+  UH_CHECK_LAUNCH();
+}
+
+void quant_fp8_block(const bf16* w, uint8_t* q, float* s, int N, int K, hipStream_t st) {
+  quant_fp8_block_kernel<<<dim3((K + 127) / 128, (N + 127) / 128), 256, 0, st>>>(w, q, s, N, K);
+  UH_CHECK_LAUNCH();
+}
+
+void fake_quant_fp8_group(bf16* x, int ldx, int rows, int cols, int group, hipStream_t st) {
+  if (group != 128 || cols % 128 != 0) throw std::runtime_error("fake_quant_fp8_group: groups of 128 only");
+  const size_t waves = size_t(rows) * (cols / 128);
+  if (waves == 0) return;
+  fake_quant_fp8_group_kernel<<<cdiv(waves * 32, 256), 256, 0, st>>>(x, ldx, rows, cols);
   UH_CHECK_LAUNCH();
 }
 

@@ -14,6 +14,8 @@ the hyper-head mean, norm, lm_head), mirroring Glm5NextTextModel.forward.
 
 Outputs in --out: meta.json, logits.bin (f32 [S, vocab]), h_LLL.bin (bf16 [S, hc_mult, hidden] after layer
 LLL, for --dump-layers), routing.json (per MoE layer, how often each expert was picked over all S positions).
+With --dump-topk, also topk_LLL.bin (int32 [S, index_topk + index_kpool - 1]) per DSA layer: the token indices its
+indexer selected for each query (-1 = none), for checking the pooled selection past index_topk tokens.
 """
 import argparse
 import json
@@ -107,8 +109,12 @@ def main():
     ap.add_argument("--ids", required=True, help="uint32 token ids")
     ap.add_argument("--prompt", type=int, required=True, help="prompt length within --ids")
     ap.add_argument("--decode", type=int, default=0, help="teacher-forced decode steps after the prompt")
+    ap.add_argument("--prefill-chunk", type=int, default=0,
+                    help="push the prompt through in calls of this many tokens (0: one call); the torch KDA "
+                    "fallback's decay mask takes 2 MB per prompt token, so long prompts need it")
     ap.add_argument("--layers", type=int, default=None, help="run only the first N layers (no logits)")
     ap.add_argument("--dump-layers", default="all", help="'all', 'none' or a comma list")
+    ap.add_argument("--dump-topk", action="store_true", help="save each DSA layer's indexer selection")
     ap.add_argument("--attn", default="eager", help="transformers attention implementation")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -134,7 +140,8 @@ def main():
         h = embed[ids].unsqueeze(2).expand(-1, -1, cfg.hc_mult, -1).contiguous()  # [1, S, hc, hidden]
         del embed
         cache = DynamicCache(config=cfg)
-        calls = [(0, P)] + [(t, t + 1) for t in range(P, S)]  # (start, end) of each forward call
+        pc = args.prefill_chunk or P
+        calls = [(s, min(s + pc, P)) for s in range(0, P, pc)] + [(t, t + 1) for t in range(P, S)]  # (start, end)
         topk = [None] * len(calls)
         routing = {}
 
@@ -152,6 +159,10 @@ def main():
 
             picks = []
             hook = None
+            sel = []
+            sel_hook = None
+            if args.dump_topk and getattr(layer.self_attn, "indexer", None) is not None:
+                sel_hook = layer.self_attn.indexer.register_forward_hook(lambda m, i, o: sel.append(o[0].cpu()))
             if hasattr(layer.mlp, "gate"):
                 hook = layer.mlp.gate.register_forward_hook(lambda m, i, o: picks.append(o[2].flatten().cpu()))
 
@@ -172,6 +183,11 @@ def main():
             if hook is not None:
                 hook.remove()
                 routing[L] = torch.bincount(torch.cat(picks), minlength=cfg.num_local_experts).tolist()
+            if sel_hook is not None:
+                sel_hook.remove()
+                # the indexer returns [1, s, width] per call; sel holds [s, width]
+                torch.cat(sel, 0).numpy().astype(np.int32).tofile(
+                    os.path.join(args.out, f"topk_{L:03d}.bin"))
             del layer, outs
             torch.cuda.empty_cache()
             print(f"layer {L:2d} ({cfg.layer_types[L]:>25s}): load {t_load:5.1f} s  run {time.time() - t0 - t_load:5.1f} s"

@@ -78,8 +78,8 @@ void kda_out_norm(const bf16* x, const bf16* gate, const bf16* w, bf16* o, int r
 // ---- DSA indexer (pooled keys) -----------------------------------------------------------------------
 // Pooled keys of pools [p0, p0 + np) of one sequence, from its key rows k [*, D] and gate rows gs [*, D]
 // (bf16): per dimension d, prob_i = bf16(softmax_i(gs[4p+i][d] + ape[i][d])) over the pool's `pool` tokens,
-// out[p][d] = bf16(sum_i bf16(prob_i * k[4p+i][d])). ape bf16 [pool, D] (f16 when f16 is set).
-void idx_pool(const bf16* k, const bf16* gs, const void* ape, bool f16, bf16* out, int p0, int np, int pool, int D,
+// out[p][d] = bf16(sum_i bf16(prob_i * k[4p+i][d])). ape f32 [pool, D].
+void idx_pool(const bf16* k, const bf16* gs, const float* ape, bf16* out, int p0, int np, int pool, int D,
               hipStream_t st);
 // Index scores of the chunk's n queries against the sequence's complete pools [0, npool):
 //   s[t][p] = sum_h (w[t][h] * H^-0.5) * relu(scale * q[t][h] . pk[p]), q bf16 [n, H, D], w bf16 [n, H],
@@ -96,6 +96,14 @@ void idx_expand(const int32_t* pools, const int32_t* pos, int32_t* idx, int n, i
 // idx[t][:] (width w, -1 skipped) when idx is given, else every position <= pos[t]. qa / ol f32 [n, H, r].
 void mla_attn(const float* qa, const bf16* kv, const int32_t* idx, int w, const int32_t* pos, float* ol, int n,
               int H, int r, float scale, hipStream_t st);
+
+// ---- weights ---------------------------------------------------------------------------------------
+// 128x128 block fp8 quantization of a bf16 matrix w [N, K], as the FP8 release's quantizer: s[nb][kb] = amax(block)
+// / 448 (fp32), q = e4m3(w / s) with round-to-nearest-even. q [N, K], s [ceil(N/128), ceil(K/128)].
+void quant_fp8_block(const bf16* w, uint8_t* q, float* s, int N, int K, hipStream_t st);
+// Dynamic fp8 activations as vLLM's per-token-group quantization does them for block-fp8 linears, in place: per
+// `group` columns of a row, s = max(amax, 1e-10) / 448, x = bf16(e4m3(x / s) * s).
+void fake_quant_fp8_group(bf16* x, int ldx, int rows, int cols, int group, hipStream_t st);
 
 // ---- MoE ---------------------------------------------------------------------------------------------
 // Sigmoid router (noaux_tc, one group): s = sigmoid(logits); the K largest s + bias (ties: lower index)

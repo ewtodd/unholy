@@ -32,12 +32,12 @@ so the first measurements decide whether to do it at all:
 
 **Candidate builds** (experts x dense format; details in "Dense format" and the fit tables):
 
-| build | experts | dense (attention, shared, head) | weights | decode read/token | 4 x 512k headroom |
-|---|---|---|---:|---:|---:|
-| **A** | EXL3 3.05 | EXL3 from the same branch (5-bit attention) | 125.15 GB | 9.00 GB (0.80x DSV4) | +47.8 GB |
-| **B** | EXL3 4.05 | EXL3 from the same branch (6-bit attention) | 165.05 GB | 10.98 GB (0.98x) | +7.9 GB |
-| **C** | EXL3 3.05 | native FP8, KDA projections re-quantized to fp8 | 129.36 GB | 12.58 GB (1.12x) | +43.6 GB |
-| **D** | EXL3 4.05 | native FP8, KDA projections re-quantized to fp8 | 168.32 GB | 13.63 GB (1.22x) | +4.6 GB |
+| build | experts | dense (attention, shared, head) | weights | decode read/token | 4 x 512k headroom | KL code / chat (measured) |
+|---|---|---|---:|---:|---:|---:|
+| **A** | EXL3 3.05 | EXL3 from the same branch (5-bit attention) | 125.15 GB | 9.00 GB (0.80x DSV4) | +47.8 GB | 2.72e-2 / 1.37e-1 |
+| **B** | EXL3 4.05 | EXL3 from the same branch (6-bit attention) | 165.05 GB | 10.98 GB (0.98x) | +7.9 GB | 1.27e-2 / 7.06e-2 |
+| **C** | EXL3 3.05 | native FP8, KDA projections re-quantized to fp8 | 129.36 GB | 12.58 GB (1.12x) | +43.6 GB | 2.84e-2 / 1.34e-1 |
+| **D** | EXL3 4.05 | native FP8, KDA projections re-quantized to fp8 | 168.32 GB | 13.63 GB (1.22x) | +4.6 GB | 1.33e-2 / 6.57e-2 |
 
 - **A leads on the numbers**: the lightest per token, ~32% of experts on the cards (served
   DSV4: 26%), ~48 GB of headroom at 4 x 512k, and 4 x 1M fits. Experts at 3.01 bits meet the
@@ -58,6 +58,46 @@ Excluded:
   streaming section.
 - **The FP8 release's dense as-is** (build E: 3.05 experts + BF16 KDA): 17.14 GB per token
   (1.53x DSV4). Only worth it if fp8 KDA projections measurably hurt.
+
+## Measured quality: KL against the FP8 oracle (G4, 2026-10-24)
+
+unholy's GLM reference forward (`src/model/glm5*`, `src/kernels/ref_glm.*`; `tools/box/glm-ref.sh`), layer-streamed
+on one R9700, against the transformers oracle on the FP8 release (`tools/ref/glm_oracle`, eager attention):
+1024-token prompt + 8 teacher-forced decode positions, KL(oracle || build) and top-1 agreement over the 1032
+positions. Two prompts: **code** (unholy's own sources, `mkids.py`) and **chat** (GSM8K test questions and their
+worked answers as user / assistant turns through GLM's template, `mkchat.py`).
+
+| | experts | dense | KDA projections | code KL | code top-1 | chat KL | chat top-1 |
+|---|---|---|---|---:|---:|---:|---:|
+| oracle eager vs SDPA (noise floor) | fp8 | fp8 | bf16 | 3.42e-3 | 97.87% | 2.25e-2 | 96.41% |
+| reference path, the release as-is | fp8 | fp8 | bf16 | 3.10e-3 | 98.64% | 2.55e-2 | 96.03% |
+| same, fp8 activations (W8A8) | fp8 | fp8 | bf16 | 5.50e-3 | 97.77% | 2.89e-2 | 96.61% |
+| **A** | EXL3 3.05 | EXL3 (5-bit) | EXL3 5-bit | 2.72e-2 | 95.06% | 1.37e-1 | 91.18% |
+| **B** | EXL3 4.05 | EXL3 (6-bit) | EXL3 6-bit | 1.27e-2 | 96.71% | 7.06e-2 | 93.22% |
+| **C** | EXL3 3.05 | fp8 | fp8 (ours) | 2.84e-2 | 95.83% | 1.34e-1 | 91.38% |
+| **D** | EXL3 4.05 | fp8 | fp8 (ours) | 1.33e-2 | 96.61% | 6.57e-2 | 93.31% |
+| E3 | EXL3 3.05 | fp8 | bf16 | 2.70e-2 | 95.74% | | |
+| E4 | EXL3 4.05 | fp8 | bf16 | 1.25e-2 | 97.00% | | |
+| C, fp8 activations | EXL3 3.05 | fp8 | fp8 (ours) | 2.86e-2 | 95.64% | | |
+| D, fp8 activations | EXL3 4.05 | fp8 | fp8 (ours) | 1.51e-2 | 95.83% | | |
+
+- **The reference path is at the oracle's noise floor** (code: 3.10e-3 against eager-vs-SDPA's 3.42e-3; chat:
+  2.55e-2 against 2.25e-2: the chat's answers are far less predictable than code, so the same arithmetic noise
+  costs more KL there, and so does quantization). Chunked prefill (256-token chunks) and two sequences batched
+  together give bit-identical logits; the pooled indexer's selection matches the oracle's on a 4096-token prompt
+  (every query that sees all keys identical; past 2048 keys mean Jaccard 0.9996, at most 2 of 512 pools swapped
+  at near-ties).
+- **The expert width decides the quality**: 4.05 experts halve the KL of 3.05 on both prompts and gain 1.5-2
+  points of top-1.
+- **The dense format hardly matters**: A vs C and B vs D are within a few percent, and re-quantizing the KDA
+  projections to fp8 costs ~5% over keeping them in bf16 (C vs E3, D vs E4). Choose it on speed and memory.
+- **fp8 activations cost**: +2.4e-3 / +3.4e-3 (code / chat) on the release itself, +14% on D (code). A
+  weight-only fp8 path (W8A16: dequantize in the GEMV / GEMM, activations in bf16) avoids it; the decode GEMV is
+  bound by weight bytes either way.
+- Scale, not a verdict (KL across models only gives a scale; the head-to-head evals decide): DSV4-VE as served
+  is its own release precision (4.19e-3 / 98.26% against its oracle on the same code prompt, its noise floor),
+  and its EXL3 3.04 experts measured 2.4-2.8e-2 / 92.7% on the earlier code prompt. A / C sit where that build
+  sat, B / D at half of it.
 
 ## The reference point: what son-of-anton serves today
 
@@ -557,12 +597,9 @@ In order:
    "Recommendation"). Nothing else matters if this fails.
 2. **The runnable build:** exllamav3 on son-of-anton with the 3.05 / 4.05 branches (needs the
    DSV4 service stopped); if it runs, the same eval.
-3. **Quality vs FP8:** KL and top-1 of each build against the FP8 oracle, on the same 1000+
-   position code prompt used for DSV4 plus prose, chat, math and long context. DSV4's numbers
-   for scale (code1024): oracle noise floor 9.9e-3 / 96.2%, native reference path 9.6e-3 /
-   95.7%, EXL3 3.04 experts 2.4-2.8e-2 / 92.7%. GLM's own scale from Project Maya: KL 0.19 /
-   90% same top token at ~3.9 bpw, ~0.31 / 86% at ~2.9 bpw. KL across different models only gives
-   a scale; the head-to-head eval decides.
+3. **Quality vs FP8:** measured 2026-10-24 on a code and a chat prompt ("Measured quality"): 4.05 experts
+   halve 3.05's KL, the dense format hardly matters, fp8 activations cost. Still open: long context
+   (the 4096-token run only checked the indexer's selection) and prose beyond the GSM8K chat.
 4. **Routing profile:** r for each build from the oracle's router histogram (break-even with
    DSV4's APU load: 49% for 3.05 experts, 62% for 4.05). Maya's adaptive-cache hit rates suggest
    the 3.05-expert builds clear it and the 4.05-expert builds are marginal.
