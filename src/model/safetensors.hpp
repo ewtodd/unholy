@@ -42,8 +42,9 @@ struct TensorInfo {
 
 class Checkpoint {
  public:
-  // `dir` holds model.safetensors.index.json (or a single model.safetensors) and config.json.
-  static std::unique_ptr<Checkpoint> open(const std::string& dir);
+  // `dir` holds model.safetensors.index.json (or a single model.safetensors) and config.json; `extra` names side
+  // files in it whose tensors join the index when they exist (exllamav3 keeps the MTP layer in mtp.safetensors).
+  static std::unique_ptr<Checkpoint> open(const std::string& dir, const std::vector<std::string>& extra = {});
   ~Checkpoint();
   Checkpoint(const Checkpoint&) = delete;
   Checkpoint& operator=(const Checkpoint&) = delete;

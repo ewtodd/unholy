@@ -244,12 +244,14 @@ Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int 
   w.dense = c.is_dense(layer);
   const std::string m = p + "mlp.";
   if (opt.load_dense) {
-    lc.upload_f32(p + "hc_attn_fn", w.hc_attn_fn);
-    w.hc_attn_base = lc.upload(p + "hc_attn_base");
-    w.hc_attn_scale = lc.upload(p + "hc_attn_scale");
-    lc.upload_f32(p + "hc_ffn_fn", w.hc_ffn_fn);
-    w.hc_ffn_base = lc.upload(p + "hc_ffn_base");
-    w.hc_ffn_scale = lc.upload(p + "hc_ffn_scale");
+    if (ck.find(p + "hc_attn_fn")) {  // (the MTP layer has no Hyper-Connections)
+      lc.upload_f32(p + "hc_attn_fn", w.hc_attn_fn);
+      w.hc_attn_base = lc.upload(p + "hc_attn_base");
+      w.hc_attn_scale = lc.upload(p + "hc_attn_scale");
+      lc.upload_f32(p + "hc_ffn_fn", w.hc_ffn_fn);
+      w.hc_ffn_base = lc.upload(p + "hc_ffn_base");
+      w.hc_ffn_scale = lc.upload(p + "hc_ffn_scale");
+    }
     w.input_norm = lc.upload(p + "input_layernorm.weight");
     w.post_norm = lc.upload(p + "post_attention_layernorm.weight");
 
@@ -411,7 +413,7 @@ namespace {
 int head_rows(int max_tokens) { return std::min(max_tokens, 64); }
 
 // Bytes of each Glm5Buf for batches of max_tokens tokens of sequences up to max_seq long.
-std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_seq) {
+std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_seq, bool fast_only) {
   const size_t T = size_t(max_tokens), D = c.dim, W = c.lin_width(), H = c.n_heads, R = c.kv_lora;
   const size_t P = T * c.n_active;
   const size_t wide_in = std::max({D, size_t(c.q_lora), H * c.v_dim, W, size_t(c.inter), size_t(c.moe_inter)});
@@ -436,8 +438,8 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       T * c.q_lora * 2,                           // q_resid
       T * H * c.nope_dim * 2,                     // q
       T * R * 2,                                  // latent
-      T * H * R * 4,                              // absorbed q
-      T * H * R * 4,                              // latent out
+      T * H * R * (fast_only ? 2 : 4),            // absorbed q (bf16 on the fast path, fp32 on the reference)
+      T * H * R * (fast_only ? 2 : 4),            // latent out
       T * H * c.v_dim * 2,                        // attention out
       T * c.idx_heads * c.idx_dim * 2,            // indexer q
       T * c.idx_dim * 2,                          // indexer k
@@ -447,7 +449,7 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       T * (c.idx_topk / c.idx_pool) * 4,          // selected pools
       T * (c.idx_topk + c.idx_pool - 1) * 4,      // selected tokens
       T * std::max(D, size_t(c.n_experts)) * 4,   // f32 rows / router logits
-      T * D * 4,                                  // f32 hn
+      fast_only ? 0 : T * D * 4,                  // f32 hn (reference)
       P * 4,                                      // sel
       P * 4,                                      // routing weights
       P * 4,                                      // pair -> token
@@ -456,11 +458,11 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       P * D * 2,                                  // gathered expert inputs
       ffn * 2,                                    // gate
       ffn * 2,                                    // up
-      ffn * 2,                                    // swiglu
+      fast_only ? 0 : ffn * 2,                    // swiglu (reference; the fast path fuses it into the down input)
       P * D * 2,                                  // expert outputs
       T * D * 2,                                  // shared expert out
-      T * wide_in * 4,                            // EXL3 x side
-      std::max(T * wide_out, HR * c.vocab) * 4,  // EXL3 y side
+      T * wide_in * (fast_only ? 2 : 4),          // EXL3 x side (fp16 on the fast path, fp32 on the reference)
+      fast_only ? 0 : std::max(T * wide_out, HR * c.vocab) * 4,  // EXL3 y side (reference)
       HR * c.vocab * 2,                           // head bf16 logits
       (T / k::kExl3TileRows + 2) * sizeof(k::Exl3Tile),  // dense tiles
       std::max(P, T) * 4,                         // zero rows (row_expert of a dense linear)
@@ -475,7 +477,7 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       std::max(P * c.moe_inter, T * c.inter) * 2,  // fp16 down inputs
       std::max(std::min<size_t>(P, 64) * std::max(D, size_t(c.moe_inter)),
                8 * std::max(3 * W, size_t(c.vocab))) * 4,  // GEMV fp32 sides
-      size_t(c.n_layers) * E * 4,                 // routing histogram [layer][expert]
+      size_t(c.n_layers + c.n_mtp) * E * 4,       // routing histogram [layer][expert] (the MTP layer last)
   };
   if (sizes.size() != size_t(kGlm5ScratchBufs)) throw std::logic_error("glm5 scratch: buffer list out of date");
   return sizes;
@@ -483,19 +485,19 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
 
 }  // namespace
 
-size_t glm5_scratch_bytes(const Glm5Config& c, int max_tokens, int max_seq) {
+size_t glm5_scratch_bytes(const Glm5Config& c, int max_tokens, int max_seq, bool fast_only) {
   size_t b = 0;
-  for (size_t s : scratch_sizes(c, max_tokens, max_seq)) b += (std::max<size_t>(s, 16) + 255) / 256 * 256;
+  for (size_t s : scratch_sizes(c, max_tokens, max_seq, fast_only)) b += (std::max<size_t>(s, 16) + 255) / 256 * 256;
   return b;
 }
 
-Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq) {
+Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq, bool fast_only) {
   Glm5Scratch s;
   s.max_tokens = max_tokens;
   s.max_seq = max_seq;
   s.head_rows = head_rows(max_tokens);
   rt::DeviceGuard g(dev);
-  for (size_t b : scratch_sizes(c, max_tokens, max_seq)) {
+  for (size_t b : scratch_sizes(c, max_tokens, max_seq, fast_only)) {
     s.bufs.emplace_back(dev, std::max<size_t>(b, 16));
     UH_CHECK(hipMemset(s.bufs.back().data(), 0, s.bufs.back().size()));  // MoE counts and zero rows start at 0
   }
@@ -526,6 +528,27 @@ size_t glm5_expert_bytes(const Checkpoint& ck, int layer, int expert) {
   for (const char* m : {"gate_proj", "up_proj", "down_proj"})
     for (const char* s : {".trellis", ".suh", ".svh"}) b += ck.at(p + m + s).nbytes;
   return b;
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+Glm5MtpWeights load_glm5_mtp(const Checkpoint& ck, const Glm5Config& c, int dev, hipStream_t st,
+                             const Glm5LoadOptions& opt) {
+  if (c.n_mtp < 1) throw std::runtime_error("glm5: the config has no MTP layer");
+  Glm5MtpWeights m;
+  m.layer = load_glm5_layer(ck, c, c.n_layers, dev, st, opt);
+  if (!opt.load_dense) return m;
+  const std::string p = kPrefix + "layers." + std::to_string(c.n_layers) + ".";
+  LoadCtx lc{ck, dev, {}, {}, opt.arena, opt.up};
+  m.eh = glinear(lc, p + "eh_proj");
+  m.enorm = lc.upload(p + "enorm.weight");
+  m.hnorm = lc.upload(p + "hnorm.weight");
+  m.head_norm = lc.upload(p + "shared_head.norm.weight");
+  lc.run(st);
+  if (m.eh.in != 2 * c.dim || m.eh.out != c.dim) throw std::runtime_error(p + "eh_proj: unexpected shape");
+  return m;
 }
 
 }  // namespace unholy::model

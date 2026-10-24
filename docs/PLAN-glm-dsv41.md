@@ -136,6 +136,14 @@ x2.5), dense layers 0-2, mHC, EXL3 experts (288, top-8) and both dense formats. 
 full-model KL / top-1. Exit: native path at the noise floor; KL table for builds A-D
 (`docs/glm53-flash-quant.md`). **Decision:** 3.05 vs 4.05 experts, EXL3 vs fp8 dense.
 
+**G5 status (2026-10-24, in progress):** `model/glm5_fast` + `kernels/glm_fast` (EXL3 linears on the grouped EXL3
+kernels, paged DSA rows with an fp8 latent and bf16 pooled keys, WMMA index scores and absorbed-MLA attention, a
+two-pass KDA recurrence, device-side MoE dispatch with 288 experts) keep the reference's KL (build B 1.329e-2 on code
+vs 1.326e-2); `engine/glm5_resident` places build B (2,606 hot experts on the cards, 119.8 GB cold on the APU, 51%
+of routing on the cards predicted) and `unholy serve` serves it (smoke test: correct answers, 19.5 tok/s decode at
+short context). Open: the 512k curve and the optimizations it points at, MTP drafting with KDA state rollback,
+prefix snapshots (G6).
+
 **G5: Fast path (4-6 days).** WMMA kernels for KDA prefill and decode, the DSA indexer and attention, and the
 chosen dense format (EXL3 dense GEMV, or fp8 KDA weights); placement from the GLM profile; two steps in flight;
 MTP drafting with KDA state rollback. Exit: KL unchanged from the reference path; measured against >= 500 tok/s

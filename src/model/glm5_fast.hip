@@ -155,9 +155,21 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
       const size_t ss = size_t(H) * Dh * Dh;
       UH_CHECK(hipMemsetAsync(slot_rows<float>(cache.state, ch.slot, ss), 0, ss * 4, st));
     }
-  for (const auto& ch : b.chunks)
-    k::kda_conv(qkv + size_t(ch.t0) * C3, C3, slot_rows<bf16>(cache.conv, ch.slot, conv_slot), w.conv.p<bf16>(),
-                qkvc + size_t(ch.t0) * C3, ch.n, C3, st);
+  // The chunks in launches of up to GlmKdaBatch::kMax (backups: verify chunks' state after save_after).
+  const auto batched = [&](auto&& launch) {
+    k::GlmKdaBatch kb;
+    for (size_t i = 0; i < b.chunks.size(); ++i) {
+      const auto& ch = b.chunks[i];
+      kb.c[kb.nchunks++] = {ch.t0, ch.n, ch.slot, ch.save_after};
+      if (kb.nchunks == k::GlmKdaBatch::kMax || i + 1 == b.chunks.size()) {
+        launch(kb);
+        kb.nchunks = 0;
+      }
+    }
+  };
+  batched([&](const k::GlmKdaBatch& kb) {
+    k::glm_kda_conv(qkv, C3, cache.conv.as<bf16>(), w.conv.p<bf16>(), qkvc, kb, C3, st, cache.conv_bak.as<bf16>());
+  });
   bf16* low = s.at<bf16>(kLowRank);
   bf16* row = s.at<bf16>(kGateRow);
   float* g = s.at<float>(kForget);
@@ -172,15 +184,10 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   float* kn = s.at<float>(kKdaK);
   float* eg = s.at<float>(kKdaE);
   k::glm_kda_prep(qkvc, qkvc + W, C3, g, qn, kn, eg, T, H, Dh, st);
-  k::GlmKdaBatch kb;
-  for (size_t i = 0; i < b.chunks.size(); ++i) {
-    const auto& ch = b.chunks[i];
-    kb.c[kb.nchunks++] = {ch.t0, ch.n, ch.slot};
-    if (kb.nchunks == k::GlmKdaBatch::kMax || i + 1 == b.chunks.size()) {
-      k::glm_kda_recurrent(qn, kn, eg, qkvc + 2 * W, C3, beta, cache.state.as<float>(), core, kb, H, Dh, st);
-      kb.nchunks = 0;
-    }
-  }
+  batched([&](const k::GlmKdaBatch& kb) {
+    k::glm_kda_recurrent(qn, kn, eg, qkvc + 2 * W, C3, beta, cache.state.as<float>(), core, kb, H, Dh, st,
+                         cache.state_bak.as<float>());
+  });
   linear(w.g_a, hn, D, low, Dh, T, s, st);
   linear(w.g_b, low, Dh, row, W, T, s, st);
   bf16* on = s.at<bf16>(kOutNorm);
@@ -188,28 +195,45 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   linear(w.o, on, W, out, D, T, s, st);
 }
 
+// A DSA layer's cache rows for the batch: the latent rows (kv_a, its norm; stored in fp8) and the indexer's keys and
+// gate scores (pooled once a pool completes).
+void dsa_write(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache, const Glm5Scratch& s,
+               const bf16* hn, const Glm5Batch& b, hipStream_t st) {
+  const int T = b.T, D = c.dim, R = c.kv_lora, ID = c.idx_dim;
+  if (!b.tables) throw std::runtime_error("glm5 fast path: DSA layers need block tables");
+  bf16* lat = s.at<bf16>(kLatent);
+  linear(w.kv_a, hn, D, lat, R, T, s, st);
+  k::rmsnorm_hf(lat, R, w.kv_a_norm.p<bf16>(), lat, R, T, R, c.norm_eps, st);
+  bf16* ik = s.at<bf16>(kIdxK);
+  bf16* ig = s.at<bf16>(kIdxGate);
+  linear(w.idx_wk, hn, D, ik, ID, T, s, st);
+  k::layernorm(ik, w.idx_knorm_w.ptr, w.idx_knorm_b.ptr, w.idx_knorm_w.dtype == DType::F16, ik, T, ID, 1e-6f, st);
+  linear(w.idx_gate, hn, D, ig, ID, T, s, st);
+  for (const auto& ch : b.chunks) {
+    if ((ch.s0 + ch.n + k::kGlmPageRows - 1) / k::kGlmPageRows > b.max_pages)
+      throw std::runtime_error("glm5: sequence longer than the block table");
+    const k::GlmPaged pg{cache.lat.as<uint8_t>(), cache.lat_s.as<uint8_t>(), cache.pk.as<bf16>(),
+                         b.tables + size_t(ch.slot) * b.max_pages};
+    k::glm_store_latent(lat + size_t(ch.t0) * R, pg, ch.s0, ch.n, st);
+    k::glm_pool_keys(ik + size_t(ch.t0) * ID, ig + size_t(ch.t0) * ID, slot_rows<bf16>(cache.tail_k, ch.slot, 4 * ID),
+                     slot_rows<bf16>(cache.tail_g, ch.slot, 4 * ID), w.idx_ape.p<float>(), pg, ch.s0, ch.n, st);
+  }
+}
+
 void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache, const Glm5Scratch& s,
               const bf16* hn, bf16* out, const Glm5Batch& b, hipStream_t st) {
   const int T = b.T, D = c.dim, H = c.n_heads, R = c.kv_lora;
   const int IH = c.idx_heads, ID = c.idx_dim, pool = c.idx_pool;
   const int kpools = c.idx_topk / pool, width = c.idx_topk + pool - 1;
-  if (!b.tables) throw std::runtime_error("glm5 fast path: DSA layers need block tables");
+  dsa_write(c, w, cache, s, hn, b, st);
   bf16* qr = s.at<bf16>(kQResid);
   linear(w.q_a, hn, D, qr, c.q_lora, T, s, st);
   k::rmsnorm_hf(qr, c.q_lora, w.q_a_norm.p<bf16>(), qr, c.q_lora, T, c.q_lora, c.norm_eps, st);
   bf16* q = s.at<bf16>(kQ);
   linear(w.q_b, qr, c.q_lora, q, H * c.nope_dim, T, s, st);
-  bf16* lat = s.at<bf16>(kLatent);
-  linear(w.kv_a, hn, D, lat, R, T, s, st);
-  k::rmsnorm_hf(lat, R, w.kv_a_norm.p<bf16>(), lat, R, T, R, c.norm_eps, st);
   bf16* iq = s.at<bf16>(kIdxQ);
-  bf16* ik = s.at<bf16>(kIdxK);
-  bf16* ig = s.at<bf16>(kIdxGate);
   bf16* iw = s.at<bf16>(kIdxW);
   linear(w.idx_wq_b, qr, c.q_lora, iq, IH * ID, T, s, st);
-  linear(w.idx_wk, hn, D, ik, ID, T, s, st);
-  k::layernorm(ik, w.idx_knorm_w.ptr, w.idx_knorm_b.ptr, w.idx_knorm_w.dtype == DType::F16, ik, T, ID, 1e-6f, st);
-  linear(w.idx_gate, hn, D, ig, ID, T, s, st);
   linear(w.idx_wproj, hn, D, iw, IH, T, s, st);
   // Absorbed queries (bf16), per head: qa[t][h] = q[t][h] . W_uk(h).
   bf16* qa = s.at<bf16>(kQAbs);
@@ -220,13 +244,8 @@ void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   int32_t* sel = s.at<int32_t>(kIdxSel);
   const float iscale = 1.0f / std::sqrt(float(ID)), ascale = 1.0f / std::sqrt(float(c.nope_dim));
   for (const auto& ch : b.chunks) {
-    k::GlmPaged pg{cache.lat.as<uint8_t>(), cache.lat_s.as<uint8_t>(), cache.pk.as<bf16>(),
-                   b.tables + size_t(ch.slot) * b.max_pages};
-    if ((ch.s0 + ch.n + k::kGlmPageRows - 1) / k::kGlmPageRows > b.max_pages)
-      throw std::runtime_error("glm5: sequence longer than the block table");
-    k::glm_store_latent(lat + size_t(ch.t0) * R, pg, ch.s0, ch.n, st);
-    k::glm_pool_keys(ik + size_t(ch.t0) * ID, ig + size_t(ch.t0) * ID, slot_rows<bf16>(cache.tail_k, ch.slot, 4 * ID),
-                     slot_rows<bf16>(cache.tail_g, ch.slot, 4 * ID), w.idx_ape.p<float>(), pg, ch.s0, ch.n, st);
+    const k::GlmPaged pg{cache.lat.as<uint8_t>(), cache.lat_s.as<uint8_t>(), cache.pk.as<bf16>(),
+                         b.tables + size_t(ch.slot) * b.max_pages};
     const int npool = (ch.s0 + ch.n) / pool;
     int32_t* cpools = pools + size_t(ch.t0) * kpools;
     if (npool == 0) {
@@ -254,7 +273,8 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
               hipStream_t st, RemoteExperts* remote) {
   const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
   const bool any_remote = w.n_resident < E;
-  if (any_remote && (!remote || !remote->can_enqueue())) throw std::runtime_error("glm5: remote experts need a backend");
+  if (any_remote && (!remote || !remote->can_enqueue()))
+    throw std::runtime_error("glm5: remote experts need a backend");
   float* logits = s.at<float>(kF32Rows);
   int32_t* sel = s.at<int32_t>(kSel);
   float* rw = s.at<float>(kRouteW);
@@ -297,7 +317,8 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   }
   const Glm5ExpertBufs eb{s.at<uint16_t>(kXh1), s.at<uint16_t>(kXh3), s.at<uint16_t>(kXh2), s.at<bf16>(kExpGate),
                           s.at<bf16>(kExpUp), s.at<float>(kYp)};
-  glm5_experts_dev(c, w, pin, ewt, row_expert, lt, max_tiles, &plan->n_local_tiles, P, eb, pout, st);
+  if (w.n_resident > 0)  // (the MTP layer's experts are all on the APU)
+    glm5_experts_dev(c, w, pin, ewt, row_expert, lt, max_tiles, &plan->n_local_tiles, P, eb, pout, st);
   bf16* sh = s.at<bf16>(kShared);
   mlp(c, w.sh_gate, w.sh_up, w.sh_down, hn, T, sh, s, st);
   if (any_remote) {
@@ -409,20 +430,68 @@ void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& hw, cons
   }
 }
 
+void glm5_head_logits(const Glm5Config& c, const Glm5HeadWeights& hw, const Glm5Scratch& s, const uint16_t* hn, int T,
+                      float* logits, hipStream_t st) {
+  const int D = c.dim, V = c.vocab, G = s.head_rows;
+  bf16* lb = s.at<bf16>(kHeadOut);
+  for (int r0 = 0; r0 < T; r0 += G) {
+    const int n = std::min(G, T - r0);
+    set_rows(s, n, st);
+    linear(hw.head, hn + size_t(r0) * D, D, lb, V, n, s, st);
+    k::cast_bf16_f32(lb, logits + size_t(r0) * V, size_t(n) * V, st);
+  }
+}
+
+void glm5_mtp_in(const Glm5Config& c, const Glm5MtpWeights& m, const uint16_t* emb, const uint16_t* h, uint16_t* x0,
+                 int rows, const Glm5Scratch& s, hipStream_t st) {
+  if (rows <= 0) return;
+  bf16* cat = s.at<bf16>(kExpIn);  // [rows, 2 dim]
+  k::glm_mtp_cat(emb, h, m.enorm.p<bf16>(), m.hnorm.p<bf16>(), cat, rows, c.dim, c.norm_eps, st);
+  set_rows(s, rows, st);
+  linear(m.eh, cat, 2 * c.dim, x0, c.dim, rows, s, st);
+}
+
+void glm5_mtp_cache(const Glm5Config& c, const Glm5MtpWeights& m, Glm5PagedCache& cache, const Glm5Scratch& s,
+                    const uint16_t* x0, const Glm5Batch& b, hipStream_t st) {
+  if (b.T <= 0) return;
+  set_rows(s, b.T, st);
+  bf16* hn = s.at<bf16>(kHn);
+  norm(x0, m.layer.input_norm.p<bf16>(), hn, b.T, c.dim, c.norm_eps, st);
+  dsa_write(c, m.layer, cache, s, hn, b, st);
+}
+
+void glm5_mtp_forward(const Glm5Config& c, const Glm5MtpWeights& m, Glm5PagedCache& cache, const Glm5Scratch& s,
+                      uint16_t* x, uint16_t* hn_out, const Glm5Batch& b, hipStream_t st, RemoteExperts* remote) {
+  const int T = b.T, D = c.dim;
+  if (T <= 0) return;
+  if (T > s.max_tokens) throw std::runtime_error("glm5_mtp_forward: batch larger than the scratch");
+  set_rows(s, T, st);
+  bf16* hn = s.at<bf16>(kHn);
+  bf16* out = s.at<bf16>(kOut);
+  norm(x, m.layer.input_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
+  dsa_fast(c, m.layer, cache, s, hn, out, b, st);
+  k::glm_add_bf16(x, out, size_t(T) * D, st);
+  norm(x, m.layer.post_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
+  moe_fast(c, m.layer, s, hn, out, T, st, remote);
+  k::glm_add_bf16(x, out, size_t(T) * D, st);
+  norm(x, m.head_norm.p<bf16>(), hn_out, T, D, c.norm_eps, st);
+}
+
 }  // namespace unholy::model
 
 namespace unholy::model {
 
-size_t glm5_paged_cache_bytes(const Glm5Config& c, bool kda, int slots, int num_pages) {
-  if (kda) return size_t(slots) * ((c.conv_kernel - 1) * 3 * size_t(c.lin_width()) * 2 +
-                                   size_t(c.lin_heads) * c.lin_dim * c.lin_dim * 4);
+size_t glm5_paged_cache_bytes(const Glm5Config& c, bool kda, int slots, int num_pages, bool backups) {
+  if (kda)
+    return (backups ? 2 : 1) * size_t(slots) *
+           ((c.conv_kernel - 1) * 3 * size_t(c.lin_width()) * 2 + size_t(c.lin_heads) * c.lin_dim * c.lin_dim * 4);
   const size_t rows = size_t(num_pages) * kernels::kGlmPageRows;
   return rows * c.kv_lora + rows * (c.kv_lora / 64) + rows / c.idx_pool * c.idx_dim * 2 +
          size_t(slots) * 2 * c.idx_pool * c.idx_dim * 2;
 }
 
 Glm5PagedCache make_glm5_paged_cache(const Glm5Config& c, int layer, int slots, int num_pages, int dev,
-                                     hipStream_t st) {
+                                     hipStream_t st, bool backups) {
   if (c.kv_lora != 512 || c.idx_dim != 128 || c.idx_pool != 4 || c.n_heads != 64 || c.idx_heads != 32)
     throw std::runtime_error("glm5 fast path: kernels/glm_fast.hip is built for GLM-5.3-Flash's shapes");
   Glm5PagedCache k;
@@ -439,6 +508,10 @@ Glm5PagedCache make_glm5_paged_cache(const Glm5Config& c, int layer, int slots, 
   if (k.kda) {
     k.conv = zeroed(size_t(slots) * (c.conv_kernel - 1) * 3 * c.lin_width() * 2);
     k.state = zeroed(size_t(slots) * c.lin_heads * c.lin_dim * c.lin_dim * 4);
+    if (backups) {
+      k.conv_bak = zeroed(k.conv.size());
+      k.state_bak = zeroed(k.state.size());
+    }
   } else {
     const size_t rows = size_t(num_pages) * kernels::kGlmPageRows;
     k.lat = zeroed(rows * c.kv_lora);
@@ -463,13 +536,14 @@ void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint
   k::exl3_xform_in(in, D, row_expert, w.tab(0, 1, E), b.xh1, P, D, false, st);
   k::exl3_xform_in(in, D, row_expert, w.tab(1, 1, E), b.xh3, P, D, false, st);
   if (P / c.n_active <= 8) {  // <= 8 tokens: every expert has <= 8 rows -> the GEMVs
-    k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I, I, st,
-                         ntiles_dev);
-    k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I, I, st,
-                         ntiles_dev);
+    const int* nt = ntiles_dev;
+    k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I, I,
+                         st, nt);
+    k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I, I,
+                         st, nt);
     k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false);
-    k::exl3_grouped_gemv(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], b.yp, out, D, D, st,
-                         ntiles_dev);
+    k::exl3_grouped_gemv(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], b.yp, out, D, D,
+                         st, nt);
     return;
   }
   k::exl3_grouped_gemm(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.h1, I, I, st,
@@ -479,6 +553,30 @@ void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint
   k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false);
   k::exl3_grouped_gemm(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], out, D, D, st,
                        ntiles_dev);
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+void glm5_restore_kda(Glm5PagedCache& cache, int slot, hipStream_t st) {
+  if (!cache.kda) return;
+  if (!cache.state_bak.data()) throw std::runtime_error("glm5_restore_kda: the cache has no backups");
+  const size_t cb = cache.conv.size() / cache.slots, sb = cache.state.size() / cache.slots;
+  UH_CHECK(hipMemcpyAsync(cache.conv.as<uint8_t>() + slot * cb, cache.conv_bak.as<uint8_t>() + slot * cb, cb,
+                          hipMemcpyDeviceToDevice, st));
+  UH_CHECK(hipMemcpyAsync(cache.state.as<uint8_t>() + slot * sb, cache.state_bak.as<uint8_t>() + slot * sb, sb,
+                          hipMemcpyDeviceToDevice, st));
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+void prepare_glm5_fast_mtp(const Glm5Config& c, Glm5MtpWeights& m, int dev, hipStream_t st) {
+  prepare_glm5_fast(c, m.layer, dev, st);
+  rt::DeviceGuard g(dev);
+  prepare_linear(m.eh, dev, st);
 }
 
 }  // namespace unholy::model

@@ -60,7 +60,7 @@ size_t dtype_size(DType d) {
   return 0;
 }
 
-std::unique_ptr<Checkpoint> Checkpoint::open(const std::string& dir) {
+std::unique_ptr<Checkpoint> Checkpoint::open(const std::string& dir, const std::vector<std::string>& extra) {
   std::unique_ptr<Checkpoint> ck(new Checkpoint());
   ck->dir_ = dir;
   const fs::path root(dir);
@@ -82,6 +82,8 @@ std::unique_ptr<Checkpoint> Checkpoint::open(const std::string& dir) {
     throw std::runtime_error(dir + ": no model.safetensors(.index.json)");
   }
   for (const auto& s : shards) ck->add_shard((root / s).string());
+  for (const auto& s : extra)  // side files outside the index (exllamav3's mtp.safetensors), when present
+    if (fs::exists(root / s)) ck->add_shard((root / s).string());
 
   ck->by_name_.reserve(ck->tensors_.size());
   for (size_t i = 0; i < ck->tensors_.size(); ++i) ck->by_name_.emplace(ck->tensors_[i].name, i);

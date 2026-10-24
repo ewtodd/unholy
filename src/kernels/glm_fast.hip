@@ -358,7 +358,7 @@ __global__ void kda_prep_kernel(const bf16* q, const bf16* k, int ld, const floa
 template <int D>
 __global__ __launch_bounds__(D) void kda_recurrent_kernel(const float* qn, const float* kn, const float* eg,
                                                           const bf16* v, int ldv, const bf16* beta, float* state,
-                                                          bf16* o, GlmKdaBatch b, int H) {
+                                                          bf16* o, GlmKdaBatch b, int H, float* bak) {
   constexpr int TT = 16;
   __shared__ float sq[TT][D], sk[TT][D], se[TT][D];
   __shared__ float sb[TT];
@@ -395,10 +395,99 @@ __global__ __launch_bounds__(D) void kda_recurrent_kernel(const float* qn, const
         out = fmaf(s[d], sq[i][d], out);
       }
       o[(t * H + h) * D + j] = f32_to_bf16(out);
+      if (bak && t0 + i == ch.save_after) {  // the state after this token (a verify chunk's rollback point)
+        float* bh = bak + (size_t(ch.slot) * H + h) * D * D;
+#pragma unroll
+        for (int d = 0; d < D; ++d) bh[size_t(d) * D + j] = s[d];
+      }
     }
   }
 #pragma unroll
   for (int i = 0; i < D; ++i) sh[size_t(i) * D + j] = s[i];
+}
+
+// kernels::kda_conv's arithmetic, one thread per (channel, chunk).
+__global__ void kda_conv_kernel(const bf16* x, int ldx, bf16* state, const bf16* w, bf16* y, GlmKdaBatch b, int C,
+                                bf16* bak) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const GlmKdaChunk ch = b.c[blockIdx.y];
+  bf16* sc = state + size_t(ch.slot) * 3 * C;
+  float w4[4], h[3];
+  for (int i = 0; i < 4; ++i) w4[i] = bf16_to_f32(w[size_t(c) * 4 + i]);
+  for (int i = 0; i < 3; ++i) h[i] = bf16_to_f32(sc[size_t(i) * C + c]);
+  for (int t = 0; t < ch.n; ++t) {
+    const float xt = bf16_to_f32(x[size_t(ch.t0 + t) * ldx + c]);
+    float acc = w4[0] * h[0];
+    acc = fmaf(w4[1], h[1], acc);
+    acc = fmaf(w4[2], h[2], acc);
+    acc = fmaf(w4[3], xt, acc);
+    const float a = round_bf16(acc);
+    y[size_t(ch.t0 + t) * C + c] = f32_to_bf16(a * sigmoidf(a));
+    h[0] = h[1];
+    h[1] = h[2];
+    h[2] = xt;
+    if (bak && t == ch.save_after)
+      for (int i = 0; i < 3; ++i) bak[(size_t(ch.slot) * 3 + i) * C + c] = f32_to_bf16(h[i]);
+  }
+  for (int i = 0; i < 3; ++i) sc[size_t(i) * C + c] = f32_to_bf16(h[i]);
+}
+
+__global__ void add_bf16_kernel(bf16* x, const bf16* y, size_t n) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    x[i] = f32_to_bf16(bf16_to_f32(x[i]) + bf16_to_f32(y[i]));
+}
+
+// One block per row: both halves' RMS norms with their weights.
+__global__ void mtp_cat_kernel(const bf16* emb, const bf16* h, const bf16* enorm, const bf16* hnorm, bf16* cat, int dim,
+                               float eps) {
+  __shared__ float red[32];
+  const int r = blockIdx.x;
+  const bf16* src[2] = {emb + size_t(r) * dim, h + size_t(r) * dim};
+  const bf16* wt[2] = {enorm, hnorm};
+  for (int half = 0; half < 2; ++half) {
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+      const float v = bf16_to_f32(src[half][i]);
+      ss += v * v;
+    }
+    const float rs = rsqrtf(block_sum(ss, red) / float(dim) + eps);
+    bf16* dst = cat + (size_t(r) * 2 + half) * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+      dst[i] = f32_to_bf16(bf16_to_f32(src[half][i]) * rs * bf16_to_f32(wt[half][i]));
+  }
+}
+
+// One block of 256 threads per row: argmax (lowest id among equals), then the softmax probability of it.
+__global__ __launch_bounds__(256) void argmax_conf_kernel(const float* logits, int V, int32_t* tok, float* conf) {
+  __shared__ float rv[8];
+  __shared__ int ri[8];
+  __shared__ float red[32];
+  const float* row = logits + size_t(blockIdx.x) * V;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  for (int v = tid; v < V; v += 256)
+    if (row[v] > bv) bv = row[v], bi = v;
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(bv, o, 32);
+    const int oi = __shfl_xor(bi, o, 32);
+    if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+  }
+  if (lane == 0) rv[warp] = bv, ri[warp] = bi;
+  __syncthreads();
+  if (tid == 0)
+    for (int w = 1; w < 8; ++w)
+      if (rv[w] > rv[0] || (rv[w] == rv[0] && ri[w] < ri[0])) rv[0] = rv[w], ri[0] = ri[w];
+  __syncthreads();
+  const float mx = rv[0];
+  float s = 0.0f;
+  for (int v = tid; v < V; v += 256) s += expf(row[v] - mx);
+  s = block_sum(s, red);
+  if (tid == 0) {
+    tok[blockIdx.x] = ri[0];
+    conf[blockIdx.x] = 1.0f / s;
+  }
 }
 
 }  // namespace
@@ -458,10 +547,40 @@ void glm_kda_prep(const bf16* q, const bf16* k, int ld, const float* g, float* q
 }
 
 void glm_kda_recurrent(const float* qn, const float* kn, const float* eg, const bf16* v, int ldv, const bf16* beta,
-                       float* state, bf16* o, const GlmKdaBatch& b, int H, int D, hipStream_t st) {
+                       float* state, bf16* o, const GlmKdaBatch& b, int H, int D, hipStream_t st, float* backup) {
   if (D != 128) throw std::runtime_error("glm_kda_recurrent: head dim must be 128");
   if (b.nchunks <= 0) return;
-  kda_recurrent_kernel<128><<<dim3(H, b.nchunks), 128, 0, st>>>(qn, kn, eg, v, ldv, beta, state, o, b, H);
+  kda_recurrent_kernel<128><<<dim3(H, b.nchunks), 128, 0, st>>>(qn, kn, eg, v, ldv, beta, state, o, b, H, backup);
+  UH_CHECK_LAUNCH();
+}
+
+}  // namespace unholy::kernels
+
+namespace unholy::kernels {
+
+void glm_kda_conv(const bf16* x, int ldx, bf16* state, const bf16* w, bf16* y, const GlmKdaBatch& b, int C,
+                  hipStream_t st, bf16* backup) {
+  if (b.nchunks <= 0) return;
+  kda_conv_kernel<<<dim3(cdiv(size_t(C), 256), b.nchunks), 256, 0, st>>>(x, ldx, state, w, y, b, C, backup);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_add_bf16(bf16* x, const bf16* y, size_t n, hipStream_t st) {
+  if (n == 0) return;
+  add_bf16_kernel<<<std::min(cdiv(n, 256), 4096), 256, 0, st>>>(x, y, n);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_mtp_cat(const bf16* emb, const bf16* h, const bf16* enorm, const bf16* hnorm, bf16* cat, int rows, int dim,
+                 float eps, hipStream_t st) {
+  if (rows <= 0) return;
+  mtp_cat_kernel<<<rows, 256, 0, st>>>(emb, h, enorm, hnorm, cat, dim, eps);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, hipStream_t st) {
+  if (rows <= 0) return;
+  argmax_conf_kernel<<<rows, 256, 0, st>>>(logits, V, tok, conf);
   UH_CHECK_LAUNCH();
 }
 

@@ -329,9 +329,9 @@ int serve_dsv4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
   const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
   const auto c = model::Glm5Config::from_hf(ck->config());
-  if (o.spec_drafts > 0 || o.vision)
-    std::printf("GLM-5.3-Flash: speculative drafts and images are not served yet; serving without them\n");
-  o.spec_drafts = 0;
+  // MTP drafting proposes one token per step (--spec-drafts > 0: 1).
+  const bool mtp = o.spec_drafts > 0 && c.n_mtp > 0;
+  o.spec_drafts = mtp ? 1 : 0;
   o.prefix_snapshots = 0;
   if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_glm53_mixed.txt";
 
@@ -350,12 +350,14 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   pin.geo = geo;
   pin.max_tokens = o.max_batch;
   pin.max_seq = max_seq;
-  pin.max_logit_rows = std::max(o.max_slots, 8);
+  pin.max_logit_rows = std::max(o.max_slots * (mtp ? 2 : 1), 8);  // a verify chunk wants its token's and its draft's
   pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
+  pin.mtp = mtp;
   if (plan_only) {
     std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
-                "tokens; GLM-5.3-Flash EXL3\n",
-                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch);
+                "tokens; GLM-5.3-Flash EXL3%s\n",
+                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch,
+                mtp ? ", MTP drafts" : "");
     try {
       std::printf("%s", engine::make_glm5_plan(pin).summary().c_str());
     } catch (const std::exception& e) {
@@ -368,7 +370,7 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   std::printf("%s", plan.summary().c_str());
   std::fflush(stdout);
   const auto t0 = std::chrono::steady_clock::now();
-  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows);
+  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows, mtp);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);
@@ -445,7 +447,7 @@ int serve(int argc, char** argv, bool plan_only) {
   sigaddset(&sigs, SIGTERM);
   pthread_sigmask(SIG_BLOCK, &sigs, nullptr);
 
-  auto ck = model::Checkpoint::open(o.model_dir);
+  auto ck = model::Checkpoint::open(o.model_dir, {"mtp.safetensors"});  // (exllamav3 GLM quants keep MTP there)
   switch (model::detect_family(ck->config())) {
     case model::Family::Dsv4:
       return serve_dsv4(o, std::move(ck), plan_only, sigs);

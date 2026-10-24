@@ -6,12 +6,16 @@
 // channel per card, device-ordered flags, no host waits). Two steps in flight: card 0 runs step k + 1 while card 1
 // finishes step k; the residual crosses once per step through pinned memory.
 //
-// Not yet: prefix snapshots (a slot's KDA state is 152.6 MB), MTP drafting, images.
+// MTP drafting (mtp = true): the nextn layer's dense part and DSA rows on card 1, its experts on the APU (a third
+// channel); every step writes its cache rows from the trunk's final-normed hidden states, draft() runs it for one draft per
+// request on card 1's draft stream; a verify chunk backs up the KDA states after its first token, restored when the
+// draft is rejected. Not yet: prefix snapshots (a slot's KDA state is 152.6 MB), images.
 #pragma once
 
 #include <hip/hip_runtime.h>
 
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "engine/plan.hpp"
@@ -59,13 +63,15 @@ struct Glm5PlanInput {
   model::CacheGeometry geo;
   int max_tokens = 0, max_seq = 0, max_logit_rows = 0;
   size_t card_margin = size_t(2) << 30, apu_margin = size_t(4) << 30;
+  bool mtp = false;  // MTP drafting: its layer on card 1 / the APU, the KDA state backups
 };
 Plan make_glm5_plan(const Glm5PlanInput& in);
 
 class Glm5ResidentModel final : public StepModel {
  public:
   Glm5ResidentModel(const model::Glm5Config& c, const model::Checkpoint& ck, const Plan& plan,
-                    const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows = 0);
+                    const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows = 0,
+                    bool mtp = false);
   ~Glm5ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -76,6 +82,10 @@ class Glm5ResidentModel final : public StepModel {
   int num_pages() const override { return geo_.num_pages; }
   int page_tokens() const override { return kernels::kGlmPageRows; }
   int max_inflight() const override { return 2; }
+  int draft_block() const override { return mtp_ ? 1 : 0; }
+  int max_verify() const override { return mtp_ ? 2 : 0; }
+  void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs, std::vector<int32_t>& tokens,
+             std::vector<float>& conf) override;
   void set_block_tables(const std::vector<int32_t>& tables) override;
   uint64_t submit(const StepInput& in) override;
   void wait(uint64_t ticket, std::vector<float>& logits) override;
@@ -104,11 +114,27 @@ class Glm5ResidentModel final : public StepModel {
   std::unique_ptr<rt::Arena> card_arena_[2], apu_arena_;
   model::Glm5HeadWeights embed_, head_;   // embedding on card 0, final norm + LM head on card 1
   rt::DeviceBuffer hrows_, logits_, rows_idx_;  // head inputs / outputs on card 1
+  // MTP (card 1): weights, cache, the draft stream / scratch / APU channel, the hidden states it reads, staging.
+  bool mtp_ = false;
+  model::Glm5MtpWeights mtpw_;
+  model::Glm5PagedCache mcache_;
+  hipStream_t dst_ = nullptr;
+  hipEvent_t drafted_ = nullptr;           // dst_: the last draft() (restores included) done
+  model::Glm5Scratch dscr_;
+  std::unique_ptr<Glm5ApuExperts> dchan_;
+  rt::DeviceBuffer h_all_, h_last_, h_prev_;  // [max_tokens][dim] this step's final-normed rows; [slot][dim]
+  rt::DeviceBuffer m_emb_, m_h_, m_x0_;       // step: MTP cache rows' embeddings, hidden states, inputs
+  rt::DeviceBuffer d_emb_, d_h_, d_x_, d_hn_, d_logits_, d_tok_;  // draft rows
+  uint16_t* d_emb_host_ = nullptr;            // [max_slots][dim]
+  int32_t* d_tok_host_ = nullptr;             // [max_slots] tokens, then [max_slots] confidences (float)
+  std::span<const uint16_t> embed_host_;      // the checkpoint's embedding table (mmap)
+
   struct Flight {
     uint16_t* x_host = nullptr;     // residual handoff card 0 -> card 1
     float* logits_host = nullptr;   // [max_logit_rows][vocab]
     int32_t* io_host = nullptr;     // [max_tokens] ids, positions, logit rows
     int32_t* tables_host = nullptr;
+    uint16_t* emb_host = nullptr;    // MTP: [max_tokens][dim] embeddings of the step's cache rows
     hipEvent_t handoff = nullptr, consumed = nullptr, done = nullptr;
     uint64_t ticket = 0;
     int rows = 0;

@@ -96,6 +96,10 @@ worked answers as user / assistant turns through GLM's template, `mkchat.py`).
 - **fp8 activations cost**: +2.4e-3 / +3.4e-3 (code / chat) on the release itself, +14% on D (code). A
   weight-only fp8 path (W8A16: dequantize in the GEMV / GEMM, activations in bf16) avoids it; the decode GEMV is
   bound by weight bytes either way.
+- **Long context** (8192-token code prompt, where the indexer selects for three quarters of the positions):
+  release 5.12e-3 / 97.83%, B with fp8 latent 1.30e-2 / 96.63% (as at 1024 tokens), and with fp8 pooled keys too
+  1.31e-2 / 96.54%. The serving cache (G5) keeps the latent in fp8 (e4m3, power-of-two scale per 64 values: +0.5e-3
+  on the release at 1024 tokens) and the pooled keys in bf16.
 - Scale, not a verdict (KL across models only gives a scale; the head-to-head evals decide): DSV4-VE as served
   is its own release precision (4.19e-3 / 98.26% against its oracle on the same code prompt, its noise floor),
   and its EXL3 3.04 experts measured 2.4-2.8e-2 / 92.7% on the earlier code prompt. A / C sit where that build

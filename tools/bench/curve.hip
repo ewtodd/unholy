@@ -19,9 +19,12 @@
 #include <string>
 #include <vector>
 
+#include "engine/glm5_resident.hpp"
 #include "engine/plan.hpp"
 #include "engine/resident.hpp"
 #include "model/dsv4.hpp"
+#include "model/family.hpp"
+#include "model/glm5.hpp"
 #include "model/safetensors.hpp"
 
 using namespace unholy;
@@ -54,24 +57,45 @@ int main(int argc, char** argv) {
     auto ck = model::Checkpoint::open(model_dir);
     std::unique_ptr<model::Checkpoint> xck;
     if (!exl3_dir.empty()) xck = model::Checkpoint::open(exl3_dir);
-    const auto c = model::Dsv4Config::from_hf(ck->config());
     const int extra = int(probes.size()) * dsteps + 16;
     const int max_seq = (ctx + extra + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
     model::CacheGeometry geo{1, max_seq / model::kPageTokens, max_seq / model::kPageTokens};
-    engine::PlanInput pin;
-    pin.cfg = &c;
-    pin.dense = ck.get();
-    pin.exl3 = xck.get();
-    pin.usage = engine::load_usage_profile(profile, c.n_layers, c.n_experts);
-    pin.geo = geo;
-    pin.max_tokens = chunk;
-    pin.max_seq = max_seq;
-    pin.max_logit_rows = 8;
-    const auto plan = engine::make_plan(pin);
-    std::printf("%s", plan.summary().c_str());
+    // The model by checkpoint family (configs outlive the model: it keeps a reference).
+    std::unique_ptr<model::Dsv4Config> dc;
+    std::unique_ptr<model::Glm5Config> gc;
+    std::unique_ptr<engine::StepModel> model_ptr;
     const auto t_load = clk::now();
-    engine::ResidentModel m(c, *ck, xck.get(), plan, geo, chunk, max_seq, 8);
-    std::printf("experts %s; loaded in %.1f s; in-flight depth %d\n", xck ? "EXL3" : "native MXFP4",
+    if (model::detect_family(ck->config()) == model::Family::Glm5Next) {
+      gc = std::make_unique<model::Glm5Config>(model::Glm5Config::from_hf(ck->config()));
+      engine::Glm5PlanInput pin;
+      pin.cfg = gc.get();
+      pin.ck = ck.get();
+      pin.usage = engine::load_usage_profile(profile, gc->n_layers, gc->n_experts);
+      pin.geo = geo;
+      pin.max_tokens = chunk;
+      pin.max_seq = max_seq;
+      pin.max_logit_rows = 8;
+      const auto plan = engine::make_glm5_plan(pin);
+      std::printf("%s", plan.summary().c_str());
+      model_ptr = std::make_unique<engine::Glm5ResidentModel>(*gc, *ck, plan, geo, chunk, max_seq, 8);
+    } else {
+      dc = std::make_unique<model::Dsv4Config>(model::Dsv4Config::from_hf(ck->config()));
+      const auto& c = *dc;
+      engine::PlanInput pin;
+      pin.cfg = &c;
+      pin.dense = ck.get();
+      pin.exl3 = xck.get();
+      pin.usage = engine::load_usage_profile(profile, c.n_layers, c.n_experts);
+      pin.geo = geo;
+      pin.max_tokens = chunk;
+      pin.max_seq = max_seq;
+      pin.max_logit_rows = 8;
+      const auto plan = engine::make_plan(pin);
+      std::printf("%s", plan.summary().c_str());
+      model_ptr = std::make_unique<engine::ResidentModel>(c, *ck, xck.get(), plan, geo, chunk, max_seq, 8);
+    }
+    engine::StepModel& m = *model_ptr;
+    std::printf("experts %s; loaded in %.1f s; in-flight depth %d\n", gc || xck ? "EXL3" : "native MXFP4",
                 std::chrono::duration<double>(clk::now() - t_load).count(), m.max_inflight());
     std::fflush(stdout);
     std::vector<int32_t> tables(static_cast<size_t>(geo.max_pages_per_seq));

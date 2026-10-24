@@ -57,6 +57,7 @@ void glm_route(const float* logits, const float* bias, int32_t* sel, float* weig
 // beta bf16 [T][H], state f32 [slot][H][D][D] (k index major), o bf16 [T][H][D].
 struct GlmKdaChunk {
   int t0, n, slot;
+  int save_after = -1;  // >= 0: also write the state as it is after token save_after of the chunk to the backup
 };
 struct GlmKdaBatch {
   static constexpr int kMax = 64;
@@ -66,7 +67,20 @@ struct GlmKdaBatch {
 void glm_kda_prep(const bf16* q, const bf16* k, int ld, const float* g, float* qn, float* kn, float* eg, int T, int H,
                   int D, hipStream_t st);
 void glm_kda_recurrent(const float* qn, const float* kn, const float* eg, const bf16* v, int ldv, const bf16* beta,
-                       float* state, bf16* o, const GlmKdaBatch& b, int H, int D, hipStream_t st);
+                       float* state, bf16* o, const GlmKdaBatch& b, int H, int D, hipStream_t st,
+                       float* backup = nullptr);
+// kernels::kda_conv over every chunk of the batch in one launch: x [T, C] (stride ldx), state [slot][3][C], y [T, C];
+// chunks with save_after >= 0 also write their state after that token to backup [slot][3][C].
+void glm_kda_conv(const bf16* x, int ldx, bf16* state, const bf16* w, bf16* y, const GlmKdaBatch& b, int C,
+                  hipStream_t st, bf16* backup = nullptr);
+
+// x = bf16(x + y) (plain residual adds of the MTP layer).
+void glm_add_bf16(bf16* x, const bf16* y, size_t n, hipStream_t st);
+// The MTP layer's input: cat [rows][2 dim] = [bf16(rms(emb) * enorm), bf16(rms(h) * hnorm)] (fp32 inside).
+void glm_mtp_cat(const bf16* emb, const bf16* h, const bf16* enorm, const bf16* hnorm, bf16* cat, int rows, int dim,
+                 float eps, hipStream_t st);
+// Per row of logits [rows][V]: the argmax (ties: lower id) and its softmax probability.
+void glm_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, hipStream_t st);
 
 // Grouped bf16 GEMM over heads (gemm_wmma's bf16 kernel with groups): c [M, G, R] = a [M, G, K] . w[g]^T, w [G][R][K].
 void gemm_grouped_bf16_wmma(const bf16* a, const bf16* w, bf16* c, int M, int G, int R, int K, hipStream_t st);

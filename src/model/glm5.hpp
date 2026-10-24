@@ -51,8 +51,9 @@ struct Glm5Config {
 
   // From config.json (the text_config of a Glm5NextForConditionalGeneration checkpoint).
   static Glm5Config from_hf(const gufo::json::Value& cfg);
-  bool is_kda(int layer) const { return kda.at(size_t(layer)) != 0; }
-  bool is_dense(int layer) const { return dense.at(size_t(layer)) != 0; }
+  // Layer n_layers (the MTP layer) is DSA + MoE.
+  bool is_kda(int layer) const { return layer < n_layers && kda.at(size_t(layer)) != 0; }
+  bool is_dense(int layer) const { return layer < n_layers && dense.at(size_t(layer)) != 0; }
   int lin_width() const { return lin_heads * lin_dim; }  // 8192
 };
 
@@ -115,6 +116,17 @@ struct Glm5LoadOptions {
 Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int layer, int dev, hipStream_t st,
                                  const Glm5LoadOptions& opt = {});
 
+// The MTP (nextn) layer, index n_layers: eh_proj([enorm(emb(t + 1)), hnorm(h_t)]) -> a DSA + MoE layer with plain
+// pre-norm residuals (no Hyper-Connections) -> the shared head's norm -> the trunk's LM head (DeepSeek-V3's scheme;
+// h_t is the trunk's final-normed hidden state at t, the LM head's input). exllamav3 keeps it in mtp.safetensors.
+struct Glm5MtpWeights {
+  Glm5LayerWeights layer;
+  GLinear eh;  // [dim, 2 dim]
+  DevTensor enorm, hnorm, head_norm;
+};
+Glm5MtpWeights load_glm5_mtp(const Checkpoint& ck, const Glm5Config& c, int dev, hipStream_t st,
+                             const Glm5LoadOptions& opt = {});
+
 // Embedding (bf16 [vocab, dim]), final norm, LM head.
 struct Glm5HeadWeights {
   DevTensor embed, norm;
@@ -139,6 +151,7 @@ void clear_glm5_slot(const Glm5Config& c, Glm5Cache& cache, int slot, hipStream_
 // Tokens [t0, t0 + n) of the batch are positions [s0, s0 + n) of the sequence in `slot` (one chunk per slot).
 struct Glm5Chunk {
   int slot = 0, s0 = 0, n = 0, t0 = 0;
+  int save_after = -1;  // fast path, >= 0: back up the KDA state after this token of the chunk (a verify chunk)
 };
 struct Glm5Batch {
   std::vector<Glm5Chunk> chunks;
@@ -172,8 +185,9 @@ struct Glm5Scratch {
     return static_cast<T*>(get(size_t(b)));
   }
 };
-Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq);
-size_t glm5_scratch_bytes(const Glm5Config& c, int max_tokens, int max_seq);
+// fast_only: for the fast path alone (smaller: its absorbed-attention buffers are bf16).
+Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq, bool fast_only = false);
+size_t glm5_scratch_bytes(const Glm5Config& c, int max_tokens, int max_seq, bool fast_only = false);
 // Device bytes of a layer's dense part (everything but routed experts) as the fast path holds it (fp16 tensors also
 // converted to bf16, kv_b also split per head), and of one routed expert.
 size_t glm5_dense_layer_bytes(const Checkpoint& ck, int layer);
@@ -216,16 +230,21 @@ struct Glm5PagedCache {
   int layer = 0, slots = 0, num_pages = 0;
   bool kda = false;
   rt::DeviceBuffer conv, state;
+  rt::DeviceBuffer conv_bak, state_bak;  // KDA, with backups: the state after a verify chunk's first token
   rt::DeviceBuffer lat, lat_s, pk, tail_k, tail_g;
 };
+// backups: room for the KDA state backups of speculative decoding (Glm5Chunk::save_after, glm5_restore_kda).
 Glm5PagedCache make_glm5_paged_cache(const Glm5Config& c, int layer, int slots, int num_pages, int dev,
-                                     hipStream_t st);
-size_t glm5_paged_cache_bytes(const Glm5Config& c, bool kda, int slots, int num_pages);
+                                     hipStream_t st, bool backups = false);
+size_t glm5_paged_cache_bytes(const Glm5Config& c, bool kda, int slots, int num_pages, bool backups = false);
+// A slot's KDA state back to its backup (a rejected draft), on st.
+void glm5_restore_kda(Glm5PagedCache& cache, int slot, hipStream_t st);
 
 // After load_glm5_layer: EXL3 pointer tables, fp16 small weights converted to bf16 (exllamav3 stored the release's
 // bf16 values as fp16; converting back is exact for them), the routed experts' grouped tables.
 void prepare_glm5_fast(const Glm5Config& c, Glm5LayerWeights& w, int dev, hipStream_t st);
 void prepare_glm5_fast_head(Glm5HeadWeights& h, int dev, hipStream_t st);
+void prepare_glm5_fast_mtp(const Glm5Config& c, Glm5MtpWeights& m, int dev, hipStream_t st);
 // The layer on the fast kernels; routed experts this device does not hold run through `remote` (the APU).
 void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache,
                              const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st,
@@ -242,4 +261,18 @@ void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint
                       int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st);
 void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* x,
                             int T, float* logits, hipStream_t st);
+// The LM head on rows that are already normed (hn [T, dim]) -> logits [T, vocab] f32.
+void glm5_head_logits(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* hn, int T,
+                      float* logits, hipStream_t st);
+
+// MTP on the fast path. x0 [rows, dim] = eh_proj([rms(emb) * enorm, rms(h) * hnorm]) (emb, h bf16 [rows, dim]).
+void glm5_mtp_in(const Glm5Config& c, const Glm5MtpWeights& m, const uint16_t* emb, const uint16_t* h, uint16_t* x0,
+                 int rows, const Glm5Scratch& scr, hipStream_t st);
+// The MTP layer's cache rows for the batch's positions, from x0 (its attention input norm, then the DSA rows only).
+void glm5_mtp_cache(const Glm5Config& c, const Glm5MtpWeights& m, Glm5PagedCache& cache, const Glm5Scratch& scr,
+                    const uint16_t* x0, const Glm5Batch& b, hipStream_t st);
+// The whole MTP layer on x [rows, dim] in place (plain residuals; it writes the batch's cache rows), then the shared
+// head's norm into hn [rows, dim].
+void glm5_mtp_forward(const Glm5Config& c, const Glm5MtpWeights& m, Glm5PagedCache& cache, const Glm5Scratch& scr,
+                      uint16_t* x, uint16_t* hn, const Glm5Batch& b, hipStream_t st, RemoteExperts* remote = nullptr);
 }  // namespace unholy::model
