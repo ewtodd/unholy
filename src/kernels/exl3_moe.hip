@@ -11,6 +11,8 @@
 // holds C[(l/16)*8 + i][l%16].
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
+
 #include "kernels/dev.hip.hpp"
 #include "kernels/exl3_moe.hpp"
 #include "rt/hip.hpp"
@@ -68,45 +70,55 @@ __device__ __forceinline__ void fwht128_lds(float* b, int i) {
   }
 }
 
+// Rows [*row0 (0 if null), *row1 (P if null)), gridDim.y of them at a time: a prefill step's few-thousand-row grids
+// would mostly be blocks that only find their row's expert elsewhere.
 __global__ __launch_bounds__(128) void xform_in_kernel(const bf16* x, int ldx, const int32_t* row_expert,
                                                        const uint16_t* const* suh_tab, uint16_t* xh, int K,
-                                                       bool fq) {
+                                                       bool fq, int P, const int* row0, const int* row1,
+                                                       const int32_t* x_rows) {
   __shared__ float b[128];
   __shared__ float red[4];
-  const int r = blockIdx.y, seg = blockIdx.x, i = threadIdx.x;
-  const uint16_t* suh = suh_tab[row_expert[r]];
-  if (!suh) return;  // expert not on this device: its rows are never read (uniform per block)
-  float v = bf16_to_f32(x[size_t(r) * ldx + seg * 128 + i]);
-  if (fq) v = fake_quant_fp8_block(v, red);
-  b[i] = v * __half2float(__ushort_as_half(suh[seg * 128 + i]));
-  __syncthreads();
-  fwht128_lds(b, i);
-  xh[size_t(r) * K + seg * 128 + i] = __half_as_ushort(__float2half(b[i] * 0.08838834764831845f));
+  const int seg = blockIdx.x, i = threadIdx.x, r1 = row1 ? *row1 : P;
+  for (int r = (row0 ? *row0 : 0) + blockIdx.y; r < r1; r += gridDim.y) {
+    const uint16_t* suh = suh_tab[row_expert[r]];
+    if (!suh) continue;  // expert not on this device: its rows are never read (uniform per block)
+    float v = bf16_to_f32(x[size_t(x_rows ? x_rows[r] : r) * ldx + seg * 128 + i]);
+    if (fq) v = fake_quant_fp8_block(v, red);
+    b[i] = v * __half2float(__ushort_as_half(suh[seg * 128 + i]));
+    __syncthreads();
+    fwht128_lds(b, i);
+    xh[size_t(r) * K + seg * 128 + i] = __half_as_ushort(__float2half(b[i] * 0.08838834764831845f));
+    __syncthreads();
+  }
 }
 
 template <bool FQ>
 __global__ __launch_bounds__(128) void swiglu_xform_kernel(const bf16* g, const bf16* u, const float* w,
                                                            const int32_t* row_expert, const uint16_t* const* suh_tab,
-                                                           uint16_t* xh, int I, float limit) {
+                                                           uint16_t* xh, int I, float limit, int P, const int* row0,
+                                                           const int* row1) {
   __shared__ float b[128];
   __shared__ float red[4];
-  const int r = blockIdx.y, seg = blockIdx.x, i = threadIdx.x;
-  const uint16_t* suh = suh_tab[row_expert[r]];
-  if (!suh) return;
-  const size_t idx = size_t(r) * I + seg * 128 + i;
-  float gv = bf16_to_f32(g[idx]), uv = bf16_to_f32(u[idx]);
-  if (limit > 0.0f) {
-    uv = fminf(fmaxf(uv, -limit), limit);
-    gv = fminf(gv, limit);
+  const int seg = blockIdx.x, i = threadIdx.x, r1 = row1 ? *row1 : P;
+  for (int r = (row0 ? *row0 : 0) + blockIdx.y; r < r1; r += gridDim.y) {
+    const uint16_t* suh = suh_tab[row_expert[r]];
+    if (!suh) continue;
+    const size_t idx = size_t(r) * I + seg * 128 + i;
+    float gv = bf16_to_f32(g[idx]), uv = bf16_to_f32(u[idx]);
+    if (limit > 0.0f) {
+      uv = fminf(fmaxf(uv, -limit), limit);
+      gv = fminf(gv, limit);
+    }
+    float hv = (gv / (1.0f + expf(-gv))) * uv;
+    if (w) hv = w[r] * hv;
+    hv = round_bf16(hv);  // the reference's swiglu output is a bf16 tensor
+    if constexpr (FQ) hv = fake_quant_fp8_block(hv, red);
+    b[i] = hv * __half2float(__ushort_as_half(suh[seg * 128 + i]));
+    __syncthreads();
+    fwht128_lds(b, i);
+    xh[idx] = __half_as_ushort(__float2half(b[i] * 0.08838834764831845f));
+    __syncthreads();
   }
-  float hv = (gv / (1.0f + expf(-gv))) * uv;
-  if (w) hv = w[r] * hv;
-  hv = round_bf16(hv);  // the reference's swiglu output is a bf16 tensor
-  if constexpr (FQ) hv = fake_quant_fp8_block(hv, red);
-  b[i] = hv * __half2float(__ushort_as_half(suh[seg * 128 + i]));
-  __syncthreads();
-  fwht128_lds(b, i);
-  xh[idx] = __half_as_ushort(__float2half(b[i] * 0.08838834764831845f));
 }
 
 constexpr int BM = 64, BN = 128, KS = 32, NT = 256;
@@ -406,20 +418,26 @@ __global__ __launch_bounds__(V2_NT) void exl3_gemm_v2_kernel(const uint16_t* __r
 
 }  // namespace
 
+constexpr int kXformGridRows = 1024;  // rows per pass of the transforms' grids
+
 void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint16_t* const* suh_tab, uint16_t* xh,
-                   int P, int K, bool fake_quant, hipStream_t st) {
+                   int P, int K, bool fake_quant, hipStream_t st, const int* row0_dev, const int* row1_dev,
+                   const int32_t* x_rows) {
   if (P <= 0) return;
-  xform_in_kernel<<<dim3(K / 128, P), 128, 0, st>>>(x, ldx, row_expert, suh_tab, xh, K, fake_quant);
+  xform_in_kernel<<<dim3(K / 128, std::min(P, kXformGridRows)), 128, 0, st>>>(x, ldx, row_expert, suh_tab, xh, K,
+                                                                             fake_quant, P, row0_dev, row1_dev, x_rows);
   UH_CHECK_LAUNCH();
 }
 
 void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
                        const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st,
-                       bool fake_quant) {
+                       bool fake_quant, const int* row0_dev, const int* row1_dev) {
   if (P <= 0) return;
-  const dim3 grid(I / 128, P);
-  if (fake_quant) swiglu_xform_kernel<true><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit);
-  else swiglu_xform_kernel<false><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit);
+  const dim3 grid(I / 128, std::min(P, kXformGridRows));
+  if (fake_quant)
+    swiglu_xform_kernel<true><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit, P, row0_dev, row1_dev);
+  else
+    swiglu_xform_kernel<false><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit, P, row0_dev, row1_dev);
   UH_CHECK_LAUNCH();
 }
 

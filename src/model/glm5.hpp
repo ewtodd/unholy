@@ -251,7 +251,9 @@ void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm
                              const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st,
                              RemoteExperts* remote = nullptr);
 // Routed experts of `w` that this device holds, over the pair rows of the tiles (*ntiles_dev of max_tiles run): in
-// bf16 [P, dim] with routing weights rw [P] and row_expert [P] -> out bf16 [P, dim] for the tiles' rows.
+// bf16 [P, dim] with routing weights rw [P] and row_expert [P] -> out bf16 [P, dim] for the tiles' rows. The tiles'
+// rows lie in [*row0_dev, *row1_dev) when given (a MoePlan's local block [0, remote0) or remote block [remote0, P)).
+// With x_rows, pair row p's input is row x_rows[p] of `in` (the remote side's compact token rows, p2u).
 struct Glm5ExpertBufs {
   uint16_t *xh1, *xh3, *xh2;  // fp16 [P, dim], [P, dim], [P, moe_inter]
   uint16_t *h1, *h3;          // bf16 [P, moe_inter]
@@ -259,7 +261,8 @@ struct Glm5ExpertBufs {
 };
 void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
                       const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
-                      int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st);
+                      int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st, const int* row0_dev = nullptr,
+                      const int* row1_dev = nullptr, const int32_t* x_rows = nullptr);
 void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* x,
                             int T, float* logits, hipStream_t st);
 // The LM head on rows that are already normed (hn [T, dim]) -> logits [T, vocab] f32.

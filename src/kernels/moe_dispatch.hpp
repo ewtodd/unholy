@@ -47,6 +47,11 @@ void remote_tokens(const int32_t* pidx, const int32_t* eidx, int T, int K, MoePl
 // accumulates every expert's output in bf16).
 void remote_combine(const uint16_t* pair_out, const int32_t* u2p, const MoePlan* plan, uint16_t* dst, int K, int dim,
                     int max_tokens, hipStream_t st);
+// Card side, compact bf16 inputs: dst[u] = x[u2t[u]] (rows of dim values) for u < plan->n_remote_tokens: each
+// token's row crosses the host link once instead of once per remote pair (the remote side reads pair row p from
+// row p2u[p]). Grid sized for max_tokens.
+void copy_remote_tokens(const uint16_t* x, int dim, const int32_t* u2t, const MoePlan* plan, uint16_t* dst,
+                        int max_tokens, hipStream_t st);
 // Card side: those rows (dst of remote_combine, in host memory) -> rows [remote0, remote0 + U) of dst.
 void copy_remote_partial(const uint16_t* src, uint16_t* dst, const MoePlan* plan, int dim, int max_tokens,
                          hipStream_t st);

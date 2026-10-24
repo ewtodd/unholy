@@ -216,6 +216,17 @@ __global__ __launch_bounds__(256) void remote_combine_kernel(const uint16_t* pai
   __threadfence_system();
 }
 
+__global__ void copy_remote_tokens_kernel(const uint16_t* x, int dim, const int32_t* u2t, const MoePlan* plan,
+                                          uint16_t* dst) {
+  const int cols = dim / 8;  // uint4 units per row
+  const size_t n = size_t(plan->n_remote_tokens) * cols;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    const size_t u = i / cols, c = i % cols;
+    reinterpret_cast<uint4*>(dst + u * dim)[c] = reinterpret_cast<const uint4*>(x + size_t(u2t[u]) * dim)[c];
+  }
+  __threadfence_system();
+}
+
 __global__ void copy_remote_partial_kernel(const uint16_t* src, uint16_t* dst, const MoePlan* plan, int dim) {
   const size_t n = size_t(plan->n_remote_tokens) * dim / 8;
   const uint4* s = reinterpret_cast<const uint4*>(src);
@@ -473,6 +484,14 @@ void copy_remote_rows(const uint16_t* src, uint16_t* dst, const MoePlan* plan, i
   const size_t units = size_t(max_rows) * dim / 8;
   const int blocks = int(std::min<size_t>((units + 255) / 256, 1024));
   copy_remote_rows_kernel<<<std::max(blocks, 1), 256, 0, st>>>(src, dst, plan, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void copy_remote_tokens(const uint16_t* x, int dim, const int32_t* u2t, const MoePlan* plan, uint16_t* dst,
+                        int max_tokens, hipStream_t st) {
+  const size_t units = size_t(max_tokens) * dim / 8;
+  const int blocks = int(std::min<size_t>((units + 255) / 256, 1024));
+  copy_remote_tokens_kernel<<<std::max(blocks, 1), 256, 0, st>>>(x, dim, u2t, plan, dst);
   UH_CHECK_LAUNCH();
 }
 

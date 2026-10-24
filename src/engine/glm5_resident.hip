@@ -35,6 +35,7 @@ Glm5ApuExperts::Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capac
   pinned(&out_host, &out_dev_, cap * D * 2);
   pinned(&w_host, &w_dev_, cap * 4);
   pinned(&e_host, &e_dev_, cap * 4);
+  pinned(&p2u_host, &p2u_dev_, cap * 4);
   pinned(&plan_host, &plan_dev_, sizeof(k::MoePlan));
   pinned(&tiles_host, &tiles_dev_, size_t(max_tiles) * sizeof(k::Exl3Tile));
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&req_flag_), 64, flags | hipHostMallocCoherent));
@@ -55,7 +56,7 @@ Glm5ApuExperts::~Glm5ApuExperts() {
   if (st_) (void)hipStreamDestroy(st_);
   for (void* p : {static_cast<void*>(in_host), static_cast<void*>(out_host), static_cast<void*>(w_host),
                   static_cast<void*>(e_host), static_cast<void*>(plan_host), static_cast<void*>(tiles_host),
-                  static_cast<void*>(req_flag_), static_cast<void*>(done_flag_)})
+                  static_cast<void*>(p2u_host), static_cast<void*>(req_flag_), static_cast<void*>(done_flag_)})
     if (p) (void)hipHostFree(p);
 }
 
@@ -81,7 +82,7 @@ void Glm5ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
   const model::Glm5ExpertBufs b{xh1_.as<uint16_t>(), xh3_.as<uint16_t>(), xh2_.as<uint16_t>(), h1_.as<uint16_t>(),
                                 h3_.as<uint16_t>(), yp_.as<float>()};
   model::glm5_experts_dev(c_, *w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P, b,
-                          out_dev_, st_);
+                          out_dev_, st_, &plan_dev_->remote0, nullptr, p2u_dev_);
   UH_CHECK(hipStreamWriteValue32(st_, done_flag_, seq_, 0));
 }
 

@@ -294,13 +294,18 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   float* ewt = s.at<float>(kEWt);
   int32_t* row_expert = s.at<int32_t>(kRowExpert);
   int32_t* pidx = s.at<int32_t>(kPairIdx);
+  // The APU's inputs go as compact token rows (remote_tokens: tok2u [T], u2t [T], in the reference's pair -> token
+  // buffer, which the fast path does not use otherwise).
+  int32_t* tok2u = s.at<int32_t>(kPairTok);
+  int32_t* u2t = tok2u + T;
   uint32_t* hist = s.at<uint32_t>(kRouteHist) + size_t(w.layer) * E;
   const int cap_tiles = P / k::kExl3TileRows + E + 1, max_tiles = std::min(P, cap_tiles);
   if (any_remote && (size_t(P) > remote->capacity_rows || cap_tiles > remote->max_tiles))
     throw std::runtime_error("glm5: remote staging too small");
   if (T <= k::kMoeSmallMaxTokens) {  // decode-sized: the bookkeeping (and the remote staging) in one block
     k::MoeSmallArgs ma{sel, rw, T, K, hist, w.resident.as<uint8_t>(), E, P, cap_tiles, k::kExl3TileRows, plan, lt, rtl,
-                       eidx, ewt, row_expert, pidx, any_remote, false, nullptr, nullptr, nullptr, nullptr,
+                       eidx, ewt, row_expert, pidx, any_remote, any_remote, tok2u, u2t,
+                       any_remote ? remote->p2u_host : nullptr, nullptr,
                        any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
                        any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
     k::moe_dispatch_small(ma, st);
@@ -309,21 +314,24 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
     k::moe_plan(s.at<int32_t>(kMoeCount), w.resident.as<uint8_t>(), E, P, plan, lt, rtl, s.at<int32_t>(kMoeOff),
                 s.at<int32_t>(kMoeFill), cap_tiles, st);
     k::moe_scatter(sel, rw, T, K, s.at<int32_t>(kMoeOff), s.at<int32_t>(kMoeFill), eidx, ewt, row_expert, pidx, st);
-    if (any_remote)
+    if (any_remote) {  // remote_tokens first: stage_remote copies the plan with the token count
+      k::remote_tokens(pidx, eidx, T, K, plan, tok2u, u2t, remote->p2u_host, nullptr, st);
       k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host,
                       remote->e_host, P, st);
+    }
   }
   bf16* pin = s.at<bf16>(kExpIn);
   bf16* pout = s.at<bf16>(kExpOut);
   k::gather_rows(hn, eidx, pin, P, D, st);
-  if (any_remote) {  // the remote block [remote0, P) to the APU, which starts once the card stream gets here
-    k::copy_remote_rows(pin, remote->in_host, plan, D, P, st);
+  if (any_remote) {  // the remote tokens' rows to the APU, which starts once the card stream gets here
+    k::copy_remote_tokens(hn, D, u2t, plan, remote->in_host, T, st);
     remote->enqueue(w.layer, st, P);
   }
   const Glm5ExpertBufs eb{s.at<uint16_t>(kXh1), s.at<uint16_t>(kXh3), s.at<uint16_t>(kXh2), s.at<bf16>(kExpGate),
                           s.at<bf16>(kExpUp), s.at<float>(kYp)};
   if (w.n_resident > 0)  // (the MTP layer's experts are all on the APU)
-    glm5_experts_dev(c, w, pin, ewt, row_expert, lt, max_tiles, &plan->n_local_tiles, P, eb, pout, st);
+    glm5_experts_dev(c, w, pin, ewt, row_expert, lt, max_tiles, &plan->n_local_tiles, P, eb, pout, st, nullptr,
+                     &plan->remote0);
   bf16* sh = s.at<bf16>(kShared);
   mlp(c, w.sh_gate, w.sh_up, w.sh_down, hn, T, sh, s, st);
   if (any_remote) {
@@ -535,18 +543,20 @@ namespace unholy::model {
 
 void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
                       const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
-                      int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st) {
+                      int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st, const int* row0_dev,
+                      const int* row1_dev, const int32_t* x_rows) {
   const int D = c.dim, I = c.moe_inter, E = c.n_experts;
   max_tiles = std::min(max_tiles, P);  // every tile has >= 1 row
-  k::exl3_xform_in(in, D, row_expert, w.tab(0, 1, E), b.xh1, P, D, false, st);
-  k::exl3_xform_in(in, D, row_expert, w.tab(1, 1, E), b.xh3, P, D, false, st);
+  k::exl3_xform_in(in, D, row_expert, w.tab(0, 1, E), b.xh1, P, D, false, st, row0_dev, row1_dev, x_rows);
+  k::exl3_xform_in(in, D, row_expert, w.tab(1, 1, E), b.xh3, P, D, false, st, row0_dev, row1_dev, x_rows);
   if (P / c.n_active <= 8) {  // <= 8 tokens: every expert has <= 8 rows -> the GEMVs
     const int* nt = ntiles_dev;
     k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I, I,
                          st, nt);
     k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I, I,
                          st, nt);
-    k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false);
+    k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false,
+                         row0_dev, row1_dev);
     k::exl3_grouped_gemv(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], b.yp, out, D, D,
                          st, nt);
     return;
@@ -555,7 +565,8 @@ void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint
                        ntiles_dev);
   k::exl3_grouped_gemm(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.h3, I, I, st,
                        ntiles_dev);
-  k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false);
+  k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false,
+                       row0_dev, row1_dev);
   k::exl3_grouped_gemm(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], out, D, D, st,
                        ntiles_dev);
 }

@@ -15,14 +15,17 @@ struct Exl3Tile {
   int expert, row0, rows;
 };
 
-// xh[r] = fp16(H128(fq(x[r]) * suh[e_r]) / sqrt(128)); fq = fp8 128-block fake quant if enabled.
+// xh[r] = fp16(H128(fq(x[r]) * suh[e_r]) / sqrt(128)); fq = fp8 128-block fake quant if enabled. Rows whose expert
+// has no suh are skipped; with row0_dev / row1_dev (device ints, e.g. a MoePlan's remote0), only rows
+// [*row0_dev, *row1_dev) are visited (default 0 / P). With x_rows, row r reads x row x_rows[r] (compact token rows).
 void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint16_t* const* suh_tab, uint16_t* xh,
-                   int P, int K, bool fake_quant, hipStream_t st);
+                   int P, int K, bool fake_quant, hipStream_t st, const int* row0_dev = nullptr,
+                   const int* row1_dev = nullptr, const int32_t* x_rows = nullptr);
 // xh[r] = fp16(H128(fq(bf16(silu(min(g,lim)) * clamp(u,±lim) * w[r])) * suh[e_r]) / sqrt(128)); fq = fp8 128-block
-// fake quant unless fake_quant is false; w may be null (no routing weight).
+// fake quant unless fake_quant is false; w may be null (no routing weight). Rows as exl3_xform_in's.
 void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
                        const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st,
-                       bool fake_quant = true);
+                       bool fake_quant = true, const int* row0_dev = nullptr, const int* row1_dev = nullptr);
 // out[r] = bf16(H128(xh[r] @ W_inner[e]) * svh[e] / sqrt(128)) for the rows of each tile. With
 // ntiles_dev, the grid is sized for `ntiles` and only the first *ntiles_dev tiles run. Tiles of up to
 // kExl3TileRows rows; K % 64 == 0, N % 128 == 0.
