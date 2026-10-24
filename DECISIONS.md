@@ -1214,3 +1214,20 @@ kinds of decode micro-batches (entry above). Tests and tools keep the exact defa
 GSM8K sweep, production flags: 31.6 / 54.3 / 69.9 / 85.5 tok/s at concurrency 1 / 2 / 4 / 8 (flexible 46 / 47 /
 46 / 47 of 48), against 31.2 / 51.8 / 62.4 / 72.1 with `--exact 1` and 29.9 / 55.3 / 68.2 / 83.5 for the earlier
 opt-in set (which had the split and the 16-row GEMVs, before the APU kernel).
+
+## 2026-10-24 — G3: GLM-5.3-Flash wiring next to DSV4, DSV4's outputs and speed unchanged
+
+docs/PLAN-glm-dsv41.md G3. The scheduler already drove an abstract `StepModel`, so DSV4's kernels, forward,
+resident model and scheduler stayed as they were; what moved is the model-specific wiring around them: `serve` /
+`plan` dispatch on the checkpoint's `model_type` (`model/family`), the OpenAI server renders and parses through a
+`ChatFormat` (DSV4's renderer and parser behind it unchanged), the tokenizer handles `ignore_merges`, and
+`text/glm_chat` ports GLM's chat template and vLLM's GLM-4.7 completion parser. CPU checks: DSV4 chat format and
+tokenizer unchanged against their references; GLM tokenizer vs HF tokenizers 28,439 / 28,440; GLM rendering vs
+transformers' `apply_chat_template` 10,000 / 10,000; GLM parsing vs vLLM 8,791 / 8,791 (870 up to leading
+whitespace before a tool call, which a stream has already sent).
+
+GPU checks against the M0 baselines of 2026-10-23 (same expert placement): `unholy-resident-test` 133,416,960 /
+133,416,960 logits bit-identical (KL 4.191e-3 and top-1 98.26% against the oracle, as before); `unholy-curve`
+decode 29.0 / 28.3 / 25.8 / 22.5 tok/s at 4k / 32k / 128k / 512k and prefill 1438 tok/s averaged to 512k, against
+29.0 / 28.2 / 25.7 / 22.6 and 1423 (`docs/bench/curve-native-1x512k-plx-2026-10-24-g3.txt`); `unholy-engine-batch`
+at concurrency 8: 48 / 48 requests token- and logprob-identical, 63.9 tok/s against 63.4.

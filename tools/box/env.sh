@@ -36,7 +36,9 @@ in_nix() { (cd "$BOX_TREE" && exec nix develop -c "$@"); }
 
 # with_gpus CMD...: stop every llm-mode service, run CMD, then restore the mode that was serving, also
 # when CMD fails or is interrupted. son-of-anton may manage these units without sudo (polkit).
+# Inside tools/box/hold.sh the services are already down and stay down: CMD just runs.
 with_gpus() {
+  if [ -n "${BOX_GPUS_HELD:-}" ]; then "$@"; return; fi
   local mode rc=0
   mode=$(cat /var/lib/llm-mode/mode 2>/dev/null || echo ds4)
   trap 'llm-mode "'"$mode"'" >/dev/null' EXIT

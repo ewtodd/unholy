@@ -107,9 +107,12 @@ family (`model/family`), the OpenAI server takes a `ChatFormat`, the tokenizer h
 format and tokenizer unchanged against their references; GLM tokenizer vs HF tokenizers 28439/28440 (the miss: a
 code point newer than HF's Oniguruma tables); GLM rendering vs transformers' apply_chat_template 10,000/10,000
 random conversations; GLM parsing vs vLLM 8,791/8,791 (870 up to the content's leading whitespace before a call,
-which a stream cannot take back). Pending a service window: DSV4 bit-identity (`validate.sh`), the 512k curve and
-engine-batch against the M0 baselines. The cache-manager pieces listed below belong to the GLM step model (G4/G5):
-the scheduler's interface already covers pages, per-slot state, snapshots and verify backups.
+which a stream cannot take back). GPU checks (2026-10-24, against the M0 baselines): resident test 133,416,960 /
+133,416,960 logits bit-identical (KL 4.191e-3, top-1 98.26%, as M0); curve decode 29.0 / 28.3 / 25.8 / 22.5 tok/s
+at 4k / 32k / 128k / 512k, prefill 1438 tok/s averaged to 512k (M0 29.0 / 28.2 / 25.7 / 22.6, 1423;
+`docs/bench/curve-native-1x512k-plx-2026-10-24-g3.txt`); engine-batch at concurrency 8: 48 / 48 token streams and
+logprobs identical, 63.9 tok/s (M0 63.4). G3 done. The cache-manager pieces listed below belong to the GLM step
+model (G4/G5): the scheduler's interface already covers pages, per-slot state, snapshots and verify backups.
 
 **G3: Model-agnostic engine (2-3 days).** A model-family interface for the loader and layer types, the planner
 sizes, the cache manager (per-sequence recurrent state, double-buffered for speculative decoding; latent KV pages;

@@ -37,3 +37,4 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `serve.sh [flags]` | the perf tree's server with the production flags on port 8300, foreground |
 | `sweep.sh LABEL [flags]` | that server + check-source `gsm8k-chat` at 1 / 2 / 4 / 8 requests (check-source pinned in `env.sh`) |
 | `eb.sh LABEL CONC [flags]` | `unholy-engine-batch` on `gsm48.jsonl` with logprobs; `REF=...jsonl` compares with an earlier run |
+| `hold.sh CMD...` | run CMD (e.g. `bash -c 'a.sh && b.sh'`) with the services stopped once, not once per script |

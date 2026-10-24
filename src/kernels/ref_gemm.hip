@@ -1,6 +1,9 @@
 // Reference GEMMs: LDS-tiled fp32 FMA, with the reference's K-block partial-sum structure.
+#include <hip/hip_fp16.h>
+
 #include "kernels/dev.hip.hpp"
 #include "kernels/ref.hpp"
+#include "kernels/ref_glm.hpp"
 #include "rt/hip.hpp"
 
 namespace unholy::kernels {
@@ -196,6 +199,74 @@ void gemm_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16*
                        hipStream_t st) {
   launch(M, R, K, K, G, LoadBf16Grouped{a, G, K}, LoadFp8DequantGrouped{w, sw, R, K}, ScaleOne{},
          StoreBf16Grouped{c, G, R}, st);
+}
+
+}  // namespace unholy::kernels
+
+// ---- GLM-5.3-Flash weights (kernels/ref_glm.hpp) ----------------------------------------------------------
+
+namespace unholy::kernels {
+
+namespace {
+
+// Row `row`, column k of a WRef matrix with K columns: bf16, fp16, or bf16(e4m3 * fp32 block scale).
+__device__ __forceinline__ float load_w(const WRef& w, int K, size_t row, int k) {
+  const size_t i = row * size_t(K) + k;
+  switch (w.fmt) {
+    case WFmt::Bf16: return bf16_to_f32(static_cast<const bf16*>(w.p)[i]);
+    case WFmt::F16: return __half2float(__ushort_as_half(static_cast<const uint16_t*>(w.p)[i]));
+    default:
+      return round_bf16(e4m3_to_f32(static_cast<const uint8_t*>(w.p)[i]) *
+                        w.scale[(row / 128) * size_t((K + 127) / 128) + k / 128]);
+  }
+}
+
+struct LoadW {
+  WRef w;
+  int K;
+  __device__ float operator()(int, int r, int k) const { return load_w(w, K, size_t(r), k); }
+};
+// Per-head key part of kv_b, transposed: element (n = latent c, k = key dim d) of head g.
+struct LoadUkT {
+  WRef w;
+  int dn, dv, r;
+  __device__ float operator()(int g, int n, int k) const { return load_w(w, r, size_t(g) * (dn + dv) + k, n); }
+};
+// Per-head value part of kv_b: element (n = value dim d, k = latent c) of head g.
+struct LoadUv {
+  WRef w;
+  int dn, dv, r;
+  __device__ float operator()(int g, int n, int k) const { return load_w(w, r, size_t(g) * (dn + dv) + dn + n, k); }
+};
+struct LoadF32Grouped {
+  const float* p;
+  int G, K;
+  __device__ float operator()(int g, int m, int k) const { return p[(size_t(m) * G + g) * K + k]; }
+};
+struct StoreF32Grouped {
+  float* c;
+  int G, R;
+  __device__ void operator()(int g, int m, int r, float v) const { c[(size_t(m) * G + g) * R + r] = v; }
+};
+
+}  // namespace
+
+void gemm_w(const bf16* a, int lda, WRef w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
+  launch(M, N, K, K, 1, LoadBf16{a, lda}, LoadW{w, K}, ScaleOne{}, StoreBf16{c, ldc}, st);
+}
+
+void gemm_w_f32(const float* a, int lda, WRef w, float* c, int ldc, int M, int N, int K, hipStream_t st) {
+  launch(M, N, K, K, 1, LoadF32{a, lda}, LoadW{w, K}, ScaleOne{}, StoreF32{c, ldc}, st);
+}
+
+void mla_absorb_q(const bf16* q, WRef kv_b, float* qa, int T, int H, int dn, int dv, int r, hipStream_t st) {
+  launch(T, r, dn, dn, H, LoadBf16Grouped{q, H, dn}, LoadUkT{kv_b, dn, dv, r}, ScaleOne{},
+         StoreF32Grouped{qa, H, r}, st);
+}
+
+void mla_out_v(const float* ol, WRef kv_b, bf16* o, int T, int H, int dn, int dv, int r, hipStream_t st) {
+  launch(T, dv, r, r, H, LoadF32Grouped{ol, H, r}, LoadUv{kv_b, dn, dv, r}, ScaleOne{}, StoreBf16Grouped{o, H, dv},
+         st);
 }
 
 }  // namespace unholy::kernels
