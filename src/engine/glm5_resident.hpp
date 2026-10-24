@@ -53,6 +53,7 @@ class Glm5ApuExperts final : public model::RemoteExperts {
   float* w_dev_ = nullptr;
   int32_t* e_dev_ = nullptr;
   int32_t* p2u_dev_ = nullptr;  // pair row -> compact token row of in_dev_
+  int32_t* u2p_dev_ = nullptr;  // compact token -> its K pair rows (-1: on the card)
   uint32_t* req_flag_ = nullptr;  // pinned, coherent: card -> APU
   uint32_t* done_flag_ = nullptr;  // APU -> card
   uint32_t seq_ = 0;

@@ -98,6 +98,17 @@ void glm_mla_attn_split(const bf16* qa, const int32_t* idx, int w, const int32_t
 // (token, 256-dim slice) workgroups: a decode step's few tokens do not run on one workgroup each.
 void glm_moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
                      hipStream_t st);
+// Combined remote outputs (the APU's share of a step's MoE in one fp32 row per token instead of a bf16 row per pair
+// over the host link). Remote side: dst[u] = sum over j of pair_out[u2p[u * K + j]] (bf16 rows, fp32, j ascending,
+// -1 skipped) for u < *n_tokens. Card side: glm_copy_partial brings those rows over (uint4 copies of *n_tokens rows),
+// then out[t] = bf16(sum of t's local pair rows (p < *remote0, pidx order) + partial[tok2u[t]] (if >= 0) + shared[t]):
+// glm_moe_combine's order with the remote pairs regrouped into one fp32 term.
+void glm_remote_partial(const bf16* pair_out, const int32_t* u2p, const int* n_tokens, float* dst, int K, int dim,
+                        int max_tokens, hipStream_t st);
+void glm_copy_partial(const float* src, float* dst, const int* n_tokens, int dim, int max_tokens, hipStream_t st);
+void glm_moe_combine_partial(const bf16* pair_out, const int32_t* pidx, const int* remote0, const int32_t* tok2u,
+                             const float* partial, const bf16* shared, bf16* out, int T, int K, int dim,
+                             hipStream_t st);
 
 // The selection as a compact token list: selected pools [n][k] (the top-k's output: valid pools first) -> idx [n][w]
 // (w = k * pool + pool - 1): the pools' tokens, then the query's incomplete pool, then -1. A query at position p has

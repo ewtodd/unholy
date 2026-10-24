@@ -662,6 +662,53 @@ __global__ void moe_combine_slices_kernel(const bf16* pair_out, const int32_t* p
   out[size_t(t) * dim + d] = f32_to_bf16(acc + bf16_to_f32(shared[size_t(t) * dim + d]));
 }
 
+// Block-stride over the compact tokens; each thread sums 8 columns (16-byte loads, two 16-byte stores).
+__global__ __launch_bounds__(256) void remote_partial_kernel(const bf16* pair_out, const int32_t* u2p,
+                                                             const int* n_tokens, float* dst, int K, int dim) {
+  const int U = *n_tokens, cols = dim / 8;
+  for (int u = blockIdx.x; u < U; u += gridDim.x)
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+      float acc[8] = {};
+      for (int j = 0; j < K; ++j) {
+        const int p = u2p[size_t(u) * K + j];
+        if (p < 0) continue;
+        const uint4 r = reinterpret_cast<const uint4*>(pair_out + size_t(p) * dim)[c];
+        const uint32_t w[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          acc[2 * k] += bf16_to_f32(uint16_t(w[k]));
+          acc[2 * k + 1] += bf16_to_f32(uint16_t(w[k] >> 16));
+        }
+      }
+      float4* d = reinterpret_cast<float4*>(dst + size_t(u) * dim + size_t(c) * 8);
+      d[0] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+      d[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
+    }
+  __threadfence_system();
+}
+
+__global__ void copy_partial_kernel(const float* src, float* dst, const int* n_tokens, int dim) {
+  const size_t n = size_t(*n_tokens) * dim / 4;  // uint4 units
+  const uint4* s = reinterpret_cast<const uint4*>(src);
+  uint4* d = reinterpret_cast<uint4*>(dst);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) d[i] = s[i];
+}
+
+__global__ void moe_combine_partial_slices_kernel(const bf16* pair_out, const int32_t* pidx, const int* remote0,
+                                                  const int32_t* tok2u, const float* partial, const bf16* shared,
+                                                  bf16* out, int K, int dim) {
+  const int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
+  if (d >= dim) return;
+  const int r0 = *remote0, u = tok2u[t];
+  float acc = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    const int p = pidx[size_t(t) * K + j];
+    if (p < r0) acc += bf16_to_f32(pair_out[size_t(p) * dim + d]);
+  }
+  if (u >= 0) acc += partial[size_t(u) * dim + d];
+  out[size_t(t) * dim + d] = f32_to_bf16(acc + bf16_to_f32(shared[size_t(t) * dim + d]));
+}
+
 // The compact selection list: entry j < 4 v (v valid pools) -> pool j / 4's token j % 4, then the tail, then -1.
 __global__ void idx_expand_compact_kernel(const int32_t* pools, const int32_t* pos, int32_t* idx, int n, int k,
                                           int pool) {
@@ -811,6 +858,29 @@ void glm_mla_attn_split(const bf16* qa, const int32_t* idx, int w, const int32_t
   mla_attn_kernel<true><<<dim3(n, splits), NT, 0, st>>>(qa, idx, w, pos, pg, o, scale, part, 0);
   UH_CHECK_LAUNCH();
   mla_combine_kernel<<<n * H, 256, 0, st>>>(part, splits, o);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_remote_partial(const bf16* pair_out, const int32_t* u2p, const int* n_tokens, float* dst, int K, int dim,
+                        int max_tokens, hipStream_t st) {
+  if (max_tokens <= 0) return;
+  remote_partial_kernel<<<std::min(max_tokens, 1024), 256, 0, st>>>(pair_out, u2p, n_tokens, dst, K, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_copy_partial(const float* src, float* dst, const int* n_tokens, int dim, int max_tokens, hipStream_t st) {
+  const size_t units = size_t(max_tokens) * dim / 4;
+  if (units == 0) return;
+  copy_partial_kernel<<<int(std::min<size_t>((units + 255) / 256, 1024)), 256, 0, st>>>(src, dst, n_tokens, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_moe_combine_partial(const bf16* pair_out, const int32_t* pidx, const int* remote0, const int32_t* tok2u,
+                             const float* partial, const bf16* shared, bf16* out, int T, int K, int dim,
+                             hipStream_t st) {
+  if (T <= 0) return;
+  moe_combine_partial_slices_kernel<<<dim3(T, (dim + 255) / 256), 256, 0, st>>>(pair_out, pidx, remote0, tok2u,
+                                                                                partial, shared, out, K, dim);
   UH_CHECK_LAUNCH();
 }
 

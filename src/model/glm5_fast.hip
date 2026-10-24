@@ -305,7 +305,7 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   if (T <= k::kMoeSmallMaxTokens) {  // decode-sized: the bookkeeping (and the remote staging) in one block
     k::MoeSmallArgs ma{sel, rw, T, K, hist, w.resident.as<uint8_t>(), E, P, cap_tiles, k::kExl3TileRows, plan, lt, rtl,
                        eidx, ewt, row_expert, pidx, any_remote, any_remote, tok2u, u2t,
-                       any_remote ? remote->p2u_host : nullptr, nullptr,
+                       any_remote ? remote->p2u_host : nullptr, any_remote ? remote->u2p_host : nullptr,
                        any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
                        any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
     k::moe_dispatch_small(ma, st);
@@ -315,7 +315,7 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
                 s.at<int32_t>(kMoeFill), cap_tiles, st);
     k::moe_scatter(sel, rw, T, K, s.at<int32_t>(kMoeOff), s.at<int32_t>(kMoeFill), eidx, ewt, row_expert, pidx, st);
     if (any_remote) {  // remote_tokens first: stage_remote copies the plan with the token count
-      k::remote_tokens(pidx, eidx, T, K, plan, tok2u, u2t, remote->p2u_host, nullptr, st);
+      k::remote_tokens(pidx, eidx, T, K, plan, tok2u, u2t, remote->p2u_host, remote->u2p_host, st);
       k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host,
                       remote->e_host, P, st);
     }
@@ -334,11 +334,16 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
                      &plan->remote0);
   bf16* sh = s.at<bf16>(kShared);
   mlp(c, w.sh_gate, w.sh_up, w.sh_down, hn, T, sh, s, st);
-  if (any_remote) {
-    remote->join(st);
-    k::copy_remote_rows(remote->out_host, pout, plan, D, P, st);
+  if (!any_remote) {
+    k::glm_moe_combine(pout, pidx, sh, out, T, K, D, st);
+    return;
   }
-  k::glm_moe_combine(pout, pidx, sh, out, T, K, D, st);
+  // The APU's share: one fp32 row per token (its pairs' sum), into the fp16 gate inputs' room (the local experts
+  // are done with it).
+  float* partial = s.at<float>(kXh1);
+  remote->join(st);
+  k::glm_copy_partial(reinterpret_cast<const float*>(remote->out_host), partial, &plan->n_remote_tokens, D, T, st);
+  k::glm_moe_combine_partial(pout, pidx, &plan->remote0, tok2u, partial, sh, out, T, K, D, st);
 }
 
 void hc_pre(const Glm5Config& c, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const bf16* x,
