@@ -140,9 +140,12 @@ full-model KL / top-1. Exit: native path at the noise floor; KL table for builds
 kernels, paged DSA rows with an fp8 latent and bf16 pooled keys, WMMA index scores and absorbed-MLA attention, a
 two-pass KDA recurrence, device-side MoE dispatch with 288 experts) keep the reference's KL (build B 1.329e-2 on code
 vs 1.326e-2); `engine/glm5_resident` places build B (2,606 hot experts on the cards, 119.8 GB cold on the APU, 51%
-of routing on the cards predicted) and `unholy serve` serves it (smoke test: correct answers, 19.5 tok/s decode at
-short context). Open: the 512k curve and the optimizations it points at, MTP drafting with KDA state rollback,
-prefix snapshots (G6).
+of routing on the cards predicted) and `unholy serve` serves it. Curve (no drafts,
+`docs/bench/curve-glm53-b-1x512k-2026-10-24.txt`): decode 21.4 / 19.2 / 17.2 / 16.2 tok/s at 4k / 32k / 128k / 512k
+(DSV4 29.0 / 28.3 / 25.8 / 22.5), prefill 768 tok/s averaged to 512k (target >= 500 met; decode target >= 20 at
+512k not yet). MTP drafting (one draft per step, KDA state rollback on rejection) accepts 88-96% of drafts, 1.9
+tokens per step, 25-27 tok/s at short context; it needs `--max-batch-tokens 3072` to fit. Open: decode overheads
+(launches, the draft path), prefix snapshots (G6).
 
 **G5: Fast path (4-6 days).** WMMA kernels for KDA prefill and decode, the DSA indexer and attention, and the
 chosen dense format (EXL3 dense GEMV, or fp8 KDA weights); placement from the GLM profile; two steps in flight;

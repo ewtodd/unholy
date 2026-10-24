@@ -4,7 +4,8 @@
 // then the head, compared with the oracle's logits by KL divergence and top-1 agreement.
 //
 //   unholy-glm-ref --oracle DIR [--ckpt FP8_DIR] [--dense DIR] [--experts DIR] [--chunk C] [--device D]
-//                  [--isolate] [--kda-fp8] [--a8] [--kv-fp8] [--idx-fp8] [--fast] [--slots N] [--layers N]
+//                  [--isolate] [--kda-fp8] [--a8] [--kv-fp8] [--idx-fp8] [--fast] [--slots N] [--decode-chunk N]
+//                  [--dump DIR] [--layers N]
 //                  [--out logits.bin]
 //
 // --dense / --experts take the dense weights / the routed experts from another checkpoint (an EXL3 quant: builds
@@ -15,7 +16,10 @@
 // stacks run the release). --slots N runs N copies of the sequence in different slots of the same batches;
 // the reference's per-row arithmetic does not depend on the other rows, so every copy must match slot 0 bit for bit.
 // --kv-fp8 / --idx-fp8 store the MLA latent rows / the indexer's pooled keys in fp8 (fake-quantized on write).
-// --fast runs the fast path (model/glm5.hpp) instead of the reference.
+// --fast runs the fast path (model/glm5.hpp) instead of the reference. --decode-chunk N feeds the teacher-forced
+// continuation N tokens per call (verify-chunk shapes); --dump DIR writes our residual after every layer.
+// --reject-test (fast path) feeds each continuation token as a verify chunk with a rejected junk draft and restores
+// the KDA state after it, as speculative decoding does: the logits must match plain decoding bit for bit.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -123,7 +127,9 @@ void compare_selection(int L, const std::vector<int32_t>& ours, const std::vecto
 
 int main(int argc, char** argv) {
   std::string ckpt = "/scratch/models/glm53-flash-fp8", oracle, dense_dir, experts_dir, out_path;
-  int chunk = 0, dev = 0, n_layers = -1, slots = 1;
+  int chunk = 0, dev = 0, n_layers = -1, slots = 1, dchunk = 1;
+  bool reject_test = false;
+  std::string dump_dir;
   bool isolate = false, kda_fp8 = false, kv_fp8 = false, idx_fp8 = false, fast = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -138,6 +144,9 @@ int main(int argc, char** argv) {
     else if (a == "--isolate") isolate = true;
     else if (a == "--kda-fp8") kda_fp8 = true;
     else if (a == "--slots") slots = std::stoi(next());
+    else if (a == "--decode-chunk") dchunk = std::stoi(next());
+    else if (a == "--dump") dump_dir = next();
+    else if (a == "--reject-test") reject_test = fast = true;
     else if (a == "--a8") model::set_glm5_a8(true);
     else if (a == "--kv-fp8") kv_fp8 = true;
     else if (a == "--fast") fast = true;
@@ -146,7 +155,8 @@ int main(int argc, char** argv) {
     else {
       std::fprintf(stderr,
                    "usage: %s --oracle DIR [--ckpt DIR] [--dense DIR] [--experts DIR] [--chunk C] [--device D] "
-                   "[--isolate] [--kda-fp8] [--a8] [--kv-fp8] [--idx-fp8] [--fast] [--slots N] [--layers N] "
+                   "[--isolate] [--kda-fp8] [--a8] [--kv-fp8] [--idx-fp8] [--fast] [--slots N] [--decode-chunk N] "
+                   "[--dump DIR] [--layers N] "
                    "[--out F]\n",
                    argv[0]);
       return 2;
@@ -176,8 +186,9 @@ int main(int argc, char** argv) {
     auto scr = model::make_glm5_scratch(c, dev, slots * std::max(chunk, 1), max_seq);
     // x: the residual of each slot's copy [slots][S][row]; xb / bpos: a multi-slot batch's rows and positions.
     const size_t xslot = size_t(S) * row;
-    rt::DeviceBuffer x(dev, slots * xslot * 2), dpos(dev, size_t(S) * 4), dids(dev, size_t(S) * 4);
-    rt::DeviceBuffer xb(dev, slots > 1 ? size_t(slots) * chunk * row * 2 : 16), bpos(dev, size_t(slots) * chunk * 4);
+    rt::DeviceBuffer x(dev, slots * xslot * 2), dpos(dev, size_t(S + 1) * 4), dids(dev, size_t(S) * 4);
+    rt::DeviceBuffer xb(dev, slots > 1 || reject_test ? size_t(std::max(slots, 2)) * chunk * row * 2 : 16),
+        bpos(dev, size_t(slots) * chunk * 4);
     // Fast path: paged DSA rows, slot i's pages [i * pps, (i + 1) * pps) (identity block tables).
     const int pps = (max_seq + kernels::kGlmPageRows - 1) / kernels::kGlmPageRows;
     rt::DeviceBuffer dtables(dev, size_t(slots) * pps * 4);
@@ -186,9 +197,9 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < tab.size(); ++i) tab[i] = int32_t(i);
       UH_CHECK(hipMemcpy(dtables.data(), tab.data(), tab.size() * 4, hipMemcpyHostToDevice));
     }
-    std::vector<int32_t> pos(static_cast<size_t>(S));
-    for (int t = 0; t < S; ++t) pos[size_t(t)] = t;
-    UH_CHECK(hipMemcpy(dpos.data(), pos.data(), size_t(S) * 4, hipMemcpyHostToDevice));
+    std::vector<int32_t> pos(static_cast<size_t>(S + 1));
+    for (int t = 0; t <= S; ++t) pos[size_t(t)] = t;
+    UH_CHECK(hipMemcpy(dpos.data(), pos.data(), size_t(S + 1) * 4, hipMemcpyHostToDevice));
     UH_CHECK(hipMemcpy(dids.data(), ids.data(), size_t(S) * 4, hipMemcpyHostToDevice));
     {
       auto hw = model::load_glm5_head(dense, dev, st, true, false);
@@ -221,7 +232,7 @@ int main(int argc, char** argv) {
       if (fast) model::prepare_glm5_fast(c, w, dev, st);
       model::Glm5Cache cache;
       model::Glm5PagedCache pcache;
-      if (fast) pcache = model::make_glm5_paged_cache(c, L, slots, slots * pps, dev, st);
+      if (fast) pcache = model::make_glm5_paged_cache(c, L, slots, slots * pps, dev, st, reject_test);
       else cache = model::make_glm5_cache(c, L, slots, max_seq, dev, st);
       auto fwd = [&](model::Glm5Batch& b, uint16_t* xp) {
         b.tables = dtables.as<int32_t>();
@@ -261,7 +272,22 @@ int main(int argc, char** argv) {
       for (int s0 = 0; s0 < P; s0 += chunk) run(s0, std::min(chunk, P - s0));
       UH_CHECK(hipStreamSynchronize(st));
       const auto td = std::chrono::steady_clock::now();
-      for (int t = P; t < S; ++t) run(t, 1);
+      // --reject-test: every continuation token as a verify chunk whose draft (a junk row: position 0's input) is
+      // rejected: the KDA state backed up after the token, restored after the chunk.
+      const auto rejected = [&](int t) {
+        UH_CHECK(hipMemcpyAsync(xb.data(), x.as<uint16_t>() + size_t(t) * row, row * 2, hipMemcpyDeviceToDevice, st));
+        UH_CHECK(hipMemcpyAsync(xb.as<uint16_t>() + row, x.data(), row * 2, hipMemcpyDeviceToDevice, st));
+        model::Glm5Batch b;
+        b.chunks = {{0, t, 2, 0, 0}};
+        b.T = 2;
+        b.pos = dpos.as<int32_t>() + t;
+        fwd(b, xb.as<uint16_t>());
+        UH_CHECK(hipMemcpyAsync(x.as<uint16_t>() + size_t(t) * row, xb.data(), row * 2, hipMemcpyDeviceToDevice, st));
+        if (w.kda) model::glm5_restore_kda(pcache, 0, st);
+      };
+      for (int t = P; t < S; t += dchunk)
+        if (reject_test) rejected(t);
+        else run(t, std::min(dchunk, S - t));
       UH_CHECK(hipStreamSynchronize(st));
       const double pre_s = std::chrono::duration<double>(td - tp).count();
       const double dec_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - td).count();
@@ -270,6 +296,12 @@ int main(int argc, char** argv) {
       std::printf("layer %2d: prefill %.1f ms (%d tokens), decode %.2f ms/token\n", L, pre_s * 1e3, P,
                   S > P ? dec_s * 1e3 / (S - P) : 0.0);
       const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - tl).count();
+      if (!dump_dir.empty()) {  // our residual after the layer (slot 0)
+        UH_CHECK(hipMemcpy(ours.data(), x.data(), ours.size() * 2, hipMemcpyDeviceToHost));
+        std::snprintf(name, sizeof name, "/h_%03d.bin", L);
+        std::ofstream(dump_dir + name, std::ios::binary).write(reinterpret_cast<const char*>(ours.data()),
+                                                                std::streamsize(ours.size() * 2));
+      }
       std::snprintf(name, sizeof name, "/h_%03d.bin", L);
       if (read_file(oracle + name, ref.data(), ref.size() * 2)) {
         UH_CHECK(hipMemcpy(ours.data(), x.data(), ours.size() * 2, hipMemcpyDeviceToHost));

@@ -3,6 +3,7 @@
 # flags (plus any given here), logprobs on, then a comparison with a reference run if one is given.
 #   tools/box/eb.sh LABEL CONC [engine-batch flags]
 #   REF=/work/runs/<dir>/eb-c4.jsonl tools/box/eb.sh LABEL 4
+#   EB_REQUESTS=FILE.jsonl tools/box/eb.sh ...      (another request set)
 # A single mismatching request needs a repeat before blaming a change: rare run-to-run logit outliers occur
 # in every build (DECISIONS 2026-10-15).
 set -euo pipefail
@@ -11,7 +12,7 @@ label=${1:?label}; conc=${2:?concurrency}; shift 2
 d=$(run_dir "eb-$label")
 out=$d/eb-c$conc.jsonl
 with_gpus in_nix "$BUILD/unholy-engine-batch" --model "$MODEL" --profile "$PROFILE" \
-  --requests "$BOX_DATA/gsm48.jsonl" --out "$out" --concurrency "$conc" --logprobs 1 "${SERVE_FLAGS[@]}" "$@" \
+  --requests "${EB_REQUESTS:-$BOX_DATA/gsm48.jsonl}" --out "$out" --concurrency "$conc" --logprobs 1 "${SERVE_FLAGS[@]}" "$@" \
   2>&1 | tee "$d/log.txt"
 [ -n "${REF:-}" ] && "$REF_PY" "$BOX_TREE/tools/engine_batch/compare.py" "$REF" "$out" | tee "$d/compare.txt"
 echo "$out"

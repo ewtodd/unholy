@@ -73,12 +73,14 @@ __global__ void pool_keys_kernel(const bf16* k, const bf16* g, const bf16* tail_
   pool_row(pg, p)[d] = f32_to_bf16(acc);
 }
 
-// The tail takes positions [end - end % 4, end) that the chunk wrote (positions before s0 are already there).
+// The tail (a ring of 4 slots, position % 4) takes the chunk's last <= 4 positions, also when the chunk completes its
+// pool: if its last positions are rejected drafts, the pool is incomplete again and the next chunk reads the accepted
+// ones from here.
 __global__ void tail_update_kernel(const bf16* k, const bf16* g, bf16* tail_k, bf16* tail_g, int s0, int end) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x, rem = end % POOL;
-  if (i >= rem * ID) return;
-  const int q = end - rem + i / ID, d = i % ID;
-  if (q < s0) return;
+  const int first = max(s0, end - POOL);
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (end - first) * ID) return;
+  const int q = first + i / ID, d = i % ID;
   tail_k[(q % POOL) * ID + d] = k[size_t(q - s0) * ID + d];
   tail_g[(q % POOL) * ID + d] = g[size_t(q - s0) * ID + d];
 }
@@ -506,10 +508,8 @@ void glm_pool_keys(const bf16* k, const bf16* g, bf16* tail_k, bf16* tail_g, con
     pool_keys_kernel<<<cdiv(size_t(p1 - p0) * ID, 256), 256, 0, st>>>(k, g, tail_k, tail_g, ape, pg, s0, p0, p1 - p0);
     UH_CHECK_LAUNCH();
   }
-  if ((s0 + n) % POOL) {
-    tail_update_kernel<<<cdiv(size_t(POOL) * ID, 256), 256, 0, st>>>(k, g, tail_k, tail_g, s0, s0 + n);
-    UH_CHECK_LAUNCH();
-  }
+  tail_update_kernel<<<cdiv(size_t(POOL) * ID, 256), 256, 0, st>>>(k, g, tail_k, tail_g, s0, s0 + n);
+  UH_CHECK_LAUNCH();
 }
 
 void glm_idx_scores(const bf16* q, const bf16* w, GlmPaged pg, const int32_t* pos, float* out, int ld, int n,

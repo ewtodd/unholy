@@ -32,7 +32,7 @@ void glm_store_latent(const bf16* lat, GlmPaged pg, int s0, int n, hipStream_t s
 // Pools completed by positions [s0, s0 + n) of one sequence: keys k / gate scores g of the chunk's rows (bf16 [n][128]),
 // the slot's tail (k, g: bf16 [4][128], positions s0 - s0 % 4 ..  s0 - 1 at index pos % 4) for the pool the chunk
 // starts inside; kernels::idx_pool's arithmetic (ape f32 [4][128]); pooled keys into the slot's pages. Then the
-// tail takes the chunk's last (s0 + n) % 4 positions.
+// tail takes the chunk's last <= 4 positions (also when they complete a pool: a rejected draft can reopen it).
 void glm_pool_keys(const bf16* k, const bf16* g, bf16* tail_k, bf16* tail_g, const float* ape, GlmPaged pg, int s0,
                    int n, hipStream_t st);
 

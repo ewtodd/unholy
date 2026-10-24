@@ -10,7 +10,7 @@
 //                       [--profile FILE] [--exl3 DIR] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]
 //                       [--max-batch-tokens N] [--prefix-snapshots N] [--spec-drafts N] [--spec-min-conf C]
 //                       [--card-margin-gb G] [--vision 0|1] [--decode-split 0|1] [--reclaim-scratch 0|1]
-//                       [--logprobs 0|1]
+//                       [--logprobs 0|1] [--glm-mtp 0|1]
 //
 // FILE.jsonl: one chat-completions request body per line (messages, chat_template_kwargs, temperature,
 // top_p, top_k, min_p, penalties, seed, max_tokens, ignore_eos, stop_token_ids; text only), rendered and
@@ -29,11 +29,15 @@
 #include <vector>
 
 #include "engine/engine.hpp"
+#include "engine/glm5_resident.hpp"
 #include "engine/plan.hpp"
 #include "engine/resident.hpp"
 #include "model/dsv4.hpp"
+#include "model/family.hpp"
+#include "model/glm5.hpp"
 #include "model/safetensors.hpp"
 #include "text/chat.hpp"
+#include "text/glm_chat.hpp"
 #include "text/json.hpp"
 #include "text/tokenizer.hpp"
 
@@ -68,7 +72,7 @@ double num(const Value& req, std::string_view key, double def) {
 }
 
 // server/openai.cpp parse_params (chat), the generation fields.
-engine::GenRequest gen_request(const Value& body, const text::Tokenizer& tok) {
+engine::GenRequest gen_request(const Value& body, const text::Tokenizer& tok, const text::ChatFormat& fmt) {
   engine::GenRequest g;
   auto& s = g.sampling;
   s.temperature = float(num(body, "temperature", 1.0));
@@ -85,7 +89,7 @@ engine::GenRequest gen_request(const Value& body, const text::Tokenizer& tok) {
   if (const Value* v = body.find("stop_token_ids"); v && v->is_array())
     for (const Value& x : v->items()) g.stop_token_ids.push_back(int32_t(x.as_int()));
   if (const Value* v = body.find("ignore_eos")) g.ignore_eos = v->truthy();
-  const text::RenderedChat r = text::render_request(body);
+  const text::RenderedChat r = fmt.render(body);
   if (!r.images.empty()) throw std::runtime_error("images are not supported here");
   g.prompt = tok.encode(r.prompt);
   return g;
@@ -99,6 +103,7 @@ int main(int argc, char** argv) {
   std::string model_dir, exl3_dir, requests_path, out_path;
   std::string profile = "data/expert_profile_unholy_mixed.txt";
   int max_slots = 8, max_seq = 65536, max_batch = 2048, prefix_snapshots = 128, spec_drafts = 0, conc = 0;
+  int glm_mtp = -1;  // GLM: load the MTP layer (-1: when drafting)
   long long kv_tokens = 0;
   float spec_min_conf = 0.5f;
   double card_margin_gb = 2.0;
@@ -123,6 +128,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-batch-tokens") max_batch = std::stoi(v);
     else if (a == "--prefix-snapshots") prefix_snapshots = std::stoi(v);
     else if (a == "--spec-drafts") spec_drafts = std::stoi(v);
+    else if (a == "--glm-mtp") glm_mtp = std::stoi(v);
     else if (a == "--spec-min-conf") spec_min_conf = std::stof(v);
     else if (a == "--card-margin-gb") card_margin_gb = std::stod(v);
     else if (a == "--vision") vision = flag(v);
@@ -140,20 +146,21 @@ int main(int argc, char** argv) {
   }
   try {
     const auto tok = text::Tokenizer::load(model_dir + "/tokenizer.json");
+    auto ck = model::Checkpoint::open(model_dir, {"mtp.safetensors"});
+    const bool glm = model::detect_family(ck->config()) == model::Family::Glm5Next;
+    const text::ChatFormat& fmt = glm ? text::glm5_chat_format() : text::dsv4_chat_format();
     std::vector<engine::GenRequest> reqs;
     {
       std::ifstream f(requests_path);
       if (!f) throw std::runtime_error("cannot read " + requests_path);
       for (std::string line; std::getline(f, line);)
         if (line.find_first_not_of(" \t\r") != std::string::npos) {
-          reqs.push_back(gen_request(json::parse(line), tok));
+          reqs.push_back(gen_request(json::parse(line), tok, fmt));
           if (logprobs) reqs.back().sampling.logprobs = true;
         }
     }
-    auto ck = model::Checkpoint::open(model_dir);
     std::unique_ptr<model::Checkpoint> xck;
     if (!exl3_dir.empty()) xck = model::Checkpoint::open(exl3_dir);
-    const auto c = model::Dsv4Config::from_hf(ck->config());
 
     // serve's geometry and plan.
     max_seq = (max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
@@ -162,30 +169,64 @@ int main(int argc, char** argv) {
     geo.max_pages_per_seq = max_seq / model::kPageTokens;
     if (kv_tokens <= 0) kv_tokens = 2LL * max_seq;
     geo.num_pages = int((kv_tokens + model::kPageTokens - 1) / model::kPageTokens);
-    engine::PlanInput pin;
-    pin.cfg = &c;
-    pin.dense = ck.get();
-    pin.exl3 = xck.get();
-    pin.usage = engine::load_usage_profile(profile, c.n_layers, c.n_experts);
-    pin.geo = geo;
-    pin.max_tokens = max_batch;
-    pin.max_seq = max_seq;
-    pin.dspark = spec_drafts > 0;
-    vision = vision && c.vision_layers > 0;
-    pin.vision = vision;
-    set_reclaim_scratch(pin, reclaim_scratch);
-    pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
-    pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
-    const auto plan = engine::make_plan(pin);
-    std::printf("%s", plan.summary().c_str());
-    std::fflush(stdout);
-    engine::ResidentModel model(c, *ck, xck.get(), plan, geo, max_batch, max_seq, pin.max_logit_rows,
-                                prefix_snapshots, spec_drafts > 0, vision);
+    // The model by family (serve's plans; the configs outlive the model, which keeps a reference).
+    std::unique_ptr<model::Dsv4Config> dc;
+    std::unique_ptr<model::Glm5Config> gc;
+    std::unique_ptr<engine::StepModel> model_ptr;
+    std::vector<int32_t> eos;
+    if (glm) {
+      gc = std::make_unique<model::Glm5Config>(model::Glm5Config::from_hf(ck->config()));
+      // --glm-mtp 1 loads the MTP layer (and its state backups) without drafting when --spec-drafts is 0: the same
+      // placement as a drafting run, so the two compute alike (a check of the drafts' rollback).
+      const bool mtp = (glm_mtp >= 0 ? glm_mtp > 0 : spec_drafts > 0) && gc->n_mtp > 0;
+      spec_drafts = mtp && spec_drafts > 0 ? 1 : 0;
+      engine::Glm5PlanInput pin;
+      pin.cfg = gc.get();
+      pin.ck = ck.get();
+      pin.usage = engine::load_usage_profile(profile, gc->n_layers, gc->n_experts);
+      pin.geo = geo;
+      pin.max_tokens = max_batch;
+      pin.max_seq = max_seq;
+      pin.max_logit_rows = std::max(max_slots * (mtp ? 2 : 1), 8);
+      pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
+      pin.mtp = mtp;
+      const auto plan = engine::make_glm5_plan(pin);
+      std::printf("%s", plan.summary().c_str());
+      std::fflush(stdout);
+      model_ptr = std::make_unique<engine::Glm5ResidentModel>(*gc, *ck, plan, geo, max_batch, max_seq,
+                                                               pin.max_logit_rows, mtp);
+      for (const char* t : {"<|endoftext|>", "<|user|>", "<|observation|>"}) eos.push_back(tok.token_id(t));
+    } else {
+      dc = std::make_unique<model::Dsv4Config>(model::Dsv4Config::from_hf(ck->config()));
+      const auto& c = *dc;
+      engine::PlanInput pin;
+      pin.cfg = &c;
+      pin.dense = ck.get();
+      pin.exl3 = xck.get();
+      pin.usage = engine::load_usage_profile(profile, c.n_layers, c.n_experts);
+      pin.geo = geo;
+      pin.max_tokens = max_batch;
+      pin.max_seq = max_seq;
+      pin.dspark = spec_drafts > 0;
+      vision = vision && c.vision_layers > 0;
+      pin.vision = vision;
+      set_reclaim_scratch(pin, reclaim_scratch);
+      pin.max_logit_rows = std::max(max_slots * (spec_drafts > 0 ? c.dspark_block + 1 : 1), 8);
+      pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
+      const auto plan = engine::make_plan(pin);
+      std::printf("%s", plan.summary().c_str());
+      std::fflush(stdout);
+      model_ptr = std::make_unique<engine::ResidentModel>(c, *ck, xck.get(), plan, geo, max_batch, max_seq,
+                                                          pin.max_logit_rows, prefix_snapshots, spec_drafts > 0,
+                                                          vision);
+    }
+    engine::StepModel& model = *model_ptr;
 
     engine::EngineConfig ecfg;
     ecfg.max_batch_tokens = max_batch;
     ecfg.max_running = conc;
-    ecfg.eos_id = tok.eos_id();
+    ecfg.eos_id = eos.empty() ? tok.eos_id() : eos[0];
+    if (eos.size() > 1) ecfg.eos_ids.assign(eos.begin() + 1, eos.end());
     ecfg.max_context = max_seq;
     ecfg.spec_drafts = spec_drafts;
     ecfg.spec_min_conf = spec_min_conf;
