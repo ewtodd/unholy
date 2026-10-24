@@ -119,19 +119,24 @@ struct LoadCtx {
   int dev;
   std::vector<Uploader::Item> items;
   std::vector<std::pair<DevTensor, DevTensor*>> to_f32;  // bf16 staging -> f32 destination, after the pass
-  std::vector<rt::DeviceBuffer> keep;
+  rt::Arena* arena = nullptr;  // weights from here when set
+  Uploader* up = nullptr;      // shared pinned staging when set
 
-  void* alloc(DevTensor& d, size_t bytes) {
-    d.buf = rt::DeviceBuffer(dev, bytes);
-    d.ptr = d.buf.data();
+  void* alloc(DevTensor& d, size_t bytes, bool own = false) {
+    if (arena && !own) {
+      d.ptr = arena->alloc(bytes);
+    } else {
+      d.buf = rt::DeviceBuffer(dev, bytes);
+      d.ptr = d.buf.data();
+    }
     return d.ptr;
   }
-  DevTensor upload(const std::string& name) {
+  DevTensor upload(const std::string& name, bool own = false) {
     const TensorInfo& t = ck.at(name);
     DevTensor d;
     d.dtype = t.dtype;
     d.shape = t.shape;
-    items.push_back({&t, alloc(d, t.nbytes)});
+    items.push_back({&t, alloc(d, t.nbytes, own)});
     return d;
   }
   // An fp32 tensor that a checkpoint may store as bf16 (converted after the pass) or fp16 (converted here).
@@ -152,14 +157,19 @@ struct LoadCtx {
       return;
     }
     if (t.dtype != DType::BF16) throw std::runtime_error(name + ": expected F32 or BF16");
-    to_f32.push_back({upload(name), &dst});
+    to_f32.push_back({upload(name, true), &dst});
   }
   void run(hipStream_t st) {
     rt::DeviceGuard g(dev);
     if (!items.empty()) {
-      Uploader up(ck);
-      up.upload_many(std::move(items), st);
-      up.sync();
+      std::unique_ptr<Uploader> own;
+      Uploader* u = up;
+      if (!u) {
+        own = std::make_unique<Uploader>(ck);
+        u = own.get();
+      }
+      u->upload_many(std::move(items), st);
+      u->sync();
       items.clear();
     }
     for (auto& [src, dst] : to_f32) {
@@ -227,112 +237,115 @@ void requant_fp8(GLinear& l, int dev, hipStream_t st) {
 Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int layer, int dev, hipStream_t st,
                                  const Glm5LoadOptions& opt) {
   const std::string p = kPrefix + "layers." + std::to_string(layer) + ".";
-  LoadCtx lc{ck, dev, {}, {}, {}};
+  LoadCtx lc{ck, dev, {}, {}, opt.arena, opt.up};
   Glm5LayerWeights w;
   w.layer = layer;
   w.kda = c.is_kda(layer);
   w.dense = c.is_dense(layer);
-  lc.upload_f32(p + "hc_attn_fn", w.hc_attn_fn);
-  w.hc_attn_base = lc.upload(p + "hc_attn_base");
-  w.hc_attn_scale = lc.upload(p + "hc_attn_scale");
-  lc.upload_f32(p + "hc_ffn_fn", w.hc_ffn_fn);
-  w.hc_ffn_base = lc.upload(p + "hc_ffn_base");
-  w.hc_ffn_scale = lc.upload(p + "hc_ffn_scale");
-  w.input_norm = lc.upload(p + "input_layernorm.weight");
-  w.post_norm = lc.upload(p + "post_attention_layernorm.weight");
-
-  const std::string a = p + "self_attn.";
-  w.o = glinear(lc, a + "o_proj");
-  std::unique_ptr<LoadCtx> ax;  // tensors from opt.aux
-  if (w.kda) {
-    const int W = c.lin_width();
-    if (ck.find(a + "qkv_proj.trellis")) {
-      w.qkv = glinear(lc, a + "qkv_proj");
-    } else {
-      w.q = glinear(lc, a + "q_proj");
-      w.k = glinear(lc, a + "k_proj");
-      w.v = glinear(lc, a + "v_proj");
-    }
-    // conv [3 W, 4] bf16: one tensor (EXL3) or q / k / v ones (the release), concatenated.
-    if (ck.find(a + "conv1d.weight")) {
-      w.conv = lc.upload(a + "conv1d.weight");
-    } else {
-      lc.alloc(w.conv, size_t(3) * W * c.conv_kernel * 2);
-      w.conv.dtype = DType::BF16;
-      const char* parts[3] = {"q_conv1d", "k_conv1d", "v_conv1d"};
-      for (int i = 0; i < 3; ++i) {
-        const TensorInfo& t = ck.at(a + parts[i] + ".weight");
-        if (t.nbytes != size_t(W) * c.conv_kernel * 2) throw std::runtime_error(t.name + ": unexpected size");
-        lc.items.push_back({&t, static_cast<uint8_t*>(w.conv.ptr) + size_t(i) * t.nbytes});
-      }
-    }
-    if (w.conv.dtype != DType::BF16) throw std::runtime_error(a + "conv: expected bf16");
-    w.f_a = glinear(lc, a + "f_a_proj");
-    w.f_b = glinear(lc, a + "f_b_proj");
-    w.b = glinear(lc, a + "b_proj");
-    w.g_a = glinear(lc, a + "g_a_proj");
-    w.g_b = glinear(lc, a + "g_b_proj");
-    w.dt_bias = lc.upload(a + "dt_bias");
-    w.a_log = lc.upload(a + "A_log");
-    w.o_norm = lc.upload(a + "o_norm.weight");
-    if (w.dt_bias.dtype != DType::F32 || w.a_log.dtype != DType::F32)
-      throw std::runtime_error(a + ": gate params not f32");
-  } else {
-    w.q_a = glinear(lc, a + "q_a_proj");
-    w.q_b = glinear(lc, a + "q_b_proj");
-    w.kv_a = glinear(lc, a + "kv_a_proj_with_mqa");
-    w.kv_b = glinear(lc, a + "kv_b_proj");
-    if (w.kv_b.exl3()) throw std::runtime_error(a + "kv_b_proj: EXL3 is not supported (absorbed attention)");
-    w.q_a_norm = lc.upload(a + "q_a_layernorm.weight");
-    w.kv_a_norm = lc.upload(a + "kv_a_layernorm.weight");
-    const std::string ip = a + "indexer.";
-    w.idx_wq_b = glinear(lc, ip + "wq_b");
-    w.idx_wk = glinear(lc, ip + "wk");
-    w.idx_wproj = glinear(lc, ip + "weights_proj");
-    w.idx_knorm_w = lc.upload(ip + "k_norm.weight");
-    w.idx_knorm_b = lc.upload(ip + "k_norm.bias");
-    w.idx_f16 = w.idx_knorm_w.dtype == DType::F16;
-    // The pooling weights: bf16 in the release, fp16 / fp32 in exllamav3 4.05, left out of 3.05's index.
-    LoadCtx* pc = &lc;
-    if (!ck.find(ip + "index_kpool_compress_gate.weight") && !ck.find(ip + "index_kpool_compress_gate")) {
-      if (!opt.aux)
-        throw std::runtime_error(ip + "index_kpool_compress_*: not in the checkpoint (pass the FP8 release as aux)");
-      ax = std::make_unique<LoadCtx>(LoadCtx{*opt.aux, dev, {}, {}, {}});
-      pc = ax.get();
-    }
-    w.idx_gate.w = pc->upload(ip + "index_kpool_compress_gate");
-    w.idx_gate.out = int(w.idx_gate.w.shape[0]);
-    w.idx_gate.in = int(w.idx_gate.w.shape[1]);
-    pc->upload_f32(ip + "index_kpool_compress_ape", w.idx_ape);
-    if (w.idx_gate.w.dtype != DType::BF16 && w.idx_gate.w.dtype != DType::F16)
-      throw std::runtime_error(ip + "index_kpool_compress_gate: expected bf16 or fp16");
-  }
-
   const std::string m = p + "mlp.";
-  if (w.dense) {
-    w.gate = glinear(lc, m + "gate_proj");
-    w.up = glinear(lc, m + "up_proj");
-    w.down = glinear(lc, m + "down_proj");
-  } else {
-    w.router = glinear(lc, m + "gate");
-    w.router_bias = lc.upload(m + "gate.e_score_correction_bias");
-    if (w.router.exl3() || w.router_bias.dtype != DType::F32) throw std::runtime_error(m + "gate: unexpected format");
-    w.sh_gate = glinear(lc, m + "shared_experts.gate_proj");
-    w.sh_up = glinear(lc, m + "shared_experts.up_proj");
-    w.sh_down = glinear(lc, m + "shared_experts.down_proj");
+  if (opt.load_dense) {
+    lc.upload_f32(p + "hc_attn_fn", w.hc_attn_fn);
+    w.hc_attn_base = lc.upload(p + "hc_attn_base");
+    w.hc_attn_scale = lc.upload(p + "hc_attn_scale");
+    lc.upload_f32(p + "hc_ffn_fn", w.hc_ffn_fn);
+    w.hc_ffn_base = lc.upload(p + "hc_ffn_base");
+    w.hc_ffn_scale = lc.upload(p + "hc_ffn_scale");
+    w.input_norm = lc.upload(p + "input_layernorm.weight");
+    w.post_norm = lc.upload(p + "post_attention_layernorm.weight");
+
+    const std::string a = p + "self_attn.";
+    w.o = glinear(lc, a + "o_proj");
+    std::unique_ptr<LoadCtx> ax;  // tensors from opt.aux
+    if (w.kda) {
+      const int W = c.lin_width();
+      if (ck.find(a + "qkv_proj.trellis")) {
+        w.qkv = glinear(lc, a + "qkv_proj");
+      } else {
+        w.q = glinear(lc, a + "q_proj");
+        w.k = glinear(lc, a + "k_proj");
+        w.v = glinear(lc, a + "v_proj");
+      }
+      // conv [3 W, 4] bf16: one tensor (EXL3) or q / k / v ones (the release), concatenated.
+      if (ck.find(a + "conv1d.weight")) {
+        w.conv = lc.upload(a + "conv1d.weight");
+      } else {
+        lc.alloc(w.conv, size_t(3) * W * c.conv_kernel * 2);
+        w.conv.dtype = DType::BF16;
+        const char* parts[3] = {"q_conv1d", "k_conv1d", "v_conv1d"};
+        for (int i = 0; i < 3; ++i) {
+          const TensorInfo& t = ck.at(a + parts[i] + ".weight");
+          if (t.nbytes != size_t(W) * c.conv_kernel * 2) throw std::runtime_error(t.name + ": unexpected size");
+          lc.items.push_back({&t, static_cast<uint8_t*>(w.conv.ptr) + size_t(i) * t.nbytes});
+        }
+      }
+      if (w.conv.dtype != DType::BF16) throw std::runtime_error(a + "conv: expected bf16");
+      w.f_a = glinear(lc, a + "f_a_proj");
+      w.f_b = glinear(lc, a + "f_b_proj");
+      w.b = glinear(lc, a + "b_proj");
+      w.g_a = glinear(lc, a + "g_a_proj");
+      w.g_b = glinear(lc, a + "g_b_proj");
+      w.dt_bias = lc.upload(a + "dt_bias");
+      w.a_log = lc.upload(a + "A_log");
+      w.o_norm = lc.upload(a + "o_norm.weight");
+      if (w.dt_bias.dtype != DType::F32 || w.a_log.dtype != DType::F32)
+        throw std::runtime_error(a + ": gate params not f32");
+    } else {
+      w.q_a = glinear(lc, a + "q_a_proj");
+      w.q_b = glinear(lc, a + "q_b_proj");
+      w.kv_a = glinear(lc, a + "kv_a_proj_with_mqa");
+      w.kv_b = glinear(lc, a + "kv_b_proj");
+      if (w.kv_b.exl3()) throw std::runtime_error(a + "kv_b_proj: EXL3 is not supported (absorbed attention)");
+      w.q_a_norm = lc.upload(a + "q_a_layernorm.weight");
+      w.kv_a_norm = lc.upload(a + "kv_a_layernorm.weight");
+      const std::string ip = a + "indexer.";
+      w.idx_wq_b = glinear(lc, ip + "wq_b");
+      w.idx_wk = glinear(lc, ip + "wk");
+      w.idx_wproj = glinear(lc, ip + "weights_proj");
+      w.idx_knorm_w = lc.upload(ip + "k_norm.weight");
+      w.idx_knorm_b = lc.upload(ip + "k_norm.bias");
+      w.idx_f16 = w.idx_knorm_w.dtype == DType::F16;
+      // The pooling weights: bf16 in the release, fp16 / fp32 in exllamav3 4.05, left out of 3.05's index.
+      LoadCtx* pc = &lc;
+      if (!ck.find(ip + "index_kpool_compress_gate.weight") && !ck.find(ip + "index_kpool_compress_gate")) {
+        if (!opt.aux)
+          throw std::runtime_error(ip + "index_kpool_compress_*: not in the checkpoint (pass the FP8 release as aux)");
+        ax = std::make_unique<LoadCtx>(LoadCtx{*opt.aux, dev, {}, {}});
+        pc = ax.get();
+      }
+      w.idx_gate.w = pc->upload(ip + "index_kpool_compress_gate");
+      w.idx_gate.out = int(w.idx_gate.w.shape[0]);
+      w.idx_gate.in = int(w.idx_gate.w.shape[1]);
+      pc->upload_f32(ip + "index_kpool_compress_ape", w.idx_ape);
+      if (w.idx_gate.w.dtype != DType::BF16 && w.idx_gate.w.dtype != DType::F16)
+        throw std::runtime_error(ip + "index_kpool_compress_gate: expected bf16 or fp16");
+    }
+
+    if (w.dense) {
+      w.gate = glinear(lc, m + "gate_proj");
+      w.up = glinear(lc, m + "up_proj");
+      w.down = glinear(lc, m + "down_proj");
+    } else {
+      w.router = glinear(lc, m + "gate");
+      w.router_bias = lc.upload(m + "gate.e_score_correction_bias");
+      if (w.router.exl3() || w.router_bias.dtype != DType::F32) throw std::runtime_error(m + "gate: unexpected format");
+      w.sh_gate = glinear(lc, m + "shared_experts.gate_proj");
+      w.sh_up = glinear(lc, m + "shared_experts.up_proj");
+      w.sh_down = glinear(lc, m + "shared_experts.down_proj");
+    }
+    lc.run(st);
+    if (ax) ax->run(st);
+    if (w.kda && opt.kda_fp8)
+      for (GLinear* l : {&w.q, &w.k, &w.v, &w.o}) requant_fp8(*l, dev, st);
   }
-  lc.run(st);
-  if (ax) ax->run(st);
-  if (w.kda && opt.kda_fp8)
-    for (GLinear* l : {&w.q, &w.k, &w.v, &w.o}) requant_fp8(*l, dev, st);
 
   if (!w.dense && opt.load_experts) {
-    LoadCtx ex{opt.experts ? *opt.experts : ck, dev, {}, {}, {}};
+    LoadCtx ex{opt.experts ? *opt.experts : ck, dev, {}, {}, opt.arena, opt.experts ? opt.experts_up : opt.up};
     const size_t E = size_t(c.n_experts);
     w.e_gate.resize(E);
     w.e_up.resize(E);
     w.e_down.resize(E);
     for (size_t e = 0; e < E; ++e) {
+      if (opt.expert_mask && !(*opt.expert_mask)[e]) continue;
       const std::string ep = m + "experts." + std::to_string(e) + ".";
       w.e_gate[e] = glinear(ex, ep + "gate_proj");
       w.e_up[e] = glinear(ex, ep + "up_proj");
@@ -344,7 +357,7 @@ Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int 
 }
 
 Glm5HeadWeights load_glm5_head(const Checkpoint& ck, int dev, hipStream_t st, bool embed, bool head) {
-  LoadCtx lc{ck, dev, {}, {}, {}};
+  LoadCtx lc{ck, dev, {}, {}};
   Glm5HeadWeights h;
   if (embed) h.embed = lc.upload(kPrefix + "embed_tokens.weight");
   if (head) {
@@ -393,18 +406,20 @@ void clear_glm5_slot(const Glm5Config& c, Glm5Cache& k, int slot, hipStream_t st
   (void)c;
 }
 
-Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq) {
-  Glm5Scratch s;
-  s.max_tokens = max_tokens;
-  s.max_seq = max_seq;
+namespace {
+
+int head_rows(int max_tokens) { return std::min(max_tokens, 64); }
+
+// Bytes of each Glm5Buf for batches of max_tokens tokens of sequences up to max_seq long.
+std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_seq) {
   const size_t T = size_t(max_tokens), D = c.dim, W = c.lin_width(), H = c.n_heads, R = c.kv_lora;
   const size_t P = T * c.n_active;
   const size_t wide_in = std::max({D, size_t(c.q_lora), H * c.v_dim, W, size_t(c.inter), size_t(c.moe_inter)});
   const size_t wide_out = std::max({3 * W, H * c.nope_dim, size_t(c.inter), D});
-  s.head_rows = int(std::min<size_t>(T, 64));
+  const size_t HR = size_t(head_rows(max_tokens));
   const size_t ffn = std::max(P * c.moe_inter, T * c.inter);
   const size_t E = c.n_experts, max_tiles = P / k::kExl3TileRows + E + 1;
-  const size_t sizes[kGlm5ScratchBufs] = {
+  std::vector<size_t> sizes = {
       T * D * 2,                                  // h
       T * D * 2,                                  // hn
       T * c.hc_mult * 4,                          // post
@@ -445,11 +460,12 @@ Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int 
       P * D * 2,                                  // expert outputs
       T * D * 2,                                  // shared expert out
       T * wide_in * 4,                            // EXL3 x side
-      std::max(T * wide_out, size_t(s.head_rows) * c.vocab) * 4,  // EXL3 y side
-      size_t(s.head_rows) * c.vocab * 2,          // head bf16 logits
+      std::max(T * wide_out, HR * c.vocab) * 4,  // EXL3 y side
+      HR * c.vocab * 2,                           // head bf16 logits
       (T / k::kExl3TileRows + 2) * sizeof(k::Exl3Tile),  // dense tiles
       std::max(P, T) * 4,                         // zero rows (row_expert of a dense linear)
       std::min<size_t>(T, k::kHcSmallMaxTokens) * 32 * 25 * 4,  // hc_pre_small partial sums
+      T * W * 4, T * W * 4, T * W * 4,            // KDA: normalized q, k, exp(forget gate)
       E * 4, E * 4, E * 4,                        // MoE count, offsets, fill
       sizeof(k::MoePlan),                         // MoE plan
       max_tiles * sizeof(k::Exl3Tile),            // local tiles
@@ -459,13 +475,57 @@ Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int 
       std::max(P * c.moe_inter, T * c.inter) * 2,  // fp16 down inputs
       std::max(std::min<size_t>(P, 64) * std::max(D, size_t(c.moe_inter)),
                8 * std::max(3 * W, size_t(c.vocab))) * 4,  // GEMV fp32 sides
+      size_t(c.n_layers) * E * 4,                 // routing histogram [layer][expert]
   };
+  if (sizes.size() != size_t(kGlm5ScratchBufs)) throw std::logic_error("glm5 scratch: buffer list out of date");
+  return sizes;
+}
+
+}  // namespace
+
+size_t glm5_scratch_bytes(const Glm5Config& c, int max_tokens, int max_seq) {
+  size_t b = 0;
+  for (size_t s : scratch_sizes(c, max_tokens, max_seq)) b += (std::max<size_t>(s, 16) + 255) / 256 * 256;
+  return b;
+}
+
+Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq) {
+  Glm5Scratch s;
+  s.max_tokens = max_tokens;
+  s.max_seq = max_seq;
+  s.head_rows = head_rows(max_tokens);
   rt::DeviceGuard g(dev);
-  for (size_t b : sizes) {
+  for (size_t b : scratch_sizes(c, max_tokens, max_seq)) {
     s.bufs.emplace_back(dev, std::max<size_t>(b, 16));
     UH_CHECK(hipMemset(s.bufs.back().data(), 0, s.bufs.back().size()));  // MoE counts and zero rows start at 0
   }
   return s;
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+size_t glm5_dense_layer_bytes(const Checkpoint& ck, int layer) {
+  const std::string p = kPrefix + "layers." + std::to_string(layer) + ".";
+  size_t b = 0;
+  for (const auto& t : ck.tensors()) {
+    if (t.name.compare(0, p.size(), p) != 0 || t.name.find(".mlp.experts.") != std::string::npos) continue;
+    if (t.name.size() > 5 && t.name.compare(t.name.size() - 5, 5, ".mul1") == 0) continue;  // codebook marker
+    b += t.nbytes;
+    if (t.dtype == DType::F16 && t.name.find(".suh") == std::string::npos && t.name.find(".svh") == std::string::npos)
+      b += t.nbytes;  // the bf16 copy
+    if (t.name.find("kv_b_proj.weight") != std::string::npos) b += t.nbytes;  // the per-head split
+  }
+  return b;
+}
+
+size_t glm5_expert_bytes(const Checkpoint& ck, int layer, int expert) {
+  const std::string p = kPrefix + "layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(expert) + ".";
+  size_t b = 0;
+  for (const char* m : {"gate_proj", "up_proj", "down_proj"})
+    for (const char* s : {".trellis", ".suh", ".svh"}) b += ck.at(p + m + s).nbytes;
+  return b;
 }
 
 }  // namespace unholy::model

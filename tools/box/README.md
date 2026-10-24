@@ -39,4 +39,5 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `sweep.sh LABEL [flags]` | that server + check-source `gsm8k-chat` at 1 / 2 / 4 / 8 requests (check-source pinned in `env.sh`) |
 | `eb.sh LABEL CONC [flags]` | `unholy-engine-batch` on `gsm48.jsonl` with logprobs; `REF=...jsonl` compares with an earlier run |
 | `glm-ref.sh LABEL [flags]` | `unholy-glm-ref`: the GLM reference forward against `glm-oracle.sh`'s dumps, layer by layer, then KL / top-1 |
+| `glm-serve.sh LABEL CMD...` | GLM build B served on port 8300 (production geometry), CMD run against it (`$URL`, `$RUN`), server stopped |
 | `hold.sh CMD...` | run CMD (e.g. `bash -c 'a.sh && b.sh'`) with the services stopped once, not once per script |

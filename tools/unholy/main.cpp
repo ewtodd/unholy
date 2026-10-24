@@ -62,6 +62,7 @@
 #include <thread>
 
 #include "engine/engine.hpp"
+#include "engine/glm5_resident.hpp"
 #include "engine/plan.hpp"
 #include "engine/resident.hpp"
 #include "model/dsv4.hpp"
@@ -69,6 +70,7 @@
 #include "model/safetensors.hpp"
 #include "server/openai.hpp"
 #include "text/chat.hpp"
+#include "text/glm_chat.hpp"
 #include "text/tokenizer.hpp"
 
 #ifndef UNHOLY_DATA_DIR
@@ -162,6 +164,7 @@ std::string engine_line(const engine::EngineStats& a, const engine::EngineStats&
 // Everything the command line sets.
 struct Options {
   std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
+  bool profile_set = false;  // --profile given (otherwise each family has its default)
   server::ServerConfig scfg;
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
   long long kv_tokens = 0;
@@ -181,11 +184,14 @@ struct Options {
 
 // The serving loop every model family shares: the engine over `model`, the periodic stats line, the OpenAI
 // server (`extras` adds the family's server settings once the engine exists) and the signal thread.
+// eos: the end-of-sequence tokens (empty: the tokenizer's EOS).
 int run_server(engine::StepModel& model, const text::Tokenizer& tok, const text::ChatFormat& chat, Options& o,
-               int max_seq, sigset_t sigs, const std::function<void(server::ServerConfig&)>& extras) {
+               int max_seq, sigset_t sigs, const std::function<void(server::ServerConfig&)>& extras,
+               const std::vector<int32_t>& eos = {}) {
   engine::EngineConfig ecfg;
   ecfg.max_batch_tokens = o.max_batch;
-  ecfg.eos_id = tok.eos_id();
+  ecfg.eos_id = eos.empty() ? tok.eos_id() : eos[0];
+  if (eos.size() > 1) ecfg.eos_ids.assign(eos.begin() + 1, eos.end());
   ecfg.max_context = max_seq;
   ecfg.spec_drafts = o.spec_drafts;
   ecfg.spec_min_conf = o.spec_min_conf;
@@ -318,6 +324,73 @@ int serve_dsv4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   });
 }
 
+// GLM-5.3-Flash, an EXL3 quant (build B, docs/PLAN-glm-dsv41.md): make_glm5_plan places the layers and experts,
+// Glm5ResidentModel runs them, text::glm5_chat_format(). No prefix snapshots, drafts or images yet.
+int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
+  const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
+  const auto c = model::Glm5Config::from_hf(ck->config());
+  if (o.spec_drafts > 0 || o.vision)
+    std::printf("GLM-5.3-Flash: speculative drafts and images are not served yet; serving without them\n");
+  o.spec_drafts = 0;
+  o.prefix_snapshots = 0;
+  if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_glm53_mixed.txt";
+
+  const int max_seq = (o.max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
+  model::CacheGeometry geo;
+  geo.max_slots = o.max_slots;
+  geo.max_pages_per_seq = max_seq / model::kPageTokens;
+  long long kv_tokens = o.kv_tokens;
+  if (kv_tokens <= 0) kv_tokens = o.num_pages > 0 ? (long long)(o.num_pages) * model::kPageTokens : 2LL * max_seq;
+  geo.num_pages = int((kv_tokens + model::kPageTokens - 1) / model::kPageTokens);
+
+  engine::Glm5PlanInput pin;
+  pin.cfg = &c;
+  pin.ck = ck.get();
+  pin.usage = engine::load_usage_profile(o.profile, c.n_layers, c.n_experts);
+  pin.geo = geo;
+  pin.max_tokens = o.max_batch;
+  pin.max_seq = max_seq;
+  pin.max_logit_rows = std::max(o.max_slots, 8);
+  pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
+  if (plan_only) {
+    std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
+                "tokens; GLM-5.3-Flash EXL3\n",
+                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch);
+    try {
+      std::printf("%s", engine::make_glm5_plan(pin).summary().c_str());
+    } catch (const std::exception& e) {
+      std::printf("does not fit: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
+  const auto plan = engine::make_glm5_plan(pin);
+  std::printf("%s", plan.summary().c_str());
+  std::fflush(stdout);
+  const auto t0 = std::chrono::steady_clock::now();
+  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows);
+  std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+              (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);
+  std::vector<int32_t> eos;
+  for (const char* t : {"<|endoftext|>", "<|user|>", "<|observation|>"}) {
+    const int32_t id = tok.token_id(t);
+    if (id < 0) throw std::runtime_error(std::string("GLM tokenizer: no ") + t);
+    eos.push_back(id);
+  }
+  return run_server(
+      model, tok, text::glm5_chat_format(), o, max_seq, sigs,
+      [&](server::ServerConfig& scfg) {
+        scfg.extra_get.emplace_back("/unholy/routing_profile",
+                                    [&model] { return engine::format_usage_profile(model.routing_histogram()); });
+        scfg.extra_post.emplace_back("/unholy/routing_profile/reset", [&model] {
+          model.reset_routing_histogram();
+          return std::string("ok\n");
+        });
+      },
+      eos);
+}
+
 int serve(int argc, char** argv, bool plan_only) {
   Options o;
   for (int i = 2; i < argc; ++i) {
@@ -326,7 +399,7 @@ int serve(int argc, char** argv, bool plan_only) {
     const std::string v = argv[++i];
     if (a == "--model") o.model_dir = v;
     else if (a == "--exl3") o.exl3_dir = v;
-    else if (a == "--profile") o.profile = v;
+    else if (a == "--profile") o.profile = v, o.profile_set = true;
     else if (a == "--host") o.scfg.host = v;
     else if (a == "--port") o.scfg.port = std::stoi(v);
     else if (a == "--served-model-name") o.scfg.model_name = v;
@@ -377,7 +450,7 @@ int serve(int argc, char** argv, bool plan_only) {
     case model::Family::Dsv4:
       return serve_dsv4(o, std::move(ck), plan_only, sigs);
     case model::Family::Glm5Next:
-      throw std::runtime_error("GLM-5.3-Flash checkpoints are not served yet (docs/PLAN-glm-dsv41.md, G4-G6)");
+      return serve_glm5(o, std::move(ck), plan_only, sigs);
   }
   return 1;
 }

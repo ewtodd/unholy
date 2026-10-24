@@ -1,0 +1,123 @@
+// GLM-5.3-Flash resident across the two cards and the APU (docs/PLAN-glm-dsv41.md, G5): the GLM counterpart of
+// ResidentModel, on the fast path of model/glm5.hpp.
+//
+// card 0: the embedding and its layers; card 1: its layers and the head; each layer's dense weights, paged DSA rows
+// or per-slot KDA state, and hot routed experts on its card; the cold experts on the APU (Glm5ApuExperts: one
+// channel per card, device-ordered flags, no host waits). Two steps in flight: card 0 runs step k + 1 while card 1
+// finishes step k; the residual crosses once per step through pinned memory.
+//
+// Not yet: prefix snapshots (a slot's KDA state is 152.6 MB), MTP drafting, images.
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+#include <memory>
+#include <vector>
+
+#include "engine/plan.hpp"
+#include "engine/step.hpp"
+#include "kernels/glm_fast.hpp"
+#include "kernels/moe_dispatch.hpp"
+#include "model/glm5.hpp"
+
+namespace unholy::engine {
+
+// The APU's cold experts as seen by one card (own stream, flags, pinned staging, scratch; shared weights).
+class Glm5ApuExperts final : public model::RemoteExperts {
+ public:
+  using Layers = std::vector<std::unique_ptr<model::Glm5LayerWeights>>;  // [layer]
+  Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers);
+  ~Glm5ApuExperts() override;
+  void add_layer(model::Glm5LayerWeights w);
+  void run(int, const std::vector<Job>&) override;  // host-synchronous jobs: not supported (enqueue only)
+  bool can_enqueue() const override { return true; }
+  void enqueue(int layer, hipStream_t card_st, int P) override;
+  void join(hipStream_t card_st) override;
+  hipStream_t stream() const { return st_; }
+
+ private:
+  const model::Glm5Config& c_;
+  int dev_;
+  hipStream_t st_ = nullptr;
+  std::shared_ptr<Layers> layers_;
+  rt::DeviceBuffer xh1_, xh3_, xh2_, h1_, h3_, yp_;
+  kernels::MoePlan* plan_dev_ = nullptr;
+  kernels::Exl3Tile* tiles_dev_ = nullptr;
+  uint16_t* in_dev_ = nullptr;
+  uint16_t* out_dev_ = nullptr;
+  float* w_dev_ = nullptr;
+  int32_t* e_dev_ = nullptr;
+  uint32_t* req_flag_ = nullptr;  // pinned, coherent: card -> APU
+  uint32_t* done_flag_ = nullptr;  // APU -> card
+  uint32_t seq_ = 0;
+};
+
+struct Glm5PlanInput {
+  const model::Glm5Config* cfg = nullptr;
+  const model::Checkpoint* ck = nullptr;  // the EXL3 checkpoint served
+  UsageProfile usage;
+  model::CacheGeometry geo;
+  int max_tokens = 0, max_seq = 0, max_logit_rows = 0;
+  size_t card_margin = size_t(2) << 30, apu_margin = size_t(4) << 30;
+};
+Plan make_glm5_plan(const Glm5PlanInput& in);
+
+class Glm5ResidentModel final : public StepModel {
+ public:
+  Glm5ResidentModel(const model::Glm5Config& c, const model::Checkpoint& ck, const Plan& plan,
+                    const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows = 0);
+  ~Glm5ResidentModel() override;
+
+  int vocab() const override { return c_.vocab; }
+  int max_tokens() const override { return max_tokens_; }
+  int max_logit_rows() const override { return max_logit_rows_; }
+  int max_slots() const override { return geo_.max_slots; }
+  int max_pages_per_seq() const override { return geo_.max_pages_per_seq; }
+  int num_pages() const override { return geo_.num_pages; }
+  int page_tokens() const override { return kernels::kGlmPageRows; }
+  int max_inflight() const override { return 2; }
+  void set_block_tables(const std::vector<int32_t>& tables) override;
+  uint64_t submit(const StepInput& in) override;
+  void wait(uint64_t ticket, std::vector<float>& logits) override;
+
+  const Plan& plan() const { return plan_; }
+  // Pairs routed to each expert since load (or the last reset), [layer][expert] (usage-profile format via
+  // format_usage_profile).
+  std::vector<std::vector<uint64_t>> routing_histogram() const;
+  void reset_routing_histogram();
+
+ private:
+  struct Card {
+    int dev = 0;
+    hipStream_t st = nullptr;
+    std::vector<model::Glm5LayerWeights> w;
+    std::vector<model::Glm5PagedCache> cache;
+    model::Glm5Scratch scratch;
+    rt::DeviceBuffer x, ids, pos, tables;
+  };
+  const model::Glm5Config& c_;
+  Plan plan_;
+  model::CacheGeometry geo_;
+  int max_tokens_ = 0, max_logit_rows_ = 0;
+  Card card_[2];
+  std::unique_ptr<Glm5ApuExperts> chan_[2];
+  std::unique_ptr<rt::Arena> card_arena_[2], apu_arena_;
+  model::Glm5HeadWeights embed_, head_;   // embedding on card 0, final norm + LM head on card 1
+  rt::DeviceBuffer hrows_, logits_, rows_idx_;  // head inputs / outputs on card 1
+  struct Flight {
+    uint16_t* x_host = nullptr;     // residual handoff card 0 -> card 1
+    float* logits_host = nullptr;   // [max_logit_rows][vocab]
+    int32_t* io_host = nullptr;     // [max_tokens] ids, positions, logit rows
+    int32_t* tables_host = nullptr;
+    hipEvent_t handoff = nullptr, consumed = nullptr, done = nullptr;
+    uint64_t ticket = 0;
+    int rows = 0;
+    bool busy = false;
+  };
+  Flight flight_[2];
+  uint64_t next_ticket_ = 1;
+  std::vector<int32_t> tables_;
+  bool tables_dirty_ = false;
+};
+
+}  // namespace unholy::engine

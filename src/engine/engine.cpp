@@ -632,7 +632,8 @@ void Engine::complete_step() {
       s.first_token = true;
       s.t_first = std::chrono::steady_clock::now();
     }
-    const bool eos = tok == cfg_.eos_id && !s.req.ignore_eos;
+    const auto& ends = cfg_.eos_ids;
+    const bool eos = (tok == cfg_.eos_id || std::find(ends.begin(), ends.end(), tok) != ends.end()) && !s.req.ignore_eos;
     const bool stop_id = std::find(s.req.stop_token_ids.begin(), s.req.stop_token_ids.end(), tok) !=
                          s.req.stop_token_ids.end();
     if (eos || stop_id) {

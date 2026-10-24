@@ -148,7 +148,13 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
     linear(w.k, hn, D, qkv + W, C3, T, s, st);
     linear(w.v, hn, D, qkv + 2 * W, C3, T, s, st);
   }
-  const size_t conv_slot = size_t(c.conv_kernel - 1) * C3, state_slot = size_t(H) * Dh * Dh;
+  const size_t conv_slot = size_t(c.conv_kernel - 1) * C3;
+  for (const auto& ch : b.chunks)  // a new sequence in the slot: zero state
+    if (ch.s0 == 0) {
+      UH_CHECK(hipMemsetAsync(slot_rows<bf16>(cache.conv, ch.slot, conv_slot), 0, conv_slot * 2, st));
+      const size_t ss = size_t(H) * Dh * Dh;
+      UH_CHECK(hipMemsetAsync(slot_rows<float>(cache.state, ch.slot, ss), 0, ss * 4, st));
+    }
   for (const auto& ch : b.chunks)
     k::kda_conv(qkv + size_t(ch.t0) * C3, C3, slot_rows<bf16>(cache.conv, ch.slot, conv_slot), w.conv.p<bf16>(),
                 qkvc + size_t(ch.t0) * C3, ch.n, C3, st);
@@ -162,10 +168,18 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   linear(w.b, hn, D, beta, H, T, s, st);
   k::sigmoid_bf16(beta, beta, size_t(T) * H, st);
   bf16* core = s.at<bf16>(kCore);
-  for (const auto& ch : b.chunks) {
-    const bf16* base = qkvc + size_t(ch.t0) * C3;
-    k::kda_recurrent(base, base + W, base + 2 * W, C3, g + size_t(ch.t0) * W, beta + size_t(ch.t0) * H,
-                     slot_rows<float>(cache.state, ch.slot, state_slot), core + size_t(ch.t0) * W, ch.n, H, Dh, st);
+  float* qn = s.at<float>(kKdaQ);
+  float* kn = s.at<float>(kKdaK);
+  float* eg = s.at<float>(kKdaE);
+  k::glm_kda_prep(qkvc, qkvc + W, C3, g, qn, kn, eg, T, H, Dh, st);
+  k::GlmKdaBatch kb;
+  for (size_t i = 0; i < b.chunks.size(); ++i) {
+    const auto& ch = b.chunks[i];
+    kb.c[kb.nchunks++] = {ch.t0, ch.n, ch.slot};
+    if (kb.nchunks == k::GlmKdaBatch::kMax || i + 1 == b.chunks.size()) {
+      k::glm_kda_recurrent(qn, kn, eg, qkvc + 2 * W, C3, beta, cache.state.as<float>(), core, kb, H, Dh, st);
+      kb.nchunks = 0;
+    }
   }
   linear(w.g_a, hn, D, low, Dh, T, s, st);
   linear(w.g_b, low, Dh, row, W, T, s, st);
@@ -234,55 +248,62 @@ void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   linear(w.o, o, H * c.v_dim, out, D, T, s, st);
 }
 
-// Routed experts on the device: router -> dispatch (kernels/moe_dispatch) -> grouped EXL3 experts -> combine.
+// Routed experts on the device: router -> dispatch (kernels/moe_dispatch) -> grouped EXL3 experts on this card's
+// tiles, the APU's (remote) tiles through `remote` meanwhile -> combine.
 void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out, int T,
-              hipStream_t st) {
-  const int D = c.dim, E = c.n_experts, K = c.n_active, I = c.moe_inter, P = T * K;
-  if (w.n_resident < E) throw std::runtime_error("glm5 fast path: remote experts are not wired yet");
+              hipStream_t st, RemoteExperts* remote) {
+  const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
+  const bool any_remote = w.n_resident < E;
+  if (any_remote && (!remote || !remote->can_enqueue())) throw std::runtime_error("glm5: remote experts need a backend");
   float* logits = s.at<float>(kF32Rows);
   int32_t* sel = s.at<int32_t>(kSel);
   float* rw = s.at<float>(kRouteW);
   if (T <= k::kGemvRowsCap) k::gemv_bf16_f32out(hn, D, w.router.w.p<bf16>(), logits, E, T, E, D, st);
   else k::gemm_bf16_f32out_wmma(hn, D, w.router.w.p<bf16>(), logits, E, T, E, D, st);
-  k::route_sigmoid(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
+  k::glm_route(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
 
   auto* plan = s.at<k::MoePlan>(kMoePlan);
   auto* lt = s.at<k::Exl3Tile>(kMoeLTiles);
+  auto* rtl = s.at<k::Exl3Tile>(kMoeRTiles);
   int32_t* eidx = s.at<int32_t>(kEIdx);
   float* ewt = s.at<float>(kEWt);
   int32_t* row_expert = s.at<int32_t>(kRowExpert);
   int32_t* pidx = s.at<int32_t>(kPairIdx);
-  const int max_tiles = std::min(P, P / k::kExl3TileRows + E + 1);
-  k::moe_count(sel, T, K, s.at<int32_t>(kMoeCount), E, st);
-  k::moe_plan(s.at<int32_t>(kMoeCount), w.resident.as<uint8_t>(), E, P, plan, lt, s.at<k::Exl3Tile>(kMoeRTiles),
-              s.at<int32_t>(kMoeOff), s.at<int32_t>(kMoeFill), P / k::kExl3TileRows + E + 1, st);
-  k::moe_scatter(sel, rw, T, K, s.at<int32_t>(kMoeOff), s.at<int32_t>(kMoeFill), eidx, ewt, row_expert, pidx, st);
+  uint32_t* hist = s.at<uint32_t>(kRouteHist) + size_t(w.layer) * E;
+  const int cap_tiles = P / k::kExl3TileRows + E + 1, max_tiles = std::min(P, cap_tiles);
+  if (any_remote && (size_t(P) > remote->capacity_rows || cap_tiles > remote->max_tiles))
+    throw std::runtime_error("glm5: remote staging too small");
+  if (T <= k::kMoeSmallMaxTokens) {  // decode-sized: the bookkeeping (and the remote staging) in one block
+    k::MoeSmallArgs ma{sel, rw, T, K, hist, w.resident.as<uint8_t>(), E, P, cap_tiles, k::kExl3TileRows, plan, lt, rtl,
+                       eidx, ewt, row_expert, pidx, any_remote, false, nullptr, nullptr, nullptr, nullptr,
+                       any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
+                       any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
+    k::moe_dispatch_small(ma, st);
+  } else {
+    k::moe_count(sel, T, K, s.at<int32_t>(kMoeCount), E, st, hist);
+    k::moe_plan(s.at<int32_t>(kMoeCount), w.resident.as<uint8_t>(), E, P, plan, lt, rtl, s.at<int32_t>(kMoeOff),
+                s.at<int32_t>(kMoeFill), cap_tiles, st);
+    k::moe_scatter(sel, rw, T, K, s.at<int32_t>(kMoeOff), s.at<int32_t>(kMoeFill), eidx, ewt, row_expert, pidx, st);
+    if (any_remote)
+      k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host,
+                      remote->e_host, P, st);
+  }
   bf16* pin = s.at<bf16>(kExpIn);
   bf16* pout = s.at<bf16>(kExpOut);
   k::gather_rows(hn, eidx, pin, P, D, st);
-
-  uint16_t* xh1 = s.at<uint16_t>(kXh1);
-  uint16_t* xh3 = s.at<uint16_t>(kXh3);
-  uint16_t* xh2 = s.at<uint16_t>(kXh2);
-  bf16* h1 = s.at<bf16>(kExpGate);
-  bf16* h3 = s.at<bf16>(kExpUp);
-  const int* nt = &plan->n_local_tiles;
-  k::exl3_xform_in(pin, D, row_expert, w.tab(0, 1, E), xh1, P, D, false, st);
-  k::exl3_xform_in(pin, D, row_expert, w.tab(1, 1, E), xh3, P, D, false, st);
-  if (T <= 8) {  // every expert has <= 8 rows: the GEMVs
-    float* yp = s.at<float>(kYp);
-    k::exl3_grouped_gemv(xh1, D, lt, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], yp, h1, I, I, st, nt);
-    k::exl3_grouped_gemv(xh3, D, lt, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], yp, h3, I, I, st, nt);
-    k::exl3_swiglu_xform(h1, h3, ewt, row_expert, w.tab(2, 1, E), xh2, P, I, c.swiglu_limit, st, false);
-    k::exl3_grouped_gemv(xh2, I, lt, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], yp, pout, D, D, st, nt);
-  } else {
-    k::exl3_grouped_gemm(xh1, D, lt, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], h1, I, I, st, nt);
-    k::exl3_grouped_gemm(xh3, D, lt, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], h3, I, I, st, nt);
-    k::exl3_swiglu_xform(h1, h3, ewt, row_expert, w.tab(2, 1, E), xh2, P, I, c.swiglu_limit, st, false);
-    k::exl3_grouped_gemm(xh2, I, lt, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], pout, D, D, st, nt);
+  if (any_remote) {  // the remote block [remote0, P) to the APU, which starts once the card stream gets here
+    k::copy_remote_rows(pin, remote->in_host, plan, D, P, st);
+    remote->enqueue(w.layer, st, P);
   }
+  const Glm5ExpertBufs eb{s.at<uint16_t>(kXh1), s.at<uint16_t>(kXh3), s.at<uint16_t>(kXh2), s.at<bf16>(kExpGate),
+                          s.at<bf16>(kExpUp), s.at<float>(kYp)};
+  glm5_experts_dev(c, w, pin, ewt, row_expert, lt, max_tiles, &plan->n_local_tiles, P, eb, pout, st);
   bf16* sh = s.at<bf16>(kShared);
   mlp(c, w.sh_gate, w.sh_up, w.sh_down, hn, T, sh, s, st);
+  if (any_remote) {
+    remote->join(st);
+    k::copy_remote_rows(remote->out_host, pout, plan, D, P, st);
+  }
   k::moe_combine(pout, pidx, sh, out, T, K, D, st);
 }
 
@@ -304,7 +325,7 @@ void prepare_glm5_fast(const Glm5Config& c, Glm5LayerWeights& w, int dev, hipStr
                      &w.kv_b, &w.idx_wq_b, &w.idx_wk, &w.idx_wproj, &w.idx_gate, &w.gate, &w.up, &w.down, &w.router,
                      &w.sh_gate, &w.sh_up, &w.sh_down})
     prepare_linear(*l, dev, st);
-  if (!w.kda) {  // the absorbed attention's per-head weights
+  if (!w.kda && w.kv_b) {  // the absorbed attention's per-head weights (not on an experts-only copy)
     const int H = c.n_heads, dn = c.nope_dim, dv = c.v_dim, r = c.kv_lora;
     for (DevTensor* t : {&w.w_ukT, &w.w_uv}) {
       const size_t n = size_t(H) * (t == &w.w_ukT ? dn : dv) * r;
@@ -348,7 +369,8 @@ void prepare_glm5_fast_head(Glm5HeadWeights& h, int dev, hipStream_t st) {
 }
 
 void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache,
-                             const Glm5Scratch& s, uint16_t* x, const Glm5Batch& b, hipStream_t st) {
+                             const Glm5Scratch& s, uint16_t* x, const Glm5Batch& b, hipStream_t st,
+                             RemoteExperts* remote) {
   const int T = b.T, D = c.dim, hc = c.hc_mult;
   if (T > s.max_tokens) throw std::runtime_error("glm5_layer_forward_fast: batch larger than the scratch");
   bf16* h = s.at<bf16>(kH);
@@ -367,7 +389,7 @@ void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm
   hc_pre(c, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, x, h, post, comb, T, s, st);
   norm(h, w.post_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
   if (w.dense) mlp(c, w.gate, w.up, w.down, hn, T, out, s, st);
-  else moe_fast(c, w, s, hn, out, T, st);
+  else moe_fast(c, w, s, hn, out, T, st, remote);
   k::hc_post_slices(out, x, post, comb, x, T, hc, D, st);
 }
 
@@ -427,6 +449,36 @@ Glm5PagedCache make_glm5_paged_cache(const Glm5Config& c, int layer, int slots, 
   }
   UH_CHECK(hipStreamSynchronize(st));
   return k;
+}
+
+}  // namespace unholy::model
+
+namespace unholy::model {
+
+void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
+                      const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
+                      int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st) {
+  const int D = c.dim, I = c.moe_inter, E = c.n_experts;
+  max_tiles = std::min(max_tiles, P);  // every tile has >= 1 row
+  k::exl3_xform_in(in, D, row_expert, w.tab(0, 1, E), b.xh1, P, D, false, st);
+  k::exl3_xform_in(in, D, row_expert, w.tab(1, 1, E), b.xh3, P, D, false, st);
+  if (P / c.n_active <= 8) {  // <= 8 tokens: every expert has <= 8 rows -> the GEMVs
+    k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I, I, st,
+                         ntiles_dev);
+    k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I, I, st,
+                         ntiles_dev);
+    k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false);
+    k::exl3_grouped_gemv(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], b.yp, out, D, D, st,
+                         ntiles_dev);
+    return;
+  }
+  k::exl3_grouped_gemm(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.h1, I, I, st,
+                       ntiles_dev);
+  k::exl3_grouped_gemm(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.h3, I, I, st,
+                       ntiles_dev);
+  k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false);
+  k::exl3_grouped_gemm(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], out, D, D, st,
+                       ntiles_dev);
 }
 
 }  // namespace unholy::model

@@ -138,10 +138,11 @@ install(TARGETS unholy-glm-ref RUNTIME DESTINATION bin)
 add_library(unholy_engine STATIC
   src/engine/plan.cpp
   src/engine/resident.hip
+  src/engine/glm5_resident.hip
 )
 set_source_files_properties(src/engine/plan.cpp PROPERTIES LANGUAGE HIP)
 target_include_directories(unholy_engine PUBLIC src third_party)
-target_link_libraries(unholy_engine PUBLIC unholy_ref)
+target_link_libraries(unholy_engine PUBLIC unholy_ref unholy_glm)
 
 add_executable(unholy-resident-test tools/resident_test/main.hip)
 target_link_libraries(unholy-resident-test PRIVATE unholy_engine)
@@ -157,7 +158,7 @@ target_compile_definitions(unholy PRIVATE UNHOLY_DATA_DIR="${CMAKE_INSTALL_PREFI
 target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
 install(TARGETS unholy unholy-text-test unholy-sched-test unholy-vision-test RUNTIME DESTINATION bin)
 install(FILES data/expert_profile_dsv4engine_code32k.txt data/expert_profile_unholy_mixed.txt
-              data/expert_profile_unholy_code32k.txt DESTINATION share/unholy)
+              data/expert_profile_unholy_code32k.txt data/expert_profile_glm53_mixed.txt DESTINATION share/unholy)
 
 # Requests through the engine on one thread (no HTTP): token-for-token comparisons of builds under concurrency.
 add_executable(unholy-engine-batch tools/engine_batch/main.cpp)

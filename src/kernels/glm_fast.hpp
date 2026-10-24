@@ -47,6 +47,27 @@ void glm_idx_scores(const bf16* q, const bf16* w, GlmPaged pg, const int32_t* po
 // pages. qa / o bf16 [n][64][512].
 void glm_mla_attn(const bf16* qa, const int32_t* idx, int w, GlmPaged pg, bf16* o, int n, float scale, hipStream_t st);
 
+// The sigmoid router (kernels::route_sigmoid's selection and weights), one block per token.
+void glm_route(const float* logits, const float* bias, int32_t* sel, float* weights, int T, int E, int K, float scale,
+               hipStream_t st);
+
+// KDA delta rule (kernels::kda_recurrent's math) in two passes: glm_kda_prep normalizes each token's q and k per head
+// (q also scaled by D^-0.5) and takes exp of the forget gate, all fp32 [T][H][D]; glm_kda_recurrent then runs every
+// chunk's tokens in order, one block per (head, chunk), 16 tokens per LDS tile. v: bf16 rows of H * D (stride ldv),
+// beta bf16 [T][H], state f32 [slot][H][D][D] (k index major), o bf16 [T][H][D].
+struct GlmKdaChunk {
+  int t0, n, slot;
+};
+struct GlmKdaBatch {
+  static constexpr int kMax = 64;
+  int nchunks = 0;
+  GlmKdaChunk c[kMax];
+};
+void glm_kda_prep(const bf16* q, const bf16* k, int ld, const float* g, float* qn, float* kn, float* eg, int T, int H,
+                  int D, hipStream_t st);
+void glm_kda_recurrent(const float* qn, const float* kn, const float* eg, const bf16* v, int ldv, const bf16* beta,
+                       float* state, bf16* o, const GlmKdaBatch& b, int H, int D, hipStream_t st);
+
 // Grouped bf16 GEMM over heads (gemm_wmma's bf16 kernel with groups): c [M, G, R] = a [M, G, K] . w[g]^T, w [G][R][K].
 void gemm_grouped_bf16_wmma(const bf16* a, const bf16* w, bf16* c, int M, int G, int R, int K, hipStream_t st);
 

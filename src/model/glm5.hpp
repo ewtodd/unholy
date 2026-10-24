@@ -23,11 +23,16 @@
 
 #include "gufo/json.hpp"
 #include "kernels/ref_glm.hpp"
+#include "kernels/exl3_moe.hpp"
 #include "model/dsv4.hpp"
+#include "model/forward_ref.hpp"
 #include "model/safetensors.hpp"
 #include "rt/hip.hpp"
+#include "rt/arena.hpp"
 
 namespace unholy::model {
+
+class Uploader;
 
 struct Glm5Config {
   int vocab = 0, dim = 0, n_layers = 0;
@@ -100,6 +105,11 @@ struct Glm5LoadOptions {
                                         // indexer's pooling weights): the FP8 release
   bool load_experts = true;
   bool kda_fp8 = false;  // re-quantize the KDA q / k / v / o projections (bf16 in the release) to 128x128 block fp8
+  bool load_dense = true;                         // attention, norms, router, shared expert (false: experts only)
+  const std::vector<uint8_t>* expert_mask = nullptr;  // [n_experts] 1 = load this routed expert (null: all)
+  rt::Arena* arena = nullptr;                     // allocate the weights from here (null: one buffer each)
+  Uploader* up = nullptr;                         // reuse pinned staging across layers (per checkpoint)
+  Uploader* experts_up = nullptr;
 };
 // Loads one layer to `dev` (synchronously).
 Glm5LayerWeights load_glm5_layer(const Checkpoint& ck, const Glm5Config& c, int layer, int dev, hipStream_t st,
@@ -147,8 +157,9 @@ enum Glm5Buf : int {
   kF32Rows, kF32Hn, kSel, kRouteW, kPairTok, kPairW, kPairIdx,            // MoE
   kExpIn, kExpGate, kExpUp, kExpAct, kExpOut, kShared,
   kExl3X, kExl3Y, kHeadOut,                                               // EXL3 sides, head
-  kDenseTiles, kZeroRows, kHcPart,                                        // fast path
+  kDenseTiles, kZeroRows, kHcPart, kKdaQ, kKdaK, kKdaE,                   // fast path
   kMoeCount, kMoeOff, kMoeFill, kMoePlan, kMoeLTiles, kMoeRTiles, kEIdx, kEWt, kRowExpert, kXh1, kXh3, kXh2, kYp,
+  kRouteHist,
   kGlm5ScratchBufs
 };
 constexpr int kIdxBlock = 64;  // queries per index-score pass
@@ -162,6 +173,11 @@ struct Glm5Scratch {
   }
 };
 Glm5Scratch make_glm5_scratch(const Glm5Config& c, int dev, int max_tokens, int max_seq);
+size_t glm5_scratch_bytes(const Glm5Config& c, int max_tokens, int max_seq);
+// Device bytes of a layer's dense part (everything but routed experts) as the fast path holds it (fp16 tensors also
+// converted to bf16, kv_b also split per head), and of one routed expert.
+size_t glm5_dense_layer_bytes(const Checkpoint& ck, int layer);
+size_t glm5_expert_bytes(const Checkpoint& ck, int layer, int expert);
 
 // Optional per-layer routing histogram ([layer][expert] counts), filled when set.
 void set_glm5_expert_histogram(std::vector<std::vector<uint64_t>>* hist);
@@ -210,8 +226,20 @@ size_t glm5_paged_cache_bytes(const Glm5Config& c, bool kda, int slots, int num_
 // bf16 values as fp16; converting back is exact for them), the routed experts' grouped tables.
 void prepare_glm5_fast(const Glm5Config& c, Glm5LayerWeights& w, int dev, hipStream_t st);
 void prepare_glm5_fast_head(Glm5HeadWeights& h, int dev, hipStream_t st);
+// The layer on the fast kernels; routed experts this device does not hold run through `remote` (the APU).
 void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache,
-                             const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st);
+                             const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st,
+                             RemoteExperts* remote = nullptr);
+// Routed experts of `w` that this device holds, over the pair rows of the tiles (*ntiles_dev of max_tiles run): in
+// bf16 [P, dim] with routing weights rw [P] and row_expert [P] -> out bf16 [P, dim] for the tiles' rows.
+struct Glm5ExpertBufs {
+  uint16_t *xh1, *xh3, *xh2;  // fp16 [P, dim], [P, dim], [P, moe_inter]
+  uint16_t *h1, *h3;          // bf16 [P, moe_inter]
+  float* yp;                  // fp32 [min(P, 64), max(dim, moe_inter)] (GEMV steps)
+};
+void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
+                      const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
+                      int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st);
 void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* x,
                             int T, float* logits, hipStream_t st);
 }  // namespace unholy::model

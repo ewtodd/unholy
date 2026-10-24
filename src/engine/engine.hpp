@@ -98,6 +98,7 @@ struct EngineConfig {
   int max_batch_tokens = 2048;  // rows per step (<= the model's max_tokens)
   int max_running = 0;          // concurrent sequences (<= the model's slots); 0 = all slots
   int eos_id = 1;
+  std::vector<int32_t> eos_ids;  // more end-of-sequence tokens (GLM: <|user|>, <|observation|>)
   int max_context = 0;          // positions per sequence; 0 = the block table's reach
   uint64_t seed = 0;            // base for requests without a seed
   bool prefix_cache = true;      // when the model keeps snapshots

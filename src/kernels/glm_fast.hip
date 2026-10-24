@@ -137,8 +137,9 @@ __global__ __launch_bounds__(256) void idx_scores_kernel(const bf16* q, const bf
 #pragma unroll
     for (int ct = 0; ct < 4; ++ct) {
       const int p = p0 + ct * 16 + lane;
-      if (p < npool) out[size_t(t) * ld + p] = p * POOL + POOL - 1 <= pt ? sPart[wave][ct][lane] + sPart[wave + 1][ct][lane]
-                                                                       : -INFINITY;
+      if (p >= npool) continue;
+      const float v = sPart[wave][ct][lane] + sPart[wave + 1][ct][lane];
+      out[size_t(t) * ld + p] = p * POOL + POOL - 1 <= pt ? v : -INFINITY;
     }
   }
 #endif
@@ -146,8 +147,8 @@ __global__ __launch_bounds__(256) void idx_scores_kernel(const bf16* q, const bf
 
 constexpr int H = 64, KB = 16, NT = 256;
 
-__global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q, const int32_t* __restrict__ idx, int w,
-                                                      GlmPaged pg, bf16* __restrict__ o, float scale) {
+__global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q, const int32_t* __restrict__ idx,
+                                                      int w, GlmPaged pg, bf16* __restrict__ o, float scale) {
 #if defined(UH_GFX12)
   __shared__ alignas(16) uint16_t sK[KB][R + 8];   // [key][dim]
   __shared__ alignas(16) uint16_t sVt[R][KB + 8];  // [dim][key]
@@ -285,6 +286,121 @@ __global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q
 #endif
 }
 
+__device__ __forceinline__ float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+// One block of 128 threads per token: K rounds of a block-wide argmax of sigmoid(logit) + bias (ties: lower index).
+__global__ __launch_bounds__(128) void route_kernel(const float* logits, const float* bias, int32_t* sel,
+                                                    float* weights, int E, int K, float scale) {
+  __shared__ float sv[512];
+  __shared__ float rv[4];
+  __shared__ int ri[4];
+  __shared__ int chosen[16];
+  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const float* lr = logits + size_t(t) * E;
+  for (int e = tid; e < E; e += 128) sv[e] = sigmoidf(lr[e]) + bias[e];
+  __syncthreads();
+  for (int k = 0; k < K; ++k) {
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
+    for (int e = tid; e < E; e += 128)
+      if (sv[e] > bv) bv = sv[e], bi = e;  // ascending e: the lowest index among equals
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor(bv, o, 32);
+      const int oi = __shfl_xor(bi, o, 32);
+      if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    }
+    if (lane == 0) rv[warp] = bv, ri[warp] = bi;
+    __syncthreads();
+    if (tid == 0) {
+      for (int w = 1; w < 4; ++w)
+        if (rv[w] > rv[0] || (rv[w] == rv[0] && ri[w] < ri[0])) rv[0] = rv[w], ri[0] = ri[w];
+      chosen[k] = ri[0];
+      sv[ri[0]] = -INFINITY;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    for (int a = 1; a < K; ++a)
+      for (int b = a; b > 0 && chosen[b - 1] > chosen[b]; --b) {
+        const int x = chosen[b];
+        chosen[b] = chosen[b - 1];
+        chosen[b - 1] = x;
+      }
+    float s[16], sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      s[k] = sigmoidf(lr[chosen[k]]);
+      sum += s[k];
+    }
+    for (int k = 0; k < K; ++k) {
+      sel[size_t(t) * K + k] = chosen[k];
+      weights[size_t(t) * K + k] = s[k] / (sum + 1e-20f) * scale;
+    }
+  }
+}
+
+// One block of D threads per (token, head): kernels::kda_recurrent's normalization (block_sum, / sqrt(+ 1e-6)).
+__global__ void kda_prep_kernel(const bf16* q, const bf16* k, int ld, const float* g, float* qn, float* kn, float* eg,
+                                int H, int D) {
+  __shared__ float red[32];
+  const int t = blockIdx.x / H, h = blockIdx.x % H, j = threadIdx.x;
+  const float qv = bf16_to_f32(q[size_t(t) * ld + size_t(h) * D + j]);
+  const float kv = bf16_to_f32(k[size_t(t) * ld + size_t(h) * D + j]);
+  const float qs = block_sum(qv * qv, red);
+  const float ks = block_sum(kv * kv, red);
+  const size_t o = (size_t(t) * H + h) * D + j;
+  qn[o] = qv / sqrtf(qs + 1e-6f) * (1.0f / sqrtf(float(D)));
+  kn[o] = kv / sqrtf(ks + 1e-6f);
+  eg[o] = expf(g[o]);
+}
+
+// One block per (head, chunk), thread j owns state column j in registers; tokens 16 at a time through LDS. The
+// arithmetic per token is kernels::kda_recurrent's.
+template <int D>
+__global__ __launch_bounds__(D) void kda_recurrent_kernel(const float* qn, const float* kn, const float* eg,
+                                                          const bf16* v, int ldv, const bf16* beta, float* state,
+                                                          bf16* o, GlmKdaBatch b, int H) {
+  constexpr int TT = 16;
+  __shared__ float sq[TT][D], sk[TT][D], se[TT][D];
+  __shared__ float sb[TT];
+  const int h = blockIdx.x, j = threadIdx.x;
+  const GlmKdaChunk ch = b.c[blockIdx.y];
+  float* sh = state + (size_t(ch.slot) * H + h) * D * D;
+  float s[D];
+#pragma unroll
+  for (int i = 0; i < D; ++i) s[i] = sh[size_t(i) * D + j];
+  for (int t0 = 0; t0 < ch.n; t0 += TT) {
+    const int m = min(TT, ch.n - t0);
+    __syncthreads();
+    for (int i = 0; i < m; ++i) {
+      const size_t at = (size_t(ch.t0 + t0 + i) * H + h) * D + j;
+      sq[i][j] = qn[at];
+      sk[i][j] = kn[at];
+      se[i][j] = eg[at];
+    }
+    if (j < m) sb[j] = bf16_to_f32(beta[size_t(ch.t0 + t0 + j) * H + h]);
+    __syncthreads();
+    for (int i = 0; i < m; ++i) {
+      const size_t t = size_t(ch.t0 + t0 + i);
+      float mem = 0.0f;
+#pragma unroll
+      for (int d = 0; d < D; ++d) {
+        s[d] *= se[i][d];
+        mem = fmaf(s[d], sk[i][d], mem);
+      }
+      const float delta = (bf16_to_f32(v[t * ldv + size_t(h) * D + j]) - mem) * sb[i];
+      float out = 0.0f;
+#pragma unroll
+      for (int d = 0; d < D; ++d) {
+        s[d] = fmaf(sk[i][d], delta, s[d]);
+        out = fmaf(s[d], sq[i][d], out);
+      }
+      o[(t * H + h) * D + j] = f32_to_bf16(out);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < D; ++i) sh[size_t(i) * D + j] = s[i];
+}
+
 }  // namespace
 
 void glm_store_latent(const bf16* lat, GlmPaged pg, int s0, int n, hipStream_t st) {
@@ -318,6 +434,34 @@ void glm_idx_scores(const bf16* q, const bf16* w, GlmPaged pg, const int32_t* po
 void glm_mla_attn(const bf16* qa, const int32_t* idx, int w, GlmPaged pg, bf16* o, int n, float scale, hipStream_t st) {
   if (n <= 0) return;
   mla_attn_kernel<<<n, NT, 0, st>>>(qa, idx, w, pg, o, scale);
+  UH_CHECK_LAUNCH();
+}
+
+}  // namespace unholy::kernels
+
+namespace unholy::kernels {
+
+void glm_route(const float* logits, const float* bias, int32_t* sel, float* weights, int T, int E, int K, float scale,
+               hipStream_t st) {
+  if (E > 512 || K > 16) throw std::runtime_error("glm_route: E > 512 or K > 16");
+  if (T <= 0) return;
+  route_kernel<<<T, 128, 0, st>>>(logits, bias, sel, weights, E, K, scale);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_kda_prep(const bf16* q, const bf16* k, int ld, const float* g, float* qn, float* kn, float* eg, int T, int H,
+                  int D, hipStream_t st) {
+  if (D != 128) throw std::runtime_error("glm_kda_prep: head dim must be 128");
+  if (T <= 0) return;
+  kda_prep_kernel<<<T * H, D, 0, st>>>(q, k, ld, g, qn, kn, eg, H, D);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_kda_recurrent(const float* qn, const float* kn, const float* eg, const bf16* v, int ldv, const bf16* beta,
+                       float* state, bf16* o, const GlmKdaBatch& b, int H, int D, hipStream_t st) {
+  if (D != 128) throw std::runtime_error("glm_kda_recurrent: head dim must be 128");
+  if (b.nchunks <= 0) return;
+  kda_recurrent_kernel<128><<<dim3(H, b.nchunks), 128, 0, st>>>(qn, kn, eg, v, ldv, beta, state, o, b, H);
   UH_CHECK_LAUNCH();
 }
 
