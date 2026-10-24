@@ -489,17 +489,30 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
 #pragma unroll
   for (int m = 0; m < GV_ROWS; ++m) acc[m][0] = acc[m][1] = 0.0f;
 
-  for (int kc = 0; kc < K; kc += GV_KC) {
-    for (int i = tid; i < M * GV_KC; i += GV_NT) {
-      const int m = i / GV_KC, k = i % GV_KC;
-      reinterpret_cast<uint16_t*>(sX[m])[k] = xh[size_t(tile.row0 + m) * K + kc + k];
+  // The input in chunks of GV_ROWS * GV_KC values over the tile's rows (a single row: 4096 columns per chunk, so few
+  // block barriers); wave w takes the chunk's k-tiles w, w + 8, ... (the global order of the 512-column chunks: the same
+  // sums), each tile's words loaded into registers one tile ahead of its decode.
+  const int chunk = max(GV_KC, GV_ROWS * GV_KC / max(M, 1) / GV_KC * GV_KC);
+  _Float16* sx = &sX[0][0];
+  for (int kc = 0; kc < K; kc += chunk) {
+    const int kn = min(chunk, K - kc), nkt = kn / 16;
+    for (int i = tid; i < M * kn; i += GV_NT) {
+      const int m = i / kn, k = i % kn;
+      reinterpret_cast<uint16_t*>(sx)[m * chunk + k] = xh[size_t(tile.row0 + m) * K + kc + k];
     }
     __syncthreads();
-    // GV_KC / 16 = 32 k-tiles in this chunk; wave w takes w, w + 8, ...
-    for (int kt = wave; kt < GV_KC / 16; kt += 8) {
+    uint32_t pf0 = 0, pf1 = 0;
+    const auto fetch = [&](int kt) {
       const size_t ti = size_t((kc / 16) + kt) * tiles_n + nb;
-      for (int i = lane; i < NW; i += 32) sW[wave][i] = trellis[ti * NW + i];
+      if (lane < NW) pf0 = trellis[ti * NW + lane];
+      if (32 + lane < NW) pf1 = trellis[ti * NW + 32 + lane];
+    };
+    if (wave < nkt) fetch(wave);
+    for (int kt = wave; kt < nkt; kt += 8) {
+      if (lane < NW) sW[wave][lane] = pf0;
+      if (32 + lane < NW) sW[wave][32 + lane] = pf1;
       __builtin_amdgcn_wave_barrier();
+      if (kt + 8 < nkt) fetch(kt + 8);
       float wv[8];
       {
         uint32_t p[4];
@@ -511,8 +524,9 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
       __builtin_amdgcn_wave_barrier();
       const int kb = kt * 16;
       for (int m = 0; m < M; ++m) {
-        const float x0 = float(sX[m][kb + r0]), x1 = float(sX[m][kb + r0 + 1]);
-        const float x8 = float(sX[m][kb + r0 + 8]), x9 = float(sX[m][kb + r0 + 9]);
+        const _Float16* xr = sx + m * chunk + kb;
+        const float x0 = float(xr[r0]), x1 = float(xr[r0 + 1]);
+        const float x8 = float(xr[r0 + 8]), x9 = float(xr[r0 + 9]);
         // j: 0 (r0,c0) 1 (r0+1,c0) 2 (r0+8,c0) 3 (r0+9,c0) 4..7 the same rows at c0+8
         acc[m][0] += wv[0] * x0 + wv[1] * x1 + wv[2] * x8 + wv[3] * x9;
         acc[m][1] += wv[4] * x0 + wv[5] * x1 + wv[6] * x8 + wv[7] * x9;
