@@ -190,11 +190,12 @@ int main(int argc, char** argv) {
       pin.max_logit_rows = std::max(max_slots * (mtp ? 2 : 1), 8);
       pin.card_margin = size_t(card_margin_gb * double(1ull << 30));
       pin.mtp = mtp;
+      pin.snapshots = prefix_snapshots;
       const auto plan = engine::make_glm5_plan(pin);
       std::printf("%s", plan.summary().c_str());
       std::fflush(stdout);
       model_ptr = std::make_unique<engine::Glm5ResidentModel>(*gc, *ck, plan, geo, max_batch, max_seq,
-                                                               pin.max_logit_rows, mtp);
+                                                               pin.max_logit_rows, mtp, plan.snapshots);
       for (const char* t : {"<|endoftext|>", "<|user|>", "<|observation|>"}) eos.push_back(tok.token_id(t));
     } else {
       dc = std::make_unique<model::Dsv4Config>(model::Dsv4Config::from_hf(ck->config()));

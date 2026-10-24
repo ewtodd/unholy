@@ -19,7 +19,7 @@ body() {
   done
   local rc=0
   URL=http://localhost:8300 RUN=$d "$@" || rc=$?
-  pkill -f "unholy serve --model $GLM_B" || true
+  stop_server "unholy serve --model $GLM_B" || rc=1
   wait $pid 2>/dev/null || true
   return $rc
 }

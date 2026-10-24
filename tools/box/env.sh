@@ -34,6 +34,20 @@ run_dir() {
 # in_nix CMD...: run inside the tree's dev shell (the binaries need the TheRock ROCm environment).
 in_nix() { (cd "$BOX_TREE" && exec nix develop -c "$@"); }
 
+# stop_server PATTERN: SIGTERM to the processes whose command line matches PATTERN (pgrep -f), then wait until they
+# are gone. `nix develop -c` runs its command in a session of its own, so signalling the wrapper's process group
+# does not reach the server, and waiting for the wrapper returns while the server still holds the GPUs.
+stop_server() {
+  pkill -f "$1" || return 0
+  local i
+  for i in $(seq 1 120); do
+    pgrep -f "$1" >/dev/null || return 0
+    sleep 1
+  done
+  echo "stop_server: still running after 120 s: $1" >&2
+  return 1
+}
+
 # with_gpus CMD...: stop every llm-mode service, run CMD, then restore the mode that was serving, also
 # when CMD fails or is interrupted. son-of-anton may manage these units without sudo (polkit).
 # Inside tools/box/hold.sh the services are already down and stay down: CMD just runs, once no unit is still

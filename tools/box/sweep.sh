@@ -11,12 +11,12 @@ d=$(run_dir "sweep-$label")
 port=${PORT:-8300}
 
 sweep() {
-  # its own process group, so stopping it also stops what nix develop started
+  # stopped by stop_server on return (signalling this process group does not reach the server: see env.sh)
   setsid bash -c 'cd "$1" && shift && exec nix develop -c "$@"' _ "$BOX_TREE" "$BUILD/unholy" serve \
     --model "$MODEL" --profile "$PROFILE" --host 127.0.0.1 --port "$port" --served-model-name dsv4-flash \
     "${SERVE_FLAGS[@]}" "$@" > "$d/server.log" 2>&1 &
   local srv=$!
-  trap 'kill -- -'"$srv"' 2>/dev/null; wait '"$srv"' 2>/dev/null' RETURN
+  trap 'stop_server "unholy serve .*--port '"$port"'"; wait '"$srv"' 2>/dev/null' RETURN
   until curl -fs "http://127.0.0.1:$port/v1/models" >/dev/null; do
     kill -0 $srv 2>/dev/null || { echo "server exited; see $d/server.log" >&2; return 1; }
     sleep 5
