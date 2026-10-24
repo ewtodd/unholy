@@ -1286,3 +1286,29 @@ cold experts and the 4 GB margin: 57 in the production geometry without MTP, 16 
 this box: `ttm.page_pool_size` lets TTM keep freed pages, which it reports as used. Reuse is bit-identical to a run
 without snapshots, with and without MTP. With 57 snapshots the host has ~2 GB available (no swapping), so MTP,
 snapshots and the KV pool now compete for the same RAM.
+
+## 2026-10-24 — GLM prefill waits on the host link; compact inputs (+18%, exact), combined outputs parked
+
+A kernel trace of a 256k-token prefill (4096-token steps, `tools/box` + rocprofv3) put neither side near saturation:
+per shallow step (3.35 s) each card computed ~1.6 s and the APU ~2.0 s, the rest waiting. Each MoE layer moved its
+APU-routed pair rows (~120 MB at 4096 tokens: 8 experts, ~45% on the APU, dim 4096) to the APU and back through the
+host link both cards share behind the PCIe switch, at ~6-7 GB/s: ~20 ms per copy, ~0.9 s per step per card on the
+critical path. The APU's input transforms also launched over every pair row of the step (~1M one-segment workgroups
+per layer, most exiting at once): 0.67 s of its 2.65 s per step. The indexer and the KDA recurrence, the suspects
+before the trace, are ~0.3 s and 0.2 s per card per step even at 250k.
+
+- Compact inputs (3b1c7f1): one bf16 row per token with a remote pair crosses instead of one per remote pair (3.6x
+  fewer bytes; the APU reads pair row p from token row p2u[p]); the transforms loop over a device row range with a
+  capped grid. Same values, same arithmetic: GLM tokens and logprobs bit-identical with and without MTP, DSV4
+  validate bit-identical. Traced step 3.39 -> 2.99 s; served 11.7k-token prompt 857 -> 1007 tok/s.
+- Combined outputs (branch `glm-combined-outputs`, not merged): the APU sums each token's remote pairs into one fp32
+  row (0.56x the output bytes). The combine's fp32 sum is regrouped, so outputs move: logprobs by up to 0.075 (0.27
+  with MTP) on the prefix pair, 4 of 16 greedy GSM8K requests token-identical (all 16 final answers the same). +4%
+  served prefill (+8% traced) is not worth giving up bit-exactness, which a GLM resident-vs-reference check (like
+  DSV4's validate) would need.
+- At depth the APU's expert time grows (1.8 -> 3.1 s per step at 250k) while the cards' shrinks, on a curve that
+  repeats a 32k-token file: a routing shift toward cold experts, to be checked on real long prompts.
+
+Throughput, engine-batch on the GSM8K set with production flags (MTP for GLM, DSpark for DSV4): GLM 24.0 / 29.0 /
+32.6 / 44.6 tok/s at concurrency 1 / 2 / 4 / 8, DSV4 37.9 / 48.1 / 55.3 / 63.6. check-source's sweep was not run: its
+CLI is changing (`--max-tokens` required, levels none / medium / xhigh).
