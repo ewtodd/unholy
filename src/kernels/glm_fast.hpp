@@ -29,9 +29,9 @@ struct GlmPaged {
 // (block 64, amax floored at 1e-4, power-of-two scale).
 void glm_store_latent(const bf16* lat, GlmPaged pg, int s0, int n, hipStream_t st);
 
-// Pools completed by positions [s0, s0 + n) of one sequence: keys k / gate scores g of the chunk's rows (bf16 [n][128]),
-// the slot's tail (k, g: bf16 [4][128], positions s0 - s0 % 4 ..  s0 - 1 at index pos % 4) for the pool the chunk
-// starts inside; kernels::idx_pool's arithmetic (ape f32 [4][128]); pooled keys into the slot's pages. Then the
+// Pools completed by positions [s0, s0 + n) of one sequence: keys k / gate scores g of the chunk's rows (bf16
+// [n][128]), the slot's tail (k, g: bf16 [4][128], positions s0 - s0 % 4 .. s0 - 1 at index pos % 4) for the pool the
+// chunk starts inside; kernels::idx_pool's arithmetic (ape f32 [4][128]); pooled keys into the slot's pages. Then the
 // tail takes the chunk's last <= 4 positions (also when they complete a pool: a rejected draft can reopen it).
 void glm_pool_keys(const bf16* k, const bf16* g, bf16* tail_k, bf16* tail_g, const float* ape, GlmPaged pg, int s0,
                    int n, hipStream_t st);
@@ -43,9 +43,10 @@ void glm_idx_scores(const bf16* q, const bf16* w, GlmPaged pg, const int32_t* po
                     int npool, float scale, hipStream_t st);
 
 // Absorbed NoPE MLA (kernels::mla_attn's math with bf16 queries and bf16-rounded probabilities, WMMA on gfx12): one
-// block per query, all 64 heads over the fp8 latent rows of positions idx[t][0 .. w) (-1 skipped) of the slot's
-// pages. qa / o bf16 [n][64][512].
-void glm_mla_attn(const bf16* qa, const int32_t* idx, int w, GlmPaged pg, bf16* o, int n, float scale, hipStream_t st);
+// block per query, all 64 heads over the fp8 latent rows of positions idx[t][0 .. glm_sel_count(pos[t])) (a compact
+// list, glm_idx_expand; -1 skipped) of the slot's pages. qa / o bf16 [n][64][512].
+void glm_mla_attn(const bf16* qa, const int32_t* idx, int w, const int32_t* pos, GlmPaged pg, bf16* o, int n,
+                  float scale, hipStream_t st);
 
 // The sigmoid router (kernels::route_sigmoid's selection and weights), one block per token.
 void glm_route(const float* logits, const float* bias, int32_t* sel, float* weights, int T, int E, int K, float scale,
@@ -81,6 +82,31 @@ void glm_mtp_cat(const bf16* emb, const bf16* h, const bf16* enorm, const bf16* 
                  float eps, hipStream_t st);
 // Per row of logits [rows][V]: the argmax (ties: lower id) and its softmax probability.
 void glm_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, hipStream_t st);
+
+// Top-k (desc, ties: lower index, -1 padded) of each of the n rows of scores [n][ld] over cols [0, cols): one block per
+// row when cols <= kGlmTopkSeg, else two stages (each 4096-column segment's top k, then their candidates') through
+// cand ([n][ceil(cols / seg)][k] values and indices; glm_topk_cand_bytes). k <= 1024. idx [n][k].
+constexpr int kGlmTopkSeg = 4096;
+size_t glm_topk_cand_bytes(int rows, int cols, int k);
+void glm_topk(const float* scores, int ld, int n, int cols, int k, int32_t* idx, void* cand, hipStream_t st);
+// glm_mla_attn for decode-sized calls: the keys split over `splits` workgroups per query (partial softmax states in
+// part: glm_mla_part_bytes), then combined. The same keys and arithmetic per split as the fused kernel's blocks.
+size_t glm_mla_part_bytes(int n, int splits);
+void glm_mla_attn_split(const bf16* qa, const int32_t* idx, int w, const int32_t* pos, GlmPaged pg, bf16* o, int n,
+                        float scale, int splits, float* part, hipStream_t st);
+// kernels::moe_combine's arithmetic (fp32 sum of each token's pair rows in pidx order, + shared, one rounding) over
+// (token, 256-dim slice) workgroups: a decode step's few tokens do not run on one workgroup each.
+void glm_moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
+                     hipStream_t st);
+
+// The selection as a compact token list: selected pools [n][k] (the top-k's output: valid pools first) -> idx [n][w]
+// (w = k * pool + pool - 1): the pools' tokens, then the query's incomplete pool, then -1. A query at position p has
+// glm_sel_count(p) entries (every complete pool is visible and scored, so min((p + 1) / pool, k) are valid).
+void glm_idx_expand(const int32_t* pools, const int32_t* pos, int32_t* idx, int n, int k, int pool, hipStream_t st);
+__host__ __device__ inline int glm_sel_count(int p, int k, int pool) {
+  const int full = (p + 1) / pool;
+  return (full < k ? full : k) * pool + (p + 1) % pool;
+}
 
 // Grouped bf16 GEMM over heads (gemm_wmma's bf16 kernel with groups): c [M, G, R] = a [M, G, K] . w[g]^T, w [G][R][K].
 void gemm_grouped_bf16_wmma(const bf16* a, const bf16* w, bf16* c, int M, int G, int R, int K, hipStream_t st);

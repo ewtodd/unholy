@@ -7,6 +7,7 @@
 
 #include "core/half.hpp"
 #include "kernels/exl3_moe.hpp"
+#include "kernels/glm_fast.hpp"
 #include "kernels/hc_fast.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "kernels/ref.hpp"
@@ -478,6 +479,9 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       std::max(std::min<size_t>(P, 64) * std::max(D, size_t(c.moe_inter)),
                8 * std::max(3 * W, size_t(c.vocab))) * 4,  // GEMV fp32 sides
       size_t(c.n_layers + c.n_mtp) * E * 4,       // routing histogram [layer][expert] (the MTP layer last)
+      k::glm_topk_cand_bytes(kIdxBlock, std::max(max_seq / c.idx_pool + 1, 8 * k::kGlmTopkSeg),
+                             c.idx_topk / c.idx_pool),  // top-k candidates (room for >= 8 segments)
+      k::glm_mla_part_bytes(kAttnSplitRows, kAttnSplits),  // split attention's partial states
   };
   if (sizes.size() != size_t(kGlm5ScratchBufs)) throw std::logic_error("glm5 scratch: buffer list out of date");
   return sizes;

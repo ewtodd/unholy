@@ -172,10 +172,11 @@ enum Glm5Buf : int {
   kExl3X, kExl3Y, kHeadOut,                                               // EXL3 sides, head
   kDenseTiles, kZeroRows, kHcPart, kKdaQ, kKdaK, kKdaE,                   // fast path
   kMoeCount, kMoeOff, kMoeFill, kMoePlan, kMoeLTiles, kMoeRTiles, kEIdx, kEWt, kRowExpert, kXh1, kXh3, kXh2, kYp,
-  kRouteHist,
+  kRouteHist, kTopkCand, kAttnPart,
   kGlm5ScratchBufs
 };
 constexpr int kIdxBlock = 64;  // queries per index-score pass
+constexpr int kAttnSplitRows = 4, kAttnSplits = 32;  // chunks of <= 4 queries: attention over 32 key splits
 struct Glm5Scratch {
   int max_tokens = 0, max_seq = 0, head_rows = 0;
   std::vector<rt::DeviceBuffer> bufs;

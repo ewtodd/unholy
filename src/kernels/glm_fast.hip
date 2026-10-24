@@ -7,6 +7,7 @@
 #include "kernels/glm_fast.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "kernels/dev.hip.hpp"
@@ -149,8 +150,13 @@ __global__ __launch_bounds__(256) void idx_scores_kernel(const bf16* q, const bf
 
 constexpr int H = 64, KB = 16, NT = 256;
 
+// kPart: block (t, s) takes the s-th of gridDim.y equal spans of the query's entries and writes its unnormalized state
+// (acc [64][512], then m and l per head) to part instead of the output.
+template <bool kPart>
 __global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q, const int32_t* __restrict__ idx,
-                                                      int w, GlmPaged pg, bf16* __restrict__ o, float scale) {
+                                                      int w, const int32_t* __restrict__ pos, GlmPaged pg,
+                                                      bf16* __restrict__ o, float scale, float* __restrict__ part,
+                                                      int span) {
 #if defined(UH_GFX12)
   __shared__ alignas(16) uint16_t sK[KB][R + 8];   // [key][dim]
   __shared__ alignas(16) uint16_t sVt[R][KB + 8];  // [dim][key]
@@ -162,6 +168,9 @@ __global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int hg = wave >> 1, dh = wave & 1;
   const int32_t* tidx = idx + size_t(t) * w;
+  const int cnt = min(w, glm_sel_count(pos[t], (w + 1) / POOL, POOL));  // compact lists: the valid entries come first
+  if constexpr (kPart) span = ((cnt + int(gridDim.y) - 1) / int(gridDim.y) + KB - 1) / KB * KB;  // this query's share
+  const int lo = kPart ? min(cnt, int(blockIdx.y) * span) : 0, hi = kPart ? min(cnt, lo + span) : cnt;
 
   bf16x8_t qf[16];
   {
@@ -179,15 +188,15 @@ __global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q
     sL[tid] = 0.0f;
   }
   const auto row_of = [&](int e) -> int64_t {
-    if (e >= w) return -1;
+    if (e >= hi) return -1;
     const int p = tidx[e];
     return p < 0 ? -1 : int64_t(row_id(pg.table, p));
   };
-  if (tid < KB) rowbuf[0][tid] = row_of(tid);
+  if (tid < KB) rowbuf[0][tid] = row_of(lo + tid);
   __syncthreads();
-  for (int e0 = 0, buf = 0; e0 < w; e0 += KB, buf ^= 1) {
+  for (int e0 = lo, buf = 0; e0 < hi; e0 += KB, buf ^= 1) {
     const int64_t* rows = rowbuf[buf];
-    const bool look = tid >= 32 && tid < 32 + KB && e0 + KB < w;
+    const bool look = tid >= 32 && tid < 32 + KB && e0 + KB < hi;
     const int64_t next = look ? row_of(e0 + KB + tid - 32) : -1;
     // Stage 16 rows x 512 dims, dequantized (e4m3 x power-of-two scale: exact in bf16): unit u -> key u % 16,
     // 32 dims at (u / 16) * 32, all inside one 64-value scale block.
@@ -277,13 +286,28 @@ __global__ __launch_bounds__(NT) void mla_attn_kernel(const bf16* __restrict__ q
     if (look) rowbuf[buf ^ 1][tid - 32] = next;
     __syncthreads();
   }
+  if constexpr (kPart) {
+    float* pb = part + (size_t(t) * gridDim.y + blockIdx.y) * H * (R + 2);
 #pragma unroll
-  for (int e = 0; e < 8; ++e) {
-    const int h = hg * 16 + (lane >> 4) * 8 + e;
-    const float denom = sL[h];
-    bf16* orow = o + (size_t(t) * H + h) * R + dh * 256 + (lane & 15);
+    for (int e = 0; e < 8; ++e) {
+      const int h = hg * 16 + (lane >> 4) * 8 + e;
+      float* prow = pb + size_t(h) * R + dh * 256 + (lane & 15);
 #pragma unroll
-    for (int n = 0; n < 16; ++n) orow[n * 16] = f32_to_bf16(denom > 0.0f ? acc[n][e] / denom : 0.0f);
+      for (int n = 0; n < 16; ++n) prow[n * 16] = acc[n][e];
+    }
+    if (tid < H) {
+      pb[size_t(H) * R + 2 * tid] = sM[tid];
+      pb[size_t(H) * R + 2 * tid + 1] = sL[tid];
+    }
+  } else {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int h = hg * 16 + (lane >> 4) * 8 + e;
+      const float denom = sL[h];
+      bf16* orow = o + (size_t(t) * H + h) * R + dh * 256 + (lane & 15);
+#pragma unroll
+      for (int n = 0; n < 16; ++n) orow[n * 16] = f32_to_bf16(denom > 0.0f ? acc[n][e] / denom : 0.0f);
+    }
   }
 #endif
 }
@@ -492,6 +516,166 @@ __global__ __launch_bounds__(256) void argmax_conf_kernel(const float* logits, i
   }
 }
 
+// The split attention's combine: one block per (query, head), each thread two of the 512 dims.
+__global__ __launch_bounds__(256) void mla_combine_kernel(const float* part, int splits, bf16* o) {
+  const int t = blockIdx.x / H, h = blockIdx.x % H;
+  const float* base = part + size_t(t) * splits * H * (R + 2);
+  float M = -INFINITY;
+  for (int s = 0; s < splits; ++s) M = fmaxf(M, base[size_t(s) * H * (R + 2) + size_t(H) * R + 2 * h]);
+  float L = 0.0f, f[64];
+  for (int s = 0; s < splits && s < 64; ++s) {
+    const float* ml = base + size_t(s) * H * (R + 2) + size_t(H) * R + 2 * h;
+    f[s] = ml[0] == -INFINITY ? 0.0f : expf(ml[0] - M);
+    L += ml[1] * f[s];
+  }
+  for (int d = threadIdx.x; d < R; d += blockDim.x) {
+    float a = 0.0f;
+    for (int s = 0; s < splits && s < 64; ++s) a += base[size_t(s) * H * (R + 2) + size_t(h) * R + d] * f[s];
+    o[(size_t(t) * H + h) * R + d] = f32_to_bf16(L > 0.0f ? a / L : 0.0f);
+  }
+}
+
+// Order-preserving map of fp32 -> uint32 (larger float -> larger key).
+__device__ __forceinline__ uint32_t sort_key(float f) {
+  const uint32_t u = __float_as_uint(f);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// One block (256 threads) per segment: kernels::topk_rows' radix select (4 passes of 8 bits; keys above the
+// threshold, then ties by lowest position; -inf never taken), sorted by (value desc, position asc). Segment `seg`
+// of row r: vals + r * ld + seg * span, n entries; out_val / out_idx [k] at out_off; an entry's index is
+// map[position] when map is given, else seg * span + position.
+__global__ __launch_bounds__(256) void topk_seg_kernel(const float* vals, size_t ld, int span, int ncols, int k,
+                                                       const int32_t* map, size_t map_ld, float* out_val,
+                                                       int32_t* out_idx, size_t out_ld) {
+  __shared__ uint32_t hist[256];
+  __shared__ uint32_t prefix_sel, need_sel, nvalid, count_above;
+  __shared__ uint32_t sel_keys[1024];
+  __shared__ int32_t sel_pos[1024];
+  const int seg = blockIdx.x, r = blockIdx.y;
+  const int c0 = seg * span, n = min(span, ncols - c0);
+  const float* row = vals + size_t(r) * ld + c0;
+  const uint32_t neg_inf_key = sort_key(-INFINITY);
+  if (threadIdx.x == 0) nvalid = 0;
+  __syncthreads();
+  uint32_t local = 0;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) local += sort_key(row[i]) > neg_inf_key;
+  atomicAdd(&nvalid, local);
+  __syncthreads();
+  const uint32_t want = min(uint32_t(k), nvalid);
+  uint32_t prefix = 0, need = want;
+  if (want > 0) {
+    for (int pass = 3; pass >= 0; --pass) {
+      for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+      __syncthreads();
+      const uint32_t mask_hi = pass == 3 ? 0u : (0xffffffffu << ((pass + 1) * 8));
+      for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const uint32_t key = sort_key(row[i]);
+        if (key <= neg_inf_key || (key & mask_hi) != (prefix & mask_hi)) continue;
+        atomicAdd(&hist[(key >> (pass * 8)) & 0xff], 1u);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        uint32_t cum = 0;
+        int b = 255;
+        for (; b > 0; --b) {
+          if (cum + hist[b] >= need) break;
+          cum += hist[b];
+        }
+        prefix_sel = prefix | (uint32_t(b) << (pass * 8));
+        need_sel = need - cum;
+      }
+      __syncthreads();
+      prefix = prefix_sel;
+      need = need_sel;
+    }
+  }
+  if (threadIdx.x == 0) count_above = 0;
+  __syncthreads();
+  for (int i = threadIdx.x; i < n && want > 0; i += blockDim.x) {
+    const uint32_t key = sort_key(row[i]);
+    if (key > prefix && key > neg_inf_key) {
+      const uint32_t slot = atomicAdd(&count_above, 1u);
+      sel_keys[slot] = key;
+      sel_pos[slot] = i;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < 32 && want > 0) {
+    const uint32_t base = count_above;
+    uint32_t taken = 0;
+    for (int i0 = 0; i0 < n && taken < need; i0 += 32) {
+      const int i = i0 + threadIdx.x;
+      const bool tie = i < n && sort_key(row[i]) == prefix;
+      const uint64_t ballot = __ballot(tie);
+      const uint32_t before = __popcll(ballot & ((1ull << threadIdx.x) - 1));
+      if (tie && taken + before < need) {
+        sel_keys[base + taken + before] = prefix;
+        sel_pos[base + taken + before] = i;
+      }
+      taken += __popcll(ballot);
+    }
+  }
+  __syncthreads();
+  int size = 1;
+  while (size < k) size <<= 1;
+  for (int i = threadIdx.x; i < size; i += blockDim.x)
+    if (uint32_t(i) >= want) {
+      sel_keys[i] = 0;
+      sel_pos[i] = 0x7fffffff;
+    }
+  __syncthreads();
+  for (int len = 2; len <= size; len <<= 1)
+    for (int stride = len >> 1; stride > 0; stride >>= 1) {
+      for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        const int j = i ^ stride;
+        if (j > i) {
+          const bool desc = (i & len) == 0;
+          const bool i_first = sel_keys[i] > sel_keys[j] || (sel_keys[i] == sel_keys[j] && sel_pos[i] < sel_pos[j]);
+          if (desc ? !i_first : i_first) {
+            const uint32_t tk = sel_keys[i];
+            sel_keys[i] = sel_keys[j];
+            sel_keys[j] = tk;
+            const int32_t tp = sel_pos[i];
+            sel_pos[i] = sel_pos[j];
+            sel_pos[j] = tp;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  const size_t ob = size_t(r) * out_ld + size_t(seg) * k;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const bool ok = uint32_t(i) < want;
+    const int p = sel_pos[i];
+    if (out_val) out_val[ob + i] = ok ? row[p] : -INFINITY;
+    out_idx[ob + i] = ok ? (map ? map[size_t(r) * map_ld + c0 + p] : c0 + p) : -1;
+  }
+}
+
+__global__ void moe_combine_slices_kernel(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out,
+                                          int K, int dim) {
+  const int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
+  if (d >= dim) return;
+  float acc = 0.0f;
+  for (int j = 0; j < K; ++j) acc += bf16_to_f32(pair_out[size_t(pidx[size_t(t) * K + j]) * dim + d]);
+  out[size_t(t) * dim + d] = f32_to_bf16(acc + bf16_to_f32(shared[size_t(t) * dim + d]));
+}
+
+// The compact selection list: entry j < 4 v (v valid pools) -> pool j / 4's token j % 4, then the tail, then -1.
+__global__ void idx_expand_compact_kernel(const int32_t* pools, const int32_t* pos, int32_t* idx, int n, int k,
+                                          int pool) {
+  const int w = k * pool + pool - 1;
+  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i >= size_t(n) * w) return;
+  const int t = int(i / w), j = int(i % w), p = pos[t];
+  const int full = (p + 1) / pool, valid = full < k ? full : k, tail = (p + 1) % pool;
+  int v = -1;
+  if (j < valid * pool) v = pools[size_t(t) * k + j / pool] * pool + j % pool;
+  else if (j < valid * pool + tail) v = p + 1 - tail + (j - valid * pool);
+  idx[i] = v;
+}
+
 }  // namespace
 
 void glm_store_latent(const bf16* lat, GlmPaged pg, int s0, int n, hipStream_t st) {
@@ -520,9 +704,10 @@ void glm_idx_scores(const bf16* q, const bf16* w, GlmPaged pg, const int32_t* po
   UH_CHECK_LAUNCH();
 }
 
-void glm_mla_attn(const bf16* qa, const int32_t* idx, int w, GlmPaged pg, bf16* o, int n, float scale, hipStream_t st) {
+void glm_mla_attn(const bf16* qa, const int32_t* idx, int w, const int32_t* pos, GlmPaged pg, bf16* o, int n,
+                  float scale, hipStream_t st) {
   if (n <= 0) return;
-  mla_attn_kernel<<<n, NT, 0, st>>>(qa, idx, w, pg, o, scale);
+  mla_attn_kernel<false><<<n, NT, 0, st>>>(qa, idx, w, pos, pg, o, scale, nullptr, 0);
   UH_CHECK_LAUNCH();
 }
 
@@ -581,6 +766,69 @@ void glm_mtp_cat(const bf16* emb, const bf16* h, const bf16* enorm, const bf16* 
 void glm_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, hipStream_t st) {
   if (rows <= 0) return;
   argmax_conf_kernel<<<rows, 256, 0, st>>>(logits, V, tok, conf);
+  UH_CHECK_LAUNCH();
+}
+
+}  // namespace unholy::kernels
+
+namespace unholy::kernels {
+
+size_t glm_topk_cand_bytes(int rows, int cols, int k) {
+  const size_t segs = size_t((cols + kGlmTopkSeg - 1) / kGlmTopkSeg);
+  return size_t(rows) * segs * k * 8;
+}
+
+void glm_topk(const float* scores, int ld, int n, int cols, int k, int32_t* idx, void* cand, hipStream_t st) {
+  if (n <= 0 || cols <= 0) return;
+  if (k > 1024) throw std::runtime_error("glm_topk: k > 1024");
+  // UNHOLY_GLM_TOPK_SEG (tests): a smaller segment, so short sequences take the two-stage path (cand must hold the
+  // extra segments: the GLM scratch has room for 8).
+  static const int seg_len = [] {
+    const char* v = std::getenv("UNHOLY_GLM_TOPK_SEG");
+    return v ? std::clamp(std::atoi(v), 1, kGlmTopkSeg) : kGlmTopkSeg;
+  }();
+  if (cols <= seg_len) {
+    topk_seg_kernel<<<dim3(1, n), 256, 0, st>>>(scores, size_t(ld), cols, cols, k, nullptr, 0, nullptr, idx, size_t(k));
+    UH_CHECK_LAUNCH();
+    return;
+  }
+  const int segs = (cols + seg_len - 1) / seg_len;
+  float* cv = static_cast<float*>(cand);
+  int32_t* ci = reinterpret_cast<int32_t*>(cv + size_t(n) * segs * k);
+  const size_t cl = size_t(segs) * k;
+  topk_seg_kernel<<<dim3(segs, n), 256, 0, st>>>(scores, size_t(ld), seg_len, cols, k, nullptr, 0, cv, ci, cl);
+  UH_CHECK_LAUNCH();
+  topk_seg_kernel<<<dim3(1, n), 256, 0, st>>>(cv, cl, int(cl), int(cl), k, ci, cl, nullptr, idx, size_t(k));
+  UH_CHECK_LAUNCH();
+}
+
+size_t glm_mla_part_bytes(int n, int splits) { return size_t(n) * splits * H * (R + 2) * 4; }
+
+void glm_mla_attn_split(const bf16* qa, const int32_t* idx, int w, const int32_t* pos, GlmPaged pg, bf16* o, int n,
+                        float scale, int splits, float* part, hipStream_t st) {
+  if (n <= 0) return;
+  if (splits < 1 || splits > 64) throw std::runtime_error("glm_mla_attn_split: 1..64 splits");
+  mla_attn_kernel<true><<<dim3(n, splits), NT, 0, st>>>(qa, idx, w, pos, pg, o, scale, part, 0);
+  UH_CHECK_LAUNCH();
+  mla_combine_kernel<<<n * H, 256, 0, st>>>(part, splits, o);
+  UH_CHECK_LAUNCH();
+}
+
+void glm_moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
+                     hipStream_t st) {
+  if (T <= 0) return;
+  moe_combine_slices_kernel<<<dim3(T, (dim + 255) / 256), 256, 0, st>>>(pair_out, pidx, shared, out, K, dim);
+  UH_CHECK_LAUNCH();
+}
+
+}  // namespace unholy::kernels
+
+namespace unholy::kernels {
+
+void glm_idx_expand(const int32_t* pools, const int32_t* pos, int32_t* idx, int n, int k, int pool, hipStream_t st) {
+  const size_t total = size_t(n) * (k * pool + pool - 1);
+  if (total == 0) return;
+  idx_expand_compact_kernel<<<cdiv(total, 256), 256, 0, st>>>(pools, pos, idx, n, k, pool);
   UH_CHECK_LAUNCH();
 }
 

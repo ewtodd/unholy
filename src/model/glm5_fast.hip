@@ -255,12 +255,17 @@ void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
         const int m = std::min(kIdxBlock, ch.n - q0), t = ch.t0 + q0;
         k::glm_idx_scores(iq + size_t(t) * IH * ID, iw + size_t(t) * IH, pg, b.pos + t, isc, npool, m, npool, iscale,
                           st);
-        k::topk_rows(isc, m, npool, kpools, cpools + size_t(q0) * kpools, st);
+        k::glm_topk(isc, npool, m, npool, kpools, cpools + size_t(q0) * kpools, s.get(kTopkCand), st);
       }
     }
     int32_t* csel = sel + size_t(ch.t0) * width;
-    k::idx_expand(cpools, b.pos + ch.t0, csel, ch.n, kpools, pool, st);
-    k::glm_mla_attn(qa + size_t(ch.t0) * H * R, csel, width, pg, ol + size_t(ch.t0) * H * R, ch.n, ascale, st);
+    k::glm_idx_expand(cpools, b.pos + ch.t0, csel, ch.n, kpools, pool, st);
+    if (ch.n <= kAttnSplitRows)  // decode / verify chunks: the keys over more workgroups
+      k::glm_mla_attn_split(qa + size_t(ch.t0) * H * R, csel, width, b.pos + ch.t0, pg, ol + size_t(ch.t0) * H * R,
+                            ch.n, ascale, kAttnSplits, s.at<float>(kAttnPart), st);
+    else
+      k::glm_mla_attn(qa + size_t(ch.t0) * H * R, csel, width, b.pos + ch.t0, pg, ol + size_t(ch.t0) * H * R, ch.n,
+                      ascale, st);
   }
   bf16* o = s.at<bf16>(kAttnOut);
   k::gemm_grouped_bf16_wmma(ol, w.w_uv.p<bf16>(), o, T, H, c.v_dim, R, st);
@@ -325,7 +330,7 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
     remote->join(st);
     k::copy_remote_rows(remote->out_host, pout, plan, D, P, st);
   }
-  k::moe_combine(pout, pidx, sh, out, T, K, D, st);
+  k::glm_moe_combine(pout, pidx, sh, out, T, K, D, st);
 }
 
 void hc_pre(const Glm5Config& c, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const bf16* x,
