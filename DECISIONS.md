@@ -1315,3 +1315,28 @@ smaller ones), about 40 prefix snapshots in the RAM that frees on the APU.
 Throughput, engine-batch on the GSM8K set with production flags (MTP for GLM, DSpark for DSV4): GLM 24.0 / 29.0 /
 32.6 / 44.6 tok/s at concurrency 1 / 2 / 4 / 8, DSV4 37.9 / 48.1 / 55.3 / 63.6. check-source's sweep was not run: its
 CLI is changing (`--max-tokens` required, levels none / medium / xhigh).
+
+## 2026-10-24 — GLM: routing profile from broad traffic; steps as two overlapping parts
+
+The "share falls with depth" seen on the curve was the profile, not depth. Measured by depth segment through the
+server (`/unholy/routing_share`, `tools/box/routing-depth.sh` over `mklong.py` texts), the placement from
+expert_profile_glm53_mixed.txt (10k tokens of unholy sources and GSM8K chat) served 24-26% of the routed pairs on the
+cards for Pile or Python text at every depth to 512k, 37% for fresh GSM8K reasoning and 27% for generated code,
+against the 56% it predicts; only repeated text drifted with depth. GLM's routing differs a lot by kind of text.
+
+- expert_profile_glm53_broad.txt (e38c017, the GLM default): five sources normalized per layer with equal weight
+  (Pile and Python at 524k tokens each, GSM8K and code-rewrite requests with their generations, the old profile).
+  An offline greedy placement reproduced measured shares to 0.1 points and chose the mix; held-out results in the
+  production configuration: Pile 23% -> 56% on the cards, prefill +6-29%; unseen code generation 27% -> 35%, decode
+  +5%; GSM8K test set +4-5% (25.8 / 50.3 tok/s at concurrency 1 / 8).
+- Two-part steps (840106a, 77ea75b): the layer split into pre / MoE start / post; model::glm5_layers_fast runs steps
+  of >= 1024 rows as two parts software-pipelined on the card's stream, so the card computes one part's attention
+  while the APU has the other's experts. Each part has its own MoE pair rows, plan, tiles and staging; a card's two
+  APU channels share one stream and working buffers. Every kernel works per row, so outputs are bit-identical with
+  UNHOLY_GLM_SPLIT=0. Served 11.7k-token prompt 1010 -> 1156 tok/s (920 -> 1131 with MTP), curve to 64k 1193 ->
+  1452 tok/s, held-out Pile up to 1469 tok/s at 64-128k.
+- The APU staging now holds one row per token (it never needed pair rows after the compact transport) and the
+  planner counts it: 39 snapshots with MTP.
+
+Where prefill stands (estimate, DECISIONS above): hardware bounds ~7k tok/s (host link, then the APU's share of the
+expert math); with today's kernels overlapped perfectly ~2.5k; next lever is the APU's EXL3 GEMM (~26% of peak).

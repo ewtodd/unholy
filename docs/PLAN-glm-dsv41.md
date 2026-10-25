@@ -154,8 +154,11 @@ MTP) and cut an 11.7k-token prompt's TTFT from 14 s to 1.0 s. Prefill is bound b
 the APU, not by kernels (DECISIONS 2026-10-24, GLM prefill): compact token inputs and row-ranged transforms took a
 served 11.7k-token prompt from 857 to 1007 tok/s, bit-identical. Throughput on the GSM8K set (engine-batch, MTP):
 24.0 / 29.0 / 32.6 / 44.6 tok/s at concurrency 1 / 2 / 4 / 8 (DSV4 37.9 / 48.1 / 55.3 / 63.6). Combined remote
-outputs (+4% served prefill, not bit-identical) are in. Service configuration for G6: MTP, `--kv-tokens 1048576`,
-~40 snapshots. Open: the APU's share growing with depth; launch count in decode.
+outputs (+4% served prefill, not bit-identical) are in. A routing profile from broad traffic replaced the 10k-token
+one (held-out Pile 23% -> 56% of routing on the cards; +4-5% GSM8K throughput) and steps run as two overlapping
+parts (exact): the served 11.7k-token prompt now prefills at 1156 tok/s (1131 with MTP), held-out Pile at up to
+~1470 tok/s by 128k. Service configuration for G6: MTP, `--kv-tokens 1048576`, 39 snapshots. Open: the APU's expert
+GEMM efficiency (~26% of peak), decode launch count (~2,500 per token).
 
 **G5: Fast path (4-6 days).** WMMA kernels for KDA prefill and decode, the DSA indexer and attention, and the
 chosen dense format (EXL3 dense GEMV, or fp8 KDA weights); placement from the GLM profile; two steps in flight;
