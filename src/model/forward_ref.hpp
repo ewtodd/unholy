@@ -77,6 +77,22 @@ class ClassRows {
   int prev_;
 };
 
+// Two-part steps (engine::ResidentModel): while a ScratchPart is alive on this thread, the scratch that lives from a
+// layer's MoE start to its finish is part `part`'s: part 0 the usual buffers, part 1 its own HC mixing weights and
+// fp8 codes, the pair rows / pair index / compact token map from its first row's pairs (row0 * n_active), and its
+// own dispatch plan. Attention, layer_moe_start and layer_moe_finish then run on a part as on a whole step while the
+// other part's MoE is in flight.
+class ScratchPart {
+ public:
+  ScratchPart(int part, int row0, int n_active, int dim);
+  ~ScratchPart();
+  ScratchPart(const ScratchPart&) = delete;
+  ScratchPart& operator=(const ScratchPart&) = delete;
+
+ private:
+  int prev_[4];
+};
+
 // Scratch for computing one routed expert over up to `rows` tokens (any device).
 struct ExpertScratch {
   rt::DeviceBuffer qb, qs, h1, h3, hh, xf, y2;
@@ -197,6 +213,19 @@ void set_expert_histogram(std::vector<std::vector<uint64_t>>* hist);
 void layer_forward(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
                    const RopeTables& rope, uint16_t* x, const BatchDesc& b, hipStream_t st,
                    RemoteExperts* remote = nullptr);
+// The layer in pieces, for two-part steps (ScratchPart): the attention half; the MoE half's start (HC mixing, norm,
+// router, dispatch: the remote share started, the local experts queued) and finish (shared expert, join, combine,
+// HC mixing). The device MoE path only (moe_split_ok); layer_forward is the three in a row.
+void layer_attention(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
+                     const RopeTables& rope, uint16_t* x, const BatchDesc& b, hipStream_t st);
+struct MoeStarted {
+  bool remote = false, combined = false;
+};
+MoeStarted layer_moe_start(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, uint16_t* x,
+                           const BatchDesc& b, hipStream_t st, RemoteExperts* remote);
+void layer_moe_finish(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, uint16_t* x,
+                      const BatchDesc& b, hipStream_t st, RemoteExperts* remote, MoeStarted started);
+bool moe_split_ok(const Dsv4Config& c, const LayerWeights& w, const RemoteExperts* remote);
 
 // ---- DSpark (model.py DSparkBlock / Transformer.forward_spec) ----------------------------------------
 // A draft block per request: rows [B r, B r + B) of the batch (B = dspark_block: the request's next

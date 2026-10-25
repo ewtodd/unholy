@@ -65,13 +65,38 @@ namespace {
 enum Buf : size_t {
   kY, kA, kPost, kComb, kQBuf, kQSc, kQA, kQR, kQ, kKV, kAF, kPK, kPS, kRowsF, kRowsB, kRowPos, kQI, kWI,
   kISc, kIdx, kO, kOA, kAO, kLG, kSel, kWt, kH1, kH3, kHH, kPairOut, kPairIdx, kShared, kEIdx, kEWt,
-  kPairIn, kHcPart, kQC, kQCS, kRTok, kNumBufs
+  kPairIn, kHcPart, kQC, kQCS, kRTok,
+  kPost2, kComb2, kQBuf2, kQSc2,  // part 1 of a two-part step (ScratchPart)
+  kNumBufs
 };
+
+// The part of a two-part step whose buffers B() hands out (ScratchPart): what lives from a layer's MoE start to
+// its finish is per part -- the HC mixing weights and the fp8 codes of the FFN input (part 1: its own set), the
+// pair rows, pair index and compact token map (part 1: from its first row's pairs on).
+struct PartCtx {
+  int part = 0, row0 = 0, K = 0, dim = 0;
+};
+thread_local PartCtx g_part;
 
 template <typename T>
 T* B(const Scratch& s, Buf b) {
-  return static_cast<T*>(s.get(b));
+  if (g_part.part == 0) return static_cast<T*>(s.get(b));
+  auto* p = static_cast<uint8_t*>(s.get(b));
+  const size_t pairs = size_t(g_part.row0) * size_t(g_part.K);
+  switch (b) {
+    case kPost: return static_cast<T*>(s.get(kPost2));
+    case kComb: return static_cast<T*>(s.get(kComb2));
+    case kQBuf: return static_cast<T*>(s.get(kQBuf2));
+    case kQSc: return static_cast<T*>(s.get(kQSc2));
+    case kPairOut: return reinterpret_cast<T*>(p + pairs * size_t(g_part.dim) * 2);
+    case kPairIdx: return reinterpret_cast<T*>(p + pairs * 4);
+    case kRTok: return reinterpret_cast<T*>(p + size_t(g_part.row0) * 2 * 4);
+    default: return static_cast<T*>(s.get(b));
+  }
 }
+
+// The dispatch plan of the current part.
+kernels::MoePlan* dispatch_plan(const Scratch& s) { return s.dispatch.plan.as<kernels::MoePlan>() + g_part.part; }
 
 }  // namespace
 
@@ -144,6 +169,12 @@ std::vector<size_t> scratch_sizes(const Dsv4Config& c, int max_tokens, int max_s
   sz[kPairIn] = legacy || pair_rows_needed(exl3) ? N * K * c.dim * 2 : 0;
   sz[kHcPart] = size_t(32) * 32 * 25 * 4;
   sz[kRTok] = N * 2 * 4;  // remote_tokens: tok2u [T], u2t [T]
+  if (!legacy) {  // a two-part step's second set (not in the 2026-10-12 count the planner plans with)
+    sz[kPost2] = sz[kPost];
+    sz[kComb2] = sz[kComb];
+    sz[kQBuf2] = sz[kQBuf];
+    sz[kQSc2] = sz[kQSc];
+  }
   return sz;
 }
 }  // namespace
@@ -210,7 +241,7 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, 
   UH_CHECK(hipMemset(s.dispatch.count.data(), 0, s.dispatch.count.size()));  // then kept zero by moe_plan
   s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   s.dispatch.fill = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
-  s.dispatch.plan = rt::DeviceBuffer(dev, sizeof(kernels::MoePlan));
+  s.dispatch.plan = rt::DeviceBuffer(dev, 2 * sizeof(kernels::MoePlan));  // a two-part step's two parts
   s.dispatch.ltiles = rt::DeviceBuffer(dev, size_t(s.dispatch.max_tiles) * sizeof(kernels::Exl3Tile));
   s.dispatch.rtiles = rt::DeviceBuffer(dev, size_t(s.dispatch.max_tiles) * sizeof(kernels::Exl3Tile));
   return s;
@@ -337,6 +368,11 @@ thread_local int g_class_rows = 0;
 int class_rows(int rows) { return g_class_rows > 0 ? g_class_rows : rows; }
 ClassRows::ClassRows(int rows) : prev_(g_class_rows) { g_class_rows = rows; }
 ClassRows::~ClassRows() { g_class_rows = prev_; }
+ScratchPart::ScratchPart(int part, int row0, int n_active, int dim)
+    : prev_{g_part.part, g_part.row0, g_part.K, g_part.dim} {
+  g_part = {part, row0, n_active, dim};
+}
+ScratchPart::~ScratchPart() { g_part = {prev_[0], prev_[1], prev_[2], prev_[3]}; }
 
 void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint8_t* q, const uint8_t* s,
                           const int32_t* p2u, const kernels::MoePlan* plan, const float* rw, const int32_t* row_expert,
@@ -895,7 +931,7 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
   int32_t* count = ds.count.as<int32_t>();
   int32_t* off = ds.off.as<int32_t>();
   int32_t* fill = ds.fill.as<int32_t>();
-  auto* plan = ds.plan.as<k::MoePlan>();
+  auto* plan = dispatch_plan(scr);
   auto* lt = ds.ltiles.as<k::Exl3Tile>();
   auto* rtl = ds.rtiles.as<k::Exl3Tile>();
   int32_t* eidx = B<int32_t>(scr, kEIdx);
@@ -970,16 +1006,17 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
 void moe_device_join(const Dsv4Config& c, const Scratch& scr, const MoeDispatch& md, int T, hipStream_t st,
                      RemoteExperts* remote) {
   if (!md.remote) return;
-  const auto* plan = scr.dispatch.plan.as<k::MoePlan>();
+  const auto* plan = dispatch_plan(scr);
   bf16* pair_out = B<bf16>(scr, kPairOut);
   remote->join(st);
   if (md.combined) k::copy_remote_partial(remote->out_host, pair_out, plan, c.dim, T, st);
   else k::copy_remote_rows(remote->out_host, pair_out, plan, c.dim, T * c.n_active, st);
 }
 
-void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
-              hipStream_t st, RemoteExperts* remote) {
-  const int D = c.dim, I = c.moe_inter, E = c.n_experts, K = c.n_active, T = b.T, L = w.layer;
+// The MoE half's front: the FFN's HC mixing, norm (f and its fp8 codes for the shared expert), router (sel, wt).
+void moe_front(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
+               hipStream_t st) {
+  const int D = c.dim, E = c.n_experts, K = c.n_active, T = b.T, L = w.layer;
   bf16* y = B<bf16>(scr, kY);
   bf16* f = B<bf16>(scr, kA);
   float* post = B<float>(scr, kPost);
@@ -1006,9 +1043,51 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
                                            w.gate_bias_vl ? w.gate_bias_vl.p<float>() : nullptr, c.vocab);
   dump(L, b, "gate_out0", wt, size_t(T) * K * 4, st);
   dump(L, b, "gate_out1", sel, size_t(T) * K * 4, st);
+}
 
-  const bool device_path = routed_fast(w) && !g_expert_hist &&
-                           (w.n_resident == E || (remote && remote->can_enqueue()));
+bool device_moe(const Dsv4Config& c, const LayerWeights& w, const RemoteExperts* remote) {
+  return routed_fast(w) && !g_expert_hist && (w.n_resident == c.n_experts || (remote && remote->can_enqueue()));
+}
+
+// The back: shared expert (queued while the remote experts run), join, combine, the HC mixing back into x.
+void moe_back(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
+              hipStream_t st, RemoteExperts* remote, const MoeDispatch& md) {
+  const int D = c.dim, I = c.moe_inter, K = c.n_active, T = b.T, L = w.layer;
+  float* post = B<float>(scr, kPost);
+  float* comb = B<float>(scr, kComb);
+  uint8_t* qb = B<uint8_t>(scr, kQBuf);
+  uint8_t* qs = B<uint8_t>(scr, kQSc);
+  int32_t* dpidx = B<int32_t>(scr, kPairIdx);
+  bf16* pair_out = B<bf16>(scr, kPairOut);
+  bf16* h1 = B<bf16>(scr, kH1);
+  bf16* h3 = B<bf16>(scr, kH3);
+  bf16* hh = B<bf16>(scr, kHH);
+  // Shared expert (fp8 weights, no routing weight), queued while the remote experts run: its buffers are
+  // not the routed path's.
+  bf16* shared = B<bf16>(scr, kShared);
+  dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);  // qb / qs: f's codes (norm_quant)
+  k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
+  k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
+  dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
+  dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
+  moe_device_join(c, scr, md, T, st, remote);
+  bf16* fo = B<bf16>(scr, kAO);
+  if (md.combined)
+    k::moe_combine_partial(pair_out, dpidx, dispatch_plan(scr), B<int32_t>(scr, kRTok), shared, fo, T, K, D, st);
+  else
+    k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
+  dump(L, b, "ffn_out", fo, size_t(T) * D * 2, st);
+  hc_post(fo, x, post, comb, x, T, c.hc_mult, D, st);
+}
+
+void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
+              hipStream_t st, RemoteExperts* remote) {
+  const int D = c.dim, E = c.n_experts, K = c.n_active, T = b.T, L = w.layer;
+  bf16* f = B<bf16>(scr, kA);
+  int32_t* sel = B<int32_t>(scr, kSel);
+  float* wt = B<float>(scr, kWt);
+  moe_front(c, w, scr, x, b, st);
+  const bool device_path = device_moe(c, w, remote);
   int32_t* dpidx = B<int32_t>(scr, kPairIdx);
   bf16* pair_out = B<bf16>(scr, kPairOut);
   MoeDispatch md;
@@ -1115,26 +1194,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
                               size_t(P - remote0) * D * 2, hipMemcpyHostToDevice, st));
     }
   }
-  bf16* h1 = B<bf16>(scr, kH1);
-  bf16* h3 = B<bf16>(scr, kH3);
-  bf16* hh = B<bf16>(scr, kHH);
-  // Shared expert (fp8 weights, no routing weight), queued while the remote experts run: its buffers are
-  // not the routed path's.
-  bf16* shared = B<bf16>(scr, kShared);
-  dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);  // qb / qs: f's codes (norm_quant)
-  k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
-  k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
-  dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
-  dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
-  moe_device_join(c, scr, md, T, st, remote);
-  bf16* fo = B<bf16>(scr, kAO);
-  if (md.combined)
-    k::moe_combine_partial(pair_out, dpidx, scr.dispatch.plan.as<k::MoePlan>(), B<int32_t>(scr, kRTok), shared, fo, T, K,
-                           D, st);
-  else
-    k::moe_combine(pair_out, dpidx, shared, fo, T, K, D, st);
-  dump(L, b, "ffn_out", fo, size_t(T) * D * 2, st);
-  hc_post(fo, x, post, comb, x, T, c.hc_mult, D, st);
+  moe_back(c, w, scr, x, b, st, remote, md);
   if (!device_path) UH_CHECK(hipStreamSynchronize(st));  // the host path's vectors
 }
 
@@ -1149,6 +1209,34 @@ void layer_forward(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache
   }
   attention_half(c, w, cache, scr, rope, x, b, st);
   moe_half(c, w, scr, x, b, st, remote);
+}
+
+void layer_attention(const Dsv4Config& c, const LayerWeights& w, LayerCache& cache, const Scratch& scr,
+                     const RopeTables& rope, uint16_t* x, const BatchDesc& b, hipStream_t st) {
+  if (b.T > scr.max_tokens) throw std::runtime_error("layer_attention: batch larger than scratch");
+  for (const auto& ch : b.chunks) {
+    if ((ch.s0 + ch.n) / 4 > scr.max_keys) throw std::runtime_error("layer_attention: context larger than scratch");
+    if (ch.slot < 0 || ch.slot >= cache.slots) throw std::runtime_error("layer_attention: bad slot");
+  }
+  attention_half(c, w, cache, scr, rope, x, b, st);
+}
+
+bool moe_split_ok(const Dsv4Config& c, const LayerWeights& w, const RemoteExperts* remote) {
+  return device_moe(c, w, remote);
+}
+
+MoeStarted layer_moe_start(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, uint16_t* x,
+                           const BatchDesc& b, hipStream_t st, RemoteExperts* remote) {
+  if (!device_moe(c, w, remote)) throw std::runtime_error("layer_moe_start: the device MoE path only");
+  moe_front(c, w, scr, x, b, st);
+  const MoeDispatch md = moe_device_dispatch(c, w, scr, B<bf16>(scr, kA), B<int32_t>(scr, kSel), B<float>(scr, kWt),
+                                             b.T, st, remote);
+  return {md.remote, md.combined};
+}
+
+void layer_moe_finish(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, uint16_t* x,
+                      const BatchDesc& b, hipStream_t st, RemoteExperts* remote, MoeStarted started) {
+  moe_back(c, w, scr, x, b, st, remote, MoeDispatch{started.remote, started.combined});
 }
 
 // ---- DSpark ---------------------------------------------------------------------------------------

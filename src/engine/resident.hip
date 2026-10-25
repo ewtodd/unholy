@@ -36,10 +36,18 @@ namespace k = unholy::kernels;
 // ApuExperts
 
 ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers,
-                       bool exl3)
+                       bool exl3, const ApuExperts* share)
     : c_(c), dev_(dev), layers_(std::move(layers)) {
   rt::DeviceGuard g(dev);
-  UH_CHECK(hipStreamCreateWithFlags(&st_, hipStreamNonBlocking));
+  if (share) {
+    if (share->capacity_rows < capacity_rows) throw std::runtime_error("ApuExperts: shared scratch too small");
+    st_ = share->st_;
+    own_stream_ = false;
+    es_ = share->es_;
+    xs_ = share->xs_;
+  } else {
+    UH_CHECK(hipStreamCreateWithFlags(&st_, hipStreamNonBlocking));
+  }
   this->capacity_rows = capacity_rows;
   const unsigned flags = hipHostMallocPortable | hipHostMallocMapped;
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&in_host), capacity_rows * c.dim * 2, flags));
@@ -64,9 +72,11 @@ ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&ins_dev_), ins_host, 0));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&p2u_dev_), p2u_host, 0));
   // Each job is one expert: at most every token of a step.
-  if (model::ref_experts_needed()) scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));  // run()
-  xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows), exl3);
-  max_tiles = xscratch_.max_tiles;
+  if (!share) {
+    if (model::ref_experts_needed()) scratch_ = model::make_expert_scratch(c, dev, int(capacity_rows));  // run()
+    xscratch_ = model::make_exl3_moe_scratch(c, dev, int(capacity_rows), exl3);
+  }
+  max_tiles = xs_->max_tiles;  // the shared channel's: the card's plans are sized like it
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&plan_host), sizeof(kernels::MoePlan), flags));
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&tiles_host), size_t(max_tiles) * sizeof(kernels::Exl3Tile), flags));
   UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(&plan_dev_), plan_host, 0));
@@ -80,7 +90,7 @@ ApuExperts::ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows
 
 ApuExperts::~ApuExperts() {
   rt::DeviceGuard g(dev_);
-  if (st_) (void)hipStreamDestroy(st_);
+  if (st_ && own_stream_) (void)hipStreamDestroy(st_);
   if (in_host) (void)hipHostFree(in_host);
   if (inq_host) (void)hipHostFree(inq_host);
   if (ins_host) (void)hipHostFree(ins_host);
@@ -112,14 +122,14 @@ void ApuExperts::run(int layer, const std::vector<Job>& jobs) {
       runs.push_back({j.expert, j.row0, j.cnt});
       P = std::max(P, j.row0 + j.cnt);
     }
-    model::exl3_moe_forward(c_, w, in_dev_, w_dev_, e_dev_, model::exl3_tiles(runs), P, xscratch_, out_dev_, st_);
+    model::exl3_moe_forward(c_, w, in_dev_, w_dev_, e_dev_, model::exl3_tiles(runs), P, *xs_, out_dev_, st_);
     UH_CHECK(hipStreamSynchronize(st_));
     return;
   }
   for (const auto& j : jobs) {
     if (!w.has_expert(j.expert)) throw std::runtime_error("ApuExperts: expert not resident on the APU");
     const size_t o = size_t(j.row0);
-    model::expert_forward(c_, w, j.expert, in_dev_ + o * c_.dim, w_dev_ + o, j.cnt, out_dev_ + o * c_.dim, scratch_,
+    model::expert_forward(c_, w, j.expert, in_dev_ + o * c_.dim, w_dev_ + o, j.cnt, out_dev_ + o * c_.dim, *es_,
                           st_);
   }
   UH_CHECK(hipStreamSynchronize(st_));
@@ -136,10 +146,10 @@ void ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
   UH_CHECK(hipStreamWaitValue32(st_, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
   if (!w.exl3_experts && quant_in_)  // the card sent compact fp8 inputs (moe_device_dispatch)
     model::mx_moe_forward_dev_q(c_, w, inq_dev_, ins_dev_, p2u_dev_, plan_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles,
-                                &plan_dev_->n_remote_tiles, P, xscratch_, out_dev_, st_, combine_out_ ? u2p_dev_ : nullptr);
+                                &plan_dev_->n_remote_tiles, P, *xs_, out_dev_, st_, combine_out_ ? u2p_dev_ : nullptr);
   else
     model::exl3_moe_forward_dev(c_, w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P,
-                                xscratch_, out_dev_, st_);
+                                *xs_, out_dev_, st_);
   UH_CHECK(hipStreamWriteValue32(st_, done_flag_, seq_, 0));
 }
 
@@ -175,6 +185,10 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
     auto layers = std::make_shared<ApuExperts::Layers>();
     for (auto& ch : chan_)
       ch = std::make_unique<ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers, exl3 != nullptr);
+    for (int k = 0; k < 2; ++k)  // two-part steps: a second part of at most half a step plus a page
+      chan2_[k] = std::make_unique<ApuExperts>(c, plan.apu,
+                                               size_t(max_tokens / 2 + model::kPageTokens) * c.n_active, layers,
+                                               exl3 != nullptr, chan_[k].get());
     if (dspark_)
       dchan_ = std::make_unique<ApuExperts>(c, plan.apu, size_t(c.dspark_block) * geo.max_slots * c.n_active, layers, false);
   }
@@ -605,6 +619,30 @@ std::vector<const void*> ResidentModel::layer_ptrs(int k) const {
   return v;
 }
 
+namespace {
+
+constexpr int kSplitMinRows = 2048;  // two-part steps from this many rows (1024-row steps: 10% slower split)
+constexpr int kSplitMinPiece = 64;   // a chunk is cut only into pieces this long
+
+// A two-part step's cut: near the middle, between chunks or where a chunk crosses a page boundary; both parts
+// >= a quarter of the step, the second <= cap2 rows. 0: run the step whole.
+int two_part_cut(const std::vector<Chunk>& chunks, int T, int cap2) {
+  if (T < kSplitMinRows) return 0;
+  int best = 0;
+  const auto consider = [&](int cut) {
+    if (cut < T / 4 || T - cut < T / 4 || T - cut > cap2) return;
+    if (best == 0 || std::abs(cut - T / 2) < std::abs(best - T / 2)) best = cut;
+  };
+  for (const Chunk& ch : chunks) {
+    if (ch.t0 > 0) consider(ch.t0);
+    for (int q = (ch.s0 / model::kPageTokens + 1) * model::kPageTokens; q < ch.s0 + ch.n; q += model::kPageTokens)
+      if (q - ch.s0 >= kSplitMinPiece && ch.s0 + ch.n - q >= kSplitMinPiece) consider(ch.t0 + q - ch.s0);
+  }
+  return best;
+}
+
+}  // namespace
+
 uint64_t ResidentModel::submit(const StepInput& in) {
   static const bool check_ptrs = std::getenv("UNHOLY_CHECK_PTRS") != nullptr;
   if (check_ptrs) {
@@ -717,6 +755,22 @@ uint64_t ResidentModel::submit(const StepInput& in) {
       parts.push_back({0, nch, 0, T, 0, ncap});
     }
   }
+  // Two-part steps (prefill-sized): each card runs its layers over the step's rows in two parts, software-pipelined
+  // on its stream (model::ScratchPart), so the APU computes one part's experts while the card computes the other
+  // part's attention. Every path is chosen by the whole step's rows (ClassRows) and a row's arithmetic does not
+  // depend on the other rows, so the outputs are the whole step's (validate --chunk: prefill steps cut anywhere are
+  // bit-identical). UNHOLY_DSV4_SPLIT=0 runs steps whole.
+  int cut = 0;
+  {
+    static const bool split_env = [] {
+      const char* e = std::getenv("UNHOLY_DSV4_SPLIT");
+      return !e || std::string(e) != "0";
+    }();
+    bool ok = split_env && parts.size() == 1 && in.image_rows.empty() && in.image_spans.empty();
+    for (int k = 0; ok && k < 2; ++k)
+      for (const auto& w : card_[k].w) ok = ok && model::moe_split_ok(c_, w, chan_[k].get());
+    if (ok) cut = two_part_cut(in.chunks, T, int(chan2_[0]->capacity_rows / size_t(c_.n_active)));
+  }
   std::chrono::steady_clock::time_point t_enq[2];
   for (int k = 0; k < 2; ++k) {
     Card& cd = card_[k];
@@ -735,7 +789,80 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     if (!in.backup.empty()) ring_ops(k, cd.st, &in.backup, nullptr);
     const int nt = int(c_.dspark_target_layers.size());
     const auto* cap_rows = cap_dev_.as<int32_t>();
-    for (size_t pi = 0; pi < parts.size(); ++pi) {
+    if (cut > 0) {
+      uint16_t* x = cd.x.as<uint16_t>();
+      if (k == 1) {  // residual from card 0 through this flight's pinned buffer, ordered by events
+        UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));
+        k::copy_kernel(x, f.x_host, size_t(T) * row * 2, cd.st);
+        UH_CHECK(hipEventRecord(f.consumed, cd.st));
+      }
+      model::BatchDesc bd[2];
+      const int r0[2] = {0, cut};
+      for (int p = 0; p < 2; ++p) {
+        bd[p].T = p == 0 ? cut : T - cut;
+        bd[p].max_pages_per_seq = geo_.max_pages_per_seq;
+        bd[p].ids = cd.ids.as<int32_t>() + r0[p];
+        bd[p].pos = cd.pos.as<int32_t>() + r0[p];
+        bd[p].block_tables = cd.tables.as<int32_t>();
+      }
+      for (const Chunk& ch : in.chunks) {
+        if (ch.t0 + ch.n <= cut) {
+          bd[0].chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0});
+        } else if (ch.t0 >= cut) {
+          bd[1].chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0 - cut});
+        } else {
+          const int n1 = cut - ch.t0;
+          bd[0].chunks.push_back({ch.slot, ch.s0, n1, ch.t0});
+          bd[1].chunks.push_back({ch.slot, ch.s0 + n1, ch.n - n1, 0});
+        }
+      }
+      int capc = 0;
+      while (capc < ncap && cap_host_[ticket % 2][capc] < cut) ++capc;
+      const int cap0[2] = {0, capc}, cap1[2] = {capc, ncap};
+      const model::ClassRows whole_step(T);
+      model::MoeStarted started[2];
+      const size_t n = cd.layers.size();
+      const auto attn = [&](size_t i, int p) {
+        const model::ScratchPart sp(p, r0[p], c_.n_active, c_.dim);
+        model::layer_attention(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, x + size_t(r0[p]) * row, bd[p], cd.st);
+      };
+      const auto start = [&](size_t i, int p) {
+        const model::ScratchPart sp(p, r0[p], c_.n_active, c_.dim);
+        started[p] = model::layer_moe_start(c_, cd.w[i], cd.scratch, x + size_t(r0[p]) * row, bd[p], cd.st,
+                                            p == 0 ? chan_[k].get() : chan2_[k].get());
+      };
+      const auto finish = [&](size_t i, int p) {
+        {
+          const model::ScratchPart sp(p, r0[p], c_.n_active, c_.dim);
+          model::layer_moe_finish(c_, cd.w[i], cd.scratch, x + size_t(r0[p]) * row, bd[p], cd.st,
+                                  p == 0 ? chan_[k].get() : chan2_[k].get(), started[p]);
+        }
+        for (int j = 0; dspark_ && cap1[p] > cap0[p] && j < nt; ++j)
+          if (cd.layers[i] == c_.dspark_target_layers[size_t(j)])
+            k::hc_mean_rows(x, c_.hc_mult, c_.dim, cap_rows + cap0[p], cap1[p] - cap0[p],
+                            mh_.as<uint16_t>() + size_t(cap0[p]) * nt * c_.dim + size_t(j) * c_.dim, nt * c_.dim,
+                            cd.st);
+      };
+      // Layer i's second part and layer i + 1's first part on the card while the APU has the other part's experts.
+      attn(0, 0);
+      start(0, 0);
+      for (size_t i = 0; i < n; ++i) {
+        attn(i, 1);
+        start(i, 1);
+        finish(i, 0);
+        if (i + 1 < n) {
+          attn(i + 1, 0);
+          start(i + 1, 0);
+        }
+        finish(i, 1);
+      }
+      if (k == 0) {  // the flight's buffer may still be read by card 1 for the step two tickets back
+        UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));
+        k::copy_kernel(f.x_host, x, size_t(T) * row * 2, cd.st);
+        UH_CHECK(hipEventRecord(f.handoff, cd.st));
+      }
+    }
+    for (size_t pi = 0; cut == 0 && pi < parts.size(); ++pi) {
       const Part& pt = parts[pi];
       const size_t xoff = size_t(pt.r0) * row;
       if (k == 1) {  // residual from card 0 through this flight's pinned buffer, ordered by events

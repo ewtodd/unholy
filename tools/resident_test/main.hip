@@ -8,6 +8,9 @@
 // --out writes this run's logits (fp32 [steps, vocab]) for a later --ref: e.g. the same placement with
 // UNHOLY_REMOTE_Q=0 (bf16 pair rows to the APU) as the reference for the compact fp8 transport.
 //
+// --chunk N prefills in steps of N tokens (default: one step) with the same placement: logits must equal the
+// one-step run's (a chunk boundary inside a step, as two-part steps make, must not change a bit either).
+//
 // --card-margin-bytes N: the planner's card margin (default 2 GiB). Lowering it by exactly what a change
 // adds to the scratch keeps the expert placement, so logits stay comparable bit for bit with --ref.
 //
@@ -67,7 +70,7 @@ double kl_row(const float* a, const float* b, int V) {
 
 int main(int argc, char** argv) {
   std::string ckpt = "/scratch/dsv4-ve", oracle, exl3_dir, profile, ref_path, out_path;
-  int batch = 0;
+  int batch = 0, chunk = 0;
   long long card_margin = -1;  // bytes; -1: the planner's default
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -79,6 +82,7 @@ int main(int argc, char** argv) {
     else if (a == "--ref") ref_path = next();
     else if (a == "--out") out_path = next();
     else if (a == "--batch") batch = std::stoi(next());
+    else if (a == "--chunk") chunk = std::stoi(next());
     else if (a == "--card-margin-bytes") card_margin = std::stoll(next());
     else {
       std::fprintf(stderr, "usage: %s --oracle DIR --profile FILE [--exl3 DIR] [--ref logits.bin] [--out FILE] [--batch N]\n", argv[0]);
@@ -122,19 +126,23 @@ int main(int argc, char** argv) {
     std::vector<float> logits;  // [S][V]
     logits.reserve(size_t(S) * c.vocab);
     {
-      engine::StepInput in;
-      in.chunks = {{0, 0, P, 0}};
-      in.ids.assign(ids.begin(), ids.begin() + P);
-      in.pos.resize(size_t(P));
-      std::iota(in.pos.begin(), in.pos.end(), 0);
-      in.logit_rows.resize(size_t(P));
-      std::iota(in.logit_rows.begin(), in.logit_rows.end(), 0);
       const auto ts = std::chrono::steady_clock::now();
-      std::vector<float> out;
-      m.step(in, out);
-      std::printf("prefill %d tokens: %.2f s\n", P,
+      const int n = chunk > 0 ? chunk : P;
+      for (int s0 = 0; s0 < P; s0 += n) {
+        const int len = std::min(n, P - s0);
+        engine::StepInput in;
+        in.chunks = {{0, s0, len, 0}};
+        in.ids.assign(ids.begin() + s0, ids.begin() + s0 + len);
+        in.pos.resize(size_t(len));
+        std::iota(in.pos.begin(), in.pos.end(), s0);
+        in.logit_rows.resize(size_t(len));
+        std::iota(in.logit_rows.begin(), in.logit_rows.end(), 0);
+        std::vector<float> out;
+        m.step(in, out);
+        logits.insert(logits.end(), out.begin(), out.end());
+      }
+      std::printf("prefill %d tokens in %d-token steps: %.2f s\n", P, n,
                   std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
-      logits.insert(logits.end(), out.begin(), out.end());
     }
     for (int t = P; t < S; ++t) {
       engine::StepInput in;

@@ -25,12 +25,15 @@ struct HcCanaryLog;
 namespace unholy::engine {
 
 // The APU's cold experts as seen by one card: its own stream, flags, pinned staging and scratch, so
-// both cards can have expert work in flight at once; the expert weights are shared between channels.
+// both cards can have expert work in flight at once; the expert weights are shared between channels. A channel
+// made with `share` runs on that channel's stream and scratch (a card's second channel for two-part steps: the two
+// parts' jobs alternate in enqueue order).
 class ApuExperts final : public model::RemoteExperts {
  public:
   using Layers = std::vector<std::unique_ptr<model::LayerWeights>>;  // [layer]
   // exl3: room for EXL3 routed experts (native MXFP4 needs less scratch).
-  ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers, bool exl3);
+  ApuExperts(const model::Dsv4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers, bool exl3,
+             const ApuExperts* share = nullptr);
   ~ApuExperts() override;
   void add_layer(model::LayerWeights w);  // experts-only weights of one layer, on this device
   void run(int layer, const std::vector<Job>& jobs) override;
@@ -46,9 +49,12 @@ class ApuExperts final : public model::RemoteExperts {
   const model::Dsv4Config& c_;
   int dev_;
   hipStream_t st_ = nullptr;
+  bool own_stream_ = true;
   std::shared_ptr<Layers> layers_;
   model::ExpertScratch scratch_;
   model::Exl3MoeScratch xscratch_;
+  const model::ExpertScratch* es_ = &scratch_;  // this channel's or the shared one's
+  const model::Exl3MoeScratch* xs_ = &xscratch_;
   int32_t* e_dev_ = nullptr;
   kernels::MoePlan* plan_dev_ = nullptr;   // device views of plan_host / tiles_host
   kernels::Exl3Tile* tiles_dev_ = nullptr;
@@ -122,7 +128,9 @@ class ResidentModel final : public StepModel {
   model::CacheGeometry geo_;
   int max_tokens_ = 0, max_logit_rows_ = 0;
   Card card_[2];
-  std::unique_ptr<ApuExperts> chan_[2];  // card k's channel to the APU experts
+  std::unique_ptr<ApuExperts> chan_[2];   // card k's channel to the APU experts
+  std::unique_ptr<ApuExperts> chan2_[2];  // and for a two-part step's second part (on chan_[k]'s stream)
+  bool split_ok_ = false;                 // every layer on the device MoE path: two-part steps possible
   std::unique_ptr<rt::Arena> card_arena_[2], apu_arena_;  // weights (256 MiB slabs)
   rt::DeviceBuffer embed_, head_, norm_, hc_fn_, hc_scale_, hc_base_;  // embed on card 0, the rest card 1
   rt::DeviceBuffer hrows_, hb_, hf_, logits_, rows_idx_;              // head scratch on card 1
