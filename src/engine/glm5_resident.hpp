@@ -9,7 +9,8 @@
 // MTP drafting (mtp = true): the nextn layer's dense part and DSA rows on card 1, its experts on the APU (a third
 // channel); every step writes its cache rows from the trunk's final-normed hidden states, draft() runs it for one draft per
 // request on card 1's draft stream; a verify chunk backs up the KDA states after its first token, restored when the
-// draft is rejected. Prefix snapshots (snapshots > 0): a slot's KDA conv tails and states (148 MB) and its
+// draft is rejected. Steps of >= 1024 rows run as two overlapping parts (model::glm5_layers_fast; a second APU
+// channel per card; UNHOLY_GLM_SPLIT=0 turns it off). Prefix snapshots (snapshots > 0): a slot's KDA conv tails and states (148 MB) and its
 // MTP hidden row, in pinned host memory (TTM pages, under the limit the APU's memory comes from). Not yet: images.
 #pragma once
 
@@ -120,7 +121,7 @@ class Glm5ResidentModel final : public StepModel {
   model::CacheGeometry geo_;
   int max_tokens_ = 0, max_logit_rows_ = 0;
   Card card_[2];
-  std::unique_ptr<Glm5ApuExperts> chan_[2];
+  std::unique_ptr<Glm5ApuExperts> chan_[2], chan2_[2];  // per card: a step's first part (or the whole), its second
   std::unique_ptr<rt::Arena> card_arena_[2], apu_arena_;
   model::Glm5HeadWeights embed_, head_;   // embedding on card 0, final norm + LM head on card 1
   rt::DeviceBuffer hrows_, logits_, rows_idx_;  // head inputs / outputs on card 1

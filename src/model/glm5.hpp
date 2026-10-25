@@ -18,6 +18,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -250,6 +251,13 @@ void prepare_glm5_fast_mtp(const Glm5Config& c, Glm5MtpWeights& m, int dev, hipS
 void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache,
                              const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st,
                              RemoteExperts* remote = nullptr);
+// A device's layers w[i] (caches cache[i]) in order over a step: glm5_layer_forward_fast each, or, with remote2 (a
+// second channel to the remote experts) and a step of >= 1024 rows, in two parts of the rows that overlap: while the
+// APU has one part's experts of a layer, the card computes the other part's attention (that layer's second part, the
+// next layer's first). The same arithmetic per row either way.
+void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, std::span<Glm5PagedCache> cache,
+                      const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st, RemoteExperts* remote,
+                      RemoteExperts* remote2 = nullptr);
 // Routed experts of `w` that this device holds, over the pair rows of the tiles (*ntiles_dev of max_tiles run): in
 // bf16 [P, dim] with routing weights rw [P] and row_expert [P] -> out bf16 [P, dim] for the tiles' rows. The tiles'
 // rows lie in [*row0_dev, *row1_dev) when given (a MoePlan's local block [0, remote0) or remote block [remote0, P)).

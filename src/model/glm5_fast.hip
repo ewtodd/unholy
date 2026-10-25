@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -272,34 +273,45 @@ void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   linear(w.o, o, H * c.v_dim, out, D, T, s, st);
 }
 
-// Routed experts on the device: router -> dispatch (kernels/moe_dispatch) -> grouped EXL3 experts on this card's
-// tiles, the APU's (remote) tiles through `remote` meanwhile -> combine.
-void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out, int T,
-              hipStream_t st, RemoteExperts* remote) {
-  const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
+// Routed experts on the device, in two calls so that other work can run between them. moe_start: router -> dispatch
+// (kernels/moe_dispatch) -> the APU's (remote) share staged and started through `remote`; moe_post: the grouped EXL3
+// experts on this card's tiles and the shared expert meanwhile -> join -> combine. A step's rows [r0, r0 + T) use
+// pair rows [r0 * K, (r0 + T) * K) of the MoE buffers, plan `idx` and the tile lists from `tile0` (glm5_layers_fast's
+// parts); everything else is used within one call.
+struct MoePart {
+  int T = 0, r0 = 0, idx = 0, tile0 = 0;
+  RemoteExperts* remote = nullptr;
+};
+
+int moe_cap_tiles(const Glm5Config& c, int T) { return T * c.n_active / k::kExl3TileRows + c.n_experts + 1; }
+
+void moe_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn,
+               const MoePart& m, hipStream_t st) {
+  const int D = c.dim, E = c.n_experts, K = c.n_active, T = m.T, P = T * K, P0 = m.r0 * K;
+  RemoteExperts* remote = m.remote;
   const bool any_remote = w.n_resident < E;
   if (any_remote && (!remote || !remote->can_enqueue()))
     throw std::runtime_error("glm5: remote experts need a backend");
   float* logits = s.at<float>(kF32Rows);
-  int32_t* sel = s.at<int32_t>(kSel);
-  float* rw = s.at<float>(kRouteW);
+  int32_t* sel = s.at<int32_t>(kSel) + P0;
+  float* rw = s.at<float>(kRouteW) + P0;
   if (T <= k::kGemvRowsCap) k::gemv_bf16_f32out(hn, D, w.router.w.p<bf16>(), logits, E, T, E, D, st);
   else k::gemm_bf16_f32out_wmma(hn, D, w.router.w.p<bf16>(), logits, E, T, E, D, st);
   k::glm_route(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
 
-  auto* plan = s.at<k::MoePlan>(kMoePlan);
-  auto* lt = s.at<k::Exl3Tile>(kMoeLTiles);
-  auto* rtl = s.at<k::Exl3Tile>(kMoeRTiles);
-  int32_t* eidx = s.at<int32_t>(kEIdx);
-  float* ewt = s.at<float>(kEWt);
-  int32_t* row_expert = s.at<int32_t>(kRowExpert);
-  int32_t* pidx = s.at<int32_t>(kPairIdx);
+  auto* plan = s.at<k::MoePlan>(kMoePlan) + m.idx;
+  auto* lt = s.at<k::Exl3Tile>(kMoeLTiles) + m.tile0;
+  auto* rtl = s.at<k::Exl3Tile>(kMoeRTiles) + m.tile0;
+  int32_t* eidx = s.at<int32_t>(kEIdx) + P0;
+  float* ewt = s.at<float>(kEWt) + P0;
+  int32_t* row_expert = s.at<int32_t>(kRowExpert) + P0;
+  int32_t* pidx = s.at<int32_t>(kPairIdx) + P0;
   // The APU's inputs go as compact token rows (remote_tokens: tok2u [T], u2t [T], in the reference's pair -> token
   // buffer, which the fast path does not use otherwise).
-  int32_t* tok2u = s.at<int32_t>(kPairTok);
+  int32_t* tok2u = s.at<int32_t>(kPairTok) + 2 * m.r0;
   int32_t* u2t = tok2u + T;
   uint32_t* hist = s.at<uint32_t>(kRouteHist) + size_t(w.layer) * E;
-  const int cap_tiles = P / k::kExl3TileRows + E + 1, max_tiles = std::min(P, cap_tiles);
+  const int cap_tiles = moe_cap_tiles(c, T);
   if (any_remote && (size_t(P) > remote->capacity_rows || cap_tiles > remote->max_tiles))
     throw std::runtime_error("glm5: remote staging too small");
   if (T <= k::kMoeSmallMaxTokens) {  // decode-sized: the bookkeeping (and the remote staging) in one block
@@ -320,18 +332,31 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
                       remote->e_host, P, st);
     }
   }
-  bf16* pin = s.at<bf16>(kExpIn);
-  bf16* pout = s.at<bf16>(kExpOut);
-  k::gather_rows(hn, eidx, pin, P, D, st);
+  k::gather_rows(hn, eidx, s.at<bf16>(kExpIn) + size_t(P0) * D, P, D, st);
   if (any_remote) {  // the remote tokens' rows to the APU, which starts once the card stream gets here
     k::copy_remote_tokens(hn, D, u2t, plan, remote->in_host, T, st);
     remote->enqueue(w.layer, st, P);
   }
+}
+
+void moe_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out,
+              const MoePart& m, hipStream_t st) {
+  const int D = c.dim, E = c.n_experts, K = c.n_active, T = m.T, P = T * K, P0 = m.r0 * K;
+  RemoteExperts* remote = m.remote;
+  const bool any_remote = w.n_resident < E;
+  auto* plan = s.at<k::MoePlan>(kMoePlan) + m.idx;
+  const int max_tiles = std::min(P, moe_cap_tiles(c, T));
+  const float* ewt = s.at<float>(kEWt) + P0;
+  const int32_t* row_expert = s.at<int32_t>(kRowExpert) + P0;
+  const int32_t* pidx = s.at<int32_t>(kPairIdx) + P0;
+  const int32_t* tok2u = s.at<int32_t>(kPairTok) + 2 * m.r0;
+  bf16* pin = s.at<bf16>(kExpIn) + size_t(P0) * D;
+  bf16* pout = s.at<bf16>(kExpOut) + size_t(P0) * D;
   const Glm5ExpertBufs eb{s.at<uint16_t>(kXh1), s.at<uint16_t>(kXh3), s.at<uint16_t>(kXh2), s.at<bf16>(kExpGate),
                           s.at<bf16>(kExpUp), s.at<float>(kYp)};
   if (w.n_resident > 0)  // (the MTP layer's experts are all on the APU)
-    glm5_experts_dev(c, w, pin, ewt, row_expert, lt, max_tiles, &plan->n_local_tiles, P, eb, pout, st, nullptr,
-                     &plan->remote0);
+    glm5_experts_dev(c, w, pin, ewt, row_expert, s.at<k::Exl3Tile>(kMoeLTiles) + m.tile0, max_tiles,
+                     &plan->n_local_tiles, P, eb, pout, st, nullptr, &plan->remote0);
   bf16* sh = s.at<bf16>(kShared);
   mlp(c, w.sh_gate, w.sh_up, w.sh_down, hn, T, sh, s, st);
   if (!any_remote) {
@@ -344,6 +369,13 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   remote->join(st);
   k::glm_copy_partial(reinterpret_cast<const float*>(remote->out_host), partial, &plan->n_remote_tokens, D, T, st);
   k::glm_moe_combine_partial(pout, pidx, &plan->remote0, tok2u, partial, sh, out, T, K, D, st);
+}
+
+void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out, int T,
+              hipStream_t st, RemoteExperts* remote) {
+  const MoePart m{T, 0, 0, 0, remote};
+  moe_start(c, w, s, hn, m, st);
+  moe_post(c, w, s, hn, out, m, st);
 }
 
 void hc_pre(const Glm5Config& c, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const bf16* x,
@@ -407,29 +439,138 @@ void prepare_glm5_fast_head(Glm5HeadWeights& h, int dev, hipStream_t st) {
   prepare_linear(h.head, dev, st);
 }
 
+namespace {
+
+// A part of a step: rows [m.r0, m.r0 + b.T) (b: their chunks, t0 relative to m.r0, pos from row m.r0).
+struct LayerPart {
+  Glm5Batch b;
+  MoePart m;
+};
+
+// Attention, then the FFN side's mixing and norm (the FFN's input in the part's rows of hn).
+void layer_pre(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache, const Glm5Scratch& s,
+               uint16_t* x, const LayerPart& p, hipStream_t st) {
+  const int T = p.b.T, D = c.dim, hc = c.hc_mult, r0 = p.m.r0;
+  bf16* h = s.at<bf16>(kH) + size_t(r0) * D;
+  bf16* hn = s.at<bf16>(kHn) + size_t(r0) * D;
+  bf16* out = s.at<bf16>(kOut) + size_t(r0) * D;
+  float* post = s.at<float>(kPost) + size_t(r0) * hc;
+  float* comb = s.at<float>(kComb) + size_t(r0) * hc * hc;
+  uint16_t* xr = x + size_t(r0) * hc * D;
+  set_rows(s, T, st);
+  hc_pre(c, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, xr, h, post, comb, T, s, st);
+  norm(h, w.input_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
+  if (w.kda) kda_fast(c, w, cache, s, hn, out, p.b, st);
+  else dsa_fast(c, w, cache, s, hn, out, p.b, st);
+  k::hc_post_slices(out, xr, post, comb, xr, T, hc, D, st);
+  hc_pre(c, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, xr, h, post, comb, T, s, st);
+  norm(h, w.post_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
+}
+
+void layer_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const LayerPart& p,
+                 hipStream_t st) {
+  if (!w.dense) moe_start(c, w, s, s.at<bf16>(kHn) + size_t(p.m.r0) * c.dim, p.m, st);
+}
+
+// The FFN (the dense MLP, or the MoE layer_start began) and its mixing back into x. tiles: the dense tile list was
+// last set for another part's rows.
+void layer_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, uint16_t* x,
+                const LayerPart& p, hipStream_t st, bool tiles) {
+  const int T = p.b.T, D = c.dim, hc = c.hc_mult, r0 = p.m.r0;
+  bf16* hn = s.at<bf16>(kHn) + size_t(r0) * D;
+  bf16* out = s.at<bf16>(kOut) + size_t(r0) * D;
+  uint16_t* xr = x + size_t(r0) * hc * D;
+  if (tiles) set_rows(s, T, st);
+  if (w.dense) mlp(c, w.gate, w.up, w.down, hn, T, out, s, st);
+  else moe_post(c, w, s, hn, out, p.m, st);
+  k::hc_post_slices(out, xr, s.at<float>(kPost) + size_t(r0) * hc, s.at<float>(kComb) + size_t(r0) * hc * hc, xr, T,
+                    hc, D, st);
+}
+
+constexpr int kSplitMinRows = 1024;  // steps this large run as two parts
+constexpr int kSplitMinPiece = 64;   // a chunk is cut only into pieces this long (attention's decode kernels: <= 4)
+
+// Where a step splits into two parts: near the middle, between chunks or where a chunk crosses a page boundary;
+// both parts >= a quarter of the step, the second within the second channel's capacity. 0: no split.
+int split_cut(const Glm5Config& c, const Glm5Batch& b, const RemoteExperts& second) {
+  const int T = b.T, cap = int(second.capacity_rows / size_t(c.n_active));
+  if (T < kSplitMinRows) return 0;
+  int best = 0;
+  const auto consider = [&](int cut) {
+    if (cut < T / 4 || T - cut < T / 4 || T - cut > cap) return;
+    if (best == 0 || std::abs(cut - T / 2) < std::abs(best - T / 2)) best = cut;
+  };
+  for (const auto& ch : b.chunks) {
+    if (ch.t0 > 0) consider(ch.t0);
+    for (int q = (ch.s0 / k::kGlmPageRows + 1) * k::kGlmPageRows; q < ch.s0 + ch.n; q += k::kGlmPageRows)
+      if (q - ch.s0 >= kSplitMinPiece && ch.s0 + ch.n - q >= kSplitMinPiece) consider(ch.t0 + q - ch.s0);
+  }
+  return best;
+}
+
+void split_batch(const Glm5Batch& b, int cut, Glm5Batch& lo, Glm5Batch& hi) {
+  for (Glm5Batch* p : {&lo, &hi}) {
+    p->tables = b.tables;
+    p->max_pages = b.max_pages;
+  }
+  lo.T = cut;
+  lo.pos = b.pos;
+  hi.T = b.T - cut;
+  hi.pos = b.pos + cut;
+  for (const Glm5Chunk& ch : b.chunks) {
+    if (ch.t0 + ch.n <= cut) {
+      lo.chunks.push_back(ch);
+    } else if (ch.t0 >= cut) {
+      Glm5Chunk h = ch;
+      h.t0 -= cut;
+      hi.chunks.push_back(h);
+    } else {  // pieces >= kSplitMinPiece: never a verify chunk (save_after)
+      const int n1 = cut - ch.t0;
+      lo.chunks.push_back({ch.slot, ch.s0, n1, ch.t0});
+      hi.chunks.push_back({ch.slot, ch.s0 + n1, ch.n - n1, 0});
+    }
+  }
+}
+
+}  // namespace
+
 void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache,
                              const Glm5Scratch& s, uint16_t* x, const Glm5Batch& b, hipStream_t st,
                              RemoteExperts* remote) {
-  const int T = b.T, D = c.dim, hc = c.hc_mult;
-  if (T > s.max_tokens) throw std::runtime_error("glm5_layer_forward_fast: batch larger than the scratch");
-  bf16* h = s.at<bf16>(kH);
-  bf16* hn = s.at<bf16>(kHn);
-  bf16* out = s.at<bf16>(kOut);
-  float* post = s.at<float>(kPost);
-  float* comb = s.at<float>(kComb);
-  set_rows(s, T, st);
+  if (b.T > s.max_tokens) throw std::runtime_error("glm5_layer_forward_fast: batch larger than the scratch");
+  const LayerPart p{b, MoePart{b.T, 0, 0, 0, remote}};
+  layer_pre(c, w, cache, s, x, p, st);
+  layer_start(c, w, s, p, st);
+  layer_post(c, w, s, x, p, st, false);
+}
 
-  hc_pre(c, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, x, h, post, comb, T, s, st);
-  norm(h, w.input_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
-  if (w.kda) kda_fast(c, w, cache, s, hn, out, b, st);
-  else dsa_fast(c, w, cache, s, hn, out, b, st);
-  k::hc_post_slices(out, x, post, comb, x, T, hc, D, st);
-
-  hc_pre(c, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, x, h, post, comb, T, s, st);
-  norm(h, w.post_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
-  if (w.dense) mlp(c, w.gate, w.up, w.down, hn, T, out, s, st);
-  else moe_fast(c, w, s, hn, out, T, st, remote);
-  k::hc_post_slices(out, x, post, comb, x, T, hc, D, st);
+void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, std::span<Glm5PagedCache> cache,
+                      const Glm5Scratch& s, uint16_t* x, const Glm5Batch& b, hipStream_t st, RemoteExperts* remote,
+                      RemoteExperts* remote2) {
+  if (b.T > s.max_tokens) throw std::runtime_error("glm5_layers_fast: batch larger than the scratch");
+  const int n = int(w.size()), cut = remote2 ? split_cut(c, b, *remote2) : 0;
+  if (cut == 0) {
+    for (int i = 0; i < n; ++i) glm5_layer_forward_fast(c, w[size_t(i)], cache[size_t(i)], s, x, b, st, remote);
+    return;
+  }
+  LayerPart p[2];
+  split_batch(b, cut, p[0].b, p[1].b);
+  p[0].m = {cut, 0, 0, 0, remote};
+  p[1].m = {b.T - cut, cut, 1, moe_cap_tiles(c, cut), remote2};
+  // Layer i's second part and layer i + 1's first part run on the card while the APU has the other part's experts.
+  layer_pre(c, w[0], cache[0], s, x, p[0], st);
+  layer_start(c, w[0], s, p[0], st);
+  for (int i = 0; i < n; ++i) {
+    const auto& wi = w[size_t(i)];
+    layer_pre(c, wi, cache[size_t(i)], s, x, p[1], st);
+    layer_start(c, wi, s, p[1], st);
+    layer_post(c, wi, s, x, p[0], st, true);
+    if (i + 1 < n) {
+      layer_pre(c, w[size_t(i) + 1], cache[size_t(i) + 1], s, x, p[0], st);
+      layer_start(c, w[size_t(i) + 1], s, p[0], st);
+    }
+    layer_post(c, wi, s, x, p[1], st, true);
+  }
 }
 
 void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& hw, const Glm5Scratch& s, const uint16_t* x,

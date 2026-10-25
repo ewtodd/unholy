@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -108,11 +109,14 @@ size_t head_bytes(const model::Checkpoint& ck) {
   return b;
 }
 
-// APU bytes besides the cold experts: both channels' scratch.
+// APU bytes of one channel's scratch (cap pair rows).
 size_t channel_bytes(const model::Glm5Config& c, size_t cap) {
   const size_t D = c.dim, I = c.moe_inter;
-  return 2 * (2 * cap * D * 2 + 3 * cap * I * 2 + std::min<size_t>(cap, 64) * std::max(D, I) * 4);
+  return 2 * cap * D * 2 + 3 * cap * I * 2 + std::min<size_t>(cap, 64) * std::max(D, I) * 4;
 }
+
+// A step's second part (glm5_layers_fast): at most half the step plus a page.
+int second_part_tokens(int max_tokens) { return max_tokens / 2 + k::kGlmPageRows; }
 
 // Card-1 bytes MTP drafting needs besides its weights and cache: the draft scratch and rows, the step's cache-row
 // inputs, the slots' hidden states.
@@ -209,10 +213,12 @@ Plan make_glm5_plan(const Glm5PlanInput& in) {
       if (!pl.on_card[size_t(cd.layer)][size_t(cd.expert)]) pl.apu_experts += cd.bytes;
   pl.routed_on_cards = mass_cards / std::max(layers_moe, 1.0);
   pl.apu_free = info(pl.apu).free_bytes;
-  size_t apu_work = channel_bytes(c, size_t(in.max_tokens) * c.n_active);
+  // Per card: a channel for a step (or its first part), one for a step's second part.
+  size_t apu_work = 2 * (channel_bytes(c, size_t(in.max_tokens) * c.n_active) +
+                         channel_bytes(c, size_t(second_part_tokens(in.max_tokens)) * c.n_active));
   if (in.mtp) {
     for (int e = 0; e < c.n_experts; ++e) pl.apu_experts += model::glm5_expert_bytes(ck, c.n_layers, e);
-    apu_work += channel_bytes(c, size_t(std::max(in.geo.max_slots, 8)) * c.n_active) / 2;  // the draft channel
+    apu_work += channel_bytes(c, size_t(std::max(in.geo.max_slots, 8)) * c.n_active);  // the draft channel
   }
   if (pl.apu_experts + apu_work + in.apu_margin > pl.apu_free) {
     char msg[256];
@@ -252,6 +258,8 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
   {
     auto layers = std::make_shared<Glm5ApuExperts::Layers>();
     for (auto& ch : chan_) ch = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers);
+    for (auto& ch : chan2_)
+      ch = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(second_part_tokens(max_tokens)) * c.n_active, layers);
     if (mtp_) dchan_ = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(draft_rows) * c.n_active, layers);
   }
   for (int k = 0; k < 2; ++k) card_arena_[k] = std::make_unique<rt::Arena>(plan.card[k], size_t(256) << 20);
@@ -542,9 +550,12 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
       UH_CHECK(hipEventRecord(f.consumed, cd.st));
     }
     state_copies(k, in.restore, false);
-    for (size_t i = 0; i < cd.w.size(); ++i)
-      model::glm5_layer_forward_fast(c_, cd.w[i], cd.cache[i], cd.scratch, cd.x.as<uint16_t>(), b, cd.st,
-                                     chan_[k].get());
+    static const bool split = [] {
+      const char* e = std::getenv("UNHOLY_GLM_SPLIT");
+      return !e || std::string(e) != "0";
+    }();
+    model::glm5_layers_fast(c_, cd.w, cd.cache, cd.scratch, cd.x.as<uint16_t>(), b, cd.st, chan_[k].get(),
+                            split ? chan2_[k].get() : nullptr);
     if (k == 0) {
       UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));  // card 1 may still read it for the step two back
       k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);

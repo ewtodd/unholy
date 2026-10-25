@@ -470,9 +470,9 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       std::min<size_t>(T, k::kHcSmallMaxTokens) * 32 * 25 * 4,  // hc_pre_small partial sums
       T * W * 4, T * W * 4, T * W * 4,            // KDA: normalized q, k, exp(forget gate)
       E * 4, E * 4, E * 4,                        // MoE count, offsets, fill
-      sizeof(k::MoePlan),                         // MoE plan
-      max_tiles * sizeof(k::Exl3Tile),            // local tiles
-      max_tiles * sizeof(k::Exl3Tile),            // remote tiles
+      2 * sizeof(k::MoePlan),                     // MoE plans (glm5_layers_fast's two parts)
+      (max_tiles + E + 1) * sizeof(k::Exl3Tile),  // local tiles (room for two parts' lists)
+      (max_tiles + E + 1) * sizeof(k::Exl3Tile),  // remote tiles
       P * 4, P * 4, P * 4,                        // pair -> token, weight, expert
       P * D * 2, P * D * 2,                       // fp16 expert inputs (gate, up)
       std::max(P * c.moe_inter, T * c.inter) * 2,  // fp16 down inputs
