@@ -19,21 +19,36 @@ namespace k = unholy::kernels;
 // ---------------------------------------------------------------------------------------------------
 // Glm5ApuExperts
 
+size_t Glm5ApuExperts::work_bytes(const model::Glm5Config& c, size_t cap) {
+  const size_t D = c.dim, I = c.moe_inter;
+  return 2 * cap * D * 2 + 3 * cap * I * 2 + std::min<size_t>(cap, 64) * std::max(D, I) * 4;
+}
+
+size_t Glm5ApuExperts::staging_bytes(const model::Glm5Config& c, size_t cap) {
+  const size_t tokens = cap / size_t(c.n_active), D = c.dim;
+  return tokens * D * (2 + 4) + cap * 4 * 4 + sizeof(k::MoePlan) +
+         (cap / k::kExl3TileRows + c.n_experts + 1) * sizeof(k::Exl3Tile);
+}
+
+Glm5ApuExperts::Work::~Work() {
+  rt::DeviceGuard g(dev);
+  if (st) (void)hipStreamDestroy(st);
+}
+
 Glm5ApuExperts::Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capacity_rows,
-                               std::shared_ptr<Layers> layers)
+                               std::shared_ptr<Layers> layers, const Glm5ApuExperts* share)
     : c_(c), dev_(dev), layers_(std::move(layers)) {
   rt::DeviceGuard g(dev);
-  UH_CHECK(hipStreamCreateWithFlags(&st_, hipStreamNonBlocking));
   this->capacity_rows = capacity_rows;
-  const size_t D = c.dim, I = c.moe_inter, cap = capacity_rows;
+  const size_t D = c.dim, I = c.moe_inter, cap = capacity_rows, tokens = cap / size_t(c.n_active);
   max_tiles = int(cap / k::kExl3TileRows + c.n_experts + 1);
   const unsigned flags = hipHostMallocPortable | hipHostMallocMapped;
   const auto pinned = [&](auto** host, auto** dev_ptr, size_t bytes) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(host), bytes, flags));
     if (dev_ptr) UH_CHECK(hipHostGetDevicePointer(reinterpret_cast<void**>(dev_ptr), *host, 0));
   };
-  pinned(&in_host, &in_dev_, cap * D * 2);
-  pinned(&out_host, &out_dev_, cap * D * 2);
+  pinned(&in_host, &in_dev_, tokens * D * 2);   // compact token rows (bf16)
+  pinned(&out_host, &out_dev_, tokens * D * 4);  // per-token partial sums (fp32)
   pinned(&w_host, &w_dev_, cap * 4);
   pinned(&e_host, &e_dev_, cap * 4);
   pinned(&p2u_host, &p2u_dev_, cap * 4);
@@ -44,18 +59,25 @@ Glm5ApuExperts::Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capac
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&done_flag_), 64, flags | hipHostMallocCoherent));
   *req_flag_ = 0;
   *done_flag_ = 0;
-  xh1_ = rt::DeviceBuffer(dev, cap * D * 2);
-  xh3_ = rt::DeviceBuffer(dev, cap * D * 2);
-  xh2_ = rt::DeviceBuffer(dev, cap * I * 2);
-  h1_ = rt::DeviceBuffer(dev, cap * I * 2);
-  h3_ = rt::DeviceBuffer(dev, cap * I * 2);
-  yp_ = rt::DeviceBuffer(dev, std::min<size_t>(cap, 64) * std::max(D, I) * 4);
+  if (share) {
+    if (share->capacity_rows < cap) throw std::runtime_error("Glm5ApuExperts: shared working buffers too small");
+    work_ = share->work_;
+  } else {
+    work_ = std::make_shared<Work>();
+    work_->dev = dev;
+    UH_CHECK(hipStreamCreateWithFlags(&work_->st, hipStreamNonBlocking));
+    work_->xh1 = rt::DeviceBuffer(dev, cap * D * 2);
+    work_->xh3 = rt::DeviceBuffer(dev, cap * D * 2);
+    work_->xh2 = rt::DeviceBuffer(dev, cap * I * 2);
+    work_->h1 = rt::DeviceBuffer(dev, cap * I * 2);
+    work_->h3 = rt::DeviceBuffer(dev, cap * I * 2);
+    work_->yp = rt::DeviceBuffer(dev, std::min<size_t>(cap, 64) * std::max(D, I) * 4);
+  }
   if (layers_->size() < size_t(c.n_layers)) layers_->resize(size_t(c.n_layers));
 }
 
 Glm5ApuExperts::~Glm5ApuExperts() {
   rt::DeviceGuard g(dev_);
-  if (st_) (void)hipStreamDestroy(st_);
   for (void* p : {static_cast<void*>(in_host), static_cast<void*>(out_host), static_cast<void*>(w_host),
                   static_cast<void*>(e_host), static_cast<void*>(plan_host), static_cast<void*>(tiles_host),
                   static_cast<void*>(p2u_host), static_cast<void*>(u2p_host), static_cast<void*>(req_flag_),
@@ -74,22 +96,24 @@ void Glm5ApuExperts::run(int, const std::vector<Job>&) {
 }
 
 // The card stream raises req after staging the inputs; the APU stream waits for it, runs the remote tiles (their
-// pair rows into xh1_, free once the gate projection is done), sums each token's pair rows into one fp32 row of
-// out_host, raises done; join() makes the card stream wait for done (sequence numbers: no resets, no host waits).
+// pair rows into the working xh1, free once the gate projection is done), sums each token's pair rows into one fp32
+// row of out_host, raises done; join() makes the card stream wait for done (sequence numbers: no resets, no host
+// waits).
 void Glm5ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
   const auto* w = layers_->at(size_t(layer)).get();
   if (!w) throw std::runtime_error("Glm5ApuExperts: no experts of layer " + std::to_string(layer) + " on the APU");
   ++seq_;
   UH_CHECK(hipStreamWriteValue32(card_st, req_flag_, seq_, 0));
   rt::DeviceGuard g(dev_);
-  UH_CHECK(hipStreamWaitValue32(st_, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
-  const model::Glm5ExpertBufs b{xh1_.as<uint16_t>(), xh3_.as<uint16_t>(), xh2_.as<uint16_t>(), h1_.as<uint16_t>(),
-                                h3_.as<uint16_t>(), yp_.as<float>()};
+  Work& wk = *work_;
+  UH_CHECK(hipStreamWaitValue32(wk.st, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
+  const model::Glm5ExpertBufs b{wk.xh1.as<uint16_t>(), wk.xh3.as<uint16_t>(), wk.xh2.as<uint16_t>(),
+                                wk.h1.as<uint16_t>(), wk.h3.as<uint16_t>(), wk.yp.as<float>()};
   model::glm5_experts_dev(c_, *w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P, b,
-                          xh1_.as<uint16_t>(), st_, &plan_dev_->remote0, nullptr, p2u_dev_);
-  k::glm_remote_partial(xh1_.as<uint16_t>(), u2p_dev_, &plan_dev_->n_remote_tokens, reinterpret_cast<float*>(out_dev_),
-                        c_.n_active, c_.dim, P / c_.n_active, st_);
-  UH_CHECK(hipStreamWriteValue32(st_, done_flag_, seq_, 0));
+                          wk.xh1.as<uint16_t>(), wk.st, &plan_dev_->remote0, nullptr, p2u_dev_);
+  k::glm_remote_partial(wk.xh1.as<uint16_t>(), u2p_dev_, &plan_dev_->n_remote_tokens,
+                        reinterpret_cast<float*>(out_dev_), c_.n_active, c_.dim, P / c_.n_active, wk.st);
+  UH_CHECK(hipStreamWriteValue32(wk.st, done_flag_, seq_, 0));
 }
 
 void Glm5ApuExperts::join(hipStream_t card_st) {
@@ -107,12 +131,6 @@ size_t head_bytes(const model::Checkpoint& ck) {
   size_t b = ck.at("model.language_model.norm.weight").nbytes;
   for (const char* s : {".trellis", ".suh", ".svh"}) b += ck.at(std::string("lm_head") + s).nbytes;
   return b;
-}
-
-// APU bytes of one channel's scratch (cap pair rows).
-size_t channel_bytes(const model::Glm5Config& c, size_t cap) {
-  const size_t D = c.dim, I = c.moe_inter;
-  return 2 * cap * D * 2 + 3 * cap * I * 2 + std::min<size_t>(cap, 64) * std::max(D, I) * 4;
 }
 
 // A step's second part (glm5_layers_fast): at most half the step plus a page.
@@ -213,12 +231,15 @@ Plan make_glm5_plan(const Glm5PlanInput& in) {
       if (!pl.on_card[size_t(cd.layer)][size_t(cd.expert)]) pl.apu_experts += cd.bytes;
   pl.routed_on_cards = mass_cards / std::max(layers_moe, 1.0);
   pl.apu_free = info(pl.apu).free_bytes;
-  // Per card: a channel for a step (or its first part), one for a step's second part.
-  size_t apu_work = 2 * (channel_bytes(c, size_t(in.max_tokens) * c.n_active) +
-                         channel_bytes(c, size_t(second_part_tokens(in.max_tokens)) * c.n_active));
-  if (in.mtp) {
+  // Per card: a channel for a step (or its first part) and one for a step's second part on its working buffers; their
+  // pinned staging (it takes the same RAM).
+  const size_t cap = size_t(in.max_tokens) * c.n_active, cap2 = size_t(second_part_tokens(in.max_tokens)) * c.n_active;
+  size_t apu_work = 2 * (Glm5ApuExperts::work_bytes(c, cap) + Glm5ApuExperts::staging_bytes(c, cap) +
+                         Glm5ApuExperts::staging_bytes(c, cap2));
+  if (in.mtp) {  // the draft channel
     for (int e = 0; e < c.n_experts; ++e) pl.apu_experts += model::glm5_expert_bytes(ck, c.n_layers, e);
-    apu_work += channel_bytes(c, size_t(std::max(in.geo.max_slots, 8)) * c.n_active);  // the draft channel
+    const size_t dcap = size_t(std::max(in.geo.max_slots, 8)) * c.n_active;
+    apu_work += Glm5ApuExperts::work_bytes(c, dcap) + Glm5ApuExperts::staging_bytes(c, dcap);
   }
   if (pl.apu_experts + apu_work + in.apu_margin > pl.apu_free) {
     char msg[256];
@@ -258,8 +279,9 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
   {
     auto layers = std::make_shared<Glm5ApuExperts::Layers>();
     for (auto& ch : chan_) ch = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers);
-    for (auto& ch : chan2_)
-      ch = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(second_part_tokens(max_tokens)) * c.n_active, layers);
+    for (int k = 0; k < 2; ++k)
+      chan2_[k] = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(second_part_tokens(max_tokens)) * c.n_active,
+                                                   layers, chan_[k].get());
     if (mtp_) dchan_ = std::make_unique<Glm5ApuExperts>(c, plan.apu, size_t(draft_rows) * c.n_active, layers);
   }
   for (int k = 0; k < 2; ++k) card_arena_[k] = std::make_unique<rt::Arena>(plan.card[k], size_t(256) << 20);

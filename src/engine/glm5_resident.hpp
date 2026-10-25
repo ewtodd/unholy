@@ -29,25 +29,36 @@
 
 namespace unholy::engine {
 
-// The APU's cold experts as seen by one card (own stream, flags, pinned staging, scratch; shared weights).
+// The APU's cold experts as seen by one card (flags, pinned staging; shared weights). The staging holds one row per
+// token: compact bf16 inputs, fp32 partial outputs. A channel made with `share` runs on that channel's APU stream and
+// working buffers (a card's two channels: their jobs alternate in enqueue order anyway).
 class Glm5ApuExperts final : public model::RemoteExperts {
  public:
   using Layers = std::vector<std::unique_ptr<model::Glm5LayerWeights>>;  // [layer]
-  Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers);
+  Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers,
+                 const Glm5ApuExperts* share = nullptr);
   ~Glm5ApuExperts() override;
   void add_layer(model::Glm5LayerWeights w);
   void run(int, const std::vector<Job>&) override;  // host-synchronous jobs: not supported (enqueue only)
   bool can_enqueue() const override { return true; }
   void enqueue(int layer, hipStream_t card_st, int P) override;
   void join(hipStream_t card_st) override;
-  hipStream_t stream() const { return st_; }
+  hipStream_t stream() const { return work_->st; }
+  // Bytes of the APU working buffers / the pinned staging for capacity_rows pair rows.
+  static size_t work_bytes(const model::Glm5Config& c, size_t capacity_rows);
+  static size_t staging_bytes(const model::Glm5Config& c, size_t capacity_rows);
 
  private:
+  struct Work {
+    int dev = 0;
+    hipStream_t st = nullptr;
+    rt::DeviceBuffer xh1, xh3, xh2, h1, h3, yp;
+    ~Work();
+  };
   const model::Glm5Config& c_;
   int dev_;
-  hipStream_t st_ = nullptr;
   std::shared_ptr<Layers> layers_;
-  rt::DeviceBuffer xh1_, xh3_, xh2_, h1_, h3_, yp_;
+  std::shared_ptr<Work> work_;
   kernels::MoePlan* plan_dev_ = nullptr;
   kernels::Exl3Tile* tiles_dev_ = nullptr;
   uint16_t* in_dev_ = nullptr;
