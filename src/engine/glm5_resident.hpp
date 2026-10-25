@@ -7,11 +7,12 @@
 // finishes step k; the residual crosses once per step through pinned memory.
 //
 // MTP drafting (mtp = true): the nextn layer's dense part and DSA rows on card 1, its experts on the APU (a third
-// channel); every step writes its cache rows from the trunk's final-normed hidden states, draft() runs it for one draft per
-// request on card 1's draft stream; a verify chunk backs up the KDA states after its first token, restored when the
-// draft is rejected. Steps of >= 1024 rows run as two overlapping parts (model::glm5_layers_fast; a second APU
-// channel per card; UNHOLY_GLM_SPLIT=0 turns it off). Prefix snapshots (snapshots > 0): a slot's KDA conv tails and states (148 MB) and its
-// MTP hidden row, in pinned host memory (TTM pages, under the limit the APU's memory comes from). Not yet: images.
+// channel); every step writes its cache rows from the trunk's final-normed hidden states, draft() runs it for one
+// draft per request on card 1's draft stream; a verify chunk backs up the KDA states after its first token, restored
+// when the draft is rejected. Steps of >= 1024 rows run as two overlapping parts (model::glm5_layers_fast; a second
+// APU channel per card on the first's stream and working buffers; UNHOLY_GLM_SPLIT=0 turns it off). Prefix snapshots
+// (snapshots > 0): a slot's KDA conv tails and states (148 MB) and its MTP hidden row, in pinned host memory (TTM
+// pages, under the limit the APU's memory comes from). Not yet: images.
 #pragma once
 
 #include <hip/hip_runtime.h>

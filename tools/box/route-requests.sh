@@ -16,4 +16,5 @@ ls "$RUN"/req/*.json | xargs -P "${CONC:-8}" -I{} sh -c \
   'curl -s --max-time 3600 "$0/v1/chat/completions" -H content-type:application/json -d @"$1" >"$1.out"' "$URL" {}
 curl -s "$URL/unholy/routing_profile" >"$RUN/profile.txt"
 curl -s "$URL/unholy/routing_share" >"$RUN/share.txt"
-echo "$i requests: $(jq -s '[.[].usage.completion_tokens] | add' "$RUN"/req/*.out) completion tokens; on cards $(head -1 "$RUN/share.txt")"
+completion=$(jq -s '[.[].usage.completion_tokens] | add' "$RUN"/req/*.out)
+echo "$i requests: $completion completion tokens; on cards $(head -1 "$RUN/share.txt")"
