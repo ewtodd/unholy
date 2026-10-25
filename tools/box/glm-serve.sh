@@ -9,7 +9,7 @@ set -euo pipefail
 label=${1:?label}; shift
 d=$(run_dir "glm-serve-$label")
 : "${GLM_B:=/scratch/models/glm53-flash-exl3-4.05bpw}"
-: "${GLM_PROFILE:=$BOX_TREE/data/expert_profile_glm53_mixed.txt}"
+: "${GLM_PROFILE:=$BOX_TREE/data/expert_profile_glm53_broad.txt}"
 body() {
   cd "$BOX_TREE"
   nix develop -c "$BUILD/unholy" serve --model "$GLM_B" --profile "$GLM_PROFILE" \

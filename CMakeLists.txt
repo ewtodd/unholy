@@ -158,7 +158,8 @@ target_compile_definitions(unholy PRIVATE UNHOLY_DATA_DIR="${CMAKE_INSTALL_PREFI
 target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
 install(TARGETS unholy unholy-text-test unholy-sched-test unholy-vision-test RUNTIME DESTINATION bin)
 install(FILES data/expert_profile_dsv4engine_code32k.txt data/expert_profile_unholy_mixed.txt
-              data/expert_profile_unholy_code32k.txt data/expert_profile_glm53_mixed.txt DESTINATION share/unholy)
+              data/expert_profile_unholy_code32k.txt data/expert_profile_glm53_mixed.txt
+              data/expert_profile_glm53_broad.txt DESTINATION share/unholy)
 
 # Requests through the engine on one thread (no HTTP): token-for-token comparisons of builds under concurrency.
 add_executable(unholy-engine-batch tools/engine_batch/main.cpp)

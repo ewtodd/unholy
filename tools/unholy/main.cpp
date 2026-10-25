@@ -335,7 +335,7 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   const bool mtp = o.spec_drafts > 0 && c.n_mtp > 0;
   o.spec_drafts = mtp ? 1 : 0;
   if (o.prefix_snapshots < 0) o.prefix_snapshots = 32;
-  if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_glm53_mixed.txt";
+  if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_glm53_broad.txt";
 
   const int max_seq = (o.max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
   model::CacheGeometry geo;
