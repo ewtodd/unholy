@@ -1,0 +1,97 @@
+# DSV4 vs GLM-5.3-Flash (build B) performance, 2026-10-24, perf tree at 1007f62 + scripts (2330ede), production configurations
+# (tools/box/model-serve.sh: DSV4 the ds4 flags; GLM MTP, --kv-tokens 1048576, --max-batch-tokens 3072, broad profile).
+# Prefill / decode: tools/box/perf-depth.sh (unique Pile documents per depth; the first request's TTFT, then four more on the
+# cached document; decode = the server's tok/s after the first token, with each engine's drafts). Concurrency: tools/box/eb.sh
+# (engine-batch, 48 GSM8K requests, thinking on, temperature 1.0 top_p 0.95 top_k 20, up to 1024 tokens).
+
+## summary
+depth   prefill tok/s (TTFT)        decode tok/s, median of 5
+        DSV4          GLM           DSV4    GLM
+8k      1681 (4.9 s)  1037 (7.9 s)  36.1    25.0
+32k     1752 (17.7 s) 1249 (26.2 s) 32.8    25.4
+128k    1763 (74 s)   1425 (92 s)   35.3    24.8
+256k    1750 (149 s)  1508 (174 s)  30.2    24.4
+512k    1742 (295 s)  1476 (355 s)  32.3    24.1
+
+concurrency (engine-batch tok/s): DSV4 37.9 / 48.2 / 55.6 / 64.2, GLM 25.8 / 32.1 / 36.5 / 50.2 at 1 / 2 / 4 / 8
+
+## plan dsv4
+geometry: kv pool 1572864 tokens (6144 pages), up to 786432 tokens per request, 8 requests at once; step 4096 tokens; experts native (MXFP4)
+card 0 (dev 0): layers 0-21  dense 4.48 GB  cache 4.49 GB  scratch 2.41 GB  hot experts 1541 (20.60 GB of 20.61 GB budget)
+card 1 (dev 1): layers 22-42  dense 5.09 GB  cache 4.92 GB  scratch 2.53 GB  hot experts 1454 (19.44 GB of 19.44 GB budget)
+apu (dev 2): cold experts 107.13 GB of 129.53 GB free; predicted routing on cards 54.5%
+vision tower: 1.20 GB on the APU
+dspark drafter: 0.73 GB on card 1 (in its dense), 10.27 GB of experts on the APU
+
+## plan glm
+geometry: kv pool 1048576 tokens (4096 pages), up to 786432 tokens per request, 8 requests at once; step 3072 tokens; GLM-5.3-Flash EXL3, MTP drafts
+card 0 (dev 0): layers 0-22  dense 5.09 GB  cache 4.31 GB  scratch 3.10 GB  hot experts 1544 (19.48 GB of 19.49 GB budget)
+card 1 (dev 1): layers 23-44  dense 4.45 GB  cache 5.40 GB  scratch 3.11 GB  hot experts 1508 (19.03 GB of 19.04 GB budget)
+apu (dev 2): cold experts 117.77 GB of 129.53 GB free; predicted routing on cards 45.9%
+prefix snapshots: 39 x 0.148 GB pinned host (5.76 GB)
+
+## requests dsv4
+length | prompt 8320, completion 256 | queue 0.00 s, ttft 4.95 s, prefill 1681.3 tok/s, decode 32.6 tok/s | drafts 104/142 accepted (73.2%), 2.02 tok/step
+length | prompt 8319 (8192 cached), completion 256 | queue 0.00 s, ttft 0.53 s, prefill 238.2 tok/s, decode 36.1 tok/s | drafts 126/158 accepted (79.7%), 2.35 tok/step
+stop | prompt 8322 (8192 cached), completion 185 | queue 0.00 s, ttft 0.54 s, prefill 242.9 tok/s, decode 36.6 tok/s | drafts 96/151 accepted (63.6%), 2.43 tok/step
+length | prompt 8319 (8192 cached), completion 256 | queue 0.00 s, ttft 0.53 s, prefill 238.0 tok/s, decode 40.4 tok/s | drafts 148/196 accepted (75.5%), 2.74 tok/step
+length | prompt 8319 (8192 cached), completion 256 | queue 0.00 s, ttft 0.53 s, prefill 240.0 tok/s, decode 34.6 tok/s | drafts 116/155 accepted (74.8%), 2.21 tok/step
+length | prompt 30996, completion 256 | queue 0.00 s, ttft 17.70 s, prefill 1751.7 tok/s, decode 31.0 tok/s | drafts 96/134 accepted (71.6%), 2.08 tok/step
+length | prompt 30995 (30976 cached), completion 256 | queue 0.00 s, ttft 0.15 s, prefill 125.1 tok/s, decode 40.4 tok/s | drafts 150/174 accepted (86.2%), 2.76 tok/step
+length | prompt 30998 (30976 cached), completion 256 | queue 0.00 s, ttft 0.16 s, prefill 141.1 tok/s, decode 38.0 tok/s | drafts 147/206 accepted (71.4%), 2.56 tok/step
+length | prompt 30995 (30976 cached), completion 256 | queue 0.00 s, ttft 0.15 s, prefill 127.9 tok/s, decode 32.8 tok/s | drafts 114/173 accepted (65.9%), 2.15 tok/step
+length | prompt 30995 (30976 cached), completion 256 | queue 0.00 s, ttft 0.15 s, prefill 130.4 tok/s, decode 32.6 tok/s | drafts 110/163 accepted (67.5%), 2.16 tok/step
+length | prompt 130391, completion 256 | queue 0.00 s, ttft 73.98 s, prefill 1762.5 tok/s, decode 31.7 tok/s | drafts 101/140 accepted (72.1%), 2.13 tok/step
+length | prompt 130390 (130304 cached), completion 256 | queue 0.00 s, ttft 0.47 s, prefill 181.6 tok/s, decode 35.3 tok/s | drafts 130/171 accepted (76.0%), 2.49 tok/step
+stop | prompt 130393 (130304 cached), completion 102 | queue 0.00 s, ttft 0.48 s, prefill 186.7 tok/s, decode 37.2 tok/s | drafts 55/72 accepted (76.4%), 2.72 tok/step
+length | prompt 130390 (130304 cached), completion 256 | queue 0.00 s, ttft 0.47 s, prefill 183.2 tok/s, decode 35.5 tok/s | drafts 130/191 accepted (68.1%), 2.38 tok/step
+length | prompt 130390 (130304 cached), completion 256 | queue 0.00 s, ttft 0.47 s, prefill 183.5 tok/s, decode 32.4 tok/s | drafts 111/178 accepted (62.4%), 2.09 tok/step
+length | prompt 260264, completion 256 | queue 0.00 s, ttft 148.72 s, prefill 1750.1 tok/s, decode 30.1 tok/s | drafts 102/152 accepted (67.1%), 2.13 tok/step
+length | prompt 260263 (260096 cached), completion 256 | queue 0.00 s, ttft 0.64 s, prefill 260.0 tok/s, decode 41.0 tok/s | drafts 163/199 accepted (81.9%), 3.26 tok/step
+length | prompt 260266 (260096 cached), completion 256 | queue 0.00 s, ttft 0.65 s, prefill 263.5 tok/s, decode 30.2 tok/s | drafts 110/163 accepted (67.5%), 2.20 tok/step
+length | prompt 260263 (260096 cached), completion 256 | queue 0.00 s, ttft 0.64 s, prefill 260.7 tok/s, decode 31.0 tok/s | drafts 114/195 accepted (58.5%), 2.13 tok/step
+length | prompt 260263 (260096 cached), completion 256 | queue 0.00 s, ttft 0.64 s, prefill 261.2 tok/s, decode 29.6 tok/s | drafts 107/195 accepted (54.9%), 2.06 tok/step
+length | prompt 513241, completion 256 | queue 0.00 s, ttft 294.67 s, prefill 1741.8 tok/s, decode 26.9 tok/s | drafts 95/158 accepted (60.1%), 1.95 tok/step
+length | prompt 513240 (513024 cached), completion 256 | queue 0.00 s, ttft 0.82 s, prefill 263.5 tok/s, decode 33.0 tok/s | drafts 150/241 accepted (62.2%), 2.74 tok/step
+stop | prompt 513243 (513024 cached), completion 238 | queue 0.00 s, ttft 0.83 s, prefill 265.9 tok/s, decode 33.1 tok/s | drafts 132/169 accepted (78.1%), 2.71 tok/step
+stop | prompt 513240 (513024 cached), completion 217 | queue 0.00 s, ttft 0.82 s, prefill 265.0 tok/s, decode 32.3 tok/s | drafts 118/150 accepted (78.7%), 2.69 tok/step
+stop | prompt 513240 (513024 cached), completion 175 | queue 0.00 s, ttft 0.82 s, prefill 264.6 tok/s, decode 32.3 tok/s | drafts 97/137 accepted (70.8%), 2.59 tok/step
+
+## requests glm
+length | prompt 8215, completion 256 | queue 0.00 s, ttft 7.92 s, prefill 1036.7 tok/s, decode 25.0 tok/s | drafts 108/134 accepted (80.6%), 1.81 tok/step
+length | prompt 8213 (8192 cached), completion 256 | queue 0.00 s, ttft 0.32 s, prefill 66.3 tok/s, decode 25.7 tok/s | drafts 119/133 accepted (89.5%), 1.89 tok/step
+length | prompt 8216 (8192 cached), completion 256 | queue 0.00 s, ttft 0.32 s, prefill 74.4 tok/s, decode 25.6 tok/s | drafts 116/131 accepted (88.5%), 1.89 tok/step
+length | prompt 8213 (8192 cached), completion 256 | queue 0.00 s, ttft 0.31 s, prefill 67.9 tok/s, decode 24.1 tok/s | drafts 100/134 accepted (74.6%), 1.75 tok/step
+length | prompt 8213 (8192 cached), completion 256 | queue 0.00 s, ttft 0.31 s, prefill 67.2 tok/s, decode 24.7 tok/s | drafts 106/130 accepted (81.5%), 1.82 tok/step
+length | prompt 32791, completion 256 | queue 0.00 s, ttft 26.24 s, prefill 1249.4 tok/s, decode 26.1 tok/s | drafts 121/129 accepted (93.8%), 1.94 tok/step
+length | prompt 32789 (32768 cached), completion 256 | queue 0.00 s, ttft 0.31 s, prefill 68.6 tok/s, decode 25.6 tok/s | drafts 119/131 accepted (90.8%), 1.91 tok/step
+length | prompt 32792 (32768 cached), completion 256 | queue 0.00 s, ttft 0.32 s, prefill 74.9 tok/s, decode 25.4 tok/s | drafts 116/130 accepted (89.2%), 1.89 tok/step
+length | prompt 32789 (32768 cached), completion 256 | queue 0.00 s, ttft 0.30 s, prefill 70.4 tok/s, decode 23.9 tok/s | drafts 99/126 accepted (78.6%), 1.79 tok/step
+stop | prompt 32789 (32768 cached), completion 132 | queue 0.00 s, ttft 0.30 s, prefill 70.2 tok/s, decode 25.0 tok/s | drafts 59/69 accepted (85.5%), 1.86 tok/step
+length | prompt 131095, completion 256 | queue 0.00 s, ttft 91.99 s, prefill 1425.2 tok/s, decode 24.2 tok/s | drafts 107/126 accepted (84.9%), 1.85 tok/step
+length | prompt 131093 (131072 cached), completion 256 | queue 0.00 s, ttft 0.29 s, prefill 73.6 tok/s, decode 26.1 tok/s | drafts 120/129 accepted (93.0%), 1.93 tok/step
+length | prompt 131096 (131072 cached), completion 256 | queue 0.00 s, ttft 0.30 s, prefill 80.5 tok/s, decode 25.4 tok/s | drafts 117/130 accepted (90.0%), 1.90 tok/step
+length | prompt 131093 (131072 cached), completion 256 | queue 0.00 s, ttft 0.28 s, prefill 75.4 tok/s, decode 24.8 tok/s | drafts 109/131 accepted (83.2%), 1.83 tok/step
+stop | prompt 131093 (131072 cached), completion 252 | queue 0.00 s, ttft 0.28 s, prefill 73.9 tok/s, decode 23.9 tok/s | drafts 101/125 accepted (80.8%), 1.81 tok/step
+length | prompt 262167, completion 256 | queue 0.00 s, ttft 173.88 s, prefill 1507.7 tok/s, decode 24.4 tok/s | drafts 106/128 accepted (82.8%), 1.83 tok/step
+length | prompt 262165 (262144 cached), completion 256 | queue 0.00 s, ttft 0.27 s, prefill 77.5 tok/s, decode 25.6 tok/s | drafts 117/124 accepted (94.4%), 1.94 tok/step
+length | prompt 262168 (262144 cached), completion 256 | queue 0.00 s, ttft 0.72 s, prefill 33.2 tok/s, decode 24.3 tok/s | drafts 103/126 accepted (81.7%), 1.82 tok/step
+stop | prompt 262165 (262144 cached), completion 242 | queue 0.00 s, ttft 0.27 s, prefill 79.1 tok/s, decode 24.3 tok/s | drafts 96/120 accepted (80.0%), 1.80 tok/step
+length | prompt 262165 (262144 cached), completion 256 | queue 0.00 s, ttft 0.26 s, prefill 80.0 tok/s, decode 25.0 tok/s | drafts 106/124 accepted (85.5%), 1.85 tok/step
+length | prompt 524310, completion 256 | queue 0.00 s, ttft 355.16 s, prefill 1476.3 tok/s, decode 24.1 tok/s | drafts 107/129 accepted (82.9%), 1.83 tok/step
+length | prompt 524308 (524288 cached), completion 256 | queue 0.00 s, ttft 0.69 s, prefill 29.0 tok/s, decode 24.3 tok/s | drafts 108/129 accepted (83.7%), 1.84 tok/step
+length | prompt 524311 (524288 cached), completion 256 | queue 0.00 s, ttft 0.27 s, prefill 85.8 tok/s, decode 23.9 tok/s | drafts 108/129 accepted (83.7%), 1.84 tok/step
+stop | prompt 524308 (524288 cached), completion 247 | queue 0.00 s, ttft 0.25 s, prefill 80.9 tok/s, decode 24.0 tok/s | drafts 104/125 accepted (83.2%), 1.83 tok/step
+length | prompt 524308 (524288 cached), completion 256 | queue 0.00 s, ttft 0.25 s, prefill 80.4 tok/s, decode 24.3 tok/s | drafts 109/126 accepted (86.5%), 1.87 tok/step
+
+## engine-batch dsv4
+48 requests, concurrency 1, decode split off: 14889 completion tokens in 392.5 s (37.9 tok/s); 5969 steps, 10375 prefill / 14921 decode tokens, 24064 cached prompt tokens, drafts 9002 / 11538 accepted, 0 preemptions
+48 requests, concurrency 2, decode split off: 14749 completion tokens in 305.9 s (48.2 tok/s); 3598 steps, 10887 prefill / 14780 decode tokens, 23552 cached prompt tokens, drafts 8904 / 11354 accepted, 0 preemptions
+48 requests, concurrency 4, decode split off: 15307 completion tokens in 275.3 s (55.6 tok/s); 2160 steps, 11911 prefill / 15330 decode tokens, 22528 cached prompt tokens, drafts 9281 / 11853 accepted, 0 preemptions
+48 requests, concurrency 8, decode split off: 15663 completion tokens in 244.2 s (64.2 tok/s); 1266 steps, 13959 prefill / 15691 decode tokens, 20480 cached prompt tokens, drafts 9347 / 12152 accepted, 0 preemptions
+
+## engine-batch glm
+48 requests, concurrency 1, decode split off: 9510 completion tokens in 369.0 s (25.8 tok/s); 5029 steps, 7115 prefill / 9528 decode tokens, 24064 cached prompt tokens, drafts 4548 / 4853 accepted, 0 preemptions
+48 requests, concurrency 2, decode split off: 9682 completion tokens in 302.1 s (32.1 tok/s); 2612 steps, 7627 prefill / 9705 decode tokens, 23552 cached prompt tokens, drafts 4629 / 4968 accepted, 0 preemptions
+48 requests, concurrency 4, decode split off: 9661 completion tokens in 264.7 s (36.5 tok/s); 1352 steps, 8651 prefill / 9686 decode tokens, 22528 cached prompt tokens, drafts 4613 / 4946 accepted, 0 preemptions
+48 requests, concurrency 8, decode split off: 9798 completion tokens in 195.1 s (50.2 tok/s); 1359 steps, 10699 prefill / 9821 decode tokens, 20480 cached prompt tokens, drafts 4679 / 4986 accepted, 0 preemptions
