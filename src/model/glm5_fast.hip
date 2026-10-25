@@ -487,7 +487,7 @@ void layer_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratc
                     hc, D, st);
 }
 
-constexpr int kSplitMinRows = 1024;  // steps this large run as two parts
+constexpr int kSplitMinRows = 2048;  // steps this large run as two parts (1024-row steps: 8% slower split)
 constexpr int kSplitMinPiece = 64;   // a chunk is cut only into pieces this long (attention's decode kernels: <= 4)
 
 // Where a step splits into two parts: near the middle, between chunks or where a chunk crosses a page boundary;

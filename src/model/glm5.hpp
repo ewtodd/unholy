@@ -252,7 +252,7 @@ void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm
                              const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st,
                              RemoteExperts* remote = nullptr);
 // A device's layers w[i] (caches cache[i]) in order over a step: glm5_layer_forward_fast each, or, with remote2 (a
-// second channel to the remote experts) and a step of >= 1024 rows, in two parts of the rows that overlap: while the
+// second channel to the remote experts) and a step of >= 2048 rows, in two parts of the rows that overlap: while the
 // APU has one part's experts of a layer, the card computes the other part's attention (that layer's second part, the
 // next layer's first). The same arithmetic per row either way.
 void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, std::span<Glm5PagedCache> cache,
