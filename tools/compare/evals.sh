@@ -25,7 +25,7 @@ esac
 mkdir -p "$OUT_DIR"
 stop=/work/runs/evals.stop
 
-ssh "$BOX" "rm -f $stop; cd /work/unholy-perf && setsid nohup tools/box/model-serve.sh $model evals \
+ssh "$BOX" "rm -f $stop; cd /work/unholy-perf; setsid nohup tools/box/model-serve.sh $model evals \
   bash -c 'until [ -e $stop ]; do sleep 15; done; rm -f $stop' >/work/runs/evals-$model.log 2>&1 </dev/null &"
 ssh -N -L "$PORT:127.0.0.1:8300" "$BOX" &
 tunnel=$!
