@@ -48,6 +48,15 @@ stop_server() {
   return 1
 }
 
+# llm_units: the llm-mode services this host has (unholy-<instance> for each unholy instance, radiance, gufo-strix;
+# unholy.service before the instance split).
+llm_units() {
+  local u
+  for u in unholy unholy-ds4 unholy-glm radiance gufo-strix; do
+    [ "$(systemctl show -p LoadState --value "$u.service")" = loaded ] && echo "$u.service"
+  done
+}
+
 # with_gpus CMD...: stop every llm-mode service, run CMD, then restore the mode that was serving, also
 # when CMD fails or is interrupted. son-of-anton may manage these units without sudo (polkit).
 # Inside tools/box/hold.sh the services are already down and stay down: CMD just runs, once no unit is still
@@ -55,9 +64,9 @@ stop_server() {
 with_gpus() {
   if [ -n "${BOX_GPUS_HELD:-}" ]; then
     local u
-    for u in unholy radiance gufo-strix; do
-      if [ "$(systemctl is-active "$u.service")" != inactive ] && [ "$(systemctl is-active "$u.service")" != failed ]; then
-        echo "with_gpus: $u.service is $(systemctl is-active "$u.service"), not stopped" >&2
+    for u in $(llm_units); do
+      if [ "$(systemctl is-active "$u")" != inactive ] && [ "$(systemctl is-active "$u")" != failed ]; then
+        echo "with_gpus: $u is $(systemctl is-active "$u"), not stopped" >&2
         return 1
       fi
     done
@@ -68,7 +77,8 @@ with_gpus() {
   mode=$(cat /var/lib/llm-mode/mode 2>/dev/null || echo ds4)
   trap 'llm-mode "'"$mode"'" >/dev/null' EXIT
   trap 'exit 130' INT TERM
-  systemctl stop unholy.service radiance.service gufo-strix.service
+  # shellcheck disable=SC2046
+  systemctl stop $(llm_units)
   "$@" || rc=$?
   llm-mode "$mode" >/dev/null
   trap - EXIT INT TERM

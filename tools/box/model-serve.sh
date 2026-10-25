@@ -29,7 +29,7 @@ body() {
   done
   local rc=0
   URL=http://localhost:8300 RUN=$d MODEL_NAME=$name "$@" || rc=$?
-  stop_server "unholy serve --model $model" || rc=1
+  stop_server "$BUILD/unholy serve --model $model" || rc=1  # not the services' (their unholy is in /nix/store)
   wait $pid 2>/dev/null || true
   return $rc
 }
