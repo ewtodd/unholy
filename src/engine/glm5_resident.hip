@@ -422,6 +422,28 @@ std::vector<std::vector<uint64_t>> Glm5ResidentModel::routing_histogram() const 
   return h;
 }
 
+std::string Glm5ResidentModel::routing_share() const {
+  const auto h = routing_histogram();
+  uint64_t card = 0, all = 0;
+  std::string lines;
+  char buf[64];
+  for (int L = 0; L < c_.n_layers; ++L) {
+    if (c_.is_dense(L)) continue;
+    uint64_t lc = 0, la = 0;
+    for (int e = 0; e < c_.n_experts; ++e) {
+      la += h[size_t(L)][size_t(e)];
+      if (plan_.on_card[size_t(L)][size_t(e)]) lc += h[size_t(L)][size_t(e)];
+    }
+    std::snprintf(buf, sizeof buf, "L%d %.4f\n", L, la ? double(lc) / double(la) : 0.0);
+    lines += buf;
+    card += lc;
+    all += la;
+  }
+  std::snprintf(buf, sizeof buf, "total %.4f (%llu pairs)\n", all ? double(card) / double(all) : 0.0,
+                static_cast<unsigned long long>(all));
+  return buf + lines;
+}
+
 void Glm5ResidentModel::reset_routing_histogram() {
   for (auto& cd : card_) {
     rt::DeviceGuard g(cd.dev);

@@ -391,6 +391,7 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
       [&](server::ServerConfig& scfg) {
         scfg.extra_get.emplace_back("/unholy/routing_profile",
                                     [&model] { return engine::format_usage_profile(model.routing_histogram()); });
+        scfg.extra_get.emplace_back("/unholy/routing_share", [&model] { return model.routing_share(); });
         scfg.extra_post.emplace_back("/unholy/routing_profile/reset", [&model] {
           model.reset_routing_histogram();
           return std::string("ok\n");

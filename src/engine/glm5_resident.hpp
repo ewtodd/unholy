@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "engine/plan.hpp"
@@ -102,6 +103,8 @@ class Glm5ResidentModel final : public StepModel {
   // format_usage_profile).
   std::vector<std::vector<uint64_t>> routing_histogram() const;
   void reset_routing_histogram();
+  // Of the pairs in that histogram, the share routed to card-resident experts: "total S" then "L<layer> S" lines.
+  std::string routing_share() const;
 
  private:
   struct Card {
