@@ -5,6 +5,11 @@
 // Decodes IMAGE, preprocesses it (src/vision/image.hpp) and lays out its token block at START_POS;
 // writes the patches (bf16 [n_vit_h * n_vit_w][3][14][14]) to OUT and prints one JSON line:
 // {"n_vit_h", "n_vit_w", "n_llm_h", "n_llm_w", "w", "h", "types": [...], "perm": [...]}.
+//
+//   unholy-vision-test glm IMAGE OUT [MAX_TOKENS]
+//
+// GLM-5.3-Flash's preprocessing (vision::glm_preprocess), for tools/ref/glm_vision_compare.py: the patches (bf16
+// [grid_h * grid_w][3 * 2 * 14 * 14]) to OUT and {"grid_h", "grid_w", "tokens", "w", "h"}.
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -47,8 +52,27 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  if ((argc == 4 || argc == 5) && std::string(argv[1]) == "glm") {
+    try {
+      std::ifstream f(argv[2], std::ios::binary);
+      if (!f) throw std::runtime_error(std::string("cannot open ") + argv[2]);
+      const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      const auto img = vision::decode_image(bytes);
+      vision::GlmVisionConfig cfg;
+      if (argc == 5) cfg.max_tokens = std::stoi(argv[4]);
+      const auto p = vision::glm_preprocess(img, cfg);
+      std::ofstream o(argv[3], std::ios::binary);
+      o.write(reinterpret_cast<const char*>(p.data.data()), std::streamsize(p.data.size() * 2));
+      std::printf("{\"grid_h\": %d, \"grid_w\": %d, \"tokens\": %d, \"w\": %d, \"h\": %d}\n", p.grid_h, p.grid_w,
+                  p.grid_h * p.grid_w / 4, img.w, img.h);
+    } catch (const std::exception& e) {
+      std::printf("{\"error\": \"%s\"}\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
   if (argc != 4) {
-    std::fprintf(stderr, "usage: unholy-vision-test IMAGE START_POS OUT\n");
+    std::fprintf(stderr, "usage: unholy-vision-test IMAGE START_POS OUT | glm IMAGE OUT [MAX_TOKENS]\n");
     return 2;
   }
   try {

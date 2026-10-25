@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <utility>
 
 namespace unholy::vision {
 
@@ -461,6 +462,121 @@ std::vector<ImageInput> expand_images(std::vector<int32_t>& ids, int32_t placeho
     in.start = int(expanded.size());
     in.block = build_image_block(in.patches.n_llm_h, in.patches.n_llm_w, in.start);
     for (const int32_t type : in.block.types) expanded.push_back(vocab + type);
+    out.push_back(std::move(in));
+  }
+  ids = std::move(expanded);
+  return out;
+}
+
+}  // namespace unholy::vision
+
+namespace unholy::vision {
+
+namespace {
+
+int align_up(double v, int f) { return int(std::ceil(v / f)) * f; }  // math.ceil(value / factor) * factor
+
+// transformers smart_resize with num_frames = temporal_factor: the aligned canvas (height, width).
+std::pair<int, int> glm_smart_resize(int height, int width, const GlmVisionConfig& c) {
+  const int factor = c.patch * c.merge, frames = c.temporal;
+  const double per_token = double(c.temporal) * factor * factor;
+  const double min_px = c.min_tokens * per_token, max_px = c.max_tokens * per_token;
+  int ah = align_up(height, factor), aw = align_up(width, factor);
+  double budget = double(frames) * ah * aw;
+  if (budget < min_px) {
+    const double scale = std::sqrt(min_px / (double(frames) * height * width));
+    ah = align_up(std::max(1.0, std::ceil(height * scale)), factor);
+    aw = align_up(std::max(1.0, std::ceil(width * scale)), factor);
+    budget = double(frames) * ah * aw;
+  }
+  if (budget > max_px) {
+    if (max_px < double(frames) * factor * factor) throw ImageError("image: token budget below one patch");
+    int low = 1, high = height, bh = factor, bw = factor;
+    while (low <= high) {
+      const int ch = (low + high) / 2;
+      const int cw = std::max(1, int(std::floor(double(width) * ch / height)));
+      const int th = align_up(ch, factor), tw = align_up(cw, factor);
+      if (double(frames) * th * tw <= max_px) {
+        bh = th;
+        bw = tw;
+        low = ch + 1;
+      } else {
+        high = ch - 1;
+      }
+    }
+    ah = bh;
+    aw = bw;
+  }
+  return {ah, aw};
+}
+
+}  // namespace
+
+GlmPatches glm_preprocess(const RgbImage& img, const GlmVisionConfig& c) {
+  if (img.w <= 0 || img.h <= 0) throw ImageError("image: empty");
+  const auto [th, tw] = glm_smart_resize(img.h, img.w, c);
+  const int factor = c.patch * c.merge, P = c.patch, T = c.temporal, m = c.merge;
+  double scale = std::min(double(th) / img.h, double(tw) / img.w);
+  if (double(c.temporal) * img.h * img.w >= double(c.temporal) * factor * factor * c.min_tokens)
+    scale = std::min(1.0, scale);
+  const int ch = std::max(1, std::min(th, int(std::floor(img.h * scale))));
+  const int cw = std::max(1, std::min(tw, int(std::floor(img.w * scale))));
+  const RgbImage content = ch == img.h && cw == img.w ? img : resize_bicubic(img, cw, ch);
+  // np.float32(np.float64(v) * (1 / 255)), (x - mean) / std in float32, to bf16 (nearest even); padding is 0.
+  const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f}, stdv[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+  uint16_t lut[3][256];
+  for (int k = 0; k < 3; ++k)
+    for (int v = 0; v < 256; ++v) {
+      const float x = (float(double(v) * (1.0 / 255.0)) - mean[k]) / stdv[k];
+      uint32_t u;
+      std::memcpy(&u, &x, 4);
+      lut[k][v] = uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+  GlmPatches out;
+  out.grid_h = th / P;
+  out.grid_w = tw / P;
+  out.data.resize(size_t(out.grid_h) * out.grid_w * 3 * T * P * P);
+  size_t o = 0;
+  for (int bh = 0; bh < out.grid_h / m; ++bh)
+    for (int bw = 0; bw < out.grid_w / m; ++bw)
+      for (int mh = 0; mh < m; ++mh)
+        for (int mw = 0; mw < m; ++mw) {
+          const int y0 = (bh * m + mh) * P, x0 = (bw * m + mw) * P;
+          for (int k = 0; k < 3; ++k)
+            for (int t = 0; t < T; ++t)
+              for (int py = 0; py < P; ++py)
+                for (int px = 0; px < P; ++px) {
+                  const int y = y0 + py, x = x0 + px;
+                  const uint8_t v = y < content.h && x < content.w ? content.px[(size_t(y) * content.w + x) * 3 + k] : 0;
+                  out.data[o++] = lut[k][v];
+                }
+        }
+  return out;
+}
+
+std::vector<GlmImageInput> glm_expand_images(std::vector<int32_t>& ids, int32_t image_token,
+                                             const std::vector<std::string>& urls, const GlmVisionConfig& cfg) {
+  const size_t n = size_t(std::count(ids.begin(), ids.end(), image_token));
+  if (n != urls.size())
+    throw ImageError("found " + std::to_string(n) + " image tokens but got " + std::to_string(urls.size()) + " images");
+  std::vector<GlmImageInput> out;
+  if (n == 0) return out;
+  std::vector<int32_t> expanded;
+  size_t next = 0;
+  for (const int32_t t : ids) {
+    if (t != image_token) {
+      expanded.push_back(t);
+      continue;
+    }
+    const std::vector<uint8_t> bytes = image_bytes_from_url(urls[next++]);
+    GlmImageInput in;
+    uint64_t h = 1469598103934665603ull;
+    for (const uint8_t b : bytes) h = (h ^ b) * 1099511628211ull;
+    in.hash = h;
+    in.patches = glm_preprocess(decode_image(bytes), cfg);
+    in.start = int(expanded.size());
+    in.tokens = in.patches.grid_h * in.patches.grid_w / (cfg.merge * cfg.merge);
+    expanded.insert(expanded.end(), size_t(in.tokens), image_token);
     out.push_back(std::move(in));
   }
   ids = std::move(expanded);

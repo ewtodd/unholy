@@ -66,6 +66,33 @@ struct ImageInput {
 std::vector<ImageInput> expand_images(std::vector<int32_t>& ids, int32_t placeholder, int32_t vocab,
                                       const std::vector<std::string>& urls, const VisionConfig& cfg);
 
+// GLM-5.3-Flash's image processor (transformers Glm5NextImageProcessorPil): a canvas aligned to patch * merge
+// pixels within the token budget (smart_resize, the frame counted twice for the temporal patch); the image resized
+// into it with PIL's bicubic filter, aspect kept and never enlarged unless under the token minimum, and zero-padded
+// right and bottom; x / 255 (float64, then float32) normalised with the CLIP mean and std in float32, as numpy does;
+// patches in 2 x 2 merge-group order, each [3][temporal][patch][patch] with the frame repeated, rounded to bf16 as
+// the model casts its input.
+struct GlmVisionConfig {
+  int patch = 14, merge = 2, temporal = 2, min_tokens = 16, max_tokens = 8000;
+};
+struct GlmPatches {
+  int grid_h = 0, grid_w = 0;  // patches
+  std::vector<uint16_t> data;  // [grid_h * grid_w][3 * temporal * patch * patch] bf16
+};
+GlmPatches glm_preprocess(const RgbImage& img, const GlmVisionConfig& cfg);
+
+// One image of a GLM request: `tokens` copies of the image token from position `start` (one per 2 x 2 merge group),
+// the encoder input, a hash of the image bytes (prefix caching tells images apart by it).
+struct GlmImageInput {
+  int start = 0, tokens = 0;
+  GlmPatches patches;
+  uint64_t hash = 0;
+};
+// Glm5NextProcessor's expansion: each `image_token` of ids (the chat template writes one per image) becomes its
+// image's token count of copies, the images decoded and preprocessed. Throws ImageError when the counts differ.
+std::vector<GlmImageInput> glm_expand_images(std::vector<int32_t>& ids, int32_t image_token,
+                                             const std::vector<std::string>& urls, const GlmVisionConfig& cfg);
+
 // Image bytes from an OpenAI-style URL: "data:<mime>;base64,<payload>" only (http(s) and paths are
 // refused). Throws ImageError.
 std::vector<uint8_t> image_bytes_from_url(const std::string& url);
