@@ -9,7 +9,7 @@ curl -s -X POST "$URL/unholy/routing_profile/reset" >/dev/null
 mkdir -p "$RUN/req"
 i=0
 while IFS= read -r line; do
-  jq -c '. + {model: "glm53"}' <<<"$line" >"$RUN/req/$i.json"
+  jq -c --arg m "${MODEL_NAME:-glm53}" '. + {model: $m}' <<<"$line" >"$RUN/req/$i.json"
   i=$((i + 1))
 done <"$REQUESTS"
 ls "$RUN"/req/*.json | xargs -P "${CONC:-8}" -I{} sh -c \

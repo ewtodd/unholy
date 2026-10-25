@@ -11,8 +11,8 @@ for t in A B A2; do
     A | A2) q="Which file is listed first above? Answer briefly." ;;
     B) q="Name three functions defined above." ;;
   esac
-  jq --argjson chars "${CHARS:-40000}" --argjson max "${MAXTOK:-128}" --arg q "$q" \
-    '{model, messages: [{role: "user", content: (.messages[0].content[0:$chars] + "\n\n" + $q)}],
+  jq --argjson chars "${CHARS:-40000}" --argjson max "${MAXTOK:-128}" --arg q "$q" --arg m "${MODEL_NAME:-glm53}" \
+    '{model: $m, messages: [{role: "user", content: (.messages[0].content[0:$chars] + "\n\n" + $q)}],
       max_tokens: $max, temperature: 0, logprobs: true}' "$src" >"$RUN/pair_$t.req.json"
   curl -s --max-time 1800 "$URL/v1/chat/completions" -H content-type:application/json \
     -d @"$RUN/pair_$t.req.json" >"$RUN/pair_$t.json"

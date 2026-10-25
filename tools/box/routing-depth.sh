@@ -10,9 +10,8 @@ set -euo pipefail
 prev=0
 while read -r depth chars; do
   curl -s -X POST "$URL/unholy/routing_profile/reset" >/dev/null
-  jq -n --rawfile t "$TEXT" --argjson n "$chars" \
-    '{model: "glm53", messages: [{role: "user", content: $t[0:$n]}], max_tokens: 1, temperature: 0}' \
-    >"$RUN/depth_req.json"
+  jq -n --rawfile t "$TEXT" --argjson n "$chars" --arg m "${MODEL_NAME:-glm53}" \
+    '{model: $m, messages: [{role: "user", content: $t[0:$n]}], max_tokens: 1, temperature: 0}' >"$RUN/depth_req.json"
   usage=$(curl -s --max-time 3600 "$URL/v1/chat/completions" -H content-type:application/json \
     -d @"$RUN/depth_req.json" | jq -c '[.usage.prompt_tokens, .usage.prompt_tokens_details.cached_tokens]')
   curl -s "$URL/unholy/routing_share" >"$RUN/share_$depth.txt"
