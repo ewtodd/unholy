@@ -1340,3 +1340,15 @@ against the 56% it predicts; only repeated text drifted with depth. GLM's routin
 
 Where prefill stands (estimate, DECISIONS above): hardware bounds ~7k tok/s (host link, then the APU's share of the
 expert math); with today's kernels overlapped perfectly ~2.5k; next lever is the APU's EXL3 GEMM (~26% of peak).
+
+## 2026-10-24 — DSV4 prefill: two-part steps (+17%, bit-identical)
+
+The GLM two-part scheme carries over to DSV4 (865efc7). DSV4's prefill trace (4096-token steps at 64k: cards busy
+68-70%, the APU 65% of each 1.65 s step) showed less idle than GLM's but the same shape. DSV4 already shipped compact
+fp8 token rows to the APU and combined rows back, so the transport was not the gap. Exactness: resident-test
+--chunk shows that DSV4 prefilled in 256-, 300- or 512-token steps gives the one-step logits bit for bit, so a cut
+inside a step changes nothing; the part buffers that live from a MoE start to its finish are double-buffered behind
+a thread-local model::ScratchPart (attention untouched), outside the legacy scratch count the planner plans with, so
+the placement does not move. Gates: validate bit-identical, eb c8 48/48 against M0 (64.3 tok/s), curve to 64k
+1960 -> 2290 tok/s, decode unchanged. Steps split from 2048 rows on both models: at 1024 rows the split is 8-10%
+slower, at 2048 1-4% faster, at 4096 16-17%. The ds4 service picks it up when the flake input moves to this commit.
