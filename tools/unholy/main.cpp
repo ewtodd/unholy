@@ -454,7 +454,9 @@ int serve(int argc, char** argv, bool plan_only) {
   sigaddset(&sigs, SIGTERM);
   pthread_sigmask(SIG_BLOCK, &sigs, nullptr);
 
-  auto ck = model::Checkpoint::open(o.model_dir, {"mtp.safetensors"});  // (exllamav3 GLM quants keep MTP there)
+  // Side files of GLM quants: exllamav3 keeps the MTP layer in mtp.safetensors; vision.safetensors holds the release's
+  // bf16 vision tower (tools/box/extract-glm-vision.py).
+  auto ck = model::Checkpoint::open(o.model_dir, {"mtp.safetensors", "vision.safetensors"});
   switch (model::detect_family(ck->config())) {
     case model::Family::Dsv4:
       return serve_dsv4(o, std::move(ck), plan_only, sigs);
