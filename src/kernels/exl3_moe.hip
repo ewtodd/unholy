@@ -628,6 +628,7 @@ struct GvFused {
   uint32_t* counters = nullptr;
   bf16* out = nullptr;
   int ldo = 0;
+  HcPostArgs hp;  // kOut: the post-mix of the output columns
 };
 
 // One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows. kIn: the input
@@ -761,9 +762,11 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
       fwht128_wave(v, lane);
       const uint16_t* svh = fu.svh_tab[tile.expert];
 #pragma unroll
-      for (int q = 0; q < 4; ++q)
-        fu.out[size_t(row) * fu.ldo + n0 + q] =
-            f32_to_bf16(v[q] * 0.08838834764831845f * __half2float(__ushort_as_half(svh[n0 + q])));
+      for (int q = 0; q < 4; ++q) {
+        const bf16 o = f32_to_bf16(v[q] * 0.08838834764831845f * __half2float(__ushort_as_half(svh[n0 + q])));
+        fu.out[size_t(row) * fu.ldo + n0 + q] = o;
+        if (fu.hp.x) hc_post_column(bf16_to_f32(o), fu.hp.x, fu.hp.post, fu.hp.comb, fu.hp.x, fu.hp.hc, N, row, n0 + q);
+      }
     }
     if (tid == 0) *cnt = 0;
   }
@@ -790,7 +793,8 @@ __global__ __launch_bounds__(128) void exl3_out_rows_kernel(const float* yp, con
 }  // namespace
 
 void exl3_linear_gemv(const bf16* x, int ldx, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* tab,
-                      int bits, float* yp, uint32_t* counters, bf16* out, int ldo, int N, hipStream_t st) {
+                      int bits, float* yp, uint32_t* counters, bf16* out, int ldo, int N, hipStream_t st,
+                      const HcPostArgs& hp) {
   if (ntiles <= 0) return;
   if (K % GV_KC || N % 128 || ldx % 4) throw std::runtime_error("exl3_linear_gemv: K % 512, N % 128 or ldx % 4");
   const dim3 grid(N / 16, ntiles);
@@ -802,6 +806,7 @@ void exl3_linear_gemv(const bf16* x, int ldx, int K, const Exl3Tile* tiles, int 
   fu.counters = counters;
   fu.out = out;
   fu.ldo = ldo;
+  fu.hp = hp;
   switch (bits) {
     case 2: exl3_gemv_kernel<2, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;
     case 3: exl3_gemv_kernel<3, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;

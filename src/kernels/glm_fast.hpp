@@ -12,6 +12,8 @@
 
 #include <cstdint>
 
+#include "kernels/elem_fast.hpp"
+
 namespace unholy::kernels {
 
 using bf16 = uint16_t;
@@ -96,14 +98,7 @@ void glm_mla_attn_split(const bf16* qa, const int32_t* idx, int w, const int32_t
                         float scale, int splits, float* part, hipStream_t st);
 // kernels::moe_combine's arithmetic (fp32 sum of each token's pair rows in pidx order, + shared, one rounding) over
 // (token, 256-dim slice) workgroups: a decode step's few tokens do not run on one workgroup each.
-// hp.x set: also the mHC post-mix of the combined row into the token's streams hp.x [T][hc][dim] in place
-// (hc_post_slices' arithmetic), with hp.post / hp.comb.
-struct HcPostArgs {
-  bf16* x = nullptr;
-  const float* post = nullptr;
-  const float* comb = nullptr;
-  int hc = 0;
-};
+// hp.x set: also the mHC post-mix of the combined row into the token's streams (hc_post_slices' arithmetic).
 void glm_moe_combine(const bf16* pair_out, const int32_t* pidx, const bf16* shared, bf16* out, int T, int K, int dim,
                      hipStream_t st, const HcPostArgs& hp = {});
 // Combined remote outputs (the APU's share of a step's MoE in one fp32 row per token instead of a bf16 row per pair

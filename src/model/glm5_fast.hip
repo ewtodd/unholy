@@ -96,23 +96,27 @@ void exl3_mm(const GLinear& l, const uint16_t* xh, bf16* out, int ldo, int rows,
                          ldo, l.out, st);
 }
 
+// hp.x set: then the mHC post-mix of out (ldo == l.out) into the streams, in the GEMV's launch when it is the fused one.
 void linear(const GLinear& l, const bf16* x, int ldx, bf16* out, int ldo, int rows, const Glm5Scratch& s,
-            hipStream_t st) {
+            hipStream_t st, const k::HcPostArgs& hp = {}) {
   if (rows <= 0) return;
   if (l.exl3()) {
     const auto* tab = l.tab.as<const uint16_t* const>();
     if (rows <= 8 && ldx % 4 == 0 && size_t(l.out / 128) * 4 <= s.bufs[kGemvCount].size()) {  // one launch
       k::exl3_linear_gemv(x, ldx, l.in, s.at<k::Exl3Tile>(kDenseTiles), 1, tab, l.x.bits, s.at<float>(kYp),
-                          s.at<uint32_t>(kGemvCount), out, ldo, l.out, st);
+                          s.at<uint32_t>(kGemvCount), out, ldo, l.out, st, hp);
       return;
     }
     uint16_t* xh = s.at<uint16_t>(kExl3X);
     k::exl3_xform_in(x, ldx, s.at<int32_t>(kZeroRows), tab + 1, xh, rows, l.in, false, st);
     exl3_mm(l, xh, out, ldo, rows, s, st);
+    if (hp.x) k::hc_post_slices(out, hp.x, hp.post, hp.comb, hp.x, rows, hp.hc, l.out, st);
   } else if (rows <= k::kGemvRowsCap && (l.in % 512 == 0 || (l.in < 512 && l.in % 64 == 0))) {
     k::gemv_bf16(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
+    if (hp.x) k::hc_post_slices(out, hp.x, hp.post, hp.comb, hp.x, rows, hp.hc, l.out, st);
   } else {
     k::gemm_bf16_wmma(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
+    if (hp.x) k::hc_post_slices(out, hp.x, hp.post, hp.comb, hp.x, rows, hp.hc, l.out, st);
   }
 }
 
@@ -142,8 +146,9 @@ T* slot_rows(const rt::DeviceBuffer& b, int slot, size_t per_slot) {
   return b.as<T>() + size_t(slot) * per_slot;
 }
 
+// hp: the mHC post-mix of out, by the output projection.
 void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache, const Glm5Scratch& s,
-              const bf16* hn, bf16* out, const Glm5Batch& b, hipStream_t st) {
+              const bf16* hn, bf16* out, const Glm5Batch& b, hipStream_t st, const k::HcPostArgs& hp) {
   const int T = b.T, D = c.dim, H = c.lin_heads, Dh = c.lin_dim, W = c.lin_width(), C3 = 3 * W;
   bf16* qkv = s.at<bf16>(kQkv);
   bf16* qkvc = s.at<bf16>(kQkvConv);
@@ -215,7 +220,7 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   }
   bf16* on = s.at<bf16>(kOutNorm);
   k::kda_out_norm(core, row_o, w.o_norm.p<bf16>(), on, T, H, Dh, c.norm_eps, st);
-  linear(w.o, on, W, out, D, T, s, st);
+  linear(w.o, on, W, out, D, T, s, st, hp);
 }
 
 // A DSA layer's cache rows for the batch: the latent rows (kv_a, its norm; stored in fp8) and the indexer's keys and
@@ -243,8 +248,9 @@ void dsa_write(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& c
   }
 }
 
+// hp: the mHC post-mix of out, by the output projection.
 void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache, const Glm5Scratch& s,
-              const bf16* hn, bf16* out, const Glm5Batch& b, hipStream_t st) {
+              const bf16* hn, bf16* out, const Glm5Batch& b, hipStream_t st, const k::HcPostArgs& hp) {
   const int T = b.T, D = c.dim, H = c.n_heads, R = c.kv_lora;
   const int IH = c.idx_heads, ID = c.idx_dim, pool = c.idx_pool;
   const int kpools = c.idx_topk / pool, width = c.idx_topk + pool - 1;
@@ -292,7 +298,7 @@ void dsa_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   }
   bf16* o = s.at<bf16>(kAttnOut);
   k::gemm_grouped_bf16_wmma(ol, w.w_uv.p<bf16>(), o, T, H, c.v_dim, R, st);
-  linear(w.o, o, H * c.v_dim, out, D, T, s, st);
+  linear(w.o, o, H * c.v_dim, out, D, T, s, st, hp);
 }
 
 // Routed experts on the device, in two calls so that other work can run between them. moe_start: router -> dispatch
@@ -496,9 +502,9 @@ void layer_pre(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& c
   if (tiles) set_rows(s, T, st);
   hc_pre_norm(c, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, xr, h, w.input_norm.p<bf16>(), hn, post, comb, T, s,
               st);
-  if (w.kda) kda_fast(c, w, cache, s, hn, out, p.b, st);
-  else dsa_fast(c, w, cache, s, hn, out, p.b, st);
-  k::hc_post_slices(out, xr, post, comb, xr, T, hc, D, st);
+  const k::HcPostArgs hp{xr, post, comb, hc};  // the post-mix by the output projection
+  if (w.kda) kda_fast(c, w, cache, s, hn, out, p.b, st, hp);
+  else dsa_fast(c, w, cache, s, hn, out, p.b, st, hp);
   hc_pre_norm(c, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, xr, h, w.post_norm.p<bf16>(), hn, post, comb, T, s, st);
 }
 
@@ -673,7 +679,7 @@ void glm5_mtp_forward(const Glm5Config& c, const Glm5MtpWeights& m, Glm5PagedCac
   bf16* hn = s.at<bf16>(kHn);
   bf16* out = s.at<bf16>(kOut);
   norm(x, m.layer.input_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
-  dsa_fast(c, m.layer, cache, s, hn, out, b, st);
+  dsa_fast(c, m.layer, cache, s, hn, out, b, st, {});
   k::glm_add_bf16(x, out, size_t(T) * D, st);
   norm(x, m.layer.post_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
   moe_fast(c, m.layer, s, hn, out, T, st, remote);

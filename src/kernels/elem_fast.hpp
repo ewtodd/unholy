@@ -11,6 +11,13 @@ namespace unholy::kernels {
 void rmsnorm_slices(const bf16* x, int ldx, const bf16* w, bf16* y, int ldy, int rows, int dim, float eps,
                     hipStream_t st);
 // kernels::hc_post (in place allowed: each column is read and written by one thread).
+// The mHC post-mix done by the producer of x, in place on the streams x [T][hc][dim] (x null: not asked for).
+struct HcPostArgs {
+  bf16* x = nullptr;
+  const float* post = nullptr;
+  const float* comb = nullptr;
+  int hc = 0;
+};
 void hc_post_slices(const bf16* x, const bf16* res, const float* post, const float* comb, bf16* out, int T, int hc,
                     int dim, hipStream_t st);
 // rmsnorm_slices, then act_quant_fp8 (block 128) of its output into q / qs, in one launch. false (nothing

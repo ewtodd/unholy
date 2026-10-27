@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "kernels/elem_fast.hpp"
+
 namespace unholy::kernels {
 
 using bf16 = uint16_t;
@@ -47,7 +49,9 @@ void exl3_grouped_gemv(const uint16_t* xh, int K, const Exl3Tile* tiles, int nti
 // A dense linear (tiles of <= 8 rows, one weight set) in one launch: bit for bit exl3_xform_in (no fake quant) +
 // exl3_grouped_gemv with counters, each block transforming its tile's input rows x [rows][ldx] (ldx % 4 == 0) itself.
 // For one tile of a few rows the redundant transforms cost less than the launch; for experts' many tiles they do not.
+// hp.x set: the segment's last block also applies the mHC post-mix of its output columns (hc_post_slices' arithmetic).
 void exl3_linear_gemv(const bf16* x, int ldx, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* tab,
-                      int bits, float* yp, uint32_t* counters, bf16* out, int ldo, int N, hipStream_t st);
+                      int bits, float* yp, uint32_t* counters, bf16* out, int ldo, int N, hipStream_t st,
+                      const HcPostArgs& hp = {});
 
 }  // namespace unholy::kernels
