@@ -72,33 +72,79 @@ __global__ __launch_bounds__(128) void mx_xform_in_kernel(const bf16* x, int ldx
   xa[size_t(r) * K + seg * 128 + i] = f32_to_bf16(v);
 }
 
-__global__ __launch_bounds__(128) void mx_xform_in_q_kernel(const uint8_t* q, const uint8_t* s, const int32_t* p2u,
-                                                            const MoePlan* plan, const int32_t* row_expert,
-                                                            const uint8_t* const* s_tab, bf16* xa, int K) {
-  const int r = blockIdx.y, seg = blockIdx.x, i = threadIdx.x;
-  if (r < plan->remote0 || r >= plan->P || !s_tab[row_expert[r]]) return;  // uniform per block
-  const size_t u = size_t(p2u[r]);
-  const float v = round_bf16(e4m3_to_f32(q[u * K + seg * 128 + i]) * e8m0_to_f32(s[u * (K / 128) + seg]));
-  xa[size_t(r) * K + seg * 128 + i] = f32_to_bf16(v);
+// The experts' input and SwiGLU transforms on a wave per (row, 128-value segment), 4 values per lane, items striding
+// over the grid: block-per-(row, segment) grids were mostly blocks exiting at once (rows of experts elsewhere), and
+// the fake quantization's block barriers become a wave max (the same amax: the codes and scales are unchanged).
+// mx_xform_in_kernel remains for x rows that are not 8-byte aligned.
+__device__ __forceinline__ void fake_quant_fp8_wave(float v[4]) {
+  float a = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  a = fmaxf(warp_max(a), 1e-4f);
+  const float sc = e8m0_to_f32(pow2_ceil_e8m0(a * (1.0f / 448.0f)));
+#pragma unroll
+  for (int q = 0; q < 4; ++q) v[q] = round_bf16(e4m3_to_f32(f32_to_e4m3(fminf(fmaxf(v[q] / sc, -448.0f), 448.0f))) * sc);
+}
+__device__ __forceinline__ void store4_bf16(bf16* dst, const float v[4]) {
+  *reinterpret_cast<uint2*>(dst) = uint2{uint32_t(f32_to_bf16(v[0])) | (uint32_t(f32_to_bf16(v[1])) << 16),
+                                         uint32_t(f32_to_bf16(v[2])) | (uint32_t(f32_to_bf16(v[3])) << 16)};
+}
+__device__ __forceinline__ void load4_bf16(const bf16* src, float v[4]) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(src);
+  v[0] = bf16_to_f32(uint16_t(raw.x));
+  v[1] = bf16_to_f32(uint16_t(raw.x >> 16));
+  v[2] = bf16_to_f32(uint16_t(raw.y));
+  v[3] = bf16_to_f32(uint16_t(raw.y >> 16));
 }
 
-__global__ __launch_bounds__(128) void mx_swiglu_kernel(const bf16* g, const bf16* u, const float* w,
-                                                        const int32_t* row_expert, const uint8_t* const* s_tab,
-                                                        bf16* hh, int I, float limit) {
-  __shared__ float red[4];
-  const int r = blockIdx.y, seg = blockIdx.x, i = threadIdx.x;
-  if (!s_tab[row_expert[r]]) return;
-  const size_t idx = size_t(r) * I + seg * 128 + i;
-  float gv = bf16_to_f32(g[idx]), uv = bf16_to_f32(u[idx]);
-  if (limit > 0.0f) {
-    uv = fminf(fmaxf(uv, -limit), limit);
-    gv = fminf(gv, limit);
+// kMode 0: mx_xform_in (x rows, fake quantized); 1: mx_xform_in_q (fp8 tokens dequantized, rows [remote0, P) of
+// the plan); 2: mx_swiglu (g / u rows, SwiGLU, fake quantized).
+template <int kMode>
+__global__ __launch_bounds__(256) void mx_transform_wave_kernel(const bf16* __restrict__ x, int ldx,
+                                                                const int32_t* __restrict__ x_rows,
+                                                                const uint8_t* __restrict__ q,
+                                                                const uint8_t* __restrict__ qs,
+                                                                const int32_t* __restrict__ p2u, const MoePlan* plan,
+                                                                const bf16* __restrict__ u, const float* __restrict__ w,
+                                                                float limit, const int32_t* __restrict__ row_expert,
+                                                                const uint8_t* const* __restrict__ s_tab,
+                                                                bf16* __restrict__ out, int K, int P) {
+  const int lane = threadIdx.x & 31, segs = K / 128;
+  const int r0 = kMode == 1 ? plan->remote0 : 0, r1 = kMode == 1 ? plan->P : P;
+  const size_t n = r1 > r0 ? size_t(r1 - r0) * segs : 0;
+  for (size_t it = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5); it < n; it += size_t(gridDim.x) * 8) {
+    const int r = r0 + int(it / segs), seg = int(it % segs), k0 = seg * 128 + 4 * lane;
+    if (!s_tab[row_expert[r]]) continue;  // expert not on this device (uniform per wave)
+    float v[4];
+    if constexpr (kMode == 0) {
+      load4_bf16(x + (x_rows ? size_t(x_rows[r]) : size_t(r)) * ldx + k0, v);
+      fake_quant_fp8_wave(v);
+    } else if constexpr (kMode == 1) {
+      const size_t t = size_t(p2u[r]);
+      const uint32_t c = *reinterpret_cast<const uint32_t*>(q + t * K + k0);
+      const float sc = e8m0_to_f32(qs[t * (K / 128) + seg]);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) v[i] = round_bf16(e4m3_to_f32(uint8_t(c >> (8 * i))) * sc);
+    } else {
+      float g[4], uv[4];
+      load4_bf16(x + size_t(r) * K + k0, g);
+      load4_bf16(u + size_t(r) * K + k0, uv);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float gv = g[i], ui = uv[i];
+        if (limit > 0.0f) {
+          ui = fminf(fmaxf(ui, -limit), limit);
+          gv = fminf(gv, limit);
+        }
+        float hv = (gv / (1.0f + expf(-gv))) * ui;
+        if (w) hv = w[r] * hv;
+        v[i] = round_bf16(hv);  // the reference's swiglu output is a bf16 tensor
+      }
+      fake_quant_fp8_wave(v);
+    }
+    store4_bf16(out + size_t(r) * K + k0, v);
   }
-  float hv = (gv / (1.0f + expf(-gv))) * uv;
-  if (w) hv = w[r] * hv;
-  hv = round_bf16(hv);  // the reference's swiglu output is a bf16 tensor
-  hh[idx] = f32_to_bf16(fake_quant_fp8_block(hv, red));
 }
+
+unsigned mx_wave_blocks(int P, int K) { return unsigned(std::min<size_t>((size_t(P) * (K / 128) + 7) / 8, 8192)); }
 
 // Grouped GEMM: block = one tile (<= 128 rows of one expert) x 128 CW output columns; wave w owns columns
 // [n0 + 16 CW w, n0 + 16 CW (w + 1)) and dequantizes that weight slice per 64-k slab into its own LDS
@@ -592,6 +638,13 @@ void mx_repack(uint8_t* w, uint8_t* s, int N, int K, uint8_t* tmp, hipStream_t s
 void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P,
                  int K, hipStream_t st, const int32_t* x_rows) {
   if (P <= 0) return;
+  if (ldx % 4 == 0) {
+    mx_transform_wave_kernel<0><<<mx_wave_blocks(P, K), 256, 0, st>>>(x, ldx, x_rows, nullptr, nullptr, nullptr,
+                                                                      nullptr, nullptr, nullptr, 0.0f, row_expert, s_tab,
+                                                                      xa, K, P);
+    UH_CHECK_LAUNCH();
+    return;
+  }
   mx_xform_in_kernel<<<dim3(K / 128, P), 128, 0, st>>>(x, ldx, row_expert, s_tab, xa, K, x_rows);
   UH_CHECK_LAUNCH();
 }
@@ -599,14 +652,16 @@ void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_
 void mx_xform_in_q(const uint8_t* q, const uint8_t* s, const int32_t* p2u, const MoePlan* plan,
                    const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P, int K, hipStream_t st) {
   if (P <= 0) return;
-  mx_xform_in_q_kernel<<<dim3(K / 128, P), 128, 0, st>>>(q, s, p2u, plan, row_expert, s_tab, xa, K);
+  mx_transform_wave_kernel<1><<<mx_wave_blocks(P, K), 256, 0, st>>>(nullptr, 0, nullptr, q, s, p2u, plan, nullptr,
+                                                                    nullptr, 0.0f, row_expert, s_tab, xa, K, P);
   UH_CHECK_LAUNCH();
 }
 
 void mx_swiglu(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert, const uint8_t* const* s_tab,
                bf16* hh, int P, int I, float limit, hipStream_t st) {
   if (P <= 0) return;
-  mx_swiglu_kernel<<<dim3(I / 128, P), 128, 0, st>>>(g, u, w, row_expert, s_tab, hh, I, limit);
+  mx_transform_wave_kernel<2><<<mx_wave_blocks(P, I), 256, 0, st>>>(g, I, nullptr, nullptr, nullptr, nullptr, nullptr, u,
+                                                                    w, limit, row_expert, s_tab, hh, I, P);
   UH_CHECK_LAUNCH();
 }
 
