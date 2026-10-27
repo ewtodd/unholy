@@ -149,12 +149,6 @@ __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, c
 }
 // K < 512 (K % 64 == 0; KDA's low-rank gate projections, K = 128): a wave per 8 columns, 4 lanes per column, each
 // lane K / 4 consecutive values of it (the per-512 layout above would leave most lanes idle).
-//
-// On gfx1201 a short kernel whose grid fills every wave slot of the card exactly (2048 waves: 64 CUs at 16 per SIMD,
-// e.g. 253-256 blocks of 8 waves; also 509-512) runs its blocks in ~6 us but takes ~22 us to complete; with LDS or
-// registers limiting the blocks per CU it does not. KDA's two 8192-column GEMVs are 256 blocks: one idle block per
-// shader engine more takes them from 22 to 9 us in decode.
-int smallk_grid(int blocks) { return blocks % 64 == 0 ? blocks + 4 : blocks; }
 template <int R, typename TOut>
 __device__ __forceinline__ void bf16_smallk_cols(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N,
                                                  int K, int block) {
@@ -247,10 +241,17 @@ __global__ __launch_bounds__(NT) void gemv_grouped_fp8w_kernel(const bf16* a, co
 }
 
 int g_force_cols = 0;
+// On gfx1201 a kernel whose grid fills every wave slot of the card exactly (2048 waves: 64 CUs at 16 per SIMD, e.g.
+// 253-256 blocks of 8 waves; also 509-512) runs its blocks in ~6 us but takes ~22 us to complete; with LDS or
+// registers limiting the blocks per CU it does not, and a kernel much longer than that hides most of it. For these
+// 8-wave blocks one idle block per shader engine more (the GEMVs skip columns past N) avoids it: KDA's two
+// 8192-column small-K GEMVs (256 blocks) 22 -> 9 us in decode, DSV4's shared w2 (512) 37 -> 21 us.
+int pad_grid(int blocks) { return blocks % 256 == 0 ? blocks + 4 : blocks; }
+
 // Columns per wave: 1. With the weights streamed from DRAM (unholy-gemv-test) more columns per wave only
 // cost occupancy; the template stays for tuning (gemv_force_cols).
 int cols_per_wave(int) { return g_force_cols ? g_force_cols : 1; }
-int blocks_for(int cols, int C) { return (cols + WAVES * C - 1) / (WAVES * C); }
+int blocks_for(int cols, int C) { return pad_grid((cols + WAVES * C - 1) / (WAVES * C)); }
 
 // Calls f(std::integral_constant<int, R>) with the smallest row capacity R in {8, 16, 32} >= M.
 template <typename F>
@@ -291,7 +292,7 @@ void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int 
   if (M <= MAXM && K < 512 && K % 64 == 0) {
     by_rows(M, [&](auto r) {
       gemv_bf16_smallk_kernel<decltype(r)::value, TOut>
-          <<<smallk_grid((N + WAVES * 8 - 1) / (WAVES * 8)), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
+          <<<pad_grid((N + WAVES * 8 - 1) / (WAVES * 8)), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
     });
     UH_CHECK_LAUNCH();
     return;
@@ -363,7 +364,7 @@ void gemv_bf16_smallk2(const bf16* a0, int lda0, const bf16* w0, bf16* c0, int l
   if (M > MAXM || K >= 512 || K % 64) throw std::runtime_error("gemv_bf16_smallk2: M > 32, K >= 512 or K % 64");
   const int nb0 = (N0 + WAVES * 8 - 1) / (WAVES * 8), nb1 = (N1 + WAVES * 8 - 1) / (WAVES * 8);
   by_rows(M, [&](auto r) {
-    gemv_bf16_smallk2_kernel<decltype(r)::value><<<smallk_grid(nb0 + nb1), NT, 0, st>>>(a0, lda0, w0, c0, ldc0, N0, a1,
+    gemv_bf16_smallk2_kernel<decltype(r)::value><<<pad_grid(nb0 + nb1), NT, 0, st>>>(a0, lda0, w0, c0, ldc0, N0, a1,
                                                                                        lda1, w1, c1, ldc1, N1, M, K, nb0);
   });
   UH_CHECK_LAUNCH();
