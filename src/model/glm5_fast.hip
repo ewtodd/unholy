@@ -179,11 +179,26 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
   bf16* low = s.at<bf16>(kLowRank);
   bf16* row = s.at<bf16>(kGateRow);
   float* g = s.at<float>(kForget);
-  linear(w.f_a, hn, D, low, Dh, T, s, st);
-  linear(w.f_b, low, Dh, row, W, T, s, st);
-  k::kda_gate(row, w.dt_bias.p<float>(), w.a_log.p<float>(), g, T, H, Dh, c.gate_lower_bound, st);
   bf16* beta = s.at<bf16>(kBeta);
-  linear(w.b, hn, D, beta, H, T, s, st);
+  // Decode-sized: the output gate's low-rank projections join the forget gate's and beta's (one launch for f_a / b /
+  // g_a on hn, one for f_b / g_b), their rows in DSA buffers a KDA layer leaves free.
+  bf16* row_o = row;  // the output gate's row
+  const bool parts = T <= k::kGemvRowsCap && D % 512 == 0 && Dh < 512 && Dh % 64 == 0 &&
+                     !(w.f_a.exl3() || w.b.exl3() || w.g_a.exl3() || w.f_b.exl3() || w.g_b.exl3());
+  if (parts) {
+    bf16* low_o = s.at<bf16>(kLatent);
+    row_o = s.at<bf16>(kQ);
+    const k::GemvPart pa[3] = {{w.f_a.w.ptr, nullptr, low, Dh, Dh},
+                               {w.b.w.ptr, nullptr, beta, H, H},
+                               {w.g_a.w.ptr, nullptr, low_o, Dh, Dh}};
+    k::gemv_bf16_parts(hn, D, pa, 3, T, D, st);
+    k::gemv_bf16_smallk2(low, Dh, w.f_b.w.p<bf16>(), row, W, W, low_o, Dh, w.g_b.w.p<bf16>(), row_o, W, W, T, Dh, st);
+  } else {
+    linear(w.f_a, hn, D, low, Dh, T, s, st);
+    linear(w.f_b, low, Dh, row, W, T, s, st);
+  }
+  k::kda_gate(row, w.dt_bias.p<float>(), w.a_log.p<float>(), g, T, H, Dh, c.gate_lower_bound, st);
+  if (!parts) linear(w.b, hn, D, beta, H, T, s, st);
   k::sigmoid_bf16(beta, beta, size_t(T) * H, st);
   bf16* core = s.at<bf16>(kCore);
   float* qn = s.at<float>(kKdaQ);
@@ -194,10 +209,12 @@ void kda_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& ca
     k::glm_kda_recurrent(qn, kn, eg, qkvc + 2 * W, C3, beta, cache.state.as<float>(), core, kb, H, Dh, st,
                          cache.state_bak.as<float>());
   });
-  linear(w.g_a, hn, D, low, Dh, T, s, st);
-  linear(w.g_b, low, Dh, row, W, T, s, st);
+  if (!parts) {
+    linear(w.g_a, hn, D, low, Dh, T, s, st);
+    linear(w.g_b, low, Dh, row, W, T, s, st);
+  }
   bf16* on = s.at<bf16>(kOutNorm);
-  k::kda_out_norm(core, row, w.o_norm.p<bf16>(), on, T, H, Dh, c.norm_eps, st);
+  k::kda_out_norm(core, row_o, w.o_norm.p<bf16>(), on, T, H, Dh, c.norm_eps, st);
   linear(w.o, on, W, out, D, T, s, st);
 }
 
@@ -467,8 +484,9 @@ struct LayerPart {
 };
 
 // Attention, then the FFN side's mixing and norm (the FFN's input in the part's rows of hn).
+// tiles: set the dense tile list for this part's rows (false: it is already).
 void layer_pre(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& cache, const Glm5Scratch& s,
-               uint16_t* x, const LayerPart& p, hipStream_t st) {
+               uint16_t* x, const LayerPart& p, hipStream_t st, bool tiles = true) {
   const int T = p.b.T, D = c.dim, hc = c.hc_mult, r0 = p.m.r0;
   bf16* h = s.at<bf16>(kH) + size_t(r0) * D;
   bf16* hn = s.at<bf16>(kHn) + size_t(r0) * D;
@@ -476,7 +494,7 @@ void layer_pre(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& c
   float* post = s.at<float>(kPost) + size_t(r0) * hc;
   float* comb = s.at<float>(kComb) + size_t(r0) * hc * hc;
   uint16_t* xr = x + size_t(r0) * hc * D;
-  set_rows(s, T, st);
+  if (tiles) set_rows(s, T, st);
   hc_pre_norm(c, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, xr, h, w.input_norm.p<bf16>(), hn, post, comb, T, s,
               st);
   if (w.kda) kda_fast(c, w, cache, s, hn, out, p.b, st);
@@ -567,8 +585,14 @@ void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, 
                       RemoteExperts* remote2) {
   if (b.T > s.max_tokens) throw std::runtime_error("glm5_layers_fast: batch larger than the scratch");
   const int n = int(w.size()), cut = remote2 ? split_cut(c, b, *remote2) : 0;
-  if (cut == 0) {
-    for (int i = 0; i < n; ++i) glm5_layer_forward_fast(c, w[size_t(i)], cache[size_t(i)], s, x, b, st, remote);
+  if (cut == 0) {  // the dense tile list once: every layer has the same rows
+    const LayerPart p{b, MoePart{b.T, 0, 0, 0, remote}};
+    set_rows(s, b.T, st);
+    for (int i = 0; i < n; ++i) {
+      layer_pre(c, w[size_t(i)], cache[size_t(i)], s, x, p, st, false);
+      layer_start(c, w[size_t(i)], s, p, st);
+      layer_post(c, w[size_t(i)], s, x, p, st, false);
+    }
     return;
   }
   LayerPart p[2];

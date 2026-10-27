@@ -150,9 +150,9 @@ __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, c
 // K < 512 (K % 64 == 0; KDA's low-rank gate projections, K = 128): a wave per 8 columns, 4 lanes per column, each
 // lane K / 4 consecutive values of it (the per-512 layout above would leave most lanes idle).
 template <int R, typename TOut>
-__global__ __launch_bounds__(NT) void gemv_bf16_smallk_kernel(const bf16* a, int lda, const bf16* w, TOut* c, int ldc,
-                                                              int M, int N, int K) {
-  const int lane = threadIdx.x & 31, n = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * 8 + (lane >> 2);
+__device__ __forceinline__ void bf16_smallk_cols(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N,
+                                                 int K, int block) {
+  const int lane = threadIdx.x & 31, n = (block * WAVES + (threadIdx.x >> 5)) * 8 + (lane >> 2);
   const int kq = K / 4, k0 = (lane & 3) * kq;
   float acc[R] = {};
   if (n < N)
@@ -176,6 +176,20 @@ __global__ __launch_bounds__(NT) void gemv_bf16_smallk_kernel(const bf16* a, int
     v += __shfl_xor(v, 2, 32);
     if ((lane & 3) == 0 && n < N) store(c, size_t(m) * ldc + n, v);
   }
+}
+template <int R, typename TOut>
+__global__ __launch_bounds__(NT) void gemv_bf16_smallk_kernel(const bf16* a, int lda, const bf16* w, TOut* c, int ldc,
+                                                              int M, int N, int K) {
+  bf16_smallk_cols<R, TOut>(a, lda, w, c, ldc, M, N, K, blockIdx.x);
+}
+// Blocks [0, nb0): the first GEMV, the rest the second.
+template <int R>
+__global__ __launch_bounds__(NT) void gemv_bf16_smallk2_kernel(const bf16* a0, int lda0, const bf16* w0, bf16* c0,
+                                                               int ldc0, int N0, const bf16* a1, int lda1,
+                                                               const bf16* w1, bf16* c1, int ldc1, int N1, int M, int K,
+                                                               int nb0) {
+  if (int(blockIdx.x) < nb0) bf16_smallk_cols<R, bf16>(a0, lda0, w0, c0, ldc0, M, N0, K, blockIdx.x);
+  else bf16_smallk_cols<R, bf16>(a1, lda1, w1, c1, ldc1, M, N1, K, blockIdx.x - nb0);
 }
 template <int R, typename TOut>
 __global__ __launch_bounds__(NT) void gemv_bf16_parts_kernel(const bf16* a, int lda, GemvParts ps, int M, int K) {
@@ -324,6 +338,27 @@ void gemv_bf16_f32out_parts(const bf16* a, int lda, const GemvPart* parts, int n
   const GemvParts ps = make_parts(parts, nparts, cols);
   by_rows(M, [&](auto r) {
     gemv_bf16_parts_kernel<decltype(r)::value, float><<<blocks_for(cols, 1), NT, 0, st>>>(a, lda, ps, M, K);
+  });
+  UH_CHECK_LAUNCH();
+}
+
+void gemv_bf16_parts(const bf16* a, int lda, const GemvPart* parts, int nparts, int M, int K, hipStream_t st) {
+  if (M > MAXM || K % 512) throw std::runtime_error("gemv_bf16_parts: M > 32 or K % 512");
+  int cols = 0;
+  const GemvParts ps = make_parts(parts, nparts, cols);
+  by_rows(M, [&](auto r) {
+    gemv_bf16_parts_kernel<decltype(r)::value, bf16><<<blocks_for(cols, 1), NT, 0, st>>>(a, lda, ps, M, K);
+  });
+  UH_CHECK_LAUNCH();
+}
+
+void gemv_bf16_smallk2(const bf16* a0, int lda0, const bf16* w0, bf16* c0, int ldc0, int N0, const bf16* a1, int lda1,
+                       const bf16* w1, bf16* c1, int ldc1, int N1, int M, int K, hipStream_t st) {
+  if (M > MAXM || K >= 512 || K % 64) throw std::runtime_error("gemv_bf16_smallk2: M > 32, K >= 512 or K % 64");
+  const int nb0 = (N0 + WAVES * 8 - 1) / (WAVES * 8), nb1 = (N1 + WAVES * 8 - 1) / (WAVES * 8);
+  by_rows(M, [&](auto r) {
+    gemv_bf16_smallk2_kernel<decltype(r)::value><<<nb0 + nb1, NT, 0, st>>>(a0, lda0, w0, c0, ldc0, N0, a1, lda1, w1, c1,
+                                                                          ldc1, N1, M, K, nb0);
   });
   UH_CHECK_LAUNCH();
 }

@@ -40,6 +40,10 @@ struct GemvParts {
 void gemv_w8a8_parts(const uint8_t* a, const uint8_t* sa, const GemvPart* parts, int nparts, int M, int K,
                      hipStream_t st);
 void gemv_bf16_f32out_parts(const bf16* a, int lda, const GemvPart* parts, int nparts, int M, int K, hipStream_t st);
+void gemv_bf16_parts(const bf16* a, int lda, const GemvPart* parts, int nparts, int M, int K, hipStream_t st);
+// Two of gemv_bf16's K < 512 GEMVs, each with its own input, in one launch (the same values as two launches).
+void gemv_bf16_smallk2(const bf16* a0, int lda0, const bf16* w0, bf16* c0, int ldc0, int N0, const bf16* a1, int lda1,
+                       const bf16* w1, bf16* c1, int ldc1, int N1, int M, int K, hipStream_t st);
 // Tests: force the columns per wave (1, 2 or 4; 0 = by shape). Results do not depend on it.
 void gemv_force_cols(int c);
 
