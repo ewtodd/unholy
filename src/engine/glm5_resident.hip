@@ -241,17 +241,25 @@ Plan make_glm5_plan(const Glm5PlanInput& in) {
     const size_t dcap = size_t(std::max(in.geo.max_slots, 8)) * c.n_active;
     apu_work += Glm5ApuExperts::work_bytes(c, dcap) + Glm5ApuExperts::staging_bytes(c, dcap);
   }
-  if (pl.apu_experts + apu_work + in.apu_margin > pl.apu_free) {
+  if (in.vision_tokens > 0) {  // the vision tower's weights, scratch and output rows; the flights' pinned image rows
+    for (const auto& t : ck.tensors())
+      if (t.name.rfind("vision.", 0) == 0) pl.vision_apu += t.nbytes;
+    pl.vision_apu += model::glm5_vision_scratch_bytes(*in.vision, in.vision_tokens) +
+                     size_t(in.vision_tokens) * in.vision->out_dim * 2 + 2 * size_t(in.max_tokens) * c.dim * 2;
+  }
+  const size_t apu_need = pl.apu_experts + apu_work + pl.vision_apu + in.apu_margin;
+  if (apu_need > pl.apu_free) {
     char msg[256];
-    std::snprintf(msg, sizeof msg, "plan: the APU cannot hold the cold experts (%.2f GB + %.2f GB working + %.2f GB margin > "
-                  "%.2f GB free)", pl.apu_experts / 1e9, apu_work / 1e9, in.apu_margin / 1e9, pl.apu_free / 1e9);
+    std::snprintf(msg, sizeof msg, "plan: the APU cannot hold the cold experts (%.2f GB + %.2f GB working + %.2f GB "
+                  "vision + %.2f GB margin > %.2f GB free)", pl.apu_experts / 1e9, apu_work / 1e9, pl.vision_apu / 1e9,
+                  in.apu_margin / 1e9, pl.apu_free / 1e9);
     throw std::runtime_error(msg);
   }
   // Prefix snapshots: pinned host memory is TTM pages too, under the same page limit as the APU's (the limit its free
   // bytes report; MemAvailable is no guide, TTM's pool keeps freed pages); as many as fit beside the margin.
   if (in.snapshots > 0) {
     pl.snapshot_bytes = glm5_snapshot_bytes(c, in.mtp);
-    const size_t left = pl.apu_free - (pl.apu_experts + apu_work + in.apu_margin);
+    const size_t left = pl.apu_free - apu_need;
     pl.snapshots = int(std::min<size_t>(size_t(in.snapshots), left / pl.snapshot_bytes));
   }
   return pl;
@@ -267,9 +275,24 @@ size_t glm5_snapshot_bytes(const model::Glm5Config& c, bool mtp) {
 // ---------------------------------------------------------------------------------------------------
 // Glm5ResidentModel
 
+// The vision tower on the APU: weights, scratch, its stream, the output rows; one image at a time.
+struct Glm5ResidentModel::Vision {
+  int dev = 0, max_tokens = 0;
+  hipStream_t st = nullptr;
+  std::mutex mu;
+  model::Glm5VisionConfig c;
+  model::Glm5VisionWeights w;
+  model::Glm5VisionScratch s;
+  rt::DeviceBuffer out;
+  ~Vision() {
+    rt::DeviceGuard g(dev);
+    if (st) (void)hipStreamDestroy(st);
+  }
+};
+
 Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Checkpoint& ck, const Plan& plan,
                                      const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows,
-                                     bool mtp, int snapshots)
+                                     bool mtp, int snapshots, int vision_tokens)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
       max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens), mtp_(mtp),
       snapshots_(snapshots) {
@@ -380,6 +403,19 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
     model::prepare_glm5_fast(c, w.layer, plan.apu, dchan_->stream());
     dchan_->add_layer(std::move(w.layer));
   }
+  if (vision_tokens > 0) {
+    vision_ = std::make_unique<Vision>();
+    Vision& v = *vision_;
+    v.dev = plan.apu;
+    v.max_tokens = vision_tokens;
+    v.c = model::Glm5VisionConfig::from_hf(ck.config());
+    if (v.c.out_dim != c.dim) throw std::runtime_error("glm5: the vision tower's output width is not the model's");
+    rt::DeviceGuard g(v.dev);
+    UH_CHECK(hipStreamCreateWithFlags(&v.st, hipStreamNonBlocking));
+    v.w = model::load_glm5_vision(ck, v.c, v.dev, v.st);
+    v.s = model::make_glm5_vision_scratch(v.c, vision_tokens, v.dev);
+    v.out = rt::DeviceBuffer(v.dev, size_t(vision_tokens) * v.c.out_dim * 2);
+  }
   const auto pinned = [](auto** p, size_t bytes) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), bytes, hipHostMallocPortable | hipHostMallocMapped));
   };
@@ -389,6 +425,7 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
     pinned(&f.io_host, size_t(max_tokens) * 3 * 4);
     pinned(&f.tables_host, size_t(geo.max_slots) * geo.max_pages_per_seq * 4);
     if (mtp_) pinned(&f.emb_host, size_t(max_tokens) * c.dim * 2);
+    if (vision_) pinned(&f.img_host, size_t(max_tokens) * c.dim * 2);
     {
       rt::DeviceGuard g(card_[0].dev);
       UH_CHECK(hipEventCreateWithFlags(&f.handoff, hipEventDisableTiming));
@@ -433,11 +470,31 @@ Glm5ResidentModel::~Glm5ResidentModel() {
     }
   for (Flight& f : flight_) {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.io_host),
-                    static_cast<void*>(f.tables_host), static_cast<void*>(f.emb_host)})
+                    static_cast<void*>(f.tables_host), static_cast<void*>(f.emb_host), static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
     for (hipEvent_t e : {f.handoff, f.consumed, f.done})
       if (e) (void)hipEventDestroy(e);
   }
+}
+
+const model::Glm5VisionConfig& Glm5ResidentModel::vision_config() const {
+  if (!vision_) throw std::runtime_error("no vision tower loaded");
+  return vision_->c;
+}
+
+int Glm5ResidentModel::vision_tokens() const { return vision_ ? vision_->max_tokens : 0; }
+
+void Glm5ResidentModel::encode_image(const vision::GlmPatches& p, std::vector<uint16_t>& rows) {
+  if (!vision_) throw std::runtime_error("no vision tower loaded");
+  Vision& v = *vision_;
+  const int tokens = p.grid_h * p.grid_w / (v.c.merge * v.c.merge);
+  if (tokens > v.max_tokens) throw std::runtime_error("image of more tokens than the vision tower holds");
+  std::lock_guard lk(v.mu);
+  rt::DeviceGuard g(v.dev);
+  model::glm5_vision_encode(v.c, v.w, v.s, p, v.out.as<uint16_t>(), v.st);
+  rows.resize(size_t(tokens) * v.c.out_dim);
+  UH_CHECK(hipMemcpyAsync(rows.data(), v.out.data(), rows.size() * 2, hipMemcpyDeviceToHost, v.st));
+  UH_CHECK(hipStreamSynchronize(v.st));
 }
 
 std::vector<std::vector<uint64_t>> Glm5ResidentModel::routing_histogram() const {
@@ -506,7 +563,8 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
   const int T = int(in.ids.size()), R = int(in.logit_rows.size()), D = c_.dim;
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
   if (R > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
-  if (!in.image_rows.empty() || !in.image_spans.empty()) throw std::runtime_error("step: GLM serves without images");
+  if (!in.image_spans.empty()) throw std::runtime_error("step: GLM image tokens are causal (no spans)");
+  if (!in.image_rows.empty() && !vision_) throw std::runtime_error("step: image rows without a vision tower");
   for (const auto* ops : {&in.restore, &in.save})
     for (const StateOp& op : *ops)
       if (op.snapshot < 0 || op.snapshot >= snapshots_ || op.slot < 0 || op.slot >= geo_.max_slots)
@@ -516,6 +574,19 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
   Flight& f = flight_[ticket % 2];
   if (f.busy) throw std::runtime_error("step: too many steps in flight");
   const size_t row = size_t(c_.hc_mult) * D;
+  // Image rows into this flight's pinned buffer, in order; img_at: batch row -> its image row (null: a token's).
+  std::vector<const uint16_t*> img_at;
+  if (!in.image_rows.empty()) {
+    img_at.assign(size_t(T), nullptr);
+    size_t off = 0;
+    for (const ImageRows& im : in.image_rows) {
+      if (im.t0 < 0 || im.n <= 0 || im.t0 + im.n > T || off + size_t(im.n) > size_t(T))
+        throw std::runtime_error("step: image rows outside the batch");
+      std::memcpy(f.img_host + off * D, im.rows, size_t(im.n) * D * 2);
+      for (int i = 0; i < im.n; ++i) img_at[size_t(im.t0 + i)] = im.rows + size_t(i) * D;
+      off += size_t(im.n);
+    }
+  }
   std::memcpy(f.io_host, in.ids.data(), size_t(T) * 4);
   std::memcpy(f.io_host + max_tokens_, in.pos.data(), size_t(T) * 4);
   std::memcpy(f.io_host + 2 * max_tokens_, in.logit_rows.data(), size_t(R) * 4);
@@ -533,7 +604,7 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
   b.T = T;
   b.max_pages = geo_.max_pages_per_seq;
   // MTP cache rows of the step: per chunk, positions s0 - 1 (from the slot's saved hidden state) .. s0 + n - 2, each
-  // from its hidden state and the next position's token embedding (host rows from the checkpoint's table).
+  // from its hidden state and the next position's embedding (host rows from the checkpoint's table, or its image row).
   model::Glm5Batch mb;
   int M = 0;
   if (mtp_) {
@@ -545,7 +616,8 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
       for (int j = 0; j < cnt; ++j) {
         const int32_t tok = in.ids[size_t(first_tok + j)];
         if (tok < 0 || tok >= c_.vocab) throw std::runtime_error("step: token id outside the vocabulary");
-        std::memcpy(f.emb_host + size_t(M + j) * D, embed_host_.data() + size_t(tok) * D, size_t(D) * 2);
+        const uint16_t* img = img_at.empty() ? nullptr : img_at[size_t(first_tok + j)];
+        std::memcpy(f.emb_host + size_t(M + j) * D, img ? img : embed_host_.data() + size_t(tok) * D, size_t(D) * 2);
       }
       mb.chunks.push_back({ch.slot, last ? ch.s0 - 1 : ch.s0, cnt, M});
       M += cnt;
@@ -565,6 +637,11 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
     if (k == 0) {
       k::embed_hc(cd.ids.as<int32_t>(), embed_.embed.p<uint16_t>(), cd.x.as<uint16_t>(), T, D, c_.hc_mult, cd.st,
                   c_.vocab);
+      size_t off = 0;  // image rows over their tokens' embeddings, from this flight's pinned buffer
+      for (const ImageRows& im : in.image_rows) {
+        k::put_rows_hc(f.img_host + off * D, im.n, cd.x.as<uint16_t>(), im.t0, D, c_.hc_mult, cd.st);
+        off += size_t(im.n);
+      }
     } else {  // the residual from card 0 through this flight's pinned buffer
       if (mtp_) UH_CHECK(hipStreamWaitEvent(cd.st, drafted_, 0));  // the last draft()'s restores
       UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));

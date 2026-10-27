@@ -238,10 +238,11 @@ void Engine::match_prefix(Seq& s) {
   int best = 0, snap = -1;
   for (int i = 0; i < limit; ++i) {
     if (!page_by_hash_.count(s.hashes[size_t(i)])) break;
-    // Never resume inside an image block: its tokens see the whole block.
+    // Never resume inside a whole image block: its tokens see the whole block.
     const int boundary = (i + 1) * page_tokens_;
     bool inside = false;
-    for (const GenImage& im : s.req.images) inside |= boundary > im.start && boundary < im.start + im.len;
+    if (model_.whole_image_blocks())
+      for (const GenImage& im : s.req.images) inside |= boundary > im.start && boundary < im.start + im.len;
     if (inside) continue;
     if (const auto it = snap_by_hash_.find(s.hashes[size_t(i)]); it != snap_by_hash_.end()) {
       best = i + 1;
@@ -347,7 +348,8 @@ void Engine::intake() {
              "prompt of " + std::to_string(s->n_prompt) + " tokens does not fit the context of " +
                  std::to_string(max_context_));
     else if (std::any_of(s->req.images.begin(), s->req.images.end(), [&](const GenImage& im) {
-               return im.len > cfg_.max_batch_tokens - slots_ || im.start < 0 || im.start + im.len > s->n_prompt || !im.rows;
+               return (model_.whole_image_blocks() && im.len > cfg_.max_batch_tokens - slots_) || im.start < 0 ||
+                      im.start + im.len > s->n_prompt || !im.rows;
              }))
       finish(*s, FinishReason::Error, "an image block does not fit one step (or lies outside the prompt)");
     else waiting_.push_back(std::move(s));
@@ -397,8 +399,8 @@ bool Engine::iterate() {
     s.admitted = ++admit_counter_;
     if (cache_on_) {
       s.cut = (int(s.tokens.size()) - 1) / page_tokens_ * page_tokens_;
-      for (const GenImage& im : s.req.images)  // not inside an image block
-        if (s.cut > im.start && s.cut < im.start + im.len) s.cut = im.start / page_tokens_ * page_tokens_;
+      for (const GenImage& im : s.req.images)  // not inside a whole image block
+        if (model_.whole_image_blocks() && s.cut > im.start && s.cut < im.start + im.len) s.cut = im.start / page_tokens_ * page_tokens_;
       if (s.cut <= s.computed) s.cut = 0;
     }
     if (!s.admitted_once) {
@@ -463,6 +465,7 @@ bool Engine::submit_step(int budget0) {
       // An image block goes into one chunk whole: stop before it, or take all of it when the step
       // has room (even past the request's cap), else wait for a step that does.
       for (const GenImage& im : s.req.images) {
+        if (!model_.whole_image_blocks()) break;
         const int a = im.start, e = im.start + im.len;
         if (n <= 0 || s.computed >= e || s.computed + n <= a || s.computed + n >= e) continue;
         if (a > s.computed) n = a - s.computed;
@@ -575,11 +578,13 @@ bool Engine::submit_step(int budget0) {
     }
     if (it.end == s.cut) s.cut = 0;
     in.chunks.push_back({s.slot, s.computed, it.n, t0});
-    for (const GenImage& im : s.req.images)  // blocks lie wholly inside chunks (planning above)
-      if (im.start >= s.computed && im.start + im.len <= s.computed + it.n) {
-        in.image_rows.push_back({t0 + im.start - s.computed, im.len, im.rows->data()});
-        in.image_spans.push_back({s.slot, im.span_start, im.span_end});
-      }
+    for (const GenImage& im : s.req.images) {  // whole blocks lie wholly inside chunks (planning above)
+      const int a = std::max(im.start, s.computed), e = std::min(im.start + im.len, s.computed + it.n - it.ndraft);
+      if (a >= e) continue;
+      const size_t dim = im.rows->size() / size_t(im.len);
+      in.image_rows.push_back({t0 + a - s.computed, e - a, im.rows->data() + size_t(a - im.start) * dim});
+      if (model_.whole_image_blocks()) in.image_spans.push_back({s.slot, im.span_start, im.span_end});
+    }
     const int fed = it.n - it.ndraft;  // tokens of the sequence; the rest are drafts
     for (int k = 0; k < it.n; ++k) {
       in.ids.push_back(k < fed ? s.tokens[size_t(s.computed + k)] : s.drafts[size_t(k - fed)]);

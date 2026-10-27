@@ -596,7 +596,25 @@ struct OpenAIServer::Impl {
     const text::RenderedChat r = fmt.render(body);
     job->thinking = r.thinking;
     job->prompt = tok.encode(r.prompt);
-    if (!r.images.empty()) {
+    if (!r.images.empty() && cfg.encode_glm_image) {
+      std::vector<vision::GlmImageInput> imgs;
+      try {
+        imgs = vision::glm_expand_images(job->prompt, cfg.image_token, r.images, cfg.glm_vision);
+      } catch (const vision::ImageError& e) {
+        throw HttpError(400, std::string("image: ") + e.what());
+      }
+      for (const auto& im : imgs) {
+        auto rows = std::make_shared<std::vector<uint16_t>>();
+        cfg.encode_glm_image(im.patches, *rows);
+        engine::GenImage g;
+        g.start = im.start;
+        g.len = im.tokens;
+        g.span_start = g.span_end = -1;  // causal
+        g.hash = im.hash;
+        g.rows = std::move(rows);
+        job->images.push_back(std::move(g));
+      }
+    } else if (!r.images.empty()) {
       if (!cfg.encode_image) throw HttpError(400, "this server has no vision tower; images are not supported");
       std::vector<vision::ImageInput> imgs;
       try {

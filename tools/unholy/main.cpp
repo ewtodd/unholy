@@ -327,7 +327,9 @@ int serve_dsv4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 
 // GLM-5.3-Flash, an EXL3 quant (build B, docs/PLAN-glm-dsv41.md): make_glm5_plan places the layers and experts,
 // Glm5ResidentModel runs them, text::glm5_chat_format(). Prefix snapshots hold a slot's KDA states (~148 MB each,
-// pinned host memory beside the APU's experts: as many of --prefix-snapshots as fit, default 32). No images.
+// pinned host memory beside the APU's experts: as many of --prefix-snapshots as fit, default 32). Images when the
+// checkpoint has its vision tower (vision.safetensors beside the quant) and --vision is on: up to the processor's
+// 8000 tokens each.
 int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
   const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
   const auto c = model::Glm5Config::from_hf(ck->config());
@@ -336,6 +338,11 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   o.spec_drafts = mtp ? 1 : 0;
   if (o.prefix_snapshots < 0) o.prefix_snapshots = 32;
   if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_glm53_broad.txt";
+  const auto vc = model::Glm5VisionConfig::from_hf(ck->config());
+  const bool has_tower = ck->find("vision.patch_embed.proj.weight") != nullptr;
+  if (o.vision && vc.depth > 0 && !has_tower)
+    std::printf("no vision.safetensors beside the quant (tools/box/extract-glm-vision.py): images are refused\n");
+  const int vision_tokens = o.vision && vc.depth > 0 && has_tower ? vision::GlmVisionConfig{}.max_tokens : 0;
 
   const int max_seq = (o.max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
   model::CacheGeometry geo;
@@ -356,11 +363,13 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
   pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
   pin.mtp = mtp;
   pin.snapshots = o.prefix_snapshots;
+  pin.vision = &vc;
+  pin.vision_tokens = vision_tokens;
   if (plan_only) {
     std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
-                "tokens; GLM-5.3-Flash EXL3%s\n",
+                "tokens; GLM-5.3-Flash EXL3%s%s\n",
                 (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch,
-                mtp ? ", MTP drafts" : "");
+                mtp ? ", MTP drafts" : "", vision_tokens > 0 ? ", vision" : "");
     try {
       std::printf("%s", engine::make_glm5_plan(pin).summary().c_str());
     } catch (const std::exception& e) {
@@ -376,7 +385,8 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
                 o.prefix_snapshots);
   std::fflush(stdout);
   const auto t0 = std::chrono::steady_clock::now();
-  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows, mtp, plan.snapshots);
+  engine::Glm5ResidentModel model(c, *ck, plan, geo, o.max_batch, max_seq, pin.max_logit_rows, mtp, plan.snapshots,
+                                  vision_tokens);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);
@@ -392,6 +402,14 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
         scfg.extra_get.emplace_back("/unholy/routing_profile",
                                     [&model] { return engine::format_usage_profile(model.routing_histogram()); });
         scfg.extra_get.emplace_back("/unholy/routing_share", [&model] { return model.routing_share(); });
+        if (model.has_vision()) {
+          scfg.encode_glm_image = [&model](const vision::GlmPatches& p, std::vector<uint16_t>& rows) {
+            model.encode_image(p, rows);
+          };
+          scfg.image_token = tok.token_id("<|image|>");
+          if (scfg.image_token < 0) throw std::runtime_error("GLM tokenizer: no <|image|>");
+          scfg.glm_vision = model.vision_config().preprocess(model.vision_tokens());
+        }
         scfg.extra_post.emplace_back("/unholy/routing_profile/reset", [&model] {
           model.reset_routing_histogram();
           return std::string("ok\n");

@@ -46,8 +46,9 @@ struct DraftReq {
 };
 
 // Images: an image block's embedding rows replace its tokens' embeddings (rows [n][dim] bf16 in host memory
-// that outlives the step, for batch rows [t0, t0 + n)); within a span [start, end] (IMAGE_START ..
-// IMAGE_END positions of the slot's sequence) tokens see each other both ways. A step holds whole blocks.
+// that outlives the step, for batch rows [t0, t0 + n)). Models with whole_image_blocks() (DSV4) get whole blocks
+// and their spans: within [start, end] (IMAGE_START .. IMAGE_END positions of the slot's sequence) tokens see each
+// other both ways. Otherwise (GLM) image tokens are causal like text: a step may hold any part of a block, no spans.
 struct ImageRows {
   int t0 = 0, n = 0;
   const uint16_t* rows = nullptr;
@@ -80,6 +81,7 @@ class StepModel {
   virtual int num_snapshots() const { return 0; }  // 0: no prefix reuse
   virtual int draft_block() const { return 0; }    // tokens one draft proposes; 0: no drafter
   virtual int max_verify() const { return 0; }     // longest verify chunk (1 + drafts) backups cover
+  virtual bool whole_image_blocks() const { return true; }  // see ImageRows
   // Applies `restore` (both cards' rings), then drafts for each request: tokens [reqs][draft_block()]
   // and their confidences. Runs after every submitted step that wrote these slots has completed.
   virtual void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs,

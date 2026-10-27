@@ -32,6 +32,10 @@ struct ServerConfig {
   std::function<void(const vision::Patches&, const vision::ImageBlock&, std::vector<uint16_t>&)> encode_image;
   int32_t image_token = -1, vocab = 0;
   vision::VisionConfig vision;
+  // GLM-5.3-Flash instead (set: encode_image unused): one image's token rows from its patches; each image_token of
+  // the prompt becomes the image's token count of copies.
+  std::function<void(const vision::GlmPatches&, std::vector<uint16_t>&)> encode_glm_image;
+  vision::GlmVisionConfig glm_vision;
   // Extra plain-text endpoints (path -> handler), e.g. the routing histogram.
   std::vector<std::pair<std::string, std::function<std::string()>>> extra_get, extra_post;
 };

@@ -6,7 +6,7 @@ It runs them across two AMD Radeon AI PRO R9700 cards and the Radeon 8060S iGPU 
 GLM-5.3-Flash as an EXL3 4.05-bit quant.
 It serves an
 OpenAI-compatible API with vLLM-style continuous batching, prefix caching, speculative decoding with
-each checkpoint's own drafter, image input (DeepSeek-V4-Flash), and contexts up to 1M tokens.
+each checkpoint's own drafter, image input, and contexts up to 1M tokens.
 <!---->
 C++20 and HIP; no Python at runtime; every kernel is our own (no rocBLAS / hipBLASLt / CK). It builds
 with Nix against TheRock's ROCm 10 SDK.
@@ -78,7 +78,7 @@ concurrency too when the requests reach the engine alike (`unholy-engine-batch`)
 <!---->
 Production settings: DeepSeek-V4-Flash with a 1.5M-token KV pool shared by up to 8 requests of up to 768k
 tokens each, DSpark with 5 drafts, 64 prefix-cache snapshots, the vision tower loaded; GLM-5.3-Flash with a
-1M-token pool, 3072-token steps, MTP drafts and the snapshots that fit (about 39). Depth curves are in
+1M-token pool, 3072-token steps, MTP drafts, the vision tower and the snapshots that fit (26; 40 without the tower). Depth curves are in
 `docs/bench/`.
 <!---->
 ## Accuracy
@@ -139,7 +139,10 @@ against that reference: bit-identical where the math allows, ulp-level where it 
   recurrent state rolled back when the draft is rejected. Drafts are verified with exact speculative
   sampling, so outputs are distributed exactly as without them.
 - **Vision**: images in chat messages (data URLs; JPEG, PNG, WebP), preprocessed on the CPU bit-exactly
-  as the reference does, and encoded by the ViT on the iGPU in under a second.
+  as the reference does, and encoded by the model's ViT on the iGPU. DeepSeek-V4-Flash's blocks (up to 384
+  tokens) encode in under a second. GLM-5.3-Flash's images run up to 8000 tokens, encoded with the release's
+  bf16 tower (`tools/box/extract-glm-vision.py`) at its reference's accuracy: 0.55 s for 1000 tokens, 11 s at
+  8000. Its image tokens are causal, so an image may span prefill steps and prefix-cache pages.
 - **Contexts to 1M tokens**: DeepSeek-V4-Flash with bf16 KV only, by design; GLM-5.3-Flash keeps its DSA
   latent in fp8 (e4m3, a power-of-two scale per 64 values).
 - **Placement planner** (`unholy plan`): what goes where for a given KV geometry, from the checkpoint and

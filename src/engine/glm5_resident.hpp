@@ -12,12 +12,16 @@
 // when the draft is rejected. Steps of >= 2048 rows run as two overlapping parts (model::glm5_layers_fast; a second
 // APU channel per card on the first's stream and working buffers; UNHOLY_GLM_SPLIT=0 turns it off). Prefix snapshots
 // (snapshots > 0): a slot's KDA conv tails and states (148 MB) and its MTP hidden row, in pinned host memory (TTM
-// pages, under the limit the APU's memory comes from). Not yet: images.
+// pages, under the limit the APU's memory comes from). Images (vision_tokens > 0): the vision tower on the APU
+// (model/glm5_vision) encodes them for the server; a step's image rows replace their tokens' embeddings on card 0 and
+// serve as the next-position embeddings of the MTP cache rows. Image tokens are causal, so a step may hold any part of
+// an image.
 #pragma once
 
 #include <hip/hip_runtime.h>
 
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -27,6 +31,8 @@
 #include "kernels/glm_fast.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "model/glm5.hpp"
+#include "model/glm5_vision.hpp"
+#include "vision/image.hpp"
 
 namespace unholy::engine {
 
@@ -82,6 +88,8 @@ struct Glm5PlanInput {
   size_t card_margin = size_t(2) << 30, apu_margin = size_t(4) << 30;
   bool mtp = false;  // MTP drafting: its layer on card 1 / the APU, the KDA state backups
   int snapshots = 0;  // prefix snapshots in pinned host memory (taken from the APU's RAM)
+  const model::Glm5VisionConfig* vision = nullptr;  // the vision tower on the APU, for images of up to
+  int vision_tokens = 0;                            // this many tokens (0: none)
 };
 Plan make_glm5_plan(const Glm5PlanInput& in);
 // Pinned host bytes of one prefix snapshot (every KDA layer's slot state; with MTP, the slot's last hidden state).
@@ -91,7 +99,7 @@ class Glm5ResidentModel final : public StepModel {
  public:
   Glm5ResidentModel(const model::Glm5Config& c, const model::Checkpoint& ck, const Plan& plan,
                     const model::CacheGeometry& geo, int max_tokens, int max_seq, int max_logit_rows = 0,
-                    bool mtp = false, int snapshots = 0);
+                    bool mtp = false, int snapshots = 0, int vision_tokens = 0);
   ~Glm5ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -105,6 +113,7 @@ class Glm5ResidentModel final : public StepModel {
   int num_snapshots() const override { return snapshots_; }
   int draft_block() const override { return mtp_ ? 1 : 0; }
   int max_verify() const override { return mtp_ ? 2 : 0; }
+  bool whole_image_blocks() const override { return false; }
   void draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs, std::vector<int32_t>& tokens,
              std::vector<float>& conf) override;
   void set_block_tables(const std::vector<int32_t>& tables) override;
@@ -112,6 +121,11 @@ class Glm5ResidentModel final : public StepModel {
   void wait(uint64_t ticket, std::vector<float>& logits) override;
 
   const Plan& plan() const { return plan_; }
+  // Images: one image's token rows [tokens][dim] bf16, in sequence order (one image at a time, any thread).
+  bool has_vision() const { return bool(vision_); }
+  const model::Glm5VisionConfig& vision_config() const;
+  int vision_tokens() const;
+  void encode_image(const vision::GlmPatches& p, std::vector<uint16_t>& rows);
   // Pairs routed to each expert since load (or the last reset), [layer][expert] (usage-profile format via
   // format_usage_profile).
   std::vector<std::vector<uint64_t>> routing_histogram() const;
@@ -158,6 +172,7 @@ class Glm5ResidentModel final : public StepModel {
     int32_t* io_host = nullptr;     // [max_tokens] ids, positions, logit rows
     int32_t* tables_host = nullptr;
     uint16_t* emb_host = nullptr;    // MTP: [max_tokens][dim] embeddings of the step's cache rows
+    uint16_t* img_host = nullptr;    // vision: [max_tokens][dim] the step's image rows
     hipEvent_t handoff = nullptr, consumed = nullptr, done = nullptr;
     uint64_t ticket = 0;
     int rows = 0;
@@ -175,6 +190,8 @@ class Glm5ResidentModel final : public StepModel {
   size_t snap_bytes_[2] = {0, 0};
   uint8_t* snap_host_[2] = {nullptr, nullptr};
   void state_copies(int k, const std::vector<StateOp>& ops, bool save);
+  struct Vision;
+  std::unique_ptr<Vision> vision_;
   uint64_t next_ticket_ = 1;
   std::vector<int32_t> tables_;
   bool tables_dirty_ = false;
