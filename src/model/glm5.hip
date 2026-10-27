@@ -476,13 +476,14 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       P * 4, P * 4, P * 4,                        // pair -> token, weight, expert
       P * D * 2, P * D * 2,                       // fp16 expert inputs (gate, up)
       std::max(P * c.moe_inter, T * c.inter) * 2,  // fp16 down inputs
-      std::max(std::min<size_t>(P, 64) * std::max(D, size_t(c.moe_inter)),
+      std::max(std::min<size_t>(P, 64) * std::max(D, 2 * size_t(c.moe_inter)),
                8 * std::max(3 * W, size_t(c.vocab))) * 4,  // GEMV fp32 sides
       size_t(c.n_layers + c.n_mtp) * E * 4,       // routing histogram [layer][expert] (the MTP layer last)
       k::glm_topk_cand_bytes(kIdxBlock, std::max(max_seq / c.idx_pool + 1, 8 * k::kGlmTopkSeg),
                              c.idx_topk / c.idx_pool),  // top-k candidates (room for >= 8 segments)
       k::glm_mla_part_bytes(kAttnSplitRows, kAttnSplits),  // split attention's partial states
-      std::max(std::max(size_t(c.vocab), 3 * W) / 128 + 1, size_t(64) * std::max(D, size_t(c.moe_inter)) / 128) *
+      std::max(std::max(size_t(c.vocab), 3 * W) / 128 + 1,
+               size_t(64) * std::max(D, 3 * size_t(c.moe_inter)) / 128 + D / 128) *
           4,  // fused GEMVs' segment counters (zeroed, left zeroed): a dense linear's, or up to 64 expert tiles'
   };
   if (sizes.size() != size_t(kGlm5ScratchBufs)) throw std::logic_error("glm5 scratch: buffer list out of date");

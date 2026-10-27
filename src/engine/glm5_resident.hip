@@ -21,7 +21,8 @@ namespace k = unholy::kernels;
 
 size_t Glm5ApuExperts::work_bytes(const model::Glm5Config& c, size_t cap) {
   const size_t D = c.dim, I = c.moe_inter;
-  return 2 * cap * D * 2 + 3 * cap * I * 2 + std::min<size_t>(cap, 64) * std::max(D, I) * 4 + 64 * std::max(D, I) / 128 * 4;
+  return 2 * cap * D * 2 + 3 * cap * I * 2 + std::min<size_t>(cap, 64) * std::max(D, 2 * I) * 4 +
+         (64 * std::max(D, 3 * I) / 128 + D / 128) * 4;
 }
 
 size_t Glm5ApuExperts::staging_bytes(const model::Glm5Config& c, size_t cap) {
@@ -71,8 +72,8 @@ Glm5ApuExperts::Glm5ApuExperts(const model::Glm5Config& c, int dev, size_t capac
     work_->xh2 = rt::DeviceBuffer(dev, cap * I * 2);
     work_->h1 = rt::DeviceBuffer(dev, cap * I * 2);
     work_->h3 = rt::DeviceBuffer(dev, cap * I * 2);
-    work_->yp = rt::DeviceBuffer(dev, std::min<size_t>(cap, 64) * std::max(D, I) * 4);
-    work_->cnt = rt::DeviceBuffer(dev, 64 * std::max(D, I) / 128 * 4);
+    work_->yp = rt::DeviceBuffer(dev, std::min<size_t>(cap, 64) * std::max(D, 2 * I) * 4);
+    work_->cnt = rt::DeviceBuffer(dev, (64 * std::max(D, 3 * I) / 128 + D / 128) * 4);
     UH_CHECK(hipMemset(work_->cnt.data(), 0, work_->cnt.size()));
   }
   if (layers_->size() < size_t(c.n_layers)) layers_->resize(size_t(c.n_layers));
@@ -111,10 +112,9 @@ void Glm5ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
   UH_CHECK(hipStreamWaitValue32(wk.st, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
   const model::Glm5ExpertBufs b{wk.xh1.as<uint16_t>(), wk.xh3.as<uint16_t>(), wk.xh2.as<uint16_t>(),
                                 wk.h1.as<uint16_t>(), wk.h3.as<uint16_t>(), wk.yp.as<float>(), wk.cnt.as<uint32_t>()};
+  const k::Exl3TokenSums sums{u2p_dev_, &plan_dev_->n_remote_tokens, reinterpret_cast<float*>(out_dev_), c_.n_active};
   model::glm5_experts_dev(c_, *w, in_dev_, w_dev_, e_dev_, tiles_dev_, max_tiles, &plan_dev_->n_remote_tiles, P, b,
-                          wk.xh1.as<uint16_t>(), wk.st, &plan_dev_->remote0, nullptr, p2u_dev_);
-  k::glm_remote_partial(wk.xh1.as<uint16_t>(), u2p_dev_, &plan_dev_->n_remote_tokens,
-                        reinterpret_cast<float*>(out_dev_), c_.n_active, c_.dim, P / c_.n_active, wk.st);
+                          wk.xh1.as<uint16_t>(), wk.st, &plan_dev_->remote0, nullptr, p2u_dev_, &sums);
   UH_CHECK(hipStreamWriteValue32(wk.st, done_flag_, seq_, 0));
 }
 

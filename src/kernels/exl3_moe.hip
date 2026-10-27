@@ -144,6 +144,7 @@ __global__ __launch_bounds__(128) void swiglu_xform_kernel(const bf16* g, const 
 
 // xform_in_kernel / swiglu_xform_kernel without fake quantization, a wave per (row, 128-column segment): the same
 // values (fwht128_wave), no barriers. Items (row, segment) of rows [*row0, *row1) stride over the grid, 8 per block.
+// suh_tab2 (input transform only): the same rows also through a second table into xh2.
 template <bool kSwiglu>
 __global__ __launch_bounds__(256) void xform_wave_kernel(const bf16* __restrict__ x, int ldx,
                                                          const int32_t* __restrict__ x_rows, const bf16* __restrict__ u,
@@ -151,7 +152,9 @@ __global__ __launch_bounds__(256) void xform_wave_kernel(const bf16* __restrict_
                                                          const int32_t* __restrict__ row_expert,
                                                          const uint16_t* const* __restrict__ suh_tab,
                                                          uint16_t* __restrict__ xh, int K, int P, const int* row0,
-                                                         const int* row1) {
+                                                         const int* row1,
+                                                         const uint16_t* const* __restrict__ suh_tab2 = nullptr,
+                                                         uint16_t* __restrict__ xh2 = nullptr) {
   const int lane = threadIdx.x & 31, segs = K / 128;
   const int r0 = row0 ? *row0 : 0, r1 = row1 ? *row1 : P;
   const size_t n = r1 > r0 ? size_t(r1 - r0) * segs : 0;
@@ -159,7 +162,7 @@ __global__ __launch_bounds__(256) void xform_wave_kernel(const bf16* __restrict_
     const int r = r0 + int(it / segs), k0 = int(it % segs) * 128 + 4 * lane;
     const uint16_t* suh = suh_tab[row_expert[r]];
     if (!suh) continue;  // expert not on this device (uniform per wave)
-    float v[4];
+    float v[4], v2[4];
     if constexpr (kSwiglu) {  // x = gate rows, u = up rows, [P][K]
       const size_t idx = size_t(r) * K + k0;
       const uint2 graw = *reinterpret_cast<const uint2*>(x + idx), uraw = *reinterpret_cast<const uint2*>(u + idx);
@@ -182,14 +185,24 @@ __global__ __launch_bounds__(256) void xform_wave_kernel(const bf16* __restrict_
 #pragma unroll
       for (int q = 0; q < 4; ++q)
         v[q] = bf16_to_f32(uint16_t(xw[q / 2] >> (16 * (q % 2)))) * __half2float(__ushort_as_half(suh[k0 + q]));
-    }
-    fwht128_wave(v, lane);
-    uint32_t o[2];
+      if (xh2) {
+        const uint16_t* suh2 = suh_tab2[row_expert[r]];
 #pragma unroll
-    for (int q = 0; q < 2; ++q)
-      o[q] = uint32_t(__half_as_ushort(__float2half(v[2 * q] * 0.08838834764831845f))) |
-             (uint32_t(__half_as_ushort(__float2half(v[2 * q + 1] * 0.08838834764831845f))) << 16);
-    *reinterpret_cast<uint2*>(xh + size_t(r) * K + k0) = uint2{o[0], o[1]};
+        for (int q = 0; q < 4; ++q)
+          v2[q] = bf16_to_f32(uint16_t(xw[q / 2] >> (16 * (q % 2)))) * __half2float(__ushort_as_half(suh2[k0 + q]));
+      }
+    }
+    const auto store = [&](float* t, uint16_t* dst) {
+      fwht128_wave(t, lane);
+      uint32_t o[2];
+#pragma unroll
+      for (int q = 0; q < 2; ++q)
+        o[q] = uint32_t(__half_as_ushort(__float2half(t[2 * q] * 0.08838834764831845f))) |
+               (uint32_t(__half_as_ushort(__float2half(t[2 * q + 1] * 0.08838834764831845f))) << 16);
+      *reinterpret_cast<uint2*>(dst + size_t(r) * K + k0) = uint2{o[0], o[1]};
+    };
+    store(v, xh);
+    if (!kSwiglu && xh2) store(v2, xh2);
   }
 }
 
@@ -524,17 +537,19 @@ constexpr int kXformGridRows = 1024;  // rows per pass of the transforms' grids
 
 void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint16_t* const* suh_tab, uint16_t* xh,
                    int P, int K, bool fake_quant, hipStream_t st, const int* row0_dev, const int* row1_dev,
-                   const int32_t* x_rows) {
+                   const int32_t* x_rows, const uint16_t* const* suh_tab2, uint16_t* xh2) {
   if (P <= 0) return;
   if (!fake_quant && ldx % 4 == 0) {
     xform_wave_kernel<false><<<xform_wave_blocks(P, K), 256, 0, st>>>(x, ldx, x_rows, nullptr, nullptr, 0.0f, row_expert,
-                                                                      suh_tab, xh, K, P, row0_dev, row1_dev);
+                                                                      suh_tab, xh, K, P, row0_dev, row1_dev, suh_tab2,
+                                                                      xh2);
     UH_CHECK_LAUNCH();
     return;
   }
   xform_in_kernel<<<dim3(K / 128, std::min(P, kXformGridRows)), 128, 0, st>>>(x, ldx, row_expert, suh_tab, xh, K,
                                                                              fake_quant, P, row0_dev, row1_dev, x_rows);
   UH_CHECK_LAUNCH();
+  if (xh2) exl3_xform_in(x, ldx, row_expert, suh_tab2, xh2, P, K, fake_quant, st, row0_dev, row1_dev, x_rows);
 }
 
 void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32_t* row_expert,
@@ -604,6 +619,20 @@ typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
 #endif
 constexpr int GV_PF = UH_GV_PF;  // k-tiles in flight per wave
 
+// The gate/up launch's second weight set (grid z = 1) and the down projection's input transform after both.
+struct GvGlu {
+  const uint16_t* xh = nullptr;
+  const uint16_t* const* trellis_tab = nullptr;
+  const uint16_t* const* svh_tab = nullptr;
+  float* yp = nullptr;
+  bf16* out = nullptr;
+  const float* rw = nullptr;  // routing weights of the pair rows (may be null)
+  float limit = 0.0f;
+  const uint16_t* const* suh_tab = nullptr;  // the down projection's
+  uint16_t* xh_next = nullptr;
+  uint32_t* pair = nullptr;  // [tiles][N / 128] zeroed counters
+};
+
 // The fused variants' inputs and outputs; unused otherwise.
 struct GvFused {
   const bf16* x = nullptr;  // kIn: the untransformed input rows
@@ -613,13 +642,17 @@ struct GvFused {
   uint32_t* counters = nullptr;
   bf16* out = nullptr;
   int ldo = 0;
-  HcPostArgs hp;  // kOut: the post-mix of the output columns
+  HcPostArgs hp;       // kOut: the post-mix of the output columns
+  GvGlu glu;           // kTail 1
+  Exl3TokenSums sums;  // kTail 2
 };
 
 // One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows. kIn: the input
 // transform while staging (xform_in_kernel's arithmetic); kOut: the output transform by the segment's last block
-// (exl3_out_rows_kernel's).
-template <int BITS, bool kIn = false, bool kOut = false>
+// (exl3_out_rows_kernel's). With kOut, kTail 1: grid z = 1 runs fu.glu's weight set (the up projection), and the second
+// of a segment's two output transforms runs xform_wave_kernel<true>'s arithmetic on the segment; kTail 2: the last tile
+// to finish a segment runs remote_partial_kernel's sums over it (bit for bit).
+template <int BITS, bool kIn = false, bool kOut = false, int kTail = 0>
 __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __restrict__ xh, int K,
                                                           const Exl3Tile* __restrict__ tiles,
                                                           const uint16_t* const* __restrict__ trellis_tab,
@@ -627,6 +660,16 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
                                                           GvFused fu = {}) {
   constexpr int NW = 8 * BITS;
   if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
+  const bf16* const g_out = fu.out;
+  if constexpr (kTail == 1)
+    if (blockIdx.z) {
+      xh = fu.glu.xh;
+      trellis_tab = fu.glu.trellis_tab;
+      yp = fu.glu.yp;
+      fu.svh_tab = fu.glu.svh_tab;
+      fu.out = fu.glu.out;
+      fu.counters += size_t(gridDim.y) * (N / 128);
+    }
   const Exl3Tile tile = tiles[blockIdx.y];
   const int nb = blockIdx.x, tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
   const int M = tile.rows;
@@ -754,6 +797,71 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
       }
     }
     if (tid == 0) *cnt = 0;
+    if constexpr (kTail == 1) {  // the second of the segment's gate and up transforms: the down projection's input
+      __shared__ bool second;
+      uint32_t* pc = fu.glu.pair + size_t(blockIdx.y) * (N / 128) + seg;
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) second = atomicAdd(pc, 1u) == 1u;
+      __syncthreads();
+      if (!second) return;
+      __threadfence();
+      if (wave < M) {
+        const int row = tile.row0 + wave, k0 = seg * 128 + 4 * lane;
+        const size_t idx = size_t(row) * N + k0;
+        const uint64_t graw = __hip_atomic_load(reinterpret_cast<const uint64_t*>(g_out + idx), __ATOMIC_RELAXED,
+                                                __HIP_MEMORY_SCOPE_AGENT);
+        const uint64_t uraw = __hip_atomic_load(reinterpret_cast<const uint64_t*>(fu.glu.out + idx), __ATOMIC_RELAXED,
+                                                __HIP_MEMORY_SCOPE_AGENT);
+        const uint16_t* suh = fu.glu.suh_tab[tile.expert];
+        const float limit = fu.glu.limit;
+        float v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          float gv = bf16_to_f32(uint16_t(graw >> (16 * q))), uv = bf16_to_f32(uint16_t(uraw >> (16 * q)));
+          if (limit > 0.0f) {
+            uv = fminf(fmaxf(uv, -limit), limit);
+            gv = fminf(gv, limit);
+          }
+          float hv = (gv / (1.0f + expf(-gv))) * uv;
+          if (fu.glu.rw) hv = fu.glu.rw[row] * hv;
+          v[q] = round_bf16(hv) * __half2float(__ushort_as_half(suh[k0 + q]));
+        }
+        fwht128_wave(v, lane);
+        uint32_t o[2];
+#pragma unroll
+        for (int q = 0; q < 2; ++q)
+          o[q] = uint32_t(__half_as_ushort(__float2half(v[2 * q] * 0.08838834764831845f))) |
+                 (uint32_t(__half_as_ushort(__float2half(v[2 * q + 1] * 0.08838834764831845f))) << 16);
+        *reinterpret_cast<uint2*>(fu.glu.xh_next + idx) = uint2{o[0], o[1]};
+      }
+      if (tid == 0) *pc = 0;
+    } else if constexpr (kTail == 2) {  // the segment's last tile: every token's sum of its pair rows over it
+      __shared__ bool last_tile;
+      uint32_t* sc = fu.counters + size_t(gridDim.y) * (N / 128) + seg;
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) last_tile = atomicAdd(sc, 1u) == uint32_t(ntiles_dev ? *ntiles_dev : int(gridDim.y)) - 1;
+      __syncthreads();
+      if (!last_tile) return;
+      __threadfence();
+      const int U = *fu.sums.n_tokens, KA = fu.sums.K;
+      for (int i = tid; i < U * 64; i += GV_NT) {
+        const int u = i / 64, d = seg * 128 + 2 * (i % 64);
+        float a0 = 0.0f, a1 = 0.0f;
+        for (int j = 0; j < KA; ++j) {
+          const int p = fu.sums.u2p[size_t(u) * KA + j];
+          if (p < 0) continue;
+          const uint32_t r = __hip_atomic_load(reinterpret_cast<const uint32_t*>(fu.out + size_t(p) * fu.ldo + d),
+                                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          a0 += bf16_to_f32(uint16_t(r));
+          a1 += bf16_to_f32(uint16_t(r >> 16));
+        }
+        *reinterpret_cast<float2*>(fu.sums.dst + size_t(u) * N + d) = make_float2(a0, a1);
+      }
+      __threadfence_system();
+      if (tid == 0) *sc = 0;
+    }
   }
 }
 
@@ -803,12 +911,61 @@ void exl3_linear_gemv(const bf16* x, int ldx, int K, const Exl3Tile* tiles, int 
   UH_CHECK_LAUNCH();
 }
 
+void exl3_grouped_gemv_glu(const uint16_t* xh_g, const uint16_t* xh_u, int K, const Exl3Tile* tiles, int ntiles,
+                           const uint16_t* const* tab_g, const uint16_t* const* svh_g, const uint16_t* const* tab_u,
+                           const uint16_t* const* svh_u, int bits, float* yp_g, float* yp_u, bf16* g, bf16* u, int N,
+                           const float* rw, float limit, const uint16_t* const* suh_down, uint16_t* xh_down,
+                           uint32_t* counters, hipStream_t st, const int* ntiles_dev) {
+  if (ntiles <= 0) return;
+  if (K % GV_KC || N % 128) throw std::runtime_error("exl3_grouped_gemv_glu: K % 512 or N % 128");
+  const dim3 grid(N / 16, ntiles, 2);
+  GvFused fu;
+  fu.svh_tab = svh_g;
+  fu.counters = counters;
+  fu.out = g;
+  fu.ldo = N;
+  fu.glu = {xh_u, tab_u, svh_u, yp_u, u, rw, limit, suh_down, xh_down, counters + size_t(2) * ntiles * (N / 128)};
+  const auto launch = [&](auto kernel) {
+    kernel<<<grid, GV_NT, 0, st>>>(xh_g, K, tiles, tab_g, yp_g, N, ntiles_dev, fu);
+  };
+  switch (bits) {
+    case 2: launch(exl3_gemv_kernel<2, false, true, 1>); break;
+    case 3: launch(exl3_gemv_kernel<3, false, true, 1>); break;
+    case 4: launch(exl3_gemv_kernel<4, false, true, 1>); break;
+    case 5: launch(exl3_gemv_kernel<5, false, true, 1>); break;
+    case 6: launch(exl3_gemv_kernel<6, false, true, 1>); break;
+    default: throw std::runtime_error("exl3_grouped_gemv_glu: unsupported bit width");
+  }
+  UH_CHECK_LAUNCH();
+}
+
 void exl3_grouped_gemv(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* trellis_tab,
                        const uint16_t* const* svh_tab, int bits, float* yp, bf16* out, int ldo, int N, hipStream_t st,
-                       const int* ntiles_dev, uint32_t* counters) {
+                       const int* ntiles_dev, uint32_t* counters, const Exl3TokenSums* sums) {
   if (ntiles <= 0) return;
   if (K % GV_KC || N % 128) throw std::runtime_error("exl3_grouped_gemv: K % 512 or N % 128");
   const dim3 grid(N / 16, ntiles);
+  if (counters && sums) {
+    GvFused fu;
+    fu.svh_tab = svh_tab;
+    fu.counters = counters;
+    fu.out = out;
+    fu.ldo = ldo;
+    fu.sums = *sums;
+    const auto launch = [&](auto kernel) {
+      kernel<<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev, fu);
+    };
+    switch (bits) {
+      case 2: launch(exl3_gemv_kernel<2, false, true, 2>); break;
+      case 3: launch(exl3_gemv_kernel<3, false, true, 2>); break;
+      case 4: launch(exl3_gemv_kernel<4, false, true, 2>); break;
+      case 5: launch(exl3_gemv_kernel<5, false, true, 2>); break;
+      case 6: launch(exl3_gemv_kernel<6, false, true, 2>); break;
+      default: throw std::runtime_error("exl3_grouped_gemv: unsupported bit width");
+    }
+    UH_CHECK_LAUNCH();
+    return;
+  }
   if (counters) {
     GvFused fu;
     fu.svh_tab = svh_tab;

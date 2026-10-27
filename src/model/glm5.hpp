@@ -265,14 +265,16 @@ void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, 
 struct Glm5ExpertBufs {
   uint16_t *xh1, *xh3, *xh2;  // fp16 [P, dim], [P, dim], [P, moe_inter]
   uint16_t *h1, *h3;          // bf16 [P, moe_inter]
-  float* yp;                  // fp32 [min(P, 64), max(dim, moe_inter)] (GEMV steps)
-  uint32_t* cnt = nullptr;    // GEMV steps' segment counters, 64 * max(dim, moe_inter) / 128 zeroed words (null: the
-                              // output transforms as their own launches)
+  float* yp;                  // fp32 [min(P, 64), max(dim, 2 moe_inter)] (GEMV steps)
+  uint32_t* cnt = nullptr;    // GEMV steps' segment counters, 64 * max(dim, 3 moe_inter) / 128 + dim / 128 zeroed
+                              // words (null: the output transforms, SwiGLU and token sums as their own launches)
 };
+// sums: also each token's fp32 sum of its pair rows of out (the APU's share of a step's MoE).
 void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
                       const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
                       int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st, const int* row0_dev = nullptr,
-                      const int* row1_dev = nullptr, const int32_t* x_rows = nullptr);
+                      const int* row1_dev = nullptr, const int32_t* x_rows = nullptr,
+                      const kernels::Exl3TokenSums* sums = nullptr);
 void glm5_head_forward_fast(const Glm5Config& c, const Glm5HeadWeights& h, const Glm5Scratch& scr, const uint16_t* x,
                             int T, float* logits, hipStream_t st);
 // The LM head on rows that are already normed (hn [T, dim]) -> logits [T, vocab] f32.

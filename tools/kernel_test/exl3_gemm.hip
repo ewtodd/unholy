@@ -3,9 +3,11 @@
 // must be identical; prints both kernels' times and the effective weight-decode rate.
 //
 //   unholy-exl3-gemm-test [--experts 64] [--rows-mean 96] [--K 4096] [--N 2048] [--bits 3] [--dev 0] [--gemv-rows R]
+//                         [--gemv-tiles T]
 //
 // The decode GEMV runs on one tile per expert of R rows (0: 1-8 at random); UH_DUMP_GEMV=FILE writes its output (bf16)
-// for comparisons between builds.
+// for comparisons between builds. With T, also back-to-back GEMVs of T tiles each (output transform in the launch)
+// that rotate over the experts, so their weights come from memory rather than the last-level cache, as in decode.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -29,7 +31,7 @@ uint16_t f2h(float f) { return uint16_t(__half_as_ushort(__float2half(f))); }
 }  // namespace
 
 int main(int argc, char** argv) {
-  int E = 64, rows_mean = 96, K = 4096, N = 2048, bits = 3, dev = 0, gemv_rows = 0;
+  int E = 64, rows_mean = 96, K = 4096, N = 2048, bits = 3, dev = 0, gemv_rows = 0, gemv_tiles = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     const int v = std::atoi(argv[i + 1]);
@@ -40,6 +42,7 @@ int main(int argc, char** argv) {
     else if (a == "--bits") bits = v;
     else if (a == "--dev") dev = v;
     else if (a == "--gemv-rows") gemv_rows = v;
+    else if (a == "--gemv-tiles") gemv_tiles = v;
   }
   const char* dump = std::getenv("UH_DUMP_OUT");  // write v2's output (bf16) there
   UH_CHECK(hipSetDevice(dev));
@@ -158,6 +161,32 @@ int main(int argc, char** argv) {
       std::vector<uint16_t> f(size_t(rowsv) * N);
       UH_CHECK(hipMemcpy(f.data(), of.data(), f.size() * 2, hipMemcpyDeviceToHost));
       for (size_t i = 0; i < f.size(); ++i) gemv_fused_diff += f[i] != v[i];
+    }
+    if (gemv_tiles > 0 && E / gemv_tiles > 0) {  // rotating launches of gemv_tiles experts each
+      const int groups = E / gemv_tiles, reps = 4;
+      rt::DeviceBuffer cnt(dev, size_t(gemv_tiles) * (N / 128) * 4), of(dev, size_t(rowsv) * N * 2);
+      UH_CHECK(hipMemset(cnt.data(), 0, cnt.size()));
+      hipEvent_t e0, e1;
+      UH_CHECK(hipEventCreate(&e0));
+      UH_CHECK(hipEventCreate(&e1));
+      auto run = [&] {
+        for (int g = 0; g < groups; ++g)
+          k::exl3_grouped_gemv(dxv.as<uint16_t>(), K, dtv.as<k::Exl3Tile>() + size_t(g) * gemv_tiles, gemv_tiles, trt,
+                               svt, bits, yp.as<float>(), of.as<uint16_t>(), N, N, nullptr, nullptr,
+                               cnt.as<uint32_t>());
+      };
+      run();
+      UH_CHECK(hipEventRecord(e0, nullptr));
+      for (int r = 0; r < reps; ++r) run();
+      UH_CHECK(hipEventRecord(e1, nullptr));
+      UH_CHECK(hipEventSynchronize(e1));
+      float ms = 0;
+      UH_CHECK(hipEventElapsedTime(&ms, e0, e1));
+      const double us = 1e3 * ms / (reps * groups);
+      std::printf("GEMV rotating (%d tiles per launch over %d experts): %.1f us per launch, %.0f GB/s of weights\n",
+                  gemv_tiles, E, us, double(gemv_tiles) * K * N * bits / 8 / 1e3 / us);
+      UH_CHECK(hipEventDestroy(e0));
+      UH_CHECK(hipEventDestroy(e1));
     }
     if (const char* gd = std::getenv("UH_DUMP_GEMV"))
       if (FILE* fd = std::fopen(gd, "wb")) {

@@ -742,21 +742,31 @@ namespace unholy::model {
 void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
                       const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,
                       int P, const Glm5ExpertBufs& b, uint16_t* out, hipStream_t st, const int* row0_dev,
-                      const int* row1_dev, const int32_t* x_rows) {
+                      const int* row1_dev, const int32_t* x_rows, const kernels::Exl3TokenSums* sums) {
   const int D = c.dim, I = c.moe_inter, E = c.n_experts;
   max_tiles = std::min(max_tiles, P);  // every tile has >= 1 row
-  k::exl3_xform_in(in, D, row_expert, w.tab(0, 1, E), b.xh1, P, D, false, st, row0_dev, row1_dev, x_rows);
-  k::exl3_xform_in(in, D, row_expert, w.tab(1, 1, E), b.xh3, P, D, false, st, row0_dev, row1_dev, x_rows);
+  k::exl3_xform_in(in, D, row_expert, w.tab(0, 1, E), b.xh1, P, D, false, st, row0_dev, row1_dev, x_rows,
+                   w.tab(1, 1, E), b.xh3);
+  const auto token_sums = [&] {
+    if (sums) k::glm_remote_partial(out, sums->u2p, sums->n_tokens, sums->dst, sums->K, D, P / c.n_active, st);
+  };
   if (P / c.n_active <= 8) {  // <= 8 tokens: every expert has <= 8 rows -> the GEMVs
     const int* nt = ntiles_dev;
-    k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I, I,
-                         st, nt, b.cnt);
-    k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I, I,
-                         st, nt, b.cnt);
-    k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false,
-                         row0_dev, row1_dev);
+    if (b.cnt && w.exl3_bits[0] == w.exl3_bits[1]) {  // gate, up and the SwiGLU into the down input in one launch
+      k::exl3_grouped_gemv_glu(b.xh1, b.xh3, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.tab(1, 0, E),
+                               w.tab(1, 2, E), w.exl3_bits[0], b.yp, b.yp + size_t(P) * I, b.h1, b.h3, I, rw,
+                               c.swiglu_limit, w.tab(2, 1, E), b.xh2, b.cnt, st, nt);
+    } else {
+      k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I,
+                           I, st, nt, b.cnt);
+      k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I,
+                           I, st, nt, b.cnt);
+      k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false,
+                           row0_dev, row1_dev);
+    }
     k::exl3_grouped_gemv(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], b.yp, out, D, D,
-                         st, nt, b.cnt);
+                         st, nt, b.cnt, b.cnt ? sums : nullptr);
+    if (!b.cnt) token_sums();
     return;
   }
   k::exl3_grouped_gemm(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.h1, I, I, st,
@@ -767,6 +777,7 @@ void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint
                        row0_dev, row1_dev);
   k::exl3_grouped_gemm(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], out, D, D, st,
                        ntiles_dev);
+  token_sums();
 }
 
 }  // namespace unholy::model
