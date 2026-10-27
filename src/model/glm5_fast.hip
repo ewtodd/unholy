@@ -302,7 +302,8 @@ void moe_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch
   float* rw = s.at<float>(kRouteW) + P0;
   if (T <= k::kGemvRowsCap) k::gemv_bf16_f32out(hn, D, w.router.w.p<bf16>(), logits, E, T, E, D, st);
   else k::gemm_bf16_f32out_wmma(hn, D, w.router.w.p<bf16>(), logits, E, T, E, D, st);
-  k::glm_route(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
+  const bool small = T <= k::kMoeSmallMaxTokens;
+  if (!small) k::glm_route(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
 
   auto* plan = s.at<k::MoePlan>(kMoePlan) + m.idx;
   auto* lt = s.at<k::Exl3Tile>(kMoeLTiles) + m.tile0;
@@ -319,12 +320,20 @@ void moe_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch
   const int cap_tiles = moe_cap_tiles(c, T);
   if (any_remote && (size_t(P) > remote->capacity_rows || cap_tiles > remote->max_tiles))
     throw std::runtime_error("glm5: remote staging too small");
-  if (T <= k::kMoeSmallMaxTokens) {  // decode-sized: the bookkeeping (and the remote staging) in one block
+  if (small) {  // decode-sized: the routing, the bookkeeping and the remote staging in one block
     k::MoeSmallArgs ma{sel, rw, T, K, hist, w.resident.as<uint8_t>(), E, P, cap_tiles, k::kExl3TileRows, plan, lt, rtl,
                        eidx, ewt, row_expert, pidx, any_remote, any_remote, tok2u, u2t,
                        any_remote ? remote->p2u_host : nullptr, any_remote ? remote->u2p_host : nullptr,
                        any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
                        any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
+    ma.route_logits = logits;
+    ma.route_bias = w.router_bias.p<float>();
+    ma.route_scale = c.route_scale;
+    if (any_remote) {
+      ma.x = hn;
+      ma.dim = D;
+      ma.x_dst = remote->in_host;
+    }
     k::moe_dispatch_small(ma, st);
   } else {
     k::moe_count(sel, T, K, s.at<int32_t>(kMoeCount), E, st, hist);
@@ -337,11 +346,11 @@ void moe_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch
                       remote->e_host, P, st);
     }
   }
-  k::gather_rows(hn, eidx, s.at<bf16>(kExpIn) + size_t(P0) * D, P, D, st);
   if (any_remote) {  // the remote tokens' rows to the APU, which starts once the card stream gets here
-    k::copy_remote_tokens(hn, D, u2t, plan, remote->in_host, T, st);
+    if (!small) k::copy_remote_tokens(hn, D, u2t, plan, remote->in_host, T, st);
     remote->enqueue(w.layer, st, P);
   }
+  k::gather_rows(hn, eidx, s.at<bf16>(kExpIn) + size_t(P0) * D, P, D, st);  // this card's experts' rows
 }
 
 void moe_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out,
@@ -383,14 +392,19 @@ void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   moe_post(c, w, s, hn, out, m, st);
 }
 
-void hc_pre(const Glm5Config& c, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const bf16* x,
-            bf16* y, float* post, float* comb, int T, const Glm5Scratch& s, hipStream_t st) {
-  if (T <= k::kHcSmallMaxTokens)
+// The mHC pre-mix into y, then hn = RMSNorm(y, norm_w); decode-sized batches in one launch.
+void hc_pre_norm(const Glm5Config& c, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const bf16* x,
+                 bf16* y, const bf16* norm_w, bf16* hn, float* post, float* comb, int T, const Glm5Scratch& s,
+                 hipStream_t st) {
+  if (T <= k::kHcSmallMaxTokens) {
     k::hc_pre_small(x, fn.p<float>(), scale.p<float>(), base.p<float>(), y, post, comb, s.at<float>(kHcPart), T,
-                    c.hc_mult, c.dim, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
-  else
-    k::hc_pre_tiled(x, fn.p<float>(), scale.p<float>(), base.p<float>(), y, post, comb, T, c.hc_mult, c.dim,
-                    c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
+                    c.hc_mult, c.dim, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st, s.at<uint32_t>(kGemvCount), norm_w,
+                    hn, c.norm_eps);
+    return;
+  }
+  k::hc_pre_tiled(x, fn.p<float>(), scale.p<float>(), base.p<float>(), y, post, comb, T, c.hc_mult, c.dim,
+                  c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
+  norm(y, norm_w, hn, T, c.dim, c.norm_eps, st);
 }
 
 }  // namespace
@@ -463,13 +477,12 @@ void layer_pre(const Glm5Config& c, const Glm5LayerWeights& w, Glm5PagedCache& c
   float* comb = s.at<float>(kComb) + size_t(r0) * hc * hc;
   uint16_t* xr = x + size_t(r0) * hc * D;
   set_rows(s, T, st);
-  hc_pre(c, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, xr, h, post, comb, T, s, st);
-  norm(h, w.input_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
+  hc_pre_norm(c, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, xr, h, w.input_norm.p<bf16>(), hn, post, comb, T, s,
+              st);
   if (w.kda) kda_fast(c, w, cache, s, hn, out, p.b, st);
   else dsa_fast(c, w, cache, s, hn, out, p.b, st);
   k::hc_post_slices(out, xr, post, comb, xr, T, hc, D, st);
-  hc_pre(c, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, xr, h, post, comb, T, s, st);
-  norm(h, w.post_norm.p<bf16>(), hn, T, D, c.norm_eps, st);
+  hc_pre_norm(c, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, xr, h, w.post_norm.p<bf16>(), hn, post, comb, T, s, st);
 }
 
 void layer_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const LayerPart& p,

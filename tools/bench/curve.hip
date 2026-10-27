@@ -6,7 +6,9 @@
 // continue the sequence, then resumes the prefill. Token ids cycle through --ids (raw int32 file).
 //
 //   unholy-curve --model DIR [--exl3 DIR] --profile FILE --ids FILE [--ctx 524288] [--chunk 4096]
-//                [--probes 4096,32768,131072,524288] [--decode-steps 8] [--every 8]
+//                [--probes 4096,32768,131072,524288] [--decode-steps 8] [--every 8] [--out FILE]
+//
+// --out FILE: every decode step's logits (fp32, in order), for comparing builds.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -31,7 +33,7 @@ using namespace unholy;
 using clk = std::chrono::steady_clock;
 
 int main(int argc, char** argv) {
-  std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path;
+  std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path, out_path;
   std::vector<int> probes = {4096, 32768, 131072, 524288};
   int ctx = 524288, chunk = 4096, dsteps = 8, every = 8;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -43,6 +45,7 @@ int main(int argc, char** argv) {
     else if (a == "--ctx") ctx = std::stoi(v);
     else if (a == "--chunk") chunk = std::stoi(v);
     else if (a == "--decode-steps") dsteps = std::stoi(v);
+    else if (a == "--out") out_path = v;
     else if (a == "--every") every = std::stoi(v);  // print every N-th chunk (and all probes)
     else if (a == "--probes") {
       probes.clear();
@@ -110,6 +113,8 @@ int main(int argc, char** argv) {
       if (pool.empty()) throw std::runtime_error("no token ids in " + ids_path);
     }
     std::vector<float> logits;
+    std::ofstream out;
+    if (!out_path.empty()) out.open(out_path, std::ios::binary);
     std::deque<std::pair<uint64_t, int>> flying;  // (ticket, chunk end depth)
     int pos = 0, chunks_done = 0, depth_done = 0;
     clk::time_point last = clk::now();
@@ -156,6 +161,7 @@ int main(int argc, char** argv) {
           const uint64_t ticket = m.submit(d);
           subs.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
           m.wait(ticket, logits);
+          if (out) out.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * 4));
           ts.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
           ++pos;
         }

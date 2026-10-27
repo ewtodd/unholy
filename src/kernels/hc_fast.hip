@@ -156,8 +156,8 @@ __global__ __launch_bounds__(NT) void hc_pre_tiled_kernel(const bf16* __restrict
 // Small T: grid (T, 32 K-splits) partial sums, then one block per token for Sinkhorn and the mix.
 constexpr int SPLITS = 32;
 
-__global__ __launch_bounds__(NT) void hc_partial_kernel(const bf16* __restrict__ x, const float* __restrict__ fn,
-                                                        float* __restrict__ part, int width) {
+__device__ __forceinline__ void hc_partial_body(const bf16* __restrict__ x, const float* __restrict__ fn,
+                                                float* __restrict__ part, int width) {
   __shared__ float red[MIX + 1][8];
   const int t = blockIdx.x, sp = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int ks = width / SPLITS, k0 = sp * ks;
@@ -184,21 +184,32 @@ __global__ __launch_bounds__(NT) void hc_partial_kernel(const bf16* __restrict__
   }
 }
 
+__global__ __launch_bounds__(NT) void hc_partial_kernel(const bf16* __restrict__ x, const float* __restrict__ fn,
+                                                        float* __restrict__ part, int width) {
+  hc_partial_body(x, fn, part, width);
+}
+
 // One block per (token, slice of dim): the partial sums, then Sinkhorn on wave 0 (lane l mod 16 owns
 // comb[l / 4][l % 4]; lanes 0-3 compute pre, 4-7 post), then the mix of the slice's columns. Every value
 // goes through the same operations in the same order as one thread doing it all (sums in index order),
 // so the slices and the lanes change nothing; every slice repeats the (tiny) Sinkhorn.
-__global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ x, const float* __restrict__ part,
-                                                       const float* __restrict__ scale, const float* __restrict__ base,
-                                                       bf16* __restrict__ y, float* __restrict__ post_out,
-                                                       float* __restrict__ comb_out, int hc, int dim, int iters,
-                                                       float norm_eps, float hc_eps, int per) {
+// kCoherent: `part` was written by other blocks of the same launch (read past the caches).
+template <bool kCoherent>
+__device__ __forceinline__ void hc_finish_token(const bf16* __restrict__ x, const float* __restrict__ part,
+                                                const float* __restrict__ scale, const float* __restrict__ base,
+                                                bf16* __restrict__ y, float* __restrict__ post_out,
+                                                float* __restrict__ comb_out, int hc, int dim, int iters, float norm_eps,
+                                                float hc_eps, int per, int t, int slice) {
   __shared__ float m[MIX + 1];
   __shared__ float pre[4];
-  const int t = blockIdx.x, tid = threadIdx.x, width = hc * dim;
+  const int tid = threadIdx.x, width = hc * dim;
   if (tid <= MIX) {
     float v = 0.0f;
-    for (int sp = 0; sp < SPLITS; ++sp) v += part[(size_t(t) * SPLITS + sp) * (MIX + 1) + tid];
+    for (int sp = 0; sp < SPLITS; ++sp) {
+      const float* p = &part[(size_t(t) * SPLITS + sp) * (MIX + 1) + tid];
+      if constexpr (kCoherent) v += __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      else v += *p;
+    }
     m[tid] = v;
   }
   __syncthreads();
@@ -239,19 +250,63 @@ __global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ 
       c = c / (rsum + hc_eps);
       col_norm();
     }
-    if (blockIdx.y == 0) {
+    if (slice == 0) {
       if (tid < 16) comb_out[size_t(t) * HC * HC + l] = c;
       if (tid >= HC && tid < 2 * HC) post_out[size_t(t) * HC + tid - HC] = post;
     }
   }
   __syncthreads();
   const bf16* xt = x + size_t(t) * width;
-  const int d1 = min(dim, int(blockIdx.y + 1) * per);
-  for (int d = blockIdx.y * per + tid; d < d1; d += NT) {
+  const int d1 = min(dim, int(slice + 1) * per);
+  for (int d = slice * per + tid; d < d1; d += NT) {
     float v = 0.0f;
     for (int h = 0; h < hc; ++h) v += pre[h] * bf16_to_f32(xt[size_t(h) * dim + d]);
     y[size_t(t) * dim + d] = f32_to_bf16(v);
   }
+}
+
+__global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ x, const float* __restrict__ part,
+                                                       const float* __restrict__ scale, const float* __restrict__ base,
+                                                       bf16* __restrict__ y, float* __restrict__ post_out,
+                                                       float* __restrict__ comb_out, int hc, int dim, int iters,
+                                                       float norm_eps, float hc_eps, int per) {
+  hc_finish_token<false>(x, part, scale, base, y, post_out, comb_out, hc, dim, iters, norm_eps, hc_eps, per, blockIdx.x,
+                         blockIdx.y);
+}
+
+// hc_partial_kernel, then the last of the token's SPLITS blocks to finish runs hc_finish for the whole row (one
+// slice) and, with norm_w, rmsnorm_slices_kernel's arithmetic on that row (same thread partition, so the same values).
+__global__ __launch_bounds__(NT) void hc_pre_fused_kernel(const bf16* __restrict__ x, const float* __restrict__ fn,
+                                                          float* __restrict__ part, const float* __restrict__ scale,
+                                                          const float* __restrict__ base, bf16* __restrict__ y,
+                                                          float* __restrict__ post_out, float* __restrict__ comb_out,
+                                                          int hc, int dim, int iters, float norm_eps, float hc_eps,
+                                                          uint32_t* __restrict__ counters, const bf16* __restrict__ nw,
+                                                          bf16* __restrict__ yn, float eps2) {
+  hc_partial_body(x, fn, part, hc * dim);
+  __shared__ bool last;
+  const int t = blockIdx.x, tid = threadIdx.x;
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) last = atomicAdd(&counters[t], 1u) == SPLITS - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  hc_finish_token<true>(x, part, scale, base, y, post_out, comb_out, hc, dim, iters, norm_eps, hc_eps, dim, t, 0);
+  if (nw) {
+    __shared__ float red[32];
+    __syncthreads();  // this block's y
+    const bf16* yr = y + size_t(t) * dim;
+    float ss = 0.0f;
+    for (int i = tid; i < dim; i += NT) {
+      const float v = bf16_to_f32(yr[i]);
+      ss += v * v;
+    }
+    ss = block_sum(ss, red);
+    const float r = rsqrtf(ss / float(dim) + eps2);
+    for (int i = tid; i < dim; i += NT) yn[size_t(t) * dim + i] = f32_to_bf16(bf16_to_f32(nw[i]) * (bf16_to_f32(yr[i]) * r));
+  }
+  if (tid == 0) counters[t] = 0;
 }
 
 }  // namespace
@@ -270,8 +325,14 @@ void hc_pre_tiled(const bf16* x, const float* fn, const float* scale, const floa
 
 void hc_pre_small(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
                   float* comb, float* part, int T, int hc, int dim, int iters, float norm_eps, float hc_eps,
-                  hipStream_t st) {
+                  hipStream_t st, uint32_t* counters, const bf16* norm_w, bf16* y_norm, float norm_eps2) {
   if (hc != 4 || (hc * dim) % (SPLITS * NT)) throw std::runtime_error("hc_pre_small: unsupported shape");
+  if (counters) {
+    hc_pre_fused_kernel<<<dim3(T, SPLITS), NT, 0, st>>>(x, fn, part, scale, base, y, post, comb, hc, dim, iters,
+                                                         norm_eps, hc_eps, counters, norm_w, y_norm, norm_eps2);
+    UH_CHECK_LAUNCH();
+    return;
+  }
   hc_partial_kernel<<<dim3(T, SPLITS), NT, 0, st>>>(x, fn, part, hc * dim);
   UH_CHECK_LAUNCH();
   const int sl = row_slices(T, dim);

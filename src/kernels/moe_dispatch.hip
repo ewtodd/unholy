@@ -278,8 +278,59 @@ __global__ __launch_bounds__(256) void quant_remote_tokens_kernel(const uint16_t
   __threadfence_system();
 }
 
+__device__ __forceinline__ float route_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+// glm_fast's route_kernel for token t on one wave: the same scores (sigmoid + bias), the same top K (the largest, the
+// lowest index among equals: the reduction order does not matter) and the same weights.
+__device__ void route_token_wave(const MoeSmallArgs& a, int t, int lane) {
+  constexpr int MAXV = 16;  // E <= 512
+  const int E = a.E, K = a.K;
+  const float* lr = a.route_logits + size_t(t) * E;
+  float sv[MAXV];
+#pragma unroll
+  for (int i = 0; i < MAXV; ++i) {
+    const int e = lane + 32 * i;
+    sv[i] = e < E ? route_sigmoid(lr[e]) + a.route_bias[e] : -INFINITY;
+  }
+  int chosen[8];
+  for (int k = 0; k < K; ++k) {
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
+#pragma unroll
+    for (int i = 0; i < MAXV; ++i)
+      if (lane + 32 * i < E && sv[i] > bv) bv = sv[i], bi = lane + 32 * i;
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor(bv, o, 32);
+      const int oi = __shfl_xor(bi, o, 32);
+      if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    }
+    chosen[k] = bi;
+#pragma unroll
+    for (int i = 0; i < MAXV; ++i)
+      if (lane + 32 * i == bi) sv[i] = -INFINITY;
+  }
+  if (lane == 0) {
+    for (int x = 1; x < K; ++x)
+      for (int y = x; y > 0 && chosen[y - 1] > chosen[y]; --y) {
+        const int c = chosen[y];
+        chosen[y] = chosen[y - 1];
+        chosen[y - 1] = c;
+      }
+    float s[8], sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      s[k] = route_sigmoid(lr[chosen[k]]);
+      sum += s[k];
+    }
+    for (int k = 0; k < K; ++k) {
+      const_cast<int32_t*>(a.sel)[size_t(t) * K + k] = chosen[k];
+      const_cast<float*>(a.wt)[size_t(t) * K + k] = s[k] / (sum + 1e-20f) * a.route_scale;
+    }
+  }
+}
+
 // moe_count + moe_plan + moe_scatter + remote_tokens + stage_remote for a step of <= 32 tokens, in one
-// block of NE threads (256 or 512, NE >= E): the counts, offsets and fill counters live in LDS (count / off /
+// block of NE threads (256 or 512, NE >= E); with route_logits the routing first, with x_dst the remote rows' copy
+// last: the counts, offsets and fill counters live in LDS (count / off /
 // fill are left untouched), every output is what the five kernels write (the rows within an expert in another
 // arrival order, as with their atomics).
 template <int NE>
@@ -289,6 +340,10 @@ __global__ __launch_bounds__(NE) void moe_dispatch_small_kernel(MoeSmallArgs a) 
   __shared__ int stok[32];
   const int tid = threadIdx.x, lane = tid & 31;
   const int E = a.E, K = a.K, T = a.T;
+  if (a.route_logits) {
+    for (int t = tid >> 5; t < T; t += NE / 32) route_token_wave(a, t, lane);
+    __syncthreads();
+  }
   scnt[tid] = 0;
   __syncthreads();
   for (int i = tid; i < T * K; i += NE) {
@@ -395,6 +450,14 @@ __global__ __launch_bounds__(NE) void moe_dispatch_small_kernel(MoeSmallArgs a) 
   for (int p = pl.remote0 + tid; p < pl.P; p += NE) {
     a.w_dst[p] = a.ewt[p];
     a.e_dst[p] = a.row_expert[p];
+  }
+  if (a.x_dst) {  // copy_remote_tokens_kernel
+    const int cols = a.dim / 8;
+    for (int i = tid; i < pl.n_remote_tokens * cols; i += NE) {
+      const int u = i / cols, c = i % cols;
+      reinterpret_cast<uint4*>(a.x_dst + size_t(u) * a.dim)[c] =
+          reinterpret_cast<const uint4*>(a.x + size_t(a.u2t[u]) * a.dim)[c];
+    }
   }
   __threadfence_system();
 }

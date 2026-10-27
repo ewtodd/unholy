@@ -86,6 +86,15 @@ struct MoeSmallArgs {
   Exl3Tile* tiles_dst;
   float* w_dst;
   int32_t* e_dst;
+  // GLM's routing in the same launch (null: sel / wt are inputs): glm_route's sigmoid(logits) + bias, its top K and
+  // weights, written to sel / wt (the same values, a wave per token).
+  const float* route_logits = nullptr;
+  const float* route_bias = nullptr;
+  float route_scale = 0.0f;
+  // copy_remote_tokens in the same launch (null x_dst: not here): the remote tokens' rows of x [T][dim] -> x_dst.
+  const uint16_t* x = nullptr;
+  int dim = 0;
+  uint16_t* x_dst = nullptr;
 };
 void moe_dispatch_small(const MoeSmallArgs& a, hipStream_t st);
 void copy_remote_meta(const float* ewt, const int32_t* row_expert, float* w_dst, int32_t* e_dst, const MoePlan* plan,
