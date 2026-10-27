@@ -70,6 +70,16 @@ __device__ __forceinline__ void fwht128_lds(float* b, int i) {
   }
 }
 
+// One cross-lane stage of fwht128_wave (half-width h >= 4: the partner is lane ^ h / 4).
+template <int h>
+__device__ __forceinline__ void fwht128_wave_stage(float v[4], int lane) {
+  const bool hi = (4 * lane) & h;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const float o = xor_lane<h / 4>(v[q]);
+    v[q] = hi ? o - v[q] : v[q] + o;
+  }
+}
 // fwht128_lds on a wave: value 4 * lane + q in v[q], the same stages and operations (bit for bit), no barriers.
 __device__ __forceinline__ void fwht128_wave(float v[4], int lane) {
 #pragma unroll
@@ -80,15 +90,11 @@ __device__ __forceinline__ void fwht128_wave(float v[4], int lane) {
 #pragma unroll
     for (int q = 0; q < 4; ++q) v[q] = nv[q];
   }
-#pragma unroll
-  for (int h = 4; h < 128; h <<= 1) {
-    const bool hi = (4 * lane) & h;
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const float o = __shfl_xor(v[q], h / 4, 32);
-      v[q] = hi ? o - v[q] : v[q] + o;
-    }
-  }
+  fwht128_wave_stage<4>(v, lane);
+  fwht128_wave_stage<8>(v, lane);
+  fwht128_wave_stage<16>(v, lane);
+  fwht128_wave_stage<32>(v, lane);
+  fwht128_wave_stage<64>(v, lane);
 }
 
 // Rows [*row0 (0 if null), *row1 (P if null)), gridDim.y of them at a time: a prefill step's few-thousand-row grids
@@ -760,8 +766,8 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
   for (int m = 0; m < M; ++m)
     for (int h = 0; h < 2; ++h) {
       float v = acc[m][h];
-      v += __shfl_xor(v, 1, 32);
-      v += __shfl_xor(v, 2, 32);
+      v += xor_lane<1>(v);
+      v += xor_lane<2>(v);
       if ((lane & 3) == 0) sRed[wave][m][c0 + 8 * h] = v;
     }
   __syncthreads();

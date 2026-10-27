@@ -611,7 +611,7 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
 #pragma unroll
   for (int m = 0; m < MV_MAXM; ++m) {
     if (m >= M) break;
-    const float v = acc[m] + __shfl_xor(acc[m], 1, 32);
+    const float v = acc[m] + xor_lane<1>(acc[m]);
     if ((lane & 1) == 0) out[size_t(tile.row0 + m) * ldo + nt * 16 + (lane >> 1)] = f32_to_bf16(v);
   }
 }

@@ -172,8 +172,8 @@ __device__ __forceinline__ void bf16_smallk_cols(const bf16* a, int lda, const b
   for (int m = 0; m < R; ++m) {
     if (m >= M) break;
     float v = acc[m];
-    v += __shfl_xor(v, 1, 32);
-    v += __shfl_xor(v, 2, 32);
+    v += xor_lane<1>(v);
+    v += xor_lane<2>(v);
     if ((lane & 3) == 0 && n < N) store(c, size_t(m) * ldc + n, v);
   }
 }
