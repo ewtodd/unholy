@@ -516,21 +516,34 @@ __global__ __launch_bounds__(256) void argmax_conf_kernel(const float* logits, i
   }
 }
 
-// The split attention's combine: one block per (query, head), each thread two of the 512 dims.
+// The split attention's combine: one block per (query, head), each thread two of the 512 dims. The splits' (max,
+// sum) pairs and weights go through LDS (one load per split, not every thread walking them), L summed in split order.
 __global__ __launch_bounds__(256) void mla_combine_kernel(const float* part, int splits, bf16* o) {
-  const int t = blockIdx.x / H, h = blockIdx.x % H;
+  __shared__ float sm[64], sl[64], sf[64], sL;
+  const int t = blockIdx.x / H, h = blockIdx.x % H, tid = threadIdx.x;
   const float* base = part + size_t(t) * splits * H * (R + 2);
-  float M = -INFINITY;
-  for (int s = 0; s < splits; ++s) M = fmaxf(M, base[size_t(s) * H * (R + 2) + size_t(H) * R + 2 * h]);
-  float L = 0.0f, f[64];
-  for (int s = 0; s < splits && s < 64; ++s) {
-    const float* ml = base + size_t(s) * H * (R + 2) + size_t(H) * R + 2 * h;
-    f[s] = ml[0] == -INFINITY ? 0.0f : expf(ml[0] - M);
-    L += ml[1] * f[s];
+  if (tid < splits) {
+    const float* ml = base + size_t(tid) * H * (R + 2) + size_t(H) * R + 2 * h;
+    sm[tid] = ml[0];
+    sl[tid] = ml[1];
   }
-  for (int d = threadIdx.x; d < R; d += blockDim.x) {
+  __syncthreads();
+  if (tid < splits) {
+    float M = -INFINITY;
+    for (int s = 0; s < splits; ++s) M = fmaxf(M, sm[s]);
+    sf[tid] = sm[tid] == -INFINITY ? 0.0f : expf(sm[tid] - M);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float L = 0.0f;
+    for (int s = 0; s < splits; ++s) L += sl[s] * sf[s];
+    sL = L;
+  }
+  __syncthreads();
+  const float L = sL;
+  for (int d = tid; d < R; d += blockDim.x) {
     float a = 0.0f;
-    for (int s = 0; s < splits && s < 64; ++s) a += base[size_t(s) * H * (R + 2) + size_t(h) * R + d] * f[s];
+    for (int s = 0; s < splits; ++s) a += base[size_t(s) * H * (R + 2) + size_t(h) * R + d] * sf[s];
     o[(size_t(t) * H + h) * R + d] = f32_to_bf16(L > 0.0f ? a / L : 0.0f);
   }
 }
