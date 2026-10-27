@@ -544,56 +544,70 @@ __device__ __forceinline__ uint32_t sort_key(float f) {
 // One block (256 threads) per segment: kernels::topk_rows' radix select (4 passes of 8 bits; keys above the
 // threshold, then ties by lowest position; -inf never taken), sorted by (value desc, position asc). Segment `seg`
 // of row r: vals + r * ld + seg * span, n entries; out_val / out_idx [k] at out_off; an entry's index is
-// map[position] when map is given, else seg * span + position.
+// map[position] when map is given, else seg * span + position. A segment of <= kGlmTopkSeg entries is read once into
+// LDS (the passes over it from L2 were most of the time); each pass's bin comes from suffix sums over the histogram
+// (a wave scan per 32 bins) instead of one thread walking it.
 __global__ __launch_bounds__(256) void topk_seg_kernel(const float* vals, size_t ld, int span, int ncols, int k,
                                                        const int32_t* map, size_t map_ld, float* out_val,
                                                        int32_t* out_idx, size_t out_ld) {
-  __shared__ uint32_t hist[256];
+  __shared__ uint32_t hist[256], wsum[8];
   __shared__ uint32_t prefix_sel, need_sel, nvalid, count_above;
+  __shared__ uint32_t skey[kGlmTopkSeg];
   __shared__ uint32_t sel_keys[1024];
   __shared__ int32_t sel_pos[1024];
-  const int seg = blockIdx.x, r = blockIdx.y;
+  const int seg = blockIdx.x, r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int c0 = seg * span, n = min(span, ncols - c0);
   const float* row = vals + size_t(r) * ld + c0;
   const uint32_t neg_inf_key = sort_key(-INFINITY);
-  if (threadIdx.x == 0) nvalid = 0;
+  const bool cached = n <= kGlmTopkSeg;
+  const auto key_at = [&](int i) { return cached ? skey[i] : sort_key(row[i]); };
+  if (tid == 0) nvalid = 0;
   __syncthreads();
   uint32_t local = 0;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) local += sort_key(row[i]) > neg_inf_key;
+  for (int i = tid; i < n; i += 256) {
+    const uint32_t key = sort_key(row[i]);
+    if (cached) skey[i] = key;
+    local += key > neg_inf_key;
+  }
   atomicAdd(&nvalid, local);
   __syncthreads();
   const uint32_t want = min(uint32_t(k), nvalid);
   uint32_t prefix = 0, need = want;
   if (want > 0) {
     for (int pass = 3; pass >= 0; --pass) {
-      for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+      hist[tid] = 0;
       __syncthreads();
       const uint32_t mask_hi = pass == 3 ? 0u : (0xffffffffu << ((pass + 1) * 8));
-      for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const uint32_t key = sort_key(row[i]);
+      for (int i = tid; i < n; i += 256) {
+        const uint32_t key = key_at(i);
         if (key <= neg_inf_key || (key & mask_hi) != (prefix & mask_hi)) continue;
         atomicAdd(&hist[(key >> (pass * 8)) & 0xff], 1u);
       }
       __syncthreads();
-      if (threadIdx.x == 0) {
-        uint32_t cum = 0;
-        int b = 255;
-        for (; b > 0; --b) {
-          if (cum + hist[b] >= need) break;
-          cum += hist[b];
-        }
-        prefix_sel = prefix | (uint32_t(b) << (pass * 8));
-        need_sel = need - cum;
+      // The highest bin b whose suffix sum (bins >= b) reaches need (bin 0 if none): above = the bins past it.
+      const uint32_t h = hist[tid];
+      uint32_t sfx = h;
+      for (int o = 1; o < 32; o <<= 1) {
+        const uint32_t t = __shfl_down(sfx, o, 32);
+        if (lane + o < 32) sfx += t;
+      }
+      if (lane == 0) wsum[wave] = sfx;
+      __syncthreads();
+      for (int w = wave + 1; w < 8; ++w) sfx += wsum[w];
+      const uint32_t above = sfx - h;
+      if (above < need && (sfx >= need || tid == 0)) {
+        prefix_sel = prefix | (uint32_t(tid) << (pass * 8));
+        need_sel = need - above;
       }
       __syncthreads();
       prefix = prefix_sel;
       need = need_sel;
     }
   }
-  if (threadIdx.x == 0) count_above = 0;
+  if (tid == 0) count_above = 0;
   __syncthreads();
-  for (int i = threadIdx.x; i < n && want > 0; i += blockDim.x) {
-    const uint32_t key = sort_key(row[i]);
+  for (int i = tid; i < n && want > 0; i += 256) {
+    const uint32_t key = key_at(i);
     if (key > prefix && key > neg_inf_key) {
       const uint32_t slot = atomicAdd(&count_above, 1u);
       sel_keys[slot] = key;
@@ -606,7 +620,7 @@ __global__ __launch_bounds__(256) void topk_seg_kernel(const float* vals, size_t
     uint32_t taken = 0;
     for (int i0 = 0; i0 < n && taken < need; i0 += 32) {
       const int i = i0 + threadIdx.x;
-      const bool tie = i < n && sort_key(row[i]) == prefix;
+      const bool tie = i < n && key_at(i) == prefix;
       const uint64_t ballot = __ballot(tie);
       const uint32_t before = __popcll(ballot & ((1ull << threadIdx.x) - 1));
       if (tie && taken + before < need) {
