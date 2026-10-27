@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
       pos += n;
       if (next_probe < probes.size() && pos >= probes[next_probe]) {
         while (!flying.empty()) complete();
-        std::vector<double> ts;
+        std::vector<double> ts, subs;  // step times; the host's share submitting them
         for (int st = 0; st < dsteps; ++st) {
           engine::StepInput d;
           d.chunks = {{0, pos, 1, 0}};
@@ -153,13 +153,16 @@ int main(int argc, char** argv) {
           d.pos = {pos};
           d.logit_rows = {0};
           const auto t0 = clk::now();
-          m.step(d, logits);
+          const uint64_t ticket = m.submit(d);
+          subs.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+          m.wait(ticket, logits);
           ts.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
           ++pos;
         }
         std::sort(ts.begin(), ts.end());
-        std::printf("decode at depth %d: median %.1f ms/token (%.1f tok/s), min %.1f, max %.1f\n", pos,
-                    ts[ts.size() / 2], 1e3 / ts[ts.size() / 2], ts.front(), ts.back());
+        std::sort(subs.begin(), subs.end());
+        std::printf("decode at depth %d: median %.1f ms/token (%.1f tok/s), min %.1f, max %.1f; submit %.1f ms\n", pos,
+                    ts[ts.size() / 2], 1e3 / ts[ts.size() / 2], ts.front(), ts.back(), subs[subs.size() / 2]);
         std::fflush(stdout);
         depth_done = pos;
         last = clk::now();

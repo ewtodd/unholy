@@ -109,7 +109,7 @@ void linear(const GLinear& l, const bf16* x, int ldx, bf16* out, int ldo, int ro
     uint16_t* xh = s.at<uint16_t>(kExl3X);
     k::exl3_xform_in(x, ldx, s.at<int32_t>(kZeroRows), tab + 1, xh, rows, l.in, false, st);
     exl3_mm(l, xh, out, ldo, rows, s, st);
-  } else if (rows <= k::kGemvRowsCap && l.in % 512 == 0) {
+  } else if (rows <= k::kGemvRowsCap && (l.in % 512 == 0 || (l.in < 512 && l.in % 64 == 0))) {
     k::gemv_bf16(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
   } else {
     k::gemm_bf16_wmma(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);

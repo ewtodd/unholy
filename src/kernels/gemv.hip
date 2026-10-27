@@ -147,6 +147,36 @@ __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, c
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C;
   if (n0 < N) bf16_cols<C, R, TOut>(a, lda, w, c, ldc, M, N, K, n0, threadIdx.x & 31);
 }
+// K < 512 (K % 64 == 0; KDA's low-rank gate projections, K = 128): a wave per 8 columns, 4 lanes per column, each
+// lane K / 4 consecutive values of it (the per-512 layout above would leave most lanes idle).
+template <int R, typename TOut>
+__global__ __launch_bounds__(NT) void gemv_bf16_smallk_kernel(const bf16* a, int lda, const bf16* w, TOut* c, int ldc,
+                                                              int M, int N, int K) {
+  const int lane = threadIdx.x & 31, n = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * 8 + (lane >> 2);
+  const int kq = K / 4, k0 = (lane & 3) * kq;
+  float acc[R] = {};
+  if (n < N)
+    for (int k = k0; k < k0 + kq; k += 16) {
+      float wv[16];
+      load16_bf16(w + size_t(n) * K + k, wv);
+#pragma unroll
+      for (int m = 0; m < R; ++m) {
+        if (m >= M) break;
+        float av[16];
+        load16_bf16(a + size_t(m) * lda + k, av);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[m] = fmaf(av[i], wv[i], acc[m]);
+      }
+    }
+#pragma unroll
+  for (int m = 0; m < R; ++m) {
+    if (m >= M) break;
+    float v = acc[m];
+    v += __shfl_xor(v, 1, 32);
+    v += __shfl_xor(v, 2, 32);
+    if ((lane & 3) == 0 && n < N) store(c, size_t(m) * ldc + n, v);
+  }
+}
 template <int R, typename TOut>
 __global__ __launch_bounds__(NT) void gemv_bf16_parts_kernel(const bf16* a, int lda, GemvParts ps, int M, int K) {
   int n0 = blockIdx.x * WAVES + (threadIdx.x >> 5), i = 0;
@@ -238,7 +268,15 @@ void gemv_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint
 }
 template <typename TOut>
 void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K, hipStream_t st) {
-  if (M > MAXM || K % 512) throw std::runtime_error("gemv_bf16: M > 32 or K % 512");
+  if (M <= MAXM && K < 512 && K % 64 == 0) {
+    by_rows(M, [&](auto r) {
+      gemv_bf16_smallk_kernel<decltype(r)::value, TOut><<<(N + WAVES * 8 - 1) / (WAVES * 8), NT, 0, st>>>(a, lda, w, c,
+                                                                                                         ldc, M, N, K);
+    });
+    UH_CHECK_LAUNCH();
+    return;
+  }
+  if (M > MAXM || K % 512) throw std::runtime_error("gemv_bf16: M > 32, or K % 512 (K >= 512) or K % 64");
   const auto go = [&](auto r) {
     constexpr int R = decltype(r)::value;
     switch (cols_per_wave(N)) {
