@@ -39,8 +39,15 @@ void exl3_grouped_gemm_v1(const uint16_t* xh, int K, const Exl3Tile* tiles, int 
 
 // Decode variant for tiles of <= 8 rows (batches of <= 8 tokens): K split across waves, each lane
 // decoding 8 trellis steps of a tile in registers; y' (fp32 [P, N]) then the output transform.
+// counters (ntiles * N / 128 zeroed words, left zeroed; one set per stream): the output transform in the same launch,
+// by the last of each 128-column segment's 8 blocks to finish (bit for bit).
 void exl3_grouped_gemv(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* trellis_tab,
                        const uint16_t* const* svh_tab, int bits, float* yp, bf16* out, int ldo, int N, hipStream_t st,
-                       const int* ntiles_dev = nullptr);
+                       const int* ntiles_dev = nullptr, uint32_t* counters = nullptr);
+// A dense linear (tiles of <= 8 rows, one weight set) in one launch: bit for bit exl3_xform_in (no fake quant) +
+// exl3_grouped_gemv with counters, each block transforming its tile's input rows x [rows][ldx] (ldx % 4 == 0) itself.
+// For one tile of a few rows the redundant transforms cost less than the launch; for experts' many tiles they do not.
+void exl3_linear_gemv(const bf16* x, int ldx, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* tab,
+                      int bits, float* yp, uint32_t* counters, bf16* out, int ldo, int N, hipStream_t st);
 
 }  // namespace unholy::kernels

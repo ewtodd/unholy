@@ -59,7 +59,7 @@ class Glm5ApuExperts final : public model::RemoteExperts {
   struct Work {
     int dev = 0;
     hipStream_t st = nullptr;
-    rt::DeviceBuffer xh1, xh3, xh2, h1, h3, yp;
+    rt::DeviceBuffer xh1, xh3, xh2, h1, h3, yp, cnt;
     ~Work();
   };
   const model::Glm5Config& c_;

@@ -100,8 +100,13 @@ void linear(const GLinear& l, const bf16* x, int ldx, bf16* out, int ldo, int ro
             hipStream_t st) {
   if (rows <= 0) return;
   if (l.exl3()) {
-    uint16_t* xh = s.at<uint16_t>(kExl3X);
     const auto* tab = l.tab.as<const uint16_t* const>();
+    if (rows <= 8 && ldx % 4 == 0 && size_t(l.out / 128) * 4 <= s.bufs[kGemvCount].size()) {  // one launch
+      k::exl3_linear_gemv(x, ldx, l.in, s.at<k::Exl3Tile>(kDenseTiles), 1, tab, l.x.bits, s.at<float>(kYp),
+                          s.at<uint32_t>(kGemvCount), out, ldo, l.out, st);
+      return;
+    }
+    uint16_t* xh = s.at<uint16_t>(kExl3X);
     k::exl3_xform_in(x, ldx, s.at<int32_t>(kZeroRows), tab + 1, xh, rows, l.in, false, st);
     exl3_mm(l, xh, out, ldo, rows, s, st);
   } else if (rows <= k::kGemvRowsCap && l.in % 512 == 0) {
@@ -353,7 +358,7 @@ void moe_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   bf16* pin = s.at<bf16>(kExpIn) + size_t(P0) * D;
   bf16* pout = s.at<bf16>(kExpOut) + size_t(P0) * D;
   const Glm5ExpertBufs eb{s.at<uint16_t>(kXh1), s.at<uint16_t>(kXh3), s.at<uint16_t>(kXh2), s.at<bf16>(kExpGate),
-                          s.at<bf16>(kExpUp), s.at<float>(kYp)};
+                          s.at<bf16>(kExpUp), s.at<float>(kYp), s.at<uint32_t>(kGemvCount)};
   if (w.n_resident > 0)  // (the MTP layer's experts are all on the APU)
     glm5_experts_dev(c, w, pin, ewt, row_expert, s.at<k::Exl3Tile>(kMoeLTiles) + m.tile0, max_tiles,
                      &plan->n_local_tiles, P, eb, pout, st, nullptr, &plan->remote0);
@@ -698,13 +703,13 @@ void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint
   if (P / c.n_active <= 8) {  // <= 8 tokens: every expert has <= 8 rows -> the GEMVs
     const int* nt = ntiles_dev;
     k::exl3_grouped_gemv(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.yp, b.h1, I, I,
-                         st, nt);
+                         st, nt, b.cnt);
     k::exl3_grouped_gemv(b.xh3, D, tiles, max_tiles, w.tab(1, 0, E), w.tab(1, 2, E), w.exl3_bits[1], b.yp, b.h3, I, I,
-                         st, nt);
+                         st, nt, b.cnt);
     k::exl3_swiglu_xform(b.h1, b.h3, rw, row_expert, w.tab(2, 1, E), b.xh2, P, I, c.swiglu_limit, st, false,
                          row0_dev, row1_dev);
     k::exl3_grouped_gemv(b.xh2, I, tiles, max_tiles, w.tab(2, 0, E), w.tab(2, 2, E), w.exl3_bits[2], b.yp, out, D, D,
-                         st, nt);
+                         st, nt, b.cnt);
     return;
   }
   k::exl3_grouped_gemm(b.xh1, D, tiles, max_tiles, w.tab(0, 0, E), w.tab(0, 2, E), w.exl3_bits[0], b.h1, I, I, st,

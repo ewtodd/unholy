@@ -173,7 +173,7 @@ enum Glm5Buf : int {
   kExl3X, kExl3Y, kHeadOut,                                               // EXL3 sides, head
   kDenseTiles, kZeroRows, kHcPart, kKdaQ, kKdaK, kKdaE,                   // fast path
   kMoeCount, kMoeOff, kMoeFill, kMoePlan, kMoeLTiles, kMoeRTiles, kEIdx, kEWt, kRowExpert, kXh1, kXh3, kXh2, kYp,
-  kRouteHist, kTopkCand, kAttnPart,
+  kRouteHist, kTopkCand, kAttnPart, kGemvCount,
   kGlm5ScratchBufs
 };
 constexpr int kIdxBlock = 64;  // queries per index-score pass
@@ -266,6 +266,8 @@ struct Glm5ExpertBufs {
   uint16_t *xh1, *xh3, *xh2;  // fp16 [P, dim], [P, dim], [P, moe_inter]
   uint16_t *h1, *h3;          // bf16 [P, moe_inter]
   float* yp;                  // fp32 [min(P, 64), max(dim, moe_inter)] (GEMV steps)
+  uint32_t* cnt = nullptr;    // GEMV steps' segment counters, 64 * max(dim, moe_inter) / 128 zeroed words (null: the
+                              // output transforms as their own launches)
 };
 void glm5_experts_dev(const Glm5Config& c, const Glm5LayerWeights& w, const uint16_t* in, const float* rw,
                       const int32_t* row_expert, const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev,

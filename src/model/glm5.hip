@@ -482,6 +482,8 @@ std::vector<size_t> scratch_sizes(const Glm5Config& c, int max_tokens, int max_s
       k::glm_topk_cand_bytes(kIdxBlock, std::max(max_seq / c.idx_pool + 1, 8 * k::kGlmTopkSeg),
                              c.idx_topk / c.idx_pool),  // top-k candidates (room for >= 8 segments)
       k::glm_mla_part_bytes(kAttnSplitRows, kAttnSplits),  // split attention's partial states
+      std::max(std::max(size_t(c.vocab), 3 * W) / 128 + 1, size_t(64) * std::max(D, size_t(c.moe_inter)) / 128) *
+          4,  // fused GEMVs' segment counters (zeroed, left zeroed): a dense linear's, or up to 64 expert tiles'
   };
   if (sizes.size() != size_t(kGlm5ScratchBufs)) throw std::logic_error("glm5 scratch: buffer list out of date");
   return sizes;

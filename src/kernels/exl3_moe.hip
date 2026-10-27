@@ -533,12 +533,47 @@ typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
 #endif
 constexpr int GV_PF = UH_GV_PF;  // k-tiles in flight per wave
 
-// One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows.
-template <int BITS>
+// fwht128_lds on a wave: value 4 * lane + q in v[q], the same stages and operations (bit for bit), no barriers.
+__device__ __forceinline__ void fwht128_wave(float v[4], int lane) {
+#pragma unroll
+  for (int h = 1; h < 4; h <<= 1) {
+    float nv[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) nv[q] = (q & h) ? v[q - h] - v[q] : v[q] + v[q + h];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) v[q] = nv[q];
+  }
+#pragma unroll
+  for (int h = 4; h < 128; h <<= 1) {
+    const bool hi = (4 * lane) & h;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float o = __shfl_xor(v[q], h / 4, 32);
+      v[q] = hi ? o - v[q] : v[q] + o;
+    }
+  }
+}
+
+// The fused variants' inputs and outputs; unused otherwise.
+struct GvFused {
+  const bf16* x = nullptr;  // kIn: the untransformed input rows
+  int ldx = 0;
+  const uint16_t* const* suh_tab = nullptr;
+  const uint16_t* const* svh_tab = nullptr;
+  uint32_t* counters = nullptr;
+  bf16* out = nullptr;
+  int ldo = 0;
+};
+
+// One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows. kIn: the input
+// transform while staging (xform_in_kernel's arithmetic); kOut: the output transform by the segment's last block
+// (exl3_out_rows_kernel's).
+template <int BITS, bool kIn = false, bool kOut = false>
 __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __restrict__ xh, int K,
                                                           const Exl3Tile* __restrict__ tiles,
                                                           const uint16_t* const* __restrict__ trellis_tab,
-                                                          float* __restrict__ yp, int N, const int* ntiles_dev) {
+                                                          float* __restrict__ yp, int N, const int* ntiles_dev,
+                                                          GvFused fu = {}) {
   constexpr int NW = 8 * BITS;
   if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
   const Exl3Tile tile = tiles[blockIdx.y];
@@ -571,9 +606,27 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
         if (lane < NW) pf0[i] = trellis[ti * NW + lane];
         if (32 + lane < NW) pf1[i] = trellis[ti * NW + 32 + lane];
       }
-    for (int i = tid; i < M * kn; i += GV_NT) {
-      const int m = i / kn, k = i % kn;
-      reinterpret_cast<uint16_t*>(sx)[m * chunk + k] = xh[size_t(tile.row0 + m) * K + kc + k];
+    if constexpr (kIn) {  // a wave per 128 columns of a row
+      const uint16_t* suh = fu.suh_tab[tile.expert];
+      const int segs = kn / 128;
+      for (int si = wave; si < M * segs; si += 8) {
+        const int m = si / segs, k0 = (si % segs) * 128 + 4 * lane;
+        const uint2 raw = *reinterpret_cast<const uint2*>(fu.x + size_t(tile.row0 + m) * fu.ldx + kc + k0);
+        const uint32_t xw[2] = {raw.x, raw.y};
+        float v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          v[q] = bf16_to_f32(uint16_t(xw[q / 2] >> (16 * (q % 2)))) * __half2float(__ushort_as_half(suh[kc + k0 + q]));
+        fwht128_wave(v, lane);
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          reinterpret_cast<uint16_t*>(sx)[m * chunk + k0 + q] = __half_as_ushort(__float2half(v[q] * 0.08838834764831845f));
+      }
+    } else {
+      for (int i = tid; i < M * kn; i += GV_NT) {
+        const int m = i / kn, k = i % kn;
+        reinterpret_cast<uint16_t*>(sx)[m * chunk + k] = xh[size_t(tile.row0 + m) * K + kc + k];
+      }
     }
     __syncthreads();
     for (int kt0 = wave; kt0 < nkt; kt0 += 8 * GV_PF) {
@@ -624,6 +677,31 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
     for (int w8 = 0; w8 < 8; ++w8) v += sRed[w8][m][cc];
     yp[size_t(tile.row0 + m) * N + nb * 16 + cc] = v;
   }
+  if constexpr (kOut) {  // the segment's last block: its rows' output transform (a wave per row)
+    __shared__ bool last;
+    const int seg = nb / 8;
+    uint32_t* cnt = fu.counters + size_t(blockIdx.y) * (N / 128) + seg;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) last = atomicAdd(cnt, 1u) == 7u;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (wave < M) {
+      const int row = tile.row0 + wave, n0 = seg * 128 + 4 * lane;
+      float v[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        v[q] = __hip_atomic_load(&yp[size_t(row) * N + n0 + q], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      fwht128_wave(v, lane);
+      const uint16_t* svh = fu.svh_tab[tile.expert];
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        fu.out[size_t(row) * fu.ldo + n0 + q] =
+            f32_to_bf16(v[q] * 0.08838834764831845f * __half2float(__ushort_as_half(svh[n0 + q])));
+    }
+    if (tid == 0) *cnt = 0;
+  }
 }
 
 // out[row] = bf16(H128(y'[row]) * svh[e] / sqrt(128)) for the tiles' rows; block per (segment, tile row).
@@ -646,12 +724,54 @@ __global__ __launch_bounds__(128) void exl3_out_rows_kernel(const float* yp, con
 
 }  // namespace
 
+void exl3_linear_gemv(const bf16* x, int ldx, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* tab,
+                      int bits, float* yp, uint32_t* counters, bf16* out, int ldo, int N, hipStream_t st) {
+  if (ntiles <= 0) return;
+  if (K % GV_KC || N % 128 || ldx % 4) throw std::runtime_error("exl3_linear_gemv: K % 512, N % 128 or ldx % 4");
+  const dim3 grid(N / 16, ntiles);
+  GvFused fu;
+  fu.x = x;
+  fu.ldx = ldx;
+  fu.suh_tab = tab + 1;
+  fu.svh_tab = tab + 2;
+  fu.counters = counters;
+  fu.out = out;
+  fu.ldo = ldo;
+  switch (bits) {
+    case 2: exl3_gemv_kernel<2, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;
+    case 3: exl3_gemv_kernel<3, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;
+    case 4: exl3_gemv_kernel<4, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;
+    case 5: exl3_gemv_kernel<5, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;
+    case 6: exl3_gemv_kernel<6, true, true><<<grid, GV_NT, 0, st>>>(nullptr, K, tiles, tab, yp, N, nullptr, fu); break;
+    default: throw std::runtime_error("exl3_linear_gemv: unsupported bit width");
+  }
+  UH_CHECK_LAUNCH();
+}
+
 void exl3_grouped_gemv(const uint16_t* xh, int K, const Exl3Tile* tiles, int ntiles, const uint16_t* const* trellis_tab,
                        const uint16_t* const* svh_tab, int bits, float* yp, bf16* out, int ldo, int N, hipStream_t st,
-                       const int* ntiles_dev) {
+                       const int* ntiles_dev, uint32_t* counters) {
   if (ntiles <= 0) return;
   if (K % GV_KC || N % 128) throw std::runtime_error("exl3_grouped_gemv: K % 512 or N % 128");
   const dim3 grid(N / 16, ntiles);
+  if (counters) {
+    GvFused fu;
+    fu.svh_tab = svh_tab;
+    fu.counters = counters;
+    fu.out = out;
+    fu.ldo = ldo;
+    const auto* tt = trellis_tab;
+    switch (bits) {
+      case 2: exl3_gemv_kernel<2, false, true><<<grid, GV_NT, 0, st>>>(xh, K, tiles, tt, yp, N, ntiles_dev, fu); break;
+      case 3: exl3_gemv_kernel<3, false, true><<<grid, GV_NT, 0, st>>>(xh, K, tiles, tt, yp, N, ntiles_dev, fu); break;
+      case 4: exl3_gemv_kernel<4, false, true><<<grid, GV_NT, 0, st>>>(xh, K, tiles, tt, yp, N, ntiles_dev, fu); break;
+      case 5: exl3_gemv_kernel<5, false, true><<<grid, GV_NT, 0, st>>>(xh, K, tiles, tt, yp, N, ntiles_dev, fu); break;
+      case 6: exl3_gemv_kernel<6, false, true><<<grid, GV_NT, 0, st>>>(xh, K, tiles, tt, yp, N, ntiles_dev, fu); break;
+      default: throw std::runtime_error("exl3_grouped_gemv: unsupported bit width");
+    }
+    UH_CHECK_LAUNCH();
+    return;
+  }
   switch (bits) {
     case 2: exl3_gemv_kernel<2><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
     case 3: exl3_gemv_kernel<3><<<grid, GV_NT, 0, st>>>(xh, K, tiles, trellis_tab, yp, N, ntiles_dev); break;
