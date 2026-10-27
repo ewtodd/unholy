@@ -149,6 +149,12 @@ __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, c
 }
 // K < 512 (K % 64 == 0; KDA's low-rank gate projections, K = 128): a wave per 8 columns, 4 lanes per column, each
 // lane K / 4 consecutive values of it (the per-512 layout above would leave most lanes idle).
+//
+// On gfx1201 a short kernel whose grid fills every wave slot of the card exactly (2048 waves: 64 CUs at 16 per SIMD,
+// e.g. 253-256 blocks of 8 waves; also 509-512) runs its blocks in ~6 us but takes ~22 us to complete; with LDS or
+// registers limiting the blocks per CU it does not. KDA's two 8192-column GEMVs are 256 blocks: one idle block per
+// shader engine more takes them from 22 to 9 us in decode.
+int smallk_grid(int blocks) { return blocks % 64 == 0 ? blocks + 4 : blocks; }
 template <int R, typename TOut>
 __device__ __forceinline__ void bf16_smallk_cols(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N,
                                                  int K, int block) {
@@ -284,8 +290,8 @@ template <typename TOut>
 void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K, hipStream_t st) {
   if (M <= MAXM && K < 512 && K % 64 == 0) {
     by_rows(M, [&](auto r) {
-      gemv_bf16_smallk_kernel<decltype(r)::value, TOut><<<(N + WAVES * 8 - 1) / (WAVES * 8), NT, 0, st>>>(a, lda, w, c,
-                                                                                                         ldc, M, N, K);
+      gemv_bf16_smallk_kernel<decltype(r)::value, TOut>
+          <<<smallk_grid((N + WAVES * 8 - 1) / (WAVES * 8)), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
     });
     UH_CHECK_LAUNCH();
     return;
@@ -357,8 +363,8 @@ void gemv_bf16_smallk2(const bf16* a0, int lda0, const bf16* w0, bf16* c0, int l
   if (M > MAXM || K >= 512 || K % 64) throw std::runtime_error("gemv_bf16_smallk2: M > 32, K >= 512 or K % 64");
   const int nb0 = (N0 + WAVES * 8 - 1) / (WAVES * 8), nb1 = (N1 + WAVES * 8 - 1) / (WAVES * 8);
   by_rows(M, [&](auto r) {
-    gemv_bf16_smallk2_kernel<decltype(r)::value><<<nb0 + nb1, NT, 0, st>>>(a0, lda0, w0, c0, ldc0, N0, a1, lda1, w1, c1,
-                                                                          ldc1, N1, M, K, nb0);
+    gemv_bf16_smallk2_kernel<decltype(r)::value><<<smallk_grid(nb0 + nb1), NT, 0, st>>>(a0, lda0, w0, c0, ldc0, N0, a1,
+                                                                                       lda1, w1, c1, ldc1, N1, M, K, nb0);
   });
   UH_CHECK_LAUNCH();
 }

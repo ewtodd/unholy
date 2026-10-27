@@ -2,7 +2,9 @@
 // depend on the columns per wave (bit for bit), and the time / weight bandwidth of each variant. Likewise
 // the WMMA GEMMs' 64 x 128 tiles vs their skinny kernels for M <= 64 (gemm_wmma.hpp): bit for bit.
 //
-//   unholy-gemv-test [--dev 0] [--reps 50]
+//   unholy-gemv-test [--dev 0] [--reps 50] [--only-smallk]
+//
+// Also GLM's KDA low-rank gate projections (gemv_bf16_smallk2: two N = 8192, K = 128 bf16 GEMVs in one launch).
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -51,10 +53,12 @@ std::vector<uint8_t> download(const rt::DeviceBuffer& b) {
 
 int main(int argc, char** argv) {
   int dev = 0, reps = 50;
-  for (int i = 1; i + 1 < argc; i += 2) {
+  bool only_smallk = false;
+  for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
-    if (a == "--dev") dev = std::stoi(argv[i + 1]);
-    else if (a == "--reps") reps = std::stoi(argv[i + 1]);
+    if (a == "--only-smallk") only_smallk = true;
+    else if (i + 1 < argc && a == "--dev") dev = std::stoi(argv[++i]);
+    else if (i + 1 < argc && a == "--reps") reps = std::stoi(argv[++i]);
   }
   rt::DeviceGuard g(dev);
   hipStream_t st;
@@ -99,6 +103,40 @@ int main(int argc, char** argv) {
     std::printf("e4m3 decode: %u of 254 finite codes differ from the bit decode\n", nbad / 4);
     if (nbad) return 1;
   }
+  {  // KDA's f_b / g_b: weights streamed from DRAM (copies past the last-level cache)
+    const int N = 8192, K = 128, copies = 40;
+    const size_t wsize = size_t(N) * K * 2;
+    rt::DeviceBuffer w(dev, 2 * wsize * copies), a = upload(dev, bf16v(size_t(8) * K)), c(dev, size_t(8) * N * 4);
+    {
+      const auto hw = bf16v(size_t(N) * K);
+      for (int i = 0; i < 2 * copies; ++i)
+        UH_CHECK(hipMemcpy(w.as<uint16_t>() + size_t(i) * N * K, hw.data(), wsize, hipMemcpyHostToDevice));
+    }
+    for (const int M : {1, 2}) {
+      int cur = 0;
+      const auto run = [&] {
+        const uint16_t* w0 = w.as<uint16_t>() + size_t(2 * cur) * N * K;
+        cur = (cur + 1) % copies;
+        k::gemv_bf16_smallk2(a.as<uint16_t>(), K, w0, c.as<uint16_t>(), N, N, a.as<uint16_t>(), K, w0 + size_t(N) * K,
+                             c.as<uint16_t>() + size_t(4) * N, N, N, M, K, st);
+      };
+      hipEvent_t e0, e1;
+      UH_CHECK(hipEventCreate(&e0));
+      UH_CHECK(hipEventCreate(&e1));
+      for (int i = 0; i < 3; ++i) run();
+      UH_CHECK(hipEventRecord(e0, st));
+      for (int i = 0; i < reps; ++i) run();
+      UH_CHECK(hipEventRecord(e1, st));
+      UH_CHECK(hipEventSynchronize(e1));
+      float ms = 0;
+      UH_CHECK(hipEventElapsedTime(&ms, e0, e1));
+      const double us = 1e3 * ms / reps;
+      std::printf("kda f_b+g_b M=%d N=2x%d K=%d: %6.1f us %4.0f GB/s\n", M, N, K, us, 2.0 * wsize / us * 1e-3);
+      UH_CHECK(hipEventDestroy(e0));
+      UH_CHECK(hipEventDestroy(e1));
+    }
+  }
+  if (only_smallk) return 0;
   bool all_same = true;
   for (const Shape& s : shapes) {
     const int G = s.kind == 'g' ? s.G : 1, N = s.N, K = s.K;
