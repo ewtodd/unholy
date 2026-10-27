@@ -2,7 +2,10 @@
 // random trellis words (any bit pattern is a valid code), random inputs and output scales. Outputs
 // must be identical; prints both kernels' times and the effective weight-decode rate.
 //
-//   unholy-exl3-gemm-test [--experts 64] [--rows-mean 96] [--K 4096] [--N 2048] [--bits 3] [--dev 0]
+//   unholy-exl3-gemm-test [--experts 64] [--rows-mean 96] [--K 4096] [--N 2048] [--bits 3] [--dev 0] [--gemv-rows R]
+//
+// The decode GEMV runs on one tile per expert of R rows (0: 1-8 at random); UH_DUMP_GEMV=FILE writes its output (bf16)
+// for comparisons between builds.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -26,7 +29,7 @@ uint16_t f2h(float f) { return uint16_t(__half_as_ushort(__float2half(f))); }
 }  // namespace
 
 int main(int argc, char** argv) {
-  int E = 64, rows_mean = 96, K = 4096, N = 2048, bits = 3, dev = 0;
+  int E = 64, rows_mean = 96, K = 4096, N = 2048, bits = 3, dev = 0, gemv_rows = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     const int v = std::atoi(argv[i + 1]);
@@ -36,6 +39,7 @@ int main(int argc, char** argv) {
     else if (a == "--N") N = v;
     else if (a == "--bits") bits = v;
     else if (a == "--dev") dev = v;
+    else if (a == "--gemv-rows") gemv_rows = v;
   }
   const char* dump = std::getenv("UH_DUMP_OUT");  // write v2's output (bf16) there
   UH_CHECK(hipSetDevice(dev));
@@ -112,7 +116,7 @@ int main(int argc, char** argv) {
     std::vector<k::Exl3Tile> tv;
     int rowsv = 0;
     for (int e = 0; e < E; ++e) {
-      const int r = 1 + int(rng() % 8);
+      const int r = gemv_rows > 0 ? gemv_rows : 1 + int(rng() % 8);
       tv.push_back({e, rowsv, r});
       rowsv += r;
     }
@@ -138,9 +142,15 @@ int main(int argc, char** argv) {
       den += double(fg) * fg;
     }
     maxrel = std::sqrt(num / std::max(den, 1e-30));
+    if (const char* gd = std::getenv("UH_DUMP_GEMV"))
+      if (FILE* fd = std::fopen(gd, "wb")) {
+        std::fwrite(v.data(), 2, v.size(), fd);
+        std::fclose(fd);
+      }
   }
-  std::printf("GEMV (E=%d tiles of 1-8 rows): %.3f ms, %.0f G weights/s; rel L2 vs GEMM %.2e\n", E, gemv_ms,
-              double(E) * K * N / 1e9 / (gemv_ms / 1e3), maxrel);
+  std::printf("GEMV (E=%d tiles of %s rows): %.3f ms, %.0f G weights/s, %.0f GB/s of weights; rel L2 vs GEMM %.2e\n",
+              E, gemv_rows > 0 ? std::to_string(gemv_rows).c_str() : "1-8", gemv_ms,
+              double(E) * K * N / 1e9 / (gemv_ms / 1e3), double(E) * K * N * bits / 8 / 1e9 / (gemv_ms / 1e3), maxrel);
   const double gw = double(E) * K * N / 1e9;  // weights per expert pass
   std::printf("E=%d P=%d K=%d N=%d bits=%d: v1 %.2f ms (%zu tiles), v2 %.2f ms (%zu tiles) -> %.2fx; "
               "v2 %.0f G weights/s, %.1f TFLOPS; outputs %zu / %zu differ\n",

@@ -272,6 +272,49 @@ __device__ __forceinline__ void decode_lane8(const uint32_t* w, int L, uint32_t 
   p[3] = decode_mul1_x2(st[6], st[7]);
 }
 
+// decode_mul1_x2 without v_mul_lo_u32 (quarter rate): for a 16-bit state s, s * 0x83DCD12D mod 2^32 =
+// s * 0xDCD12D + (s << 8) * 0x830000, full-rate 24-bit multiplies (in asm: LLVM folds them back into one 32-bit
+// multiply). The same values.
+__device__ __forceinline__ uint32_t mul1_state(uint32_t s) {
+  uint32_t lo, x;
+  asm("v_mul_u32_u24 %0, 0xdcd12d, %1" : "=v"(lo) : "v"(s));
+  asm("v_mad_u32_u24 %0, %1, 0x830000, %2" : "=v"(x) : "v"(s << 8), "v"(lo));
+  return x;
+}
+__device__ __forceinline__ uint32_t decode_mul1_x2_fast(uint32_t s0, uint32_t s1) {
+  const uint32_t x0 = mul1_state(s0), x1 = mul1_state(s1);
+  const uint32_t a = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+  const uint32_t b = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
+  const __half2 h = __halves2half2(__ushort_as_half(uint16_t(a)), __ushort_as_half(uint16_t(b)));
+  const __half2 r = __hfma2(h, __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee)),
+                            __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931)));
+  return uint32_t(__half_as_ushort(__low2half(r))) | (uint32_t(__half_as_ushort(__high2half(r))) << 16);
+}
+
+// decode_lane8's values with 32-bit funnel shifts: window o of w0 w1 w2 (MSB first) is alignbit of the word pair
+// holding it. When 8 * BITS is a multiple of 32 every lane's first window starts at the same bit, so the shifts are
+// immediates.
+template <int BITS>
+__device__ __forceinline__ void decode_lane8_fast(const uint32_t* w, int L, uint32_t p[4]) {
+  constexpr int LEN = 256 * BITS, NW = 8 * BITS;
+  const int s = (8 * L * BITS + BITS - 16 + LEN) % LEN;
+  const int i0 = s >> 5;
+  const int o0 = (8 * BITS) % 32 == 0 ? (BITS + 16) % 32 : s & 31;
+  const uint32_t w0 = w[i0], w1 = w[(i0 + 1) % NW], w2 = w[(i0 + 2) % NW];
+  uint32_t st[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int o = o0 + j * BITS;  // bits [o, o + 16): in w0 (o <= 16), w0 w1 (o <= 48) or w1 w2
+    const uint32_t a = o > 48 ? w1 : w0, b = o > 48 ? w2 : (o > 16 ? w1 : w0);
+    const uint32_t sh = o > 48 ? 80 - o : (o > 16 ? 48 - o : 16 - o);
+    st[j] = __builtin_amdgcn_alignbit(a, b, sh) & 0xffffu;
+  }
+  p[0] = decode_mul1_x2_fast(st[0], st[1]);
+  p[1] = decode_mul1_x2_fast(st[2], st[3]);
+  p[2] = decode_mul1_x2_fast(st[4], st[5]);
+  p[3] = decode_mul1_x2_fast(st[6], st[7]);
+}
+
 template <int BITS>
 __global__ __launch_bounds__(V2_NT) void exl3_gemm_v2_kernel(const uint16_t* __restrict__ xh, int K,
                                                              const Exl3Tile* __restrict__ tiles,
@@ -484,6 +527,11 @@ namespace unholy::kernels {
 namespace {
 
 constexpr int GV_ROWS = 8, GV_KC = 512, GV_NT = 256;
+typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
+#ifndef UH_GV_PF
+#define UH_GV_PF 4
+#endif
+constexpr int GV_PF = UH_GV_PF;  // k-tiles in flight per wave
 
 // One block per (16-column block nb, tile); y'[row][n] = xh[row] @ W_inner[e][:, n] for the tile's rows.
 template <int BITS>
@@ -509,45 +557,54 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
 
   // The input in chunks of GV_ROWS * GV_KC values over the tile's rows (a single row: 4096 columns per chunk, so few
   // block barriers); wave w takes the chunk's k-tiles w, w + 8, ... (the global order of the 512-column chunks: the same
-  // sums), each tile's words loaded into registers one tile ahead of its decode.
+  // sums). Each wave keeps GV_PF tiles' words in flight in registers (a decode GEMV has too few waves to cover the
+  // memory latency one tile ahead); the first ones are requested before the input is staged.
   const int chunk = max(GV_KC, GV_ROWS * GV_KC / max(M, 1) / GV_KC * GV_KC);
   _Float16* sx = &sX[0][0];
   for (int kc = 0; kc < K; kc += chunk) {
     const int kn = min(chunk, K - kc), nkt = kn / 16;
+    uint32_t pf0[GV_PF], pf1[GV_PF];
+#pragma unroll
+    for (int i = 0; i < GV_PF; ++i)
+      if (wave + 8 * i < nkt) {
+        const size_t ti = size_t((kc / 16) + wave + 8 * i) * tiles_n + nb;
+        if (lane < NW) pf0[i] = trellis[ti * NW + lane];
+        if (32 + lane < NW) pf1[i] = trellis[ti * NW + 32 + lane];
+      }
     for (int i = tid; i < M * kn; i += GV_NT) {
       const int m = i / kn, k = i % kn;
       reinterpret_cast<uint16_t*>(sx)[m * chunk + k] = xh[size_t(tile.row0 + m) * K + kc + k];
     }
     __syncthreads();
-    uint32_t pf0 = 0, pf1 = 0;
-    const auto fetch = [&](int kt) {
-      const size_t ti = size_t((kc / 16) + kt) * tiles_n + nb;
-      if (lane < NW) pf0 = trellis[ti * NW + lane];
-      if (32 + lane < NW) pf1 = trellis[ti * NW + 32 + lane];
-    };
-    if (wave < nkt) fetch(wave);
-    for (int kt = wave; kt < nkt; kt += 8) {
-      if (lane < NW) sW[wave][lane] = pf0;
-      if (32 + lane < NW) sW[wave][32 + lane] = pf1;
-      __builtin_amdgcn_wave_barrier();
-      if (kt + 8 < nkt) fetch(kt + 8);
-      float wv[8];
-      {
-        uint32_t p[4];
-        decode_lane8<BITS>(sW[wave], lane, p);
+    for (int kt0 = wave; kt0 < nkt; kt0 += 8 * GV_PF) {
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-          wv[j] = __half2float(__ushort_as_half(uint16_t(p[j / 2] >> (16 * (j % 2)))));
-      }
-      __builtin_amdgcn_wave_barrier();
-      const int kb = kt * 16;
-      for (int m = 0; m < M; ++m) {
-        const _Float16* xr = sx + m * chunk + kb;
-        const float x0 = float(xr[r0]), x1 = float(xr[r0 + 1]);
-        const float x8 = float(xr[r0 + 8]), x9 = float(xr[r0 + 9]);
-        // j: 0 (r0,c0) 1 (r0+1,c0) 2 (r0+8,c0) 3 (r0+9,c0) 4..7 the same rows at c0+8
-        acc[m][0] += wv[0] * x0 + wv[1] * x1 + wv[2] * x8 + wv[3] * x9;
-        acc[m][1] += wv[4] * x0 + wv[5] * x1 + wv[6] * x8 + wv[7] * x9;
+      for (int i = 0; i < GV_PF; ++i) {
+        const int kt = kt0 + 8 * i;
+        if (kt >= nkt) break;
+        if (lane < NW) sW[wave][lane] = pf0[i];
+        if (32 + lane < NW) sW[wave][32 + lane] = pf1[i];
+        __builtin_amdgcn_wave_barrier();
+        if (kt + 8 * GV_PF < nkt) {
+          const size_t ti = size_t((kc / 16) + kt + 8 * GV_PF) * tiles_n + nb;
+          if (lane < NW) pf0[i] = trellis[ti * NW + lane];
+          if (32 + lane < NW) pf1[i] = trellis[ti * NW + 32 + lane];
+        }
+        uint32_t p[4];
+        decode_lane8_fast<BITS>(sW[wave], lane, p);
+        __builtin_amdgcn_wave_barrier();
+        const int kb = kt * 16;
+        // p[0] (rows r0, r0+1) and p[1] (r0+8, r0+9) at column c0; p[2], p[3] the same rows at c0+8. Rows unrolled
+        // (a runtime index into acc costs register-relative moves).
+        const h2_t w0 = __builtin_bit_cast(h2_t, p[0]), w1 = __builtin_bit_cast(h2_t, p[1]);
+        const h2_t w2 = __builtin_bit_cast(h2_t, p[2]), w3 = __builtin_bit_cast(h2_t, p[3]);
+#pragma unroll
+        for (int m = 0; m < GV_ROWS; ++m) {
+          if (m >= M) break;
+          const _Float16* xr = sx + m * chunk + kb;
+          const h2_t x01 = *reinterpret_cast<const h2_t*>(xr + r0), x89 = *reinterpret_cast<const h2_t*>(xr + r0 + 8);
+          acc[m][0] = __builtin_amdgcn_fdot2(w1, x89, __builtin_amdgcn_fdot2(w0, x01, acc[m][0], false), false);
+          acc[m][1] = __builtin_amdgcn_fdot2(w3, x89, __builtin_amdgcn_fdot2(w2, x01, acc[m][1], false), false);
+        }
       }
     }
     __syncthreads();
