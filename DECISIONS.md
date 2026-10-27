@@ -1389,3 +1389,39 @@ a947f9d. Every change after 8f08be4 is bit-identical: GLM logits, GLM decode log
     decode +2-3% (35.6 -> 36.4 ms at 6k). That is the owner's trade; the production config stays at 3072.
   - Unsplit 3072-token steps: 1199 tok/s.
   - DSV4 8192-token steps: slower (2193 vs 2299 tok/s).
+
+## 2026-10-27 — decode: the trellis decode's instructions, the APU's stream, exactly-full grids
+
+Single-stream decode against fa9ff21: GLM 35.9 -> 32.1 ms/token at 4k (6k 35.6 -> 31.8, 32k 39.1 -> 35.0), DSV4
+33.0 -> 31.8; GLM prefill to 32k 1375 -> 1417 tok/s. Commits 5d1dc73 .. 59d9f5c, all bit-identical: GLM logits
+(unholy-glm-ref, code1024) and 64 curve decode steps against fa9ff21; DSV4's gates.
+
+- The EXL3 trellis decode took 55 VALU per lane and tile on gfx1151 (4-bit): masked windows, then s * 0x83DCD12D as
+  mul_u24 + shift + mad_u24. With the windows in a register's high half, v_pk_mul_lo_u16 + v_mad_u32_u16 (op_sel)
+  and one v_perm to pack: 39. The cards' 4-bit GEMV is +15% at 32 tiles; the v2 GEMM (prefill) uses it too.
+- The APU's expert GEMV is bound by its memory stream, not by instructions: 2-, 3- and 4-bit ran at the same ~400 G
+  weights/s and 5-bit at 198 GB/s; after the decode change 4-bit still streams 195 GB/s. Rotating over 64 experts,
+  so the weights come from memory as in decode (unholy-exl3-gemm-test --gemv-tiles), a launch costs ~19 us plus
+  21 us per 4096 x 2048 4-bit tile (~200 GB/s; plain reads 237).
+- So GLM's MoE layers wait on the APU. Gate, up and the SwiGLU in one launch, both input transforms in one, and the
+  token sums in the down GEMV took its chain per layer from 7 launches and 330 us to 3 and 302 us, against ~215 us
+  of card work. The cards still wait ~6 ms per step, mostly in card 1's layers (median wait 110 us vs ~0 on card 0).
+- gfx1201 completion cliff: a kernel whose grid fills every wave slot exactly (2048 waves, e.g. 253-256 blocks of 8
+  waves, or 509-512) runs its blocks in ~6 us but takes ~22 us to complete. There is no cliff when LDS or registers
+  limit the blocks per CU, and none on the APU; kernels longer than ~20 us hide it. 4 idle blocks: KDA's small-K
+  GEMV 22 -> 9 us, DSV4's shared w2 37 -> 21 us.
+- Small kernels serialized on loads: GLM's top-k read its row from L2 in each of 6 passes and walked the 256-bin
+  histogram on one thread; the split attention's combine made 32 dependent loads per thread and kept its weights in a
+  runtime-indexed array; the mHC finish read 32 partials per thread in 4-load batches. Warp reductions and the
+  128-point Hadamard ran on ds_bpermute; DPP and v_permlanex16 take the same partners.
+- Not adopted:
+  - Unconditional GEMV prefetch loads, so the waits count (s_wait_loadcnt 3) instead of draining each round: slower,
+    a card's 4-tile launch 42.8 -> 55.3 us and the APU's 101 -> 109, at 2 or 4 tiles in flight alike.
+  - Global instead of flat trellis loads: no measurable change (kept: LDS waits no longer wait for them).
+  - Moving GLM's layer split (22 -> 23..25) to give card 1's layers more hot experts: 33.2 -> 33.1 ms, routing on
+    cards unchanged at 53.3%.
+  - The small-K GEMV's input rows through LDS (an L2 hot-spot guess): no change; the cliff was the cause.
+  - One idle block for bf16_skinny's 512-block grid: -5 us per DSA layer (0.05 ms per step), not worth a special case.
+- Left: the APU's chain (down chained into the gate/up launch would save one ~19 us ramp and tail per layer), card 1
+  reading the APU's partial across the link (combine 20 us vs 8 on card 0), hc_pre_fused (18 us x 96 per step),
+  moe_dispatch_small (17 us x 45), bf16_skinny at 250-300 GB/s (1.3 ms per step).
