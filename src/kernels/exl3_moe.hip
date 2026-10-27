@@ -70,6 +70,27 @@ __device__ __forceinline__ void fwht128_lds(float* b, int i) {
   }
 }
 
+// fwht128_lds on a wave: value 4 * lane + q in v[q], the same stages and operations (bit for bit), no barriers.
+__device__ __forceinline__ void fwht128_wave(float v[4], int lane) {
+#pragma unroll
+  for (int h = 1; h < 4; h <<= 1) {
+    float nv[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) nv[q] = (q & h) ? v[q - h] - v[q] : v[q] + v[q + h];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) v[q] = nv[q];
+  }
+#pragma unroll
+  for (int h = 4; h < 128; h <<= 1) {
+    const bool hi = (4 * lane) & h;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const float o = __shfl_xor(v[q], h / 4, 32);
+      v[q] = hi ? o - v[q] : v[q] + o;
+    }
+  }
+}
+
 // Rows [*row0 (0 if null), *row1 (P if null)), gridDim.y of them at a time: a prefill step's few-thousand-row grids
 // would mostly be blocks that only find their row's expert elsewhere.
 __global__ __launch_bounds__(128) void xform_in_kernel(const bf16* x, int ldx, const int32_t* row_expert,
@@ -120,6 +141,59 @@ __global__ __launch_bounds__(128) void swiglu_xform_kernel(const bf16* g, const 
     __syncthreads();
   }
 }
+
+// xform_in_kernel / swiglu_xform_kernel without fake quantization, a wave per (row, 128-column segment): the same
+// values (fwht128_wave), no barriers. Items (row, segment) of rows [*row0, *row1) stride over the grid, 8 per block.
+template <bool kSwiglu>
+__global__ __launch_bounds__(256) void xform_wave_kernel(const bf16* __restrict__ x, int ldx,
+                                                         const int32_t* __restrict__ x_rows, const bf16* __restrict__ u,
+                                                         const float* __restrict__ w, float limit,
+                                                         const int32_t* __restrict__ row_expert,
+                                                         const uint16_t* const* __restrict__ suh_tab,
+                                                         uint16_t* __restrict__ xh, int K, int P, const int* row0,
+                                                         const int* row1) {
+  const int lane = threadIdx.x & 31, segs = K / 128;
+  const int r0 = row0 ? *row0 : 0, r1 = row1 ? *row1 : P;
+  const size_t n = r1 > r0 ? size_t(r1 - r0) * segs : 0;
+  for (size_t it = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5); it < n; it += size_t(gridDim.x) * 8) {
+    const int r = r0 + int(it / segs), k0 = int(it % segs) * 128 + 4 * lane;
+    const uint16_t* suh = suh_tab[row_expert[r]];
+    if (!suh) continue;  // expert not on this device (uniform per wave)
+    float v[4];
+    if constexpr (kSwiglu) {  // x = gate rows, u = up rows, [P][K]
+      const size_t idx = size_t(r) * K + k0;
+      const uint2 graw = *reinterpret_cast<const uint2*>(x + idx), uraw = *reinterpret_cast<const uint2*>(u + idx);
+      const uint32_t gw[2] = {graw.x, graw.y}, uw[2] = {uraw.x, uraw.y};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        float gv = bf16_to_f32(uint16_t(gw[q / 2] >> (16 * (q % 2))));
+        float uv = bf16_to_f32(uint16_t(uw[q / 2] >> (16 * (q % 2))));
+        if (limit > 0.0f) {
+          uv = fminf(fmaxf(uv, -limit), limit);
+          gv = fminf(gv, limit);
+        }
+        float hv = (gv / (1.0f + expf(-gv))) * uv;
+        if (w) hv = w[r] * hv;
+        v[q] = round_bf16(hv) * __half2float(__ushort_as_half(suh[k0 + q]));
+      }
+    } else {
+      const uint2 raw = *reinterpret_cast<const uint2*>(x + size_t(x_rows ? x_rows[r] : r) * ldx + k0);
+      const uint32_t xw[2] = {raw.x, raw.y};
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        v[q] = bf16_to_f32(uint16_t(xw[q / 2] >> (16 * (q % 2)))) * __half2float(__ushort_as_half(suh[k0 + q]));
+    }
+    fwht128_wave(v, lane);
+    uint32_t o[2];
+#pragma unroll
+    for (int q = 0; q < 2; ++q)
+      o[q] = uint32_t(__half_as_ushort(__float2half(v[2 * q] * 0.08838834764831845f))) |
+             (uint32_t(__half_as_ushort(__float2half(v[2 * q + 1] * 0.08838834764831845f))) << 16);
+    *reinterpret_cast<uint2*>(xh + size_t(r) * K + k0) = uint2{o[0], o[1]};
+  }
+}
+
+unsigned xform_wave_blocks(int P, int K) { return unsigned(std::min<size_t>((size_t(P) * (K / 128) + 7) / 8, 8192)); }
 
 constexpr int BM = 64, BN = 128, KS = 32, NT = 256;
 
@@ -467,6 +541,12 @@ void exl3_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint
                    int P, int K, bool fake_quant, hipStream_t st, const int* row0_dev, const int* row1_dev,
                    const int32_t* x_rows) {
   if (P <= 0) return;
+  if (!fake_quant && ldx % 4 == 0) {
+    xform_wave_kernel<false><<<xform_wave_blocks(P, K), 256, 0, st>>>(x, ldx, x_rows, nullptr, nullptr, 0.0f, row_expert,
+                                                                      suh_tab, xh, K, P, row0_dev, row1_dev);
+    UH_CHECK_LAUNCH();
+    return;
+  }
   xform_in_kernel<<<dim3(K / 128, std::min(P, kXformGridRows)), 128, 0, st>>>(x, ldx, row_expert, suh_tab, xh, K,
                                                                              fake_quant, P, row0_dev, row1_dev, x_rows);
   UH_CHECK_LAUNCH();
@@ -476,6 +556,12 @@ void exl3_swiglu_xform(const bf16* g, const bf16* u, const float* w, const int32
                        const uint16_t* const* suh_tab, uint16_t* xh, int P, int I, float limit, hipStream_t st,
                        bool fake_quant, const int* row0_dev, const int* row1_dev) {
   if (P <= 0) return;
+  if (!fake_quant) {
+    xform_wave_kernel<true><<<xform_wave_blocks(P, I), 256, 0, st>>>(g, I, nullptr, u, w, limit, row_expert, suh_tab, xh,
+                                                                     I, P, row0_dev, row1_dev);
+    UH_CHECK_LAUNCH();
+    return;
+  }
   const dim3 grid(I / 128, std::min(P, kXformGridRows));
   if (fake_quant)
     swiglu_xform_kernel<true><<<grid, 128, 0, st>>>(g, u, w, row_expert, suh_tab, xh, I, limit, P, row0_dev, row1_dev);
@@ -532,27 +618,6 @@ typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
 #define UH_GV_PF 4
 #endif
 constexpr int GV_PF = UH_GV_PF;  // k-tiles in flight per wave
-
-// fwht128_lds on a wave: value 4 * lane + q in v[q], the same stages and operations (bit for bit), no barriers.
-__device__ __forceinline__ void fwht128_wave(float v[4], int lane) {
-#pragma unroll
-  for (int h = 1; h < 4; h <<= 1) {
-    float nv[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) nv[q] = (q & h) ? v[q - h] - v[q] : v[q] + v[q + h];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) v[q] = nv[q];
-  }
-#pragma unroll
-  for (int h = 4; h < 128; h <<= 1) {
-    const bool hi = (4 * lane) & h;
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const float o = __shfl_xor(v[q], h / 4, 32);
-      v[q] = hi ? o - v[q] : v[q] + o;
-    }
-  }
-}
 
 // The fused variants' inputs and outputs; unused otherwise.
 struct GvFused {
