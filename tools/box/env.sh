@@ -59,10 +59,11 @@ llm_units() {
 
 # with_gpus CMD...: stop every llm-mode service, run CMD, then restore the mode that was serving, also
 # when CMD fails or is interrupted. son-of-anton may manage these units without sudo (polkit).
-# Inside tools/box/hold.sh the services are already down and stay down: CMD just runs, once no unit is still
-# starting or stopping (a unit winding down still holds its device memory).
+# Inside tools/box/hold.sh, or while `llm-mode pause` holds the box, the services are already down and stay
+# down: CMD just runs, once no unit is still starting or stopping (a unit winding down still holds its device
+# memory).
 with_gpus() {
-  if [ -n "${BOX_GPUS_HELD:-}" ]; then
+  if [ -n "${BOX_GPUS_HELD:-}" ] || [ -e /run/llm-mode/paused ]; then
     local u
     for u in $(llm_units); do
       if [ "$(systemctl is-active "$u")" != inactive ] && [ "$(systemctl is-active "$u")" != failed ]; then
