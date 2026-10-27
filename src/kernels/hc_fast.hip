@@ -206,14 +206,17 @@ __device__ __forceinline__ void hc_finish_token(const bf16* __restrict__ x, cons
                                                 uint8_t* qs = nullptr) {
   __shared__ float m[MIX + 1];
   __shared__ float pre[4];
+  __shared__ float sp_part[SPLITS * (MIX + 1)];  // the token's partial sums, loaded at once (summed in split order)
   const int tid = threadIdx.x, width = hc * dim;
+  for (int i = tid; i < SPLITS * (MIX + 1); i += NT) {
+    const float* p = &part[size_t(t) * SPLITS * (MIX + 1) + i];
+    if constexpr (kCoherent) sp_part[i] = __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    else sp_part[i] = *p;
+  }
+  __syncthreads();
   if (tid <= MIX) {
     float v = 0.0f;
-    for (int sp = 0; sp < SPLITS; ++sp) {
-      const float* p = &part[(size_t(t) * SPLITS + sp) * (MIX + 1) + tid];
-      if constexpr (kCoherent) v += __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      else v += *p;
-    }
+    for (int sp = 0; sp < SPLITS; ++sp) v += sp_part[sp * (MIX + 1) + tid];
     m[tid] = v;
   }
   __syncthreads();

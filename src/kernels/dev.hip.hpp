@@ -115,15 +115,32 @@ __device__ __forceinline__ uint8_t pow2_ceil_e8m0(float v) {
   return uint8_t(e + 127);
 }
 
-// Wave32 reductions (RDNA HIP default wave size).
+// x of lane ^ O (O in 1, 2, 4, 8, 16), __shfl_xor(x, O, 32) with every lane active: DPP within 16-lane rows,
+// v_permlanex16 across them (__shfl_xor becomes ds_bpermute, an LDS round trip per step).
+template <int O>
+__device__ __forceinline__ float xor_lane(float x) {
+  const int i = __float_as_int(x);
+  if constexpr (O == 16)
+    return __int_as_float(__builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+  else
+    return __int_as_float(__builtin_amdgcn_update_dpp(i, i, 0x160 | O, 0xf, 0xf, false));  // row_xmask:O
+}
+
+// Wave32 reductions (RDNA HIP default wave size): butterflies over lane ^ 16, 8, 4, 2, 1.
 __device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+  v += xor_lane<16>(v);
+  v += xor_lane<8>(v);
+  v += xor_lane<4>(v);
+  v += xor_lane<2>(v);
+  v += xor_lane<1>(v);
   return v;
 }
 __device__ __forceinline__ float warp_max(float v) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, 32));
+  v = fmaxf(v, xor_lane<16>(v));
+  v = fmaxf(v, xor_lane<8>(v));
+  v = fmaxf(v, xor_lane<4>(v));
+  v = fmaxf(v, xor_lane<2>(v));
+  v = fmaxf(v, xor_lane<1>(v));
   return v;
 }
 
