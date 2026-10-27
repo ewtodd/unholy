@@ -89,8 +89,9 @@ void set_rows(const Glm5Scratch& s, int rows, hipStream_t st) {
 void exl3_mm(const GLinear& l, const uint16_t* xh, bf16* out, int ldo, int rows, const Glm5Scratch& s, hipStream_t st) {
   const auto* tab = l.tab.as<const uint16_t* const>();
   const auto* tiles = s.at<k::Exl3Tile>(kDenseTiles);
-  if (rows <= 8)
-    k::exl3_grouped_gemv(xh, l.in, tiles, 1, tab, tab + 2, l.x.bits, s.at<float>(kYp), out, ldo, l.out, st);
+  if (rows <= 8)  // the output transform in the launch when the counters cover the columns
+    k::exl3_grouped_gemv(xh, l.in, tiles, 1, tab, tab + 2, l.x.bits, s.at<float>(kYp), out, ldo, l.out, st, nullptr,
+                         size_t(l.out / 128) * 4 <= s.bufs[kGemvCount].size() ? s.at<uint32_t>(kGemvCount) : nullptr);
   else
     k::exl3_grouped_gemm(xh, l.in, tiles, (rows + k::kExl3TileRows - 1) / k::kExl3TileRows, tab, tab + 2, l.x.bits, out,
                          ldo, l.out, st);
