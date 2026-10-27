@@ -237,6 +237,8 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, 
   // Every layer the MoE runs for: the target's and the DSpark stages (n_layers + n_mtp).
   s.route_hist = rt::DeviceBuffer(dev, std::max(size_t(c.n_layers + c.n_mtp), c.compress_ratios.size()) * c.n_experts * 4);
   UH_CHECK(hipMemset(s.route_hist.data(), 0, s.route_hist.size()));
+  s.hc_count = rt::DeviceBuffer(dev, size_t(k::kHcSmallMaxTokens) * 4);
+  UH_CHECK(hipMemset(s.hc_count.data(), 0, s.hc_count.size()));
   s.dispatch.count = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   UH_CHECK(hipMemset(s.dispatch.count.data(), 0, s.dispatch.count.size()));  // then kept zero by moe_plan
   s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
@@ -610,6 +612,26 @@ void hc_pre(const bf16* x, const float* fn, const float* scale, const float* bas
   else k::hc_pre(x, fn, scale, base, y, post, comb, T, hc, dim, iters, norm_eps, hc_eps, st);
 }
 
+// hc_pre, then norm_quant of its output (into ny and the fp8 codes q / qs): decode-sized batches in one launch when
+// both take their fast paths (hc_pre_small with the norm and the quantization in its last block, the same values).
+void hc_pre_norm_quant(const Scratch& s, const bf16* x, const float* fn, const float* scale, const float* base, bf16* y,
+                       float* post, float* comb, float* part, int T, int hc, int dim, int iters, float norm_eps,
+                       float hc_eps, const bf16* nw, bf16* ny, uint8_t* q, uint8_t* qs, hipStream_t st) {
+  static const bool fast_hc = [] {
+    const char* v = std::getenv("UNHOLY_REF_HC");
+    return !v || std::string(v) == "0";
+  }();
+  if (fast_hc && fast_elem() && class_rows(T) <= k::kHcSmallMaxTokens && T <= k::kHcSmallMaxTokens && dim % 256 == 0 &&
+      s.hc_count.data()) {
+    if (!k::hc_pre_small(x, fn, scale, base, y, post, comb, part, T, hc, dim, iters, norm_eps, hc_eps, st, nullptr, nw,
+                         ny, norm_eps, q, qs))
+      norm_quant(y, dim, nw, ny, dim, q, qs, T, dim, norm_eps, st);
+    return;
+  }
+  hc_pre(x, fn, scale, base, y, post, comb, part, T, hc, dim, iters, norm_eps, hc_eps, st);
+  norm_quant(y, dim, nw, ny, dim, q, qs, T, dim, norm_eps, st);
+}
+
 // UNHOLY_DUMP=dir: raw intermediates of batches whose first chunk starts at position 0, named like
 // the oracle's captures (tools/ref/oracle/run.py --capture-layer), for tools/ref/compare_dump.py.
 void dump(int layer, const BatchDesc& b, const char* name, const void* dptr, size_t bytes, hipStream_t st) {
@@ -697,12 +719,12 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   uint8_t* qb = B<uint8_t>(scr, kQBuf);
   uint8_t* qs = B<uint8_t>(scr, kQSc);
 
-  hc_pre(x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), y, post, comb, B<float>(scr, kHcPart), T,
-            c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
+  hc_pre_norm_quant(scr, x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), y, post,
+                    comb, B<float>(scr, kHcPart), T, c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps,
+                    w.attn_norm.p<bf16>(), a, qb, qs, st);  // y, a and its fp8 codes
   dump(L, b, "hcpre_attn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_attn_post", post, size_t(T) * c.hc_mult * 4, st);
   dump(L, b, "hcpre_attn_comb", comb, size_t(T) * c.hc_mult * c.hc_mult * 4, st);
-  norm_quant(y, D, w.attn_norm.p<bf16>(), a, D, qb, qs, T, D, c.norm_eps, st);  // a and its fp8 codes
   dump(L, b, "attn_in", a, size_t(T) * D * 2, st);
 
   // q: wq_a -> q_norm (qr) -> wq_b -> per-head rms -> rope; kv: wkv from the same quantized input.
@@ -1023,12 +1045,12 @@ void moe_front(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, b
   float* comb = B<float>(scr, kComb);
   uint8_t* qb = B<uint8_t>(scr, kQBuf);
   uint8_t* qs = B<uint8_t>(scr, kQSc);
-  hc_pre(x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), y, post, comb, B<float>(scr, kHcPart), T,
-            c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps, st);
+  hc_pre_norm_quant(scr, x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), y, post, comb,
+                    B<float>(scr, kHcPart), T, c.hc_mult, D, c.sinkhorn_iters, c.norm_eps, c.hc_eps,
+                    w.ffn_norm.p<bf16>(), f, qb, qs, st);  // y, f and its fp8 codes for the shared expert
   dump(L, b, "hcpre_ffn_y", y, size_t(T) * D * 2, st);
   dump(L, b, "hcpre_ffn_post", post, size_t(T) * c.hc_mult * 4, st);
   dump(L, b, "hcpre_ffn_comb", comb, size_t(T) * c.hc_mult * c.hc_mult * 4, st);
-  norm_quant(y, D, w.ffn_norm.p<bf16>(), f, D, qb, qs, T, D, c.norm_eps, st);  // f, and its fp8 codes for the shared expert
   dump(L, b, "ffn_in", f, size_t(T) * D * 2, st);
 
   // Router (fp32 linear on x.float()).

@@ -194,12 +194,16 @@ __global__ __launch_bounds__(NT) void hc_partial_kernel(const bf16* __restrict__
 // goes through the same operations in the same order as one thread doing it all (sums in index order),
 // so the slices and the lanes change nothing; every slice repeats the (tiny) Sinkhorn.
 // kCoherent: `part` was written by other blocks of the same launch (read past the caches).
-template <bool kCoherent>
+// kNorm (hc_finish_norm_kernel): the whole row is mixed for the sum of squares (rmsnorm_slices' thread partition),
+// the slice is written, normalized with nw and, with q, quantized as rmsnorm_quant_slices does.
+template <bool kCoherent, bool kNorm = false>
 __device__ __forceinline__ void hc_finish_token(const bf16* __restrict__ x, const float* __restrict__ part,
                                                 const float* __restrict__ scale, const float* __restrict__ base,
                                                 bf16* __restrict__ y, float* __restrict__ post_out,
                                                 float* __restrict__ comb_out, int hc, int dim, int iters, float norm_eps,
-                                                float hc_eps, int per, int t, int slice) {
+                                                float hc_eps, int per, int t, int slice, const bf16* nw = nullptr,
+                                                bf16* yn = nullptr, float eps2 = 0.0f, uint8_t* q = nullptr,
+                                                uint8_t* qs = nullptr) {
   __shared__ float m[MIX + 1];
   __shared__ float pre[4];
   const int tid = threadIdx.x, width = hc * dim;
@@ -257,12 +261,64 @@ __device__ __forceinline__ void hc_finish_token(const bf16* __restrict__ x, cons
   }
   __syncthreads();
   const bf16* xt = x + size_t(t) * width;
-  const int d1 = min(dim, int(slice + 1) * per);
-  for (int d = slice * per + tid; d < d1; d += NT) {
-    float v = 0.0f;
-    for (int h = 0; h < hc; ++h) v += pre[h] * bf16_to_f32(xt[size_t(h) * dim + d]);
-    y[size_t(t) * dim + d] = f32_to_bf16(v);
+  const int d0 = slice * per, d1 = min(dim, int(slice + 1) * per);
+  if constexpr (!kNorm) {
+    for (int d = d0 + tid; d < d1; d += NT) {
+      float v = 0.0f;
+      for (int h = 0; h < hc; ++h) v += pre[h] * bf16_to_f32(xt[size_t(h) * dim + d]);
+      y[size_t(t) * dim + d] = f32_to_bf16(v);
+    }
+  } else {
+    __shared__ float red[32];
+    float ss = 0.0f;
+    for (int d = tid; d < dim; d += NT) {
+      float v = 0.0f;
+      for (int h = 0; h < hc; ++h) v += pre[h] * bf16_to_f32(xt[size_t(h) * dim + d]);
+      const bf16 yb = f32_to_bf16(v);
+      if (d >= d0 && d < d1) y[size_t(t) * dim + d] = yb;
+      const float yv = bf16_to_f32(yb);
+      ss += yv * yv;
+    }
+    ss = block_sum(ss, red);
+    const float r = rsqrtf(ss / float(dim) + eps2);
+    const bf16* yr = y + size_t(t) * dim;  // this thread's own slice values
+    if (q) {  // rmsnorm_quant_slices_kernel's chunks of the slice
+      __shared__ float bmax[8];
+      const int lane = tid & 31, wave = tid >> 5;
+      for (int c0 = d0; c0 < d1; c0 += NT) {
+        const int d = c0 + tid;
+        const float tv = bf16_to_f32(yr[d]) * r;
+        const bf16 yv = f32_to_bf16(bf16_to_f32(nw[d]) * tv);
+        yn[size_t(t) * dim + d] = yv;
+        const float v = bf16_to_f32(yv);
+        const float a = warp_max(fabsf(v));
+        if (lane == 0) bmax[wave] = a;
+        __syncthreads();
+        const int g = wave & ~3;
+        const float m = fmaxf(fmaxf(fmaxf(bmax[g], bmax[g + 1]), fmaxf(bmax[g + 2], bmax[g + 3])), 1e-4f);
+        __syncthreads();
+        const uint8_t se = pow2_ceil_e8m0(m * (1.0f / 448.0f));
+        const float sc = e8m0_to_f32(se);
+        q[size_t(t) * dim + d] = f32_to_e4m3(fminf(fmaxf(v / sc, -448.0f), 448.0f));
+        if ((tid & 127) == 0) qs[size_t(t) * (dim / 128) + d / 128] = se;
+      }
+    } else {
+      for (int d = d0 + tid; d < d1; d += NT)
+        yn[size_t(t) * dim + d] = f32_to_bf16(bf16_to_f32(nw[d]) * (bf16_to_f32(yr[d]) * r));
+    }
   }
+}
+
+__global__ __launch_bounds__(NT) void hc_finish_norm_kernel(const bf16* __restrict__ x, const float* __restrict__ part,
+                                                            const float* __restrict__ scale,
+                                                            const float* __restrict__ base, bf16* __restrict__ y,
+                                                            float* __restrict__ post_out, float* __restrict__ comb_out,
+                                                            int hc, int dim, int iters, float norm_eps, float hc_eps,
+                                                            int per, const bf16* __restrict__ nw, bf16* __restrict__ yn,
+                                                            float eps2, uint8_t* __restrict__ q,
+                                                            uint8_t* __restrict__ qs) {
+  hc_finish_token<false, true>(x, part, scale, base, y, post_out, comb_out, hc, dim, iters, norm_eps, hc_eps, per,
+                               blockIdx.x, blockIdx.y, nw, yn, eps2, q, qs);
 }
 
 __global__ __launch_bounds__(NT) void hc_finish_kernel(const bf16* __restrict__ x, const float* __restrict__ part,
@@ -282,7 +338,8 @@ __global__ __launch_bounds__(NT) void hc_pre_fused_kernel(const bf16* __restrict
                                                           float* __restrict__ post_out, float* __restrict__ comb_out,
                                                           int hc, int dim, int iters, float norm_eps, float hc_eps,
                                                           uint32_t* __restrict__ counters, const bf16* __restrict__ nw,
-                                                          bf16* __restrict__ yn, float eps2) {
+                                                          bf16* __restrict__ yn, float eps2, uint8_t* __restrict__ q,
+                                                          uint8_t* __restrict__ qs) {
   hc_partial_body(x, fn, part, hc * dim);
   __shared__ bool last;
   const int t = blockIdx.x, tid = threadIdx.x;
@@ -304,7 +361,30 @@ __global__ __launch_bounds__(NT) void hc_pre_fused_kernel(const bf16* __restrict
     }
     ss = block_sum(ss, red);
     const float r = rsqrtf(ss / float(dim) + eps2);
-    for (int i = tid; i < dim; i += NT) yn[size_t(t) * dim + i] = f32_to_bf16(bf16_to_f32(nw[i]) * (bf16_to_f32(yr[i]) * r));
+    if (q) {  // rmsnorm_quant_slices_kernel's chunks
+      __shared__ float bmax[8];
+      const int lane = tid & 31, wave = tid >> 5;
+      for (int c0 = 0; c0 < dim; c0 += NT) {
+        const int d = c0 + tid;
+        const float tv = bf16_to_f32(yr[d]) * r;
+        const bf16 yv = f32_to_bf16(bf16_to_f32(nw[d]) * tv);
+        yn[size_t(t) * dim + d] = yv;
+        const float v = bf16_to_f32(yv);
+        const float a = warp_max(fabsf(v));
+        if (lane == 0) bmax[wave] = a;
+        __syncthreads();
+        const int g = wave & ~3;
+        const float m = fmaxf(fmaxf(fmaxf(bmax[g], bmax[g + 1]), fmaxf(bmax[g + 2], bmax[g + 3])), 1e-4f);
+        __syncthreads();
+        const uint8_t se = pow2_ceil_e8m0(m * (1.0f / 448.0f));
+        const float sc = e8m0_to_f32(se);
+        q[size_t(t) * dim + d] = f32_to_e4m3(fminf(fmaxf(v / sc, -448.0f), 448.0f));
+        if ((tid & 127) == 0) qs[size_t(t) * (dim / 128) + d / 128] = se;
+      }
+    } else {
+      for (int i = tid; i < dim; i += NT)
+        yn[size_t(t) * dim + i] = f32_to_bf16(bf16_to_f32(nw[i]) * (bf16_to_f32(yr[i]) * r));
+    }
   }
   if (tid == 0) counters[t] = 0;
 }
@@ -323,22 +403,31 @@ void hc_pre_tiled(const bf16* x, const float* fn, const float* scale, const floa
   UH_CHECK_LAUNCH();
 }
 
-void hc_pre_small(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
+bool hc_pre_small(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
                   float* comb, float* part, int T, int hc, int dim, int iters, float norm_eps, float hc_eps,
-                  hipStream_t st, uint32_t* counters, const bf16* norm_w, bf16* y_norm, float norm_eps2) {
+                  hipStream_t st, uint32_t* counters, const bf16* norm_w, bf16* y_norm, float norm_eps2, uint8_t* q,
+                  uint8_t* qs) {
   if (hc != 4 || (hc * dim) % (SPLITS * NT)) throw std::runtime_error("hc_pre_small: unsupported shape");
+  if (q && dim % NT) throw std::runtime_error("hc_pre_small: quantized output needs dim % 256 == 0");
   if (counters) {
     hc_pre_fused_kernel<<<dim3(T, SPLITS), NT, 0, st>>>(x, fn, part, scale, base, y, post, comb, hc, dim, iters,
-                                                         norm_eps, hc_eps, counters, norm_w, y_norm, norm_eps2);
+                                                         norm_eps, hc_eps, counters, norm_w, y_norm, norm_eps2, q, qs);
     UH_CHECK_LAUNCH();
-    return;
+    return true;
   }
   hc_partial_kernel<<<dim3(T, SPLITS), NT, 0, st>>>(x, fn, part, hc * dim);
   UH_CHECK_LAUNCH();
   const int sl = row_slices(T, dim);
+  if (norm_w && !(q && (dim % sl || (dim / sl) % NT))) {  // the norm in the finish's slices (each mixes the row)
+    hc_finish_norm_kernel<<<dim3(T, sl), NT, 0, st>>>(x, part, scale, base, y, post, comb, hc, dim, iters, norm_eps,
+                                                      hc_eps, (dim + sl - 1) / sl, norm_w, y_norm, norm_eps2, q, qs);
+    UH_CHECK_LAUNCH();
+    return true;
+  }
   hc_finish_kernel<<<dim3(T, sl), NT, 0, st>>>(x, part, scale, base, y, post, comb, hc, dim, iters, norm_eps, hc_eps,
                                                (dim + sl - 1) / sl);
   UH_CHECK_LAUNCH();
+  return norm_w == nullptr;
 }
 
 }  // namespace unholy::kernels

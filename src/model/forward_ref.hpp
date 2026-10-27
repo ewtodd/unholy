@@ -146,6 +146,7 @@ struct Scratch {
   ExpertScratch expert;
   Exl3MoeScratch exl3;
   MoeDispatchScratch dispatch;
+  rt::DeviceBuffer hc_count;  // hc_pre_small's per-token counters (zero; kernels leave them zero)
   void* get(size_t i) const { return bufs.at(i).data(); }
 };
 // exl3: room for EXL3 routed experts (native MXFP4 needs less); the reference expert path's scratch only

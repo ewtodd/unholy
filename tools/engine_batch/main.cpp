@@ -252,11 +252,14 @@ int main(int argc, char** argv) {
         if (o.finished) {
           r.done = true;
           ++finished;
+          if (!o.error.empty()) std::fprintf(stderr, "request %zu: %s\n", i, o.error.c_str());
         }
         r.last = std::move(o);
       });
     while (finished < res.size())
-      if (!eng.iterate() && finished < res.size()) throw std::runtime_error("the engine stopped with requests left");
+      if (!eng.iterate() && finished < res.size())
+        throw std::runtime_error("the engine stopped with requests left (" + std::to_string(res.size() - finished) +
+                                 " unfinished):\n" + eng.debug_state());
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     std::ofstream out(out_path);

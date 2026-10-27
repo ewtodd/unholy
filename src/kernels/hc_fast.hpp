@@ -9,12 +9,15 @@ void hc_pre_tiled(const bf16* x, const float* fn, const float* scale, const floa
                   float* comb, int T, int hc, int dim, int iters, float norm_eps, float hc_eps, hipStream_t st);
 
 // Small T (decode): split-K partial sums into `part` [T, 32, 25] floats, then Sinkhorn and the mix.
-// counters (T zeroed words, left zeroed; one set per stream): one launch, the last of a token's 32 partial blocks
-// finishing it (the same values). norm_w (with counters): also y_norm = rmsnorm_slices(y, norm_w, norm_eps2).
-void hc_pre_small(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
+// norm_w: also y_norm = rmsnorm_slices(y, norm_w, norm_eps2), and with q / qs rmsnorm_quant_slices' fp8 codes and
+// scales of it, in the finish's launch; false when the quantized norm's slices do not fit (as rmsnorm_quant_slices
+// returns false), the norm then the caller's. counters (T zeroed words, left zeroed; one set per stream):
+// all of it in one launch, the last of a token's 32 partial blocks finishing the whole row (the same values; one block
+// for the row's mix and norm is slower than the second launch when the norm also quantizes).
+bool hc_pre_small(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post,
                   float* comb, float* part, int T, int hc, int dim, int iters, float norm_eps, float hc_eps,
                   hipStream_t st, uint32_t* counters = nullptr, const bf16* norm_w = nullptr, bf16* y_norm = nullptr,
-                  float norm_eps2 = 0.0f);
+                  float norm_eps2 = 0.0f, uint8_t* q = nullptr, uint8_t* qs = nullptr);
 constexpr int kHcSmallMaxTokens = 32;
 
 // Fault diagnostics (UNHOLY_CANARY): hc_pre_tiled checks the address of every weight load against one

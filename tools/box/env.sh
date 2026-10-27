@@ -17,7 +17,7 @@
 : "${GLM_ORACLE:=$BOX_DATA/glm/oracle/code1024}"
 : "${GLM_PY:=/work/env/glm/bin/python}"
 : "${TRANSFORMERS_REV:=50e35cc0ca18ec19b80653690de553e6decf74f5}"   # transformers main with glm5_next
-BUILD=$BOX_TREE/build
+: "${BUILD:=$BOX_TREE/build}"  # another tree's build: BUILD=/work/<tree>/build
 
 # The production server's flags (the NixOS module's, without host / port / name).
 SERVE_FLAGS=(--kv-tokens 1572864 --max-model-len 786432 --max-num-seqs 8 --max-batch-tokens 4096

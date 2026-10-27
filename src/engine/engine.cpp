@@ -827,7 +827,13 @@ void Engine::loop() {
 namespace unholy::engine {
 
 std::string Engine::debug_state() const {
-  std::string out;
+  std::string out = "waiting " + std::to_string(waiting_.size()) + ", running " + std::to_string(running_.size()) +
+                    ", inflight " + std::to_string(inflight_.size()) + ", free slots " +
+                    std::to_string(free_slots_.size()) + ", available pages " + std::to_string(available_pages()) +
+                    ", cached pages " + std::to_string(page_by_hash_.size()) + "\n";
+  for (const auto& s : waiting_)
+    out += "waiting seq " + std::to_string(s->id) + ": tokens " + std::to_string(s->tokens.size()) + " computed " +
+           std::to_string(s->computed) + " pages " + std::to_string(s->pages.size()) + "\n";
   for (const auto& s : running_) {
     out += "seq " + std::to_string(s->id) + ": tokens " + std::to_string(s->tokens.size()) + " prompt " +
            std::to_string(s->n_prompt) + " computed " + std::to_string(s->computed) + " inflight " +
