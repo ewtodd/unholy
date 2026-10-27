@@ -1,7 +1,8 @@
-// unholy-vit-test: the vision tower (model/vision) on one image against the reference rows from
-// tools/ref/oracle/vision_ref.py (same image, block at start position 0).
+// unholy-vit-test: a vision tower on one image against reference rows. DSV4 (model/vision): the image block's rows
+// from tools/ref/oracle/vision_ref.py (block at start position 0). GLM-5.3-Flash (model/glm5_vision): the image
+// token rows from tools/ref/glm_vit_compare.py, which also runs this tool.
 //
-//   unholy-vit-test --model DIR --image FILE --ref FILE [--dev N] [--reps 3]
+//   unholy-vit-test --model DIR --image FILE [--ref FILE] [--out FILE] [--dev N] [--reps 3] [--max-tokens N]
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -14,6 +15,8 @@
 #include <vector>
 
 #include "model/dsv4.hpp"
+#include "model/family.hpp"
+#include "model/glm5_vision.hpp"
 #include "model/safetensors.hpp"
 #include "model/vision.hpp"
 #include "rt/hip.hpp"
@@ -23,7 +26,7 @@ using namespace unholy;
 
 int main(int argc, char** argv) {
   std::string model_dir = "/scratch/dsv4-ve", image, ref, out_path;
-  int dev = 0, reps = 3;
+  int dev = 0, reps = 3, max_tokens = 8000;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
     if (a == "--model") model_dir = v;
@@ -32,39 +35,66 @@ int main(int argc, char** argv) {
     else if (a == "--dev") dev = std::stoi(v);
     else if (a == "--reps") reps = std::stoi(v);
     else if (a == "--out") out_path = v;
+    else if (a == "--max-tokens") max_tokens = std::stoi(v);
   }
   try {
-    auto ck = model::Checkpoint::open(model_dir);
-    const auto c = model::Dsv4Config::from_hf(ck->config());
+    auto ck = model::Checkpoint::open(model_dir, {"vision.safetensors"});
+    const bool glm = model::detect_family(ck->config()) == model::Family::Glm5Next;
     UH_CHECK(hipSetDevice(dev));
     hipStream_t st;
     UH_CHECK(hipStreamCreate(&st));
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto w = model::load_vision(*ck, c, dev, st);
-    auto s = model::make_vision_scratch(c, dev);
-    std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     std::ifstream f(image, std::ios::binary);
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    vision::VisionConfig vc{c.vision_patch, c.vision_downsample, c.vision_max_tokens, c.vision_min_pixels,
-                            c.vision_max_wh_ratio};
-    const auto p = vision::preprocess(vision::decode_image(bytes), vc);
-    const auto blk = vision::build_image_block(p.n_llm_h, p.n_llm_w, 0);
-    const size_t n = blk.types.size();
-    rt::DeviceBuffer out(dev, n * c.dim * 2);
+    const auto img = vision::decode_image(bytes);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<uint16_t> got;
+    size_t n = 0;
+    int dim = 0;
     double ms = 0;
-    for (int r = 0; r < reps; ++r) {
-      const auto a = std::chrono::steady_clock::now();
-      model::vision_encode(c, w, s, p, blk, out.as<uint16_t>(), st);
-      UH_CHECK(hipStreamSynchronize(st));
-      ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    auto timed = [&](auto&& encode) {
+      for (int r = 0; r < reps; ++r) {
+        const auto a = std::chrono::steady_clock::now();
+        encode();
+        UH_CHECK(hipStreamSynchronize(st));
+        ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+      }
+    };
+    if (glm) {
+      const auto c = model::Glm5VisionConfig::from_hf(ck->config());
+      const auto w = model::load_glm5_vision(*ck, c, dev, st);
+      const auto p = vision::glm_preprocess(img, c.preprocess(max_tokens));
+      const int tokens = p.grid_h * p.grid_w / (c.merge * c.merge);
+      auto s = model::make_glm5_vision_scratch(c, tokens, dev);
+      std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      n = size_t(tokens);
+      dim = c.out_dim;
+      rt::DeviceBuffer out(dev, n * dim * 2);
+      timed([&] { model::glm5_vision_encode(c, w, s, p, out.as<uint16_t>(), st); });
+      got.resize(n * dim);
+      UH_CHECK(hipMemcpy(got.data(), out.data(), got.size() * 2, hipMemcpyDeviceToHost));
+      std::printf("grid %dx%d, %zu tokens, encode %.1f ms\n", p.grid_h, p.grid_w, n, ms);
+    } else {
+      const auto c = model::Dsv4Config::from_hf(ck->config());
+      const auto w = model::load_vision(*ck, c, dev, st);
+      auto s = model::make_vision_scratch(c, dev);
+      std::printf("loaded in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      vision::VisionConfig vc{c.vision_patch, c.vision_downsample, c.vision_max_tokens, c.vision_min_pixels,
+                              c.vision_max_wh_ratio};
+      const auto p = vision::preprocess(img, vc);
+      const auto blk = vision::build_image_block(p.n_llm_h, p.n_llm_w, 0);
+      n = blk.types.size();
+      dim = c.dim;
+      rt::DeviceBuffer out(dev, n * dim * 2);
+      timed([&] { model::vision_encode(c, w, s, p, blk, out.as<uint16_t>(), st); });
+      got.resize(n * dim);
+      UH_CHECK(hipMemcpy(got.data(), out.data(), got.size() * 2, hipMemcpyDeviceToHost));
+      std::printf("grid %dx%d -> %dx%d, block %zu rows, encode %.1f ms\n", p.n_vit_h, p.n_vit_w, p.n_llm_h,
+                  p.n_llm_w, n, ms);
     }
-    std::vector<uint16_t> got(n * c.dim);
-    UH_CHECK(hipMemcpy(got.data(), out.data(), got.size() * 2, hipMemcpyDeviceToHost));
     if (!out_path.empty()) {
       std::ofstream of(out_path, std::ios::binary);
       of.write(reinterpret_cast<const char*>(got.data()), std::streamsize(got.size() * 2));
     }
-    std::printf("grid %dx%d -> %dx%d, block %zu rows, encode %.1f ms\n", p.n_vit_h, p.n_vit_w, p.n_llm_h, p.n_llm_w, n, ms);
     if (!ref.empty()) {
       std::ifstream rf(ref, std::ios::binary);
       std::vector<uint16_t> want(got.size());
@@ -80,11 +110,11 @@ int main(int argc, char** argv) {
       size_t same = 0;
       for (size_t r = 0; r < n; ++r) {
         double rn = 0, rd = 0;
-        for (int d = 0; d < c.dim; ++d) {
-          const double a = f32(got[r * c.dim + size_t(d)]), b = f32(want[r * c.dim + size_t(d)]);
+        for (int d = 0; d < dim; ++d) {
+          const double a = f32(got[r * dim + size_t(d)]), b = f32(want[r * dim + size_t(d)]);
           rn += (a - b) * (a - b);
           rd += b * b;
-          same += got[r * c.dim + size_t(d)] == want[r * c.dim + size_t(d)];
+          same += got[r * dim + size_t(d)] == want[r * dim + size_t(d)];
         }
         num += rn;
         den += rd;
