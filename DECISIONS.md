@@ -1352,3 +1352,40 @@ a thread-local model::ScratchPart (attention untouched), outside the legacy scra
 the placement does not move. Gates: validate bit-identical, eb c8 48/48 against M0 (64.3 tok/s), curve to 64k
 1960 -> 2290 tok/s, decode unchanged. Steps split from 2048 rows on both models: at 1024 rows the split is 8-10%
 slower, at 2048 1-4% faster, at 4096 16-17%. The ds4 service picks it up when the flake input moves to this commit.
+
+## 2026-10-27 — decode launches and the APU's transforms; what did not pay
+
+Single-stream decode at 4k (unholy-curve): GLM 42.2 -> 35.9 ms/token, DSV4 33.1 -> 32.9. Prefill to 32k: GLM 1339 ->
+1419 tok/s, DSV4 2437 -> 2527. Byte rooflines: ~19 ms (GLM) and ~17 ms (DSV4) per decode token. Commits 8f08be4 ..
+a947f9d. Every change after 8f08be4 is bit-identical: GLM logits, GLM decode logits through the APU (unholy-curve
+--out), and DSV4's gates (validate, eb c8 48/48).
+
+- GLM decode was instruction bound in the cards' EXL3 GEMV, not memory bound: ~17 cycles per weight from a
+  quarter-rate v_mul_lo_u32, 64-bit window shifts, and register-relative moves for acc[m]. Fixing those took 42.2 ->
+  38.1 ms (fp32 sums reordered: one bf16 ulp in ~0.02% of outputs, KL unchanged). The remaining launch-bound glue
+  went into producer/consumer kernels with "last block per segment" counters: the EXL3 transforms, the mHC pre-mix
+  with its norm (DSV4: two launches, since one block for the whole quantized row was slower), and routing with
+  dispatch. That took GLM to 35.9 ms.
+- Launch boundaries on the cards measure ~4.6 us under rocprofv3, with ~2 us of that from the profiler; host
+  submit is 2.5 ms per step. A removed launch is worth 2.3-3.9 us (git history). In GLM's MoE layers the APU's
+  experts (~270 us) run alongside the card's (~290 us), so card-side savings often turn into waiting at the join.
+  A scoping pass on a persistent decode kernel recommended more fusion rather than a megakernel: 1-2 ms beyond
+  fusion for weeks of work, and grid-sync and second-stream deadlock risks.
+- Prefill on both models is bound by the APU (99.6-99.8% busy). Its EXL3 / MXFP4 transforms ran a block per
+  (row, 128-value segment) with LDS barriers; DSV4's grids were ~786k blocks per 4096-token step, mostly exiting at
+  once. On a wave per segment with shuffles they cost a fraction: +6% / +3.7% prefill.
+- Not adopted:
+  - EXL3 trellis words n-major for the APU: loads alone +12-17%, the GEMV +4-11% on single rows, but -6% on 1-8
+    rows and -7-10% for the v2 GEMM that prefill runs.
+  - Fusing the input transform into the experts' GEMVs: every block repeats it, and on the APU it reads uncached
+    pinned memory. 36.7 -> 37.2 / 37.8 ms.
+  - 64-row tiles for the v2 GEMM: the register count stays at 217, so no occupancy gain; slower.
+  - A register-B EXL3 GEMM for gfx11, after mx_gemm_rb: bit-identical, 156 VGPRs and 22.5 KB of LDS, so two
+    blocks per CU, but -9 .. +6% by shape, neutral on average. On RDNA3.5 the WMMAs and the trellis decode share
+    the SIMD's issue, so overlap buys nothing. Without the decode the same kernel reaches only ~26 TFLOPS at
+    32-96 rows per expert (decode is 20-30% of the time).
+- Rows per APU job are the remaining prefill lever:
+  - GLM 6144-token steps (two 3072-token parts): prefill 1373 -> 1478 tok/s, but routing on cards 53.2 -> 48.9% and
+    decode +2-3% (35.6 -> 36.4 ms at 6k). That is the owner's trade; the production config stays at 3072.
+  - Unsplit 3072-token steps: 1199 tok/s.
+  - DSV4 8192-token steps: slower (2193 vs 2299 tok/s).
