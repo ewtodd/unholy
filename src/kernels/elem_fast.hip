@@ -40,19 +40,9 @@ __global__ __launch_bounds__(NT) void rmsnorm_slices_kernel(const bf16* __restri
 __global__ __launch_bounds__(NT) void hc_post_slices_kernel(const bf16* x, const bf16* res, const float* post,
                                                             const float* comb, bf16* out, int hc, int dim, int per) {
   const int t = blockIdx.x;
-  const float* pt = post + size_t(t) * hc;
-  const float* ct = comb + size_t(t) * hc * hc;
   const int d1 = min(dim, int(blockIdx.y + 1) * per);
-  for (int d = blockIdx.y * per + threadIdx.x; d < d1; d += NT) {
-    const float xv = bf16_to_f32(x[size_t(t) * dim + d]);
-    float r[4];
-    for (int i = 0; i < hc; ++i) r[i] = bf16_to_f32(res[(size_t(t) * hc + i) * dim + d]);
-    for (int j = 0; j < hc; ++j) {
-      float s = 0.0f;
-      for (int i = 0; i < hc; ++i) s += ct[i * hc + j] * r[i];
-      out[(size_t(t) * hc + j) * dim + d] = f32_to_bf16(pt[j] * xv + s);
-    }
-  }
+  for (int d = blockIdx.y * per + threadIdx.x; d < d1; d += NT)
+    hc_post_column(bf16_to_f32(x[size_t(t) * dim + d]), res, post, comb, out, hc, dim, t, d);
 }
 
 // rmsnorm_slices_kernel, then act_quant_fp8 (128-blocks) of the slice's output values: per 128-block the

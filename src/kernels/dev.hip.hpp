@@ -129,6 +129,21 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
   return warp_sum(v);
 }
 
+// The mHC post-mix of column d of token t (hc_post_kernel, ref_elem.hip): stream j = bf16(post[j] * x + sum over i of
+// comb[i][j] * res[i]), with x = xv and res the token's hc stream rows [hc][dim] (out may be res: each column alone).
+__device__ __forceinline__ void hc_post_column(float xv, const bf16* res, const float* post, const float* comb,
+                                               bf16* out, int hc, int dim, int t, int d) {
+  const float* pt = post + size_t(t) * hc;
+  const float* ct = comb + size_t(t) * hc * hc;
+  float r[4];
+  for (int i = 0; i < hc; ++i) r[i] = bf16_to_f32(res[(size_t(t) * hc + i) * dim + d]);
+  for (int j = 0; j < hc; ++j) {
+    float s = 0.0f;
+    for (int i = 0; i < hc; ++i) s += ct[i * hc + j] * r[i];
+    out[(size_t(t) * hc + j) * dim + d] = f32_to_bf16(pt[j] * xv + s);
+  }
+}
+
 // A8 fake quantization of one 128-value block held by a 128-thread block (one value per thread):
 // the reference's act_quant (amax floor 1e-4, power-of-two e8m0 scale, e4m3, back to bf16). `red`: 4
 // floats of LDS.

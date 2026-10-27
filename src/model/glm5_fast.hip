@@ -370,8 +370,9 @@ void moe_start(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch
   k::gather_rows(hn, eidx, s.at<bf16>(kExpIn) + size_t(P0) * D, P, D, st);  // this card's experts' rows
 }
 
+// hp: the mHC post-mix of out into the streams, in the combine's launch (hp.x null: the caller's).
 void moe_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out,
-              const MoePart& m, hipStream_t st) {
+              const MoePart& m, hipStream_t st, const k::HcPostArgs& hp = {}) {
   const int D = c.dim, E = c.n_experts, K = c.n_active, T = m.T, P = T * K, P0 = m.r0 * K;
   RemoteExperts* remote = m.remote;
   const bool any_remote = w.n_resident < E;
@@ -391,15 +392,13 @@ void moe_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch&
   bf16* sh = s.at<bf16>(kShared);
   mlp(c, w.sh_gate, w.sh_up, w.sh_down, hn, T, sh, s, st);
   if (!any_remote) {
-    k::glm_moe_combine(pout, pidx, sh, out, T, K, D, st);
+    k::glm_moe_combine(pout, pidx, sh, out, T, K, D, st, hp);
     return;
   }
-  // The APU's share: one fp32 row per token (its pairs' sum), into the fp16 gate inputs' room (the local experts
-  // are done with it).
-  float* partial = s.at<float>(kXh1);
+  // The APU's share: one fp32 row per token (its pairs' sum), read by the combine straight from the pinned rows.
   remote->join(st);
-  k::glm_copy_partial(reinterpret_cast<const float*>(remote->out_host), partial, &plan->n_remote_tokens, D, T, st);
-  k::glm_moe_combine_partial(pout, pidx, &plan->remote0, tok2u, partial, sh, out, T, K, D, st);
+  k::glm_moe_combine_partial(pout, pidx, &plan->remote0, tok2u, reinterpret_cast<const float*>(remote->out_host), sh,
+                             out, T, K, D, st, hp);
 }
 
 void moe_fast(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratch& s, const bf16* hn, bf16* out, int T,
@@ -517,10 +516,14 @@ void layer_post(const Glm5Config& c, const Glm5LayerWeights& w, const Glm5Scratc
   bf16* out = s.at<bf16>(kOut) + size_t(r0) * D;
   uint16_t* xr = x + size_t(r0) * hc * D;
   if (tiles) set_rows(s, T, st);
-  if (w.dense) mlp(c, w.gate, w.up, w.down, hn, T, out, s, st);
-  else moe_post(c, w, s, hn, out, p.m, st);
-  k::hc_post_slices(out, xr, s.at<float>(kPost) + size_t(r0) * hc, s.at<float>(kComb) + size_t(r0) * hc * hc, xr, T,
-                    hc, D, st);
+  float* post = s.at<float>(kPost) + size_t(r0) * hc;
+  float* comb = s.at<float>(kComb) + size_t(r0) * hc * hc;
+  if (w.dense) {
+    mlp(c, w.gate, w.up, w.down, hn, T, out, s, st);
+    k::hc_post_slices(out, xr, post, comb, xr, T, hc, D, st);
+  } else {
+    moe_post(c, w, s, hn, out, p.m, st, k::HcPostArgs{xr, post, comb, hc});  // the post-mix in the combine
+  }
 }
 
 constexpr int kSplitMinRows = 2048;  // steps this large run as two parts (1024-row steps: 8% slower split)
