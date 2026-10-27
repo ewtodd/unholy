@@ -17,6 +17,15 @@ using bf16 = uint16_t;
 #define UH_GFX11 1
 #endif
 
+// A pointer read from memory (a table of per-expert weights) is generic, so loads through it compile to flat_load,
+// which also counts in lgkmcnt: every LDS wait then waits for them too. Through this one they are global loads.
+template <class T>
+using global_ptr = const __attribute__((address_space(1))) T*;
+template <class T>
+__device__ __forceinline__ global_ptr<T> as_global(const T* p) {
+  return (global_ptr<T>)p;
+}
+
 __device__ __forceinline__ float bf16_to_f32(bf16 v) { return __uint_as_float(uint32_t(v) << 16); }
 
 // Round-to-nearest-even (NaN preserved as quiet NaN).

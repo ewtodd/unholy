@@ -314,79 +314,64 @@ __global__ __launch_bounds__(NT) void exl3_gemm_kernel(const uint16_t* __restric
 // the same, so the results are identical.
 constexpr int V2_BM = 128, V2_BN = 128, V2_KS = 64, V2_NT = 256, V2_PAD = 8;
 
-// fp16 bits of mul1(state) for two states: x = s * 0x83DCD12D; byte sum + 0x6400 as fp16; h * 0x1eee + 0xc931.
-__device__ __forceinline__ uint32_t decode_mul1_x2(uint32_t s0, uint32_t s1) {
-  const uint32_t a = __builtin_amdgcn_udot4(s0 * 0x83DCD12Du, 0x01010101u, 0x6400u, false);
-  const uint32_t b = __builtin_amdgcn_udot4(s1 * 0x83DCD12Du, 0x01010101u, 0x6400u, false);
-  const __half2 h = __halves2half2(__ushort_as_half(uint16_t(a)), __ushort_as_half(uint16_t(b)));
+// mul1's state product s * 0x83DCD12D mod 2^32 for the 16-bit state s in the high half of `win` (the low half is
+// ignored, so a window needs no mask): s * 0x83DC mod 2^16 into the high half from one packed 16-bit multiply (its low
+// lane multiplies by 0), plus s * 0xD12D from a 16-bit mad that reads win's high half. Two full-rate instructions.
+__device__ __forceinline__ uint32_t mul1_state_hi(uint32_t win) {
+  uint32_t t, x;
+  asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(t) : "v"(win), "s"(0x83DC0000u));
+  asm("v_mad_u32_u16 %0, %1, 0xd12d, %2 op_sel:[1,0,0,0]" : "=v"(x) : "v"(win), "v"(t));
+  return x;
+}
+// fp16 bits of mul1(state) for the states in the high halves of win0, win1: x = s * 0x83DCD12D; byte sum + 0x6400 as
+// fp16; h * 0x1eee + 0xc931.
+__device__ __forceinline__ uint32_t decode_mul1_x2_hi(uint32_t win0, uint32_t win1) {
+  const uint32_t a = __builtin_amdgcn_udot4(mul1_state_hi(win0), 0x01010101u, 0x6400u, false);
+  const uint32_t b = __builtin_amdgcn_udot4(mul1_state_hi(win1), 0x01010101u, 0x6400u, false);
+  const __half2 h = __builtin_bit_cast(__half2, __builtin_amdgcn_perm(b, a, 0x05040100u));  // both sums < 2^16
   const __half2 r = __hfma2(h, __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee)),
                             __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931)));
-  return uint32_t(__half_as_ushort(__low2half(r))) | (uint32_t(__half_as_ushort(__high2half(r))) << 16);
+  return __builtin_bit_cast(uint32_t, r);
 }
 
 // Lane L's 8 trellis steps (8L .. 8L + 7) of one tile (`w`: its 8*BITS words), as 4 packed fp16 pairs:
 // p[0] = (k r0, r0 + 1) at column c0, p[1] = (r0 + 8, r0 + 9) at c0, p[2], p[3] the same at c0 + 8, with
-// r0 = (L & 3) * 2, c0 = L >> 2 (the tensor-core permutation).
+// r0 = (L & 3) * 2, c0 = L >> 2 (the tensor-core permutation). Step 8L + j's window (bits [o0 + j BITS, + 16) of
+// w0 w1 w2, MSB first) goes to the high half of a register in one shift or funnel shift. When 8 * BITS is a multiple
+// of 32 every lane's first window starts at the same bit, so the shifts are immediates; otherwise the lane's stream is
+// first realigned to start at o0 (never 0 for BITS 2..6), which makes the windows' offsets immediates too.
 template <int BITS>
 __device__ __forceinline__ void decode_lane8(const uint32_t* w, int L, uint32_t p[4]) {
+  static_assert(BITS >= 2 && BITS <= 6);
   constexpr int LEN = 256 * BITS, NW = 8 * BITS;
   const int s = (8 * L * BITS + BITS - 16 + LEN) % LEN;  // first bit of step 8L's window
-  const int i0 = s >> 5, o0 = s & 31;
-  const uint32_t w0 = w[i0], w1 = w[(i0 + 1) % NW], w2 = w[(i0 + 2) % NW];
-  const uint64_t lo = (uint64_t(w0) << 32) | w1, hi = (uint64_t(w1) << 32) | w2;
-  uint32_t st[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    const int o = o0 + j * BITS;  // window = bits [o, o + 16) of w0 w1 w2 (MSB first)
-    st[j] = o <= 48 ? uint32_t(lo >> (48 - o)) & 0xffffu : uint32_t(hi >> (80 - o)) & 0xffffu;
-  }
-  p[0] = decode_mul1_x2(st[0], st[1]);
-  p[1] = decode_mul1_x2(st[2], st[3]);
-  p[2] = decode_mul1_x2(st[4], st[5]);
-  p[3] = decode_mul1_x2(st[6], st[7]);
-}
-
-// decode_mul1_x2 without v_mul_lo_u32 (quarter rate): for a 16-bit state s, s * 0x83DCD12D mod 2^32 =
-// s * 0xDCD12D + (s << 8) * 0x830000, full-rate 24-bit multiplies (in asm: LLVM folds them back into one 32-bit
-// multiply). The same values.
-__device__ __forceinline__ uint32_t mul1_state(uint32_t s) {
-  uint32_t lo, x;
-  asm("v_mul_u32_u24 %0, 0xdcd12d, %1" : "=v"(lo) : "v"(s));
-  asm("v_mad_u32_u24 %0, %1, 0x830000, %2" : "=v"(x) : "v"(s << 8), "v"(lo));
-  return x;
-}
-__device__ __forceinline__ uint32_t decode_mul1_x2_fast(uint32_t s0, uint32_t s1) {
-  const uint32_t x0 = mul1_state(s0), x1 = mul1_state(s1);
-  const uint32_t a = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
-  const uint32_t b = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
-  const __half2 h = __halves2half2(__ushort_as_half(uint16_t(a)), __ushort_as_half(uint16_t(b)));
-  const __half2 r = __hfma2(h, __halves2half2(__ushort_as_half(0x1eee), __ushort_as_half(0x1eee)),
-                            __halves2half2(__ushort_as_half(0xc931), __ushort_as_half(0xc931)));
-  return uint32_t(__half_as_ushort(__low2half(r))) | (uint32_t(__half_as_ushort(__high2half(r))) << 16);
-}
-
-// decode_lane8's values with 32-bit funnel shifts: window o of w0 w1 w2 (MSB first) is alignbit of the word pair
-// holding it. When 8 * BITS is a multiple of 32 every lane's first window starts at the same bit, so the shifts are
-// immediates.
-template <int BITS>
-__device__ __forceinline__ void decode_lane8_fast(const uint32_t* w, int L, uint32_t p[4]) {
-  constexpr int LEN = 256 * BITS, NW = 8 * BITS;
-  const int s = (8 * L * BITS + BITS - 16 + LEN) % LEN;
   const int i0 = s >> 5;
-  const int o0 = (8 * BITS) % 32 == 0 ? (BITS + 16) % 32 : s & 31;
   const uint32_t w0 = w[i0], w1 = w[(i0 + 1) % NW], w2 = w[(i0 + 2) % NW];
-  uint32_t st[8];
+  uint32_t win[8];
+  if constexpr ((8 * BITS) % 32 == 0) {
+    constexpr int o0 = (BITS + 16) % 32;
 #pragma unroll
-  for (int j = 0; j < 8; ++j) {
-    const int o = o0 + j * BITS;  // bits [o, o + 16): in w0 (o <= 16), w0 w1 (o <= 48) or w1 w2
-    const uint32_t a = o > 48 ? w1 : w0, b = o > 48 ? w2 : (o > 16 ? w1 : w0);
-    const uint32_t sh = o > 48 ? 80 - o : (o > 16 ? 48 - o : 16 - o);
-    st[j] = __builtin_amdgcn_alignbit(a, b, sh) & 0xffffu;
+    for (int j = 0; j < 8; ++j) {
+      const int o = o0 + j * BITS, r = o & 31;
+      const uint32_t a = o < 32 ? w0 : w1, b = o < 32 ? w1 : w2;
+      win[j] = r == 0 ? a : (r <= 16 ? a << r : __builtin_amdgcn_alignbit(a, b, 32 - r));
+    }
+  } else {
+    const int o0 = s & 31;
+    const uint32_t u0 = __builtin_amdgcn_alignbit(w0, w1, 32 - o0), u1 = __builtin_amdgcn_alignbit(w1, w2, 32 - o0);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int o = j * BITS;  // <= 42: in u0, u0 u1 or u1
+      win[j] = o == 0    ? u0
+               : o <= 16 ? u0 << o
+               : o < 32  ? __builtin_amdgcn_alignbit(u0, u1, 32 - o)
+                         : u1 << (o - 32);
+    }
   }
-  p[0] = decode_mul1_x2_fast(st[0], st[1]);
-  p[1] = decode_mul1_x2_fast(st[2], st[3]);
-  p[2] = decode_mul1_x2_fast(st[4], st[5]);
-  p[3] = decode_mul1_x2_fast(st[6], st[7]);
+  p[0] = decode_mul1_x2_hi(win[0], win[1]);
+  p[1] = decode_mul1_x2_hi(win[2], win[3]);
+  p[2] = decode_mul1_x2_hi(win[4], win[5]);
+  p[3] = decode_mul1_x2_hi(win[6], win[7]);
 }
 
 template <int BITS>
@@ -648,7 +633,7 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
   __shared__ _Float16 sX[GV_ROWS][GV_KC];
   __shared__ uint32_t sW[8][NW];  // one tile's words per wave
   __shared__ float sRed[8][GV_ROWS][16];
-  const uint32_t* trellis = reinterpret_cast<const uint32_t*>(trellis_tab[tile.expert]);
+  const auto trellis = as_global(reinterpret_cast<const uint32_t*>(trellis_tab[tile.expert]));
   const int tiles_n = N / 16;
   // This lane's 8 trellis steps cover rows {r0, r0+1, r0+8, r0+9} x columns {c0, c0+8}.
   const int r0 = (lane & 3) * 2, c0 = lane >> 2;
@@ -709,7 +694,7 @@ __global__ __launch_bounds__(GV_NT) void exl3_gemv_kernel(const uint16_t* __rest
           if (32 + lane < NW) pf1[i] = trellis[ti * NW + 32 + lane];
         }
         uint32_t p[4];
-        decode_lane8_fast<BITS>(sW[wave], lane, p);
+        decode_lane8<BITS>(sW[wave], lane, p);
         __builtin_amdgcn_wave_barrier();
         const int kb = kt * 16;
         // p[0] (rows r0, r0+1) and p[1] (r0+8, r0+9) at column c0; p[2], p[3] the same rows at c0+8. Rows unrolled
