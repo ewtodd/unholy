@@ -41,3 +41,6 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `glm-ref.sh LABEL [flags]` | `unholy-glm-ref`: the GLM reference forward against `glm-oracle.sh`'s dumps, layer by layer, then KL / top-1 |
 | `glm-serve.sh LABEL CMD...` | GLM build B served on port 8300 (production geometry), CMD run against it (`$URL`, `$RUN`), server stopped |
 | `hold.sh CMD...` | run CMD (e.g. `bash -c 'a.sh && b.sh'`) with the services stopped once, not once per script |
+| `trace-summary.py TRACE [flags]` | a rocprofv3 kernel trace (csv): per device, busy time and kernels by total time |
+| `trace-grids.py TRACE [flags]` | the same trace by kernel and grid (blocks, VGPRs, LDS), flagging grids that fill a card's wave slots exactly |
+| `isa.sh SRC ARCH OUT.s` | a source file's device assembly with the build's flags |
