@@ -1425,3 +1425,30 @@ Single-stream decode against fa9ff21: GLM 35.9 -> 32.1 ms/token at 4k (6k 35.6 -
 - Left: the APU's chain (down chained into the gate/up launch would save one ~19 us ramp and tail per layer), card 1
   reading the APU's partial across the link (combine 20 us vs 8 on card 0), hc_pre_fused (18 us x 96 per step),
   moe_dispatch_small (17 us x 45), bf16_skinny at 250-300 GB/s (1.3 ms per step).
+
+## 2026-10-29 — what a speculative verify step costs; DFlash2 for GLM not worth building now
+
+`unholy-curve --decode-tokens 1,2,3,4,6,8`: synchronous steps of K consecutive tokens of one sequence with logits for
+every row (a verify step without its drafter), median of 24, production placement. Ratio to a one-token step:
+
+| K | GLM 6k | GLM 32k | DSV4 4k | DSV4 32k |
+|---:|---:|---:|---:|---:|
+| 1 | 31.7 ms | 32.8 ms | 32.2 ms | 35.0 ms |
+| 2 | 1.39x | 1.39x | 1.21x | 1.24x |
+| 3 | 1.74x | 1.82x | 1.38x | 1.48x |
+| 4 | 2.16x | 2.30x | 1.50x | 1.68x |
+| 6 | 2.97x | 3.12x | 1.85x | 2.02x |
+| 8 | 3.59x | 3.84x | 2.22x | 2.52x |
+
+- Each extra token costs ~12.5 ms on GLM and ~6 ms on DSV4: the APU streaming that token's cold experts (GLM: 8
+  active, 47% off the cards, ~2.0 GB per token; DSV4: 6 active, 39% off the cards, ~1.35 GB). Consecutive tokens
+  share few experts.
+- incoai/GLM-5.3-Flash-DFlash2 (block diffusion, 5 layers at 4096, conditioned on target layers 5/14/24/33/42,
+  2.3 GB bf16, CC BY-NC-ND) publishes no GLM numbers; on Qwen3.8-27B its blog reports 4.80 accepted tokens per step
+  at block 8 (that model's chained MTP: 4.28), a per-position acceptance of ~0.85, the same as our single-token GLM
+  MTP's 83-86%. At 0.85 the best verify width is 3-4 tokens: ~1.4x plain decode at 6k and ~1.35x at 32k after a
+  ~4 ms drafter pass, against ~1.3x for MTP's two-token steps (1.2x measured served). Even at 0.9 it is ~1.5x. Not
+  worth a drafter, a multi-token verify path and KDA rollback to any position while the APU's expert bytes set the
+  price of every verified token; cutting those (more routing on the cards, fewer bits for the cold experts) raises
+  every speculation gain, and multi-stream throughput.
+- DSV4's DSpark at --spec-drafts 5 (6-token steps, 1.85-2.02x) pays once ~2 tokens per step are accepted.

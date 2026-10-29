@@ -7,8 +7,11 @@
 //
 //   unholy-curve --model DIR [--exl3 DIR] --profile FILE --ids FILE [--ctx 524288] [--chunk 4096]
 //                [--probes 4096,32768,131072,524288] [--decode-steps 8] [--every 8] [--out FILE]
+//                [--decode-tokens 1,2,4,8]
 //
 // --out FILE: every decode step's logits (fp32, in order), for comparing builds.
+// --decode-tokens: the probes' steps take K consecutive tokens each (logits for all K: what a speculative verify
+// step costs, without the drafter), one set of --decode-steps steps per K (default 1).
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -34,7 +37,7 @@ using clk = std::chrono::steady_clock;
 
 int main(int argc, char** argv) {
   std::string model_dir = "/scratch/dsv4-ve", exl3_dir, profile, ids_path, out_path;
-  std::vector<int> probes = {4096, 32768, 131072, 524288};
+  std::vector<int> probes = {4096, 32768, 131072, 524288}, step_tokens = {1};
   int ctx = 524288, chunk = 4096, dsteps = 8, every = 8;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
@@ -47,10 +50,11 @@ int main(int argc, char** argv) {
     else if (a == "--decode-steps") dsteps = std::stoi(v);
     else if (a == "--out") out_path = v;
     else if (a == "--every") every = std::stoi(v);  // print every N-th chunk (and all probes)
-    else if (a == "--probes") {
-      probes.clear();
+    else if (a == "--probes" || a == "--decode-tokens") {
+      auto& list = a == "--probes" ? probes : step_tokens;
+      list.clear();
       std::stringstream ss(v);
-      for (std::string t; std::getline(ss, t, ',');) probes.push_back(std::stoi(t));
+      for (std::string t; std::getline(ss, t, ',');) list.push_back(std::stoi(t));
     } else {
       std::fprintf(stderr, "unknown option %s\n", a.c_str());
       return 2;
@@ -60,7 +64,9 @@ int main(int argc, char** argv) {
     auto ck = model::Checkpoint::open(model_dir);
     std::unique_ptr<model::Checkpoint> xck;
     if (!exl3_dir.empty()) xck = model::Checkpoint::open(exl3_dir);
-    const int extra = int(probes.size()) * dsteps + 16;
+    int per_probe = 0;
+    for (const int k : step_tokens) per_probe += k * dsteps;
+    const int extra = int(probes.size()) * per_probe + 16;
     const int max_seq = (ctx + extra + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
     model::CacheGeometry geo{1, max_seq / model::kPageTokens, max_seq / model::kPageTokens};
     // The model by checkpoint family (configs outlive the model: it keeps a reference).
@@ -119,6 +125,7 @@ int main(int argc, char** argv) {
     int pos = 0, chunks_done = 0, depth_done = 0;
     clk::time_point last = clk::now();
     size_t next_probe = 0;
+    double step1_ms = 0;  // the probe's median one-token step (ratios for multi-token steps)
     const auto t_start = last;
     double prefill_s = 0;
     int prefill_tokens = 0;
@@ -150,26 +157,37 @@ int main(int argc, char** argv) {
       pos += n;
       if (next_probe < probes.size() && pos >= probes[next_probe]) {
         while (!flying.empty()) complete();
-        std::vector<double> ts, subs;  // step times; the host's share submitting them
-        for (int st = 0; st < dsteps; ++st) {
-          engine::StepInput d;
-          d.chunks = {{0, pos, 1, 0}};
-          d.ids = {pool[size_t(pos) % pool.size()]};
-          d.pos = {pos};
-          d.logit_rows = {0};
-          const auto t0 = clk::now();
-          const uint64_t ticket = m.submit(d);
-          subs.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
-          m.wait(ticket, logits);
-          if (out) out.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * 4));
-          ts.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
-          ++pos;
+        for (const int K : step_tokens) {
+          std::vector<double> ts, subs;  // step times; the host's share submitting them
+          for (int st = 0; st < dsteps; ++st) {
+            engine::StepInput d;
+            d.chunks = {{0, pos, K, 0}};
+            for (int k = 0; k < K; ++k) {
+              d.ids.push_back(pool[size_t(pos + k) % pool.size()]);
+              d.pos.push_back(pos + k);
+              d.logit_rows.push_back(k);
+            }
+            const auto t0 = clk::now();
+            const uint64_t ticket = m.submit(d);
+            subs.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+            m.wait(ticket, logits);
+            if (out) out.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * 4));
+            ts.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+            pos += K;
+          }
+          std::sort(ts.begin(), ts.end());
+          std::sort(subs.begin(), subs.end());
+          if (K == 1)
+            std::printf("decode at depth %d: median %.1f ms/token (%.1f tok/s), min %.1f, max %.1f; submit %.1f ms\n",
+                        pos, ts[ts.size() / 2], 1e3 / ts[ts.size() / 2], ts.front(), ts.back(), subs[subs.size() / 2]);
+          else
+            std::printf("decode at depth %d, %d tokens per step: median %.1f ms/step (%.2fx one token's step), "
+                        "min %.1f, max %.1f; submit %.1f ms\n",
+                        pos, K, ts[ts.size() / 2], ts[ts.size() / 2] / std::max(step1_ms, 1e-9), ts.front(), ts.back(),
+                        subs[subs.size() / 2]);
+          if (K == 1) step1_ms = ts[ts.size() / 2];
+          std::fflush(stdout);
         }
-        std::sort(ts.begin(), ts.end());
-        std::sort(subs.begin(), subs.end());
-        std::printf("decode at depth %d: median %.1f ms/token (%.1f tok/s), min %.1f, max %.1f; submit %.1f ms\n", pos,
-                    ts[ts.size() / 2], 1e3 / ts[ts.size() / 2], ts.front(), ts.back(), subs[subs.size() / 2]);
-        std::fflush(stdout);
         depth_done = pos;
         last = clk::now();
         ++next_probe;
