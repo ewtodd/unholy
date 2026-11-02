@@ -179,7 +179,10 @@ remaining 44 shards (~304 GB) to `/scratch/models`; reuse the 4 in `~/engram/dsv
 Engram tables, which move to `/stream`, with the owner's OK since engram-probe reads them). Confirm exllamav3
 supports `deepseek_v41`. **Decision:** go / no-go.
 
-**D2: EXL3 3.0 quantization (2-4 days, mostly compute, one long window).** Experts at 3.0 bpw from the native
+**D2 superseded (2026-11-01):** no quantization run of our own; unholy loads Unsloth's UD-Q2_K_XL GGUF (fallback
+UD-IQ2_XXS) and needs GGUF kernels instead, and D3 sizes for ~41 GB beyond the device. `docs/dsv41-flash-quant.md`.
+
+**D2 (as planned): EXL3 3.0 quantization (2-4 days, mostly compute, one long window).** Experts at 3.0 bpw from the native
 MXFP4, dense weights stay native fp8; working files on `/work`. Weight-space error vs the native weights.
 Fallback if it fails: LibertAIDAI's 3.5 bpw build (80.7 GB on the SSD instead of 44.9).
 

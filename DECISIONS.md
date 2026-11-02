@@ -1452,3 +1452,14 @@ every row (a verify step without its drafter), median of 24, production placemen
   price of every verified token; cutting those (more routing on the cards, fewer bits for the cold experts) raises
   every speculation gain, and multi-stream throughput.
 - DSV4's DSpark at --spec-drafts 5 (6-token steps, 1.85-2.02x) pays once ~2 tokens per step are accepted.
+
+## 2026-11-01 — V4.1-Flash: Unsloth's UD-Q2_K_XL GGUF instead of our own EXL3 quantization
+
+`docs/dsv41-flash-quant.md`. Published 2-3 bpw GGUF builds of DeepSeek-V4.1-Flash-1017 replace D2's EXL3 3.0
+quantization run. From their headers (`tools/ref/gguf_inventory.py`) and Unsloth's measurements: UD-Q2_K_XL has
+191.1 GB of routed experts (~41 GB past the ~150 GB of expert room that DSV4's and GLM's plans leave), averages 87.49
+on six benchmarks against its Q8's 87.68, KL 0.088 on long17k; UD-IQ2_XXS (156.9 GB, 86.63, 0.142) is the fallback.
+ISTA's GSQ-RCO builds measure lower at every size when re-measured with more samples (IQ2_XS 98.2% of the reference
+on ISTA's three benchmarks, not 99.8%); ISTA's IQ2_XS was deleted, its IQ1_M kept for the APU-only test. The ~41 GB
+go to the SSD tier or come from a smaller build's experts; the D4 oracle checks the KL independently of both
+quantizers.
