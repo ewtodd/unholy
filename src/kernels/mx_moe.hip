@@ -550,7 +550,8 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
                                                         const uint8_t* const* w_tab, const uint8_t* const* s_tab,
                                                         bf16* out, int ldo, int N, const int* ntiles_dev,
                                                         const uint8_t* const* w_tab2, const uint8_t* const* s_tab2,
-                                                        bf16* out2) {
+                                                        bf16* out2, MxGlu glu) {
+  bf16* const g_out = out;
   if (blockIdx.z) {  // the second projection on the same inputs (w1 and w3 in one launch)
     w_tab = w_tab2;
     s_tab = s_tab2;
@@ -607,13 +608,45 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
       }
     }
   }
-  if (nt * 16 >= size_t(N)) return;
+  if (nt * 16 < size_t(N))
 #pragma unroll
-  for (int m = 0; m < MV_MAXM; ++m) {
-    if (m >= M) break;
-    const float v = acc[m] + xor_lane<1>(acc[m]);
-    if ((lane & 1) == 0) out[size_t(tile.row0 + m) * ldo + nt * 16 + (lane >> 1)] = f32_to_bf16(v);
+    for (int m = 0; m < MV_MAXM; ++m) {
+      if (m >= M) break;
+      const float v = acc[m] + xor_lane<1>(acc[m]);
+      if ((lane & 1) == 0) out[size_t(tile.row0 + m) * ldo + nt * 16 + (lane >> 1)] = f32_to_bf16(v);
+    }
+  if (!glu.hh) return;
+  // The segment's second block: mx_transform_wave_kernel<2>'s arithmetic on the tile's rows (a wave per row).
+  __shared__ bool second;
+  uint32_t* cnt = glu.counters + size_t(blockIdx.y) * (N / 128) + blockIdx.x;
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) second = atomicAdd(cnt, 1u) == 1u;
+  __syncthreads();
+  if (!second) return;
+  __threadfence();
+  if (tid == 0) *cnt = 0;
+  if (wave >= M) return;
+  const int r = tile.row0 + wave, k0 = blockIdx.x * 128 + 4 * lane;
+  if (!glu.s_tab[glu.row_expert[r]]) return;
+  const uint64_t graw = __hip_atomic_load(reinterpret_cast<const uint64_t*>(g_out + size_t(r) * ldo + k0),
+                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  const uint64_t uraw = __hip_atomic_load(reinterpret_cast<const uint64_t*>(out2 + size_t(r) * ldo + k0),
+                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  float v[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float gv = bf16_to_f32(uint16_t(graw >> (16 * i))), ui = bf16_to_f32(uint16_t(uraw >> (16 * i)));
+    if (glu.limit > 0.0f) {
+      ui = fminf(fmaxf(ui, -glu.limit), glu.limit);
+      gv = fminf(gv, glu.limit);
+    }
+    float hv = (gv / (1.0f + expf(-gv))) * ui;
+    if (glu.w) hv = glu.w[r] * hv;
+    v[i] = round_bf16(hv);
   }
+  fake_quant_fp8_wave(v);
+  store4_bf16(glu.hh + size_t(r) * N + k0, v);
 }
 
 }  // namespace
@@ -745,11 +778,13 @@ void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, c
 
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev,
-                     const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2, int) {
+                     const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2, int, const MxGlu& glu) {
   if (ntiles <= 0) return;
   if (K % MV_KC || N % 16) throw std::runtime_error("mx_grouped_gemv: K % 512 or N % 16");
+  if (glu.hh && (!out2 || N % 128 || ldo != N)) throw std::runtime_error("mx_grouped_gemv: glu shape");
   mx_gemv_kernel<<<dim3((N / 16 + 7) / 8, ntiles, out2 ? 2 : 1), MV_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo,
-                                                                                  N, ntiles_dev, w_tab2, s_tab2, out2);
+                                                                                  N, ntiles_dev, w_tab2, s_tab2, out2,
+                                                                                  glu);
   UH_CHECK_LAUNCH();
 }
 

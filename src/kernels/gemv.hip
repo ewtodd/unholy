@@ -52,8 +52,19 @@ __device__ __forceinline__ void store(TOut* c, size_t i, float v) {
 // W8A8: the wave's columns n0 .. n0 + C - 1 (< N).
 template <int C, int R>
 __device__ __forceinline__ void w8a8_cols(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw,
-                                          bf16* c, int ldc, int M, int N, int K, int n0, int lane) {
+                                          bf16* c, int ldc, int M, int N, int K, int n0, int lane,
+                                          const HcPostArgs& hp) {
   const int nc = min(C, N - n0), nkb = K / 128;
+  // hp.x (C == 1, M <= 8, hc == 4): lane 4 m + j holds row m's stream j at this column, its post weight and comb
+  // column, loaded before the K loop (in the stores they would add their latency to every wave's tail).
+  const int hm = lane >> 2, hj = lane & 3;
+  float hr = 0.0f, hpj = 0.0f, hcj[4] = {};
+  if (hp.x && hm < M) {
+    hr = bf16_to_f32(hp.x[(size_t(hm) * 4 + hj) * N + n0]);
+    hpj = hp.post[hm * 4 + hj];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) hcj[i] = hp.comb[hm * 16 + i * 4 + hj];
+  }
   float acc[C][R] = {};
   for (int k = lane * 16; k < K; k += 512) {
     float wv[C][16], ws[C];
@@ -86,15 +97,90 @@ __device__ __forceinline__ void w8a8_cols(const uint8_t* a, const uint8_t* sa, c
     for (int m = 0; m < R; ++m) {
       if (j >= nc || m >= M) break;
       const float v = warp_sum(acc[j][m]);
-      if (lane == 0) c[size_t(m) * ldc + n0 + j] = f32_to_bf16(v);
+      const bf16 o = f32_to_bf16(v);
+      if (lane == 0) c[size_t(m) * ldc + n0 + j] = o;
+      if (hp.x) {  // hc_post_column's arithmetic, stream hj of row m in lane 4 m + hj
+        const float r[4] = {quad_lane<0>(hr), quad_lane<1>(hr), quad_lane<2>(hr), quad_lane<3>(hr)};
+        if (hm == m) hp.x[(size_t(m) * 4 + hj) * N + n0] = f32_to_bf16(hc_post_value(bf16_to_f32(o), r, hcj, hpj, 4));
+      }
     }
 }
+// act_quant_fp8_kernel's arithmetic on one 128-value block held by a wave (lane l: values 4 l .. 4 l + 3): codes into
+// q[0 .. 128), the scale exponent into *qs.
+__device__ __forceinline__ void quant128_wave(const float v[4], uint8_t* q, uint8_t* qs, int lane) {
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) amax = fmaxf(amax, fabsf(v[i]));
+  amax = fmaxf(warp_max(amax), 1e-4f);
+  const uint8_t se = pow2_ceil_e8m0(amax * (1.0f / 448.0f));
+  const float sc = e8m0_to_f32(se);
+  uint32_t packed = 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) packed |= uint32_t(f32_to_e4m3(fminf(fmaxf(v[i] / sc, -448.0f), 448.0f))) << (8 * i);
+  *reinterpret_cast<uint32_t*>(q + 4 * lane) = packed;
+  if (lane == 0) *qs = se;
+}
+// Four bf16 values another block of the launch stored (after its fence), as floats.
+__device__ __forceinline__ void load4_peer(const bf16* p, float v[4]) {
+  const uint64_t r = __hip_atomic_load(reinterpret_cast<const uint64_t*>(p), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = bf16_to_f32(uint16_t(r >> (16 * i)));
+}
+// The block's turn on a segment counter: true for the target-th block to arrive (it then resets the counter).
+__device__ __forceinline__ bool last_block(uint32_t* cnt, uint32_t target) {
+  __shared__ bool last;
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) last = atomicAdd(cnt, 1u) == target - 1;
+  __syncthreads();
+  if (!last) return false;
+  __threadfence();
+  if (threadIdx.x == 0) *cnt = 0;
+  return true;
+}
+
 template <int C, int R>
 __global__ __launch_bounds__(NT) void gemv_w8a8_kernel(const uint8_t* a, const uint8_t* sa, const uint8_t* w,
-                                                       const uint8_t* sw, bf16* c, int ldc, int M, int N, int K) {
+                                                       const uint8_t* sw, bf16* c, int ldc, int M, int N, int K,
+                                                       HcPostArgs hp) {
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C;
-  if (n0 < N) w8a8_cols<C, R>(a, sa, w, sw, c, ldc, M, N, K, n0, threadIdx.x & 31);
+  if (n0 < N) w8a8_cols<C, R>(a, sa, w, sw, c, ldc, M, N, K, n0, threadIdx.x & 31, hp);
 }
+// gemv_w8a8_parts_kernel on [gate; up] (two parts of width I), then each segment's last block (of 32: 16 per part):
+// swiglu_kernel's arithmetic and the quantization of its products (a wave per row).
+template <int R>
+__global__ __launch_bounds__(NT) void gemv_w8a8_glu_kernel(const uint8_t* a, const uint8_t* sa, GemvParts ps, int M,
+                                                           int K, float limit, GemvQuant gq) {
+  const int I = ps.p[0].N;
+  int n0 = blockIdx.x * WAVES + (threadIdx.x >> 5);
+  const int part = n0 >= I;
+  n0 -= part * I;
+  if (n0 >= I) return;  // pad blocks (whole blocks: I % 8 == 0)
+  const GemvPart& p = ps.p[part];
+  w8a8_cols<1, R>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, I, K, n0,
+                  threadIdx.x & 31, HcPostArgs{});
+  const int seg = n0 / 128, lane = threadIdx.x & 31;
+  if (!last_block(gq.counters + seg, 32)) return;
+  const bf16* g = static_cast<const bf16*>(ps.p[0].c);
+  const bf16* u = static_cast<const bf16*>(ps.p[1].c);
+  for (int m = threadIdx.x >> 5; m < M; m += WAVES) {
+    const int k0 = seg * 128 + 4 * lane;
+    float gv[4], uv[4], v[4];
+    load4_peer(g + size_t(m) * ps.p[0].ldc + k0, gv);
+    load4_peer(u + size_t(m) * ps.p[1].ldc + k0, uv);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float gi = gv[i], ui = uv[i];
+      if (limit > 0.0f) {
+        ui = fminf(fmaxf(ui, -limit), limit);
+        gi = fminf(gi, limit);
+      }
+      v[i] = round_bf16((gi / (1.0f + expf(-gi))) * ui);
+    }
+    quant128_wave(v, gq.q + size_t(m) * I + seg * 128, gq.qs + size_t(m) * (I / 128) + seg, lane);
+  }
+}
+
 // Several column ranges (parts with their own weights, scales and outputs) on one input: wave -> (part,
 // column), then the single GEMV's code.
 template <int R>
@@ -105,14 +191,23 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_parts_kernel(const uint8_t* a, c
   const GemvPart& p = ps.p[i];
   if (n0 < p.N)
     w8a8_cols<1, R>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, p.N, K, n0,
-                    threadIdx.x & 31);
+                    threadIdx.x & 31, HcPostArgs{});
 }
 
 // bf16 weights x bf16 activations: the wave's columns n0 .. n0 + C - 1 (< N).
+// scale != 0 (bf16 outputs): scale_bf16 on each output. ring (fp32 outputs, C == 1, part: its index): rg's stores,
+// row m's position and ape value loaded into lane m before the K loop.
 template <int C, int R, typename TOut>
 __device__ __forceinline__ void bf16_cols(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K,
-                                          int n0, int lane) {
+                                          int n0, int lane, float scale = 0.0f, bool ring = false, GemvRing rg = {},
+                                          int part = 0) {
   const int nc = min(C, N - n0);
+  int rpos = 0;
+  float rape = 0.0f;
+  if (ring && lane < M) {
+    rpos = rg.pos[lane];
+    if (part == 1) rape = rg.ape[size_t(rpos % rg.ratio) * N + n0];
+  }
   float acc[C][R] = {};
   for (int k = lane * 16; k < K; k += 512) {
     float wv[C][16];
@@ -137,15 +232,26 @@ __device__ __forceinline__ void bf16_cols(const bf16* a, int lda, const bf16* w,
 #pragma unroll
     for (int m = 0; m < R; ++m) {
       if (j >= nc || m >= M) break;
-      const float v = warp_sum(acc[j][m]);
-      if (lane == 0) store(c, size_t(m) * ldc + n0 + j, v);
+      float v = warp_sum(acc[j][m]);
+      int p = 0;
+      if (ring) {
+        p = __builtin_amdgcn_readlane(rpos, m);
+        if (part == 1) v += __int_as_float(__builtin_amdgcn_readlane(__float_as_int(rape), m));
+      }
+      if (lane != 0) continue;
+      if constexpr (sizeof(TOut) == 2) {
+        if (scale != 0.0f) v = bf16_to_f32(f32_to_bf16(v)) * scale;
+      } else if (ring && rg.slot[m] >= 0) {
+        (part ? rg.sc : rg.kv)[(size_t(rg.slot[m]) * rg.ring + p % rg.ring) * N + n0 + j] = v;
+      }
+      store(c, size_t(m) * ldc + n0 + j, v);
     }
 }
 template <int C, int R, typename TOut>
 __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M,
-                                                       int N, int K) {
+                                                       int N, int K, float scale) {
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C;
-  if (n0 < N) bf16_cols<C, R, TOut>(a, lda, w, c, ldc, M, N, K, n0, threadIdx.x & 31);
+  if (n0 < N) bf16_cols<C, R, TOut>(a, lda, w, c, ldc, M, N, K, n0, threadIdx.x & 31, scale);
 }
 // K < 512 (K % 64 == 0; KDA's low-rank gate projections, K = 128): a wave per 8 columns, 4 lanes per column, each
 // lane K / 4 consecutive values of it (the per-512 layout above would leave most lanes idle).
@@ -192,20 +298,22 @@ __global__ __launch_bounds__(NT) void gemv_bf16_smallk2_kernel(const bf16* a0, i
   else bf16_smallk_cols<R, bf16>(a1, lda1, w1, c1, ldc1, M, N1, K, blockIdx.x - nb0);
 }
 template <int R, typename TOut>
-__global__ __launch_bounds__(NT) void gemv_bf16_parts_kernel(const bf16* a, int lda, GemvParts ps, int M, int K) {
+__global__ __launch_bounds__(NT) void gemv_bf16_parts_kernel(const bf16* a, int lda, GemvParts ps, int M, int K,
+                                                             GemvRing rg) {
   int n0 = blockIdx.x * WAVES + (threadIdx.x >> 5), i = 0;
   while (i + 1 < ps.n && n0 >= ps.p[i].N) n0 -= ps.p[i++].N;
   const GemvPart& p = ps.p[i];
   if (n0 < p.N)
     bf16_cols<1, R, TOut>(a, lda, static_cast<const bf16*>(p.w), static_cast<TOut*>(p.c), p.ldc, M, p.N, K, n0,
-                          threadIdx.x & 31);
+                          threadIdx.x & 31, 0.0f, rg.ape != nullptr, rg, i);
 }
 
 // Grouped "mgk,grk->mgr": fp8 weights x 128x128 scales (exact in bf16), bf16 activations. A wave's C
 // columns lie in one group (R % C == 0).
+// gq.q: then each 128-column segment's last block (C == 1: 16 blocks of 8 columns) quantizes its rows.
 template <int C, int RM>
 __global__ __launch_bounds__(NT) void gemv_grouped_fp8w_kernel(const bf16* a, const uint8_t* w, const uint8_t* sw,
-                                                               bf16* c, int M, int G, int R, int K) {
+                                                               bf16* c, int M, int G, int R, int K, GemvQuant gq) {
   const int col0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C, lane = threadIdx.x & 31;  // col over G*R
   if (col0 >= G * R) return;
   const int g = col0 / R, r0 = col0 % R;
@@ -238,6 +346,14 @@ __global__ __launch_bounds__(NT) void gemv_grouped_fp8w_kernel(const bf16* a, co
       const float v = warp_sum(acc[j][m]);
       if (lane == 0) c[(size_t(m) * G + g) * R + r0 + j] = f32_to_bf16(v);
     }
+  if (!gq.q) return;
+  const int N = G * R, seg = col0 / 128;
+  if (!last_block(gq.counters + seg, 128 / (WAVES * C))) return;
+  for (int m = threadIdx.x >> 5; m < M; m += WAVES) {
+    float v[4];
+    load4_peer(c + size_t(m) * N + seg * 128 + 4 * lane, v);
+    quant128_wave(v, gq.q + size_t(m) * N + seg * 128, gq.qs + size_t(m) * (N / 128) + seg, lane);
+  }
 }
 
 int g_force_cols = 0;
@@ -274,22 +390,25 @@ int gemv_max_rows() {
 void gemv_force_cols(int c) { g_force_cols = c == 1 || c == 2 || c == 4 ? c : 0; }
 
 void gemv_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
-               int N, int K, hipStream_t st) {
+               int N, int K, hipStream_t st, const HcPostArgs& hp) {
   if (M > MAXM || K % 512) throw std::runtime_error("gemv_w8a8: M > 32 or K % 512");
+  if (hp.x && (M > 8 || hp.hc != 4 || cols_per_wave(N) != 1)) throw std::runtime_error("gemv_w8a8: post-mix shape");
   const auto go = [&](auto r) {
     constexpr int R = decltype(r)::value;
     switch (cols_per_wave(N)) {
-      case 4: gemv_w8a8_kernel<4, R><<<blocks_for(N, 4), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K); break;
-      case 2: gemv_w8a8_kernel<2, R><<<blocks_for(N, 2), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K); break;
-      default: gemv_w8a8_kernel<1, R><<<blocks_for(N, 1), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K);
+      case 4: gemv_w8a8_kernel<4, R><<<blocks_for(N, 4), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K, hp); break;
+      case 2: gemv_w8a8_kernel<2, R><<<blocks_for(N, 2), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K, hp); break;
+      default: gemv_w8a8_kernel<1, R><<<blocks_for(N, 1), NT, 0, st>>>(a, sa, w, sw, c, ldc, M, N, K, hp);
     }
   };
   by_rows(M, go);
   UH_CHECK_LAUNCH();
 }
 template <typename TOut>
-void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K, hipStream_t st) {
+void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K, hipStream_t st,
+                   float scale = 0.0f) {
   if (M <= MAXM && K < 512 && K % 64 == 0) {
+    if (scale != 0.0f) throw std::runtime_error("gemv_bf16: scale needs K >= 512");
     by_rows(M, [&](auto r) {
       gemv_bf16_smallk_kernel<decltype(r)::value, TOut>
           <<<pad_grid((N + WAVES * 8 - 1) / (WAVES * 8)), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
@@ -301,16 +420,17 @@ void gemv_bf16_any(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int 
   const auto go = [&](auto r) {
     constexpr int R = decltype(r)::value;
     switch (cols_per_wave(N)) {
-      case 4: gemv_bf16_kernel<4, R, TOut><<<blocks_for(N, 4), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K); break;
-      case 2: gemv_bf16_kernel<2, R, TOut><<<blocks_for(N, 2), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K); break;
-      default: gemv_bf16_kernel<1, R, TOut><<<blocks_for(N, 1), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K);
+      case 4: gemv_bf16_kernel<4, R, TOut><<<blocks_for(N, 4), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K, scale); break;
+      case 2: gemv_bf16_kernel<2, R, TOut><<<blocks_for(N, 2), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K, scale); break;
+      default: gemv_bf16_kernel<1, R, TOut><<<blocks_for(N, 1), NT, 0, st>>>(a, lda, w, c, ldc, M, N, K, scale);
     }
   };
   by_rows(M, go);
   UH_CHECK_LAUNCH();
 }
-void gemv_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st) {
-  gemv_bf16_any(a, lda, w, c, ldc, M, N, K, st);
+void gemv_bf16(const bf16* a, int lda, const bf16* w, bf16* c, int ldc, int M, int N, int K, hipStream_t st,
+               float scale) {
+  gemv_bf16_any(a, lda, w, c, ldc, M, N, K, st, scale);
 }
 void gemv_bf16_f32out(const bf16* a, int lda, const bf16* w, float* c, int ldc, int M, int N, int K, hipStream_t st) {
   gemv_bf16_any(a, lda, w, c, ldc, M, N, K, st);
@@ -339,12 +459,26 @@ void gemv_w8a8_parts(const uint8_t* a, const uint8_t* sa, const GemvPart* parts,
   });
   UH_CHECK_LAUNCH();
 }
-void gemv_bf16_f32out_parts(const bf16* a, int lda, const GemvPart* parts, int nparts, int M, int K, hipStream_t st) {
+void gemv_w8a8_glu(const uint8_t* a, const uint8_t* sa, const GemvPart* parts, int M, int K, float limit,
+                   const GemvQuant& gq, hipStream_t st) {
+  if (M > MAXM || K % 512) throw std::runtime_error("gemv_w8a8_glu: M > 32 or K % 512");
+  if (parts[0].N != parts[1].N || parts[0].N % 128) throw std::runtime_error("gemv_w8a8_glu: two parts of one width");
+  int cols = 0;
+  const GemvParts ps = make_parts(parts, 2, cols);
+  by_rows(M, [&](auto r) {
+    gemv_w8a8_glu_kernel<decltype(r)::value><<<blocks_for(cols, 1), NT, 0, st>>>(a, sa, ps, M, K, limit, gq);
+  });
+  UH_CHECK_LAUNCH();
+}
+void gemv_bf16_f32out_parts(const bf16* a, int lda, const GemvPart* parts, int nparts, int M, int K, hipStream_t st,
+                            const GemvRing* ring) {
   if (M > MAXM || K % 512) throw std::runtime_error("gemv_bf16_f32out_parts: M > 32 or K % 512");
+  if (ring && (nparts != 2 || parts[0].N != parts[1].N)) throw std::runtime_error("gemv ring: two parts of one width");
   int cols = 0;
   const GemvParts ps = make_parts(parts, nparts, cols);
+  const GemvRing rg = ring ? *ring : GemvRing{};
   by_rows(M, [&](auto r) {
-    gemv_bf16_parts_kernel<decltype(r)::value, float><<<blocks_for(cols, 1), NT, 0, st>>>(a, lda, ps, M, K);
+    gemv_bf16_parts_kernel<decltype(r)::value, float><<<blocks_for(cols, 1), NT, 0, st>>>(a, lda, ps, M, K, rg);
   });
   UH_CHECK_LAUNCH();
 }
@@ -354,7 +488,7 @@ void gemv_bf16_parts(const bf16* a, int lda, const GemvPart* parts, int nparts, 
   int cols = 0;
   const GemvParts ps = make_parts(parts, nparts, cols);
   by_rows(M, [&](auto r) {
-    gemv_bf16_parts_kernel<decltype(r)::value, bf16><<<blocks_for(cols, 1), NT, 0, st>>>(a, lda, ps, M, K);
+    gemv_bf16_parts_kernel<decltype(r)::value, bf16><<<blocks_for(cols, 1), NT, 0, st>>>(a, lda, ps, M, K, GemvRing{});
   });
   UH_CHECK_LAUNCH();
 }
@@ -371,16 +505,17 @@ void gemv_bf16_smallk2(const bf16* a0, int lda0, const bf16* w0, bf16* c0, int l
 }
 
 void gemv_grouped_fp8w(const bf16* a, const uint8_t* w, const uint8_t* sw, bf16* c, int M, int G, int R, int K,
-                       hipStream_t st) {
+                       hipStream_t st, const GemvQuant& gq) {
   if (M > MAXM || K % 512) throw std::runtime_error("gemv_grouped_fp8w: M > 32 or K % 512");
   int C = cols_per_wave(G * R);
   while (R % C) C /= 2;
+  if (gq.q && (C != 1 || (G * R) % 128)) throw std::runtime_error("gemv_grouped_fp8w: quantization shape");
   const auto go = [&](auto r) {
     constexpr int RR = decltype(r)::value;
     switch (C) {
-      case 4: gemv_grouped_fp8w_kernel<4, RR><<<blocks_for(G * R, 4), NT, 0, st>>>(a, w, sw, c, M, G, R, K); break;
-      case 2: gemv_grouped_fp8w_kernel<2, RR><<<blocks_for(G * R, 2), NT, 0, st>>>(a, w, sw, c, M, G, R, K); break;
-      default: gemv_grouped_fp8w_kernel<1, RR><<<blocks_for(G * R, 1), NT, 0, st>>>(a, w, sw, c, M, G, R, K);
+      case 4: gemv_grouped_fp8w_kernel<4, RR><<<blocks_for(G * R, 4), NT, 0, st>>>(a, w, sw, c, M, G, R, K, gq); break;
+      case 2: gemv_grouped_fp8w_kernel<2, RR><<<blocks_for(G * R, 2), NT, 0, st>>>(a, w, sw, c, M, G, R, K, gq); break;
+      default: gemv_grouped_fp8w_kernel<1, RR><<<blocks_for(G * R, 1), NT, 0, st>>>(a, w, sw, c, M, G, R, K, gq);
     }
   };
   by_rows(M, go);

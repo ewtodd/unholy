@@ -103,6 +103,7 @@ ExpertScratch make_expert_scratch(const Dsv4Config& c, int dev, int rows);
 // Scratch for the grouped EXL3 path over up to `rows` pair rows.
 struct Exl3MoeScratch {
   rt::DeviceBuffer xh1, xh3, h1, h3, xh2, tiles, row_expert, yp;
+  rt::DeviceBuffer counters;  // [max_tiles][moe_inter / 128] (zero; kernels leave them zero): the MXFP4 GLU's
   int rows = 0, max_tiles = 0;
 };
 // exl3: the buffers only the EXL3 experts use (xh3, yp).
@@ -147,6 +148,9 @@ struct Scratch {
   Exl3MoeScratch exl3;
   MoeDispatchScratch dispatch;
   rt::DeviceBuffer hc_count;  // hc_pre_small's per-token counters (zero; kernels leave them zero)
+  // GEMV tails' segment counters (zero; kernels leave them zero): [0, 64) wo_a's quantization, [64, 96) the shared
+  // expert's swiglu.
+  rt::DeviceBuffer gemv_count;
   void* get(size_t i) const { return bufs.at(i).data(); }
 };
 // exl3: room for EXL3 routed experts (native MXFP4 needs less); the reference expert path's scratch only

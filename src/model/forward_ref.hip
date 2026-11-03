@@ -239,6 +239,8 @@ Scratch make_scratch(const Dsv4Config& c, int dev, int max_tokens, int max_seq, 
   UH_CHECK(hipMemset(s.route_hist.data(), 0, s.route_hist.size()));
   s.hc_count = rt::DeviceBuffer(dev, size_t(k::kHcSmallMaxTokens) * 4);
   UH_CHECK(hipMemset(s.hc_count.data(), 0, s.hc_count.size()));
+  s.gemv_count = rt::DeviceBuffer(dev, 96 * 4);
+  UH_CHECK(hipMemset(s.gemv_count.data(), 0, s.gemv_count.size()));
   s.dispatch.count = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
   UH_CHECK(hipMemset(s.dispatch.count.data(), 0, s.dispatch.count.size()));  // then kept zero by moe_plan
   s.dispatch.off = rt::DeviceBuffer(dev, size_t(c.n_experts) * 4);
@@ -314,6 +316,8 @@ Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows, boo
   s.tiles = rt::DeviceBuffer(dev, size_t(s.max_tiles) * sizeof(kernels::Exl3Tile));
   s.row_expert = rt::DeviceBuffer(dev, R * 4);
   if (exl3) s.yp = rt::DeviceBuffer(dev, R * size_t(std::max(c.dim, c.moe_inter)) * 4);  // the EXL3 GEMV's partials
+  s.counters = rt::DeviceBuffer(dev, size_t(std::max(s.max_tiles, 1)) * std::max(c.moe_inter / 128, 1) * 4);
+  UH_CHECK(hipMemset(s.counters.data(), 0, s.counters.size()));
   return s;
 }
 
@@ -391,7 +395,10 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
   bf16* u = sc.h3.as<bf16>();
   k::mx_xform_in_q(q, s, p2u, plan, row_expert, tab(0, 1), xa, P, D, st);
   const bool gemv = k::mx_use_gemv(class_rows(P / c.n_active));
-  const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
+  const auto lin = [gemv](auto&&... a) {
+    if (gemv) k::mx_grouped_gemv(a...);
+    else k::mx_grouped_gemm(a...);
+  };
   const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
   lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
   k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
@@ -418,10 +425,18 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
     bf16* u = s.h3.as<bf16>();
     k::mx_xform_in(in, D, row_expert, tab(0, 1), xa, P, D, st, in_rows);
     const bool gemv = k::mx_use_gemv(class_rows(P / c.n_active));
-    const auto lin = gemv ? k::mx_grouped_gemv : k::mx_grouped_gemm;
+    const auto lin = [gemv](auto&&... a) {
+      if (gemv) k::mx_grouped_gemv(a...);
+      else k::mx_grouped_gemm(a...);
+    };
     const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
-    lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
-    k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
+    if (gemv && I % 128 == 0) {  // the SwiGLU transform in the w1 / w3 launch
+      k::mx_grouped_gemv(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u,
+                         rows, k::MxGlu{rw, row_expert, tab(2, 1), hh, c.swiglu_limit, s.counters.as<uint32_t>()});
+    } else {
+      lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
+      k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
+    }
     lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev, nullptr, nullptr, nullptr, rows);
     return;
   }
@@ -478,6 +493,8 @@ bool on_gfx12() {
   }
   return arch[dev] == 2;
 }
+// The dense dispatchers below take the GEMV for these rows and K.
+bool dense_gemv(int M, int K) { return fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0; }
 void dense_w8a8(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw, bf16* c, int ldc, int M,
                 int N, int K, hipStream_t st) {
   if (fast_dense() && class_rows(M) <= k::gemv_max_rows() && K % 512 == 0) k::gemv_w8a8(a, sa, w, sw, c, ldc, M, N, K, st);
@@ -666,9 +683,10 @@ bool fast_indexer() {
 
 // Compressor rows for one chunk, given the batch-wide projections (pk/ps already include ape):
 // emitted rows are normed, roped at their block start, quant-simulated and stored to the pool.
+// ring_done: the projections' GEMV already stored this chunk's ring rows (compressor_proj).
 void compress_chunk(const Dsv4Config& c, const CompressorWeights& cw, const float* pk, const float* ps,
                     float* ring_kv, float* ring_sc, k::PagedRows dst, k::PagedFp4 dst4, const Scratch& scr,
-                    const RopeTables& rope, const ChunkDesc& ch, hipStream_t st) {
+                    const RopeTables& rope, const ChunkDesc& ch, hipStream_t st, bool ring_done = false) {
   const int width = cw.width(), d = cw.d;
   const float* cpk = pk + size_t(ch.t0) * width;
   const float* cps = ps + size_t(ch.t0) * width;
@@ -691,18 +709,31 @@ void compress_chunk(const Dsv4Config& c, const CompressorWeights& cw, const floa
       k::store_rows(rb, nrows, d, dst, row0, st);
     }
   }
-  k::ring_update(cpk, cps, ring_kv, ring_sc, ch.s0, ch.n, cw.ring(), width, st);
+  if (!ring_done) k::ring_update(cpk, cps, ring_kv, ring_sc, ch.s0, ch.n, cw.ring(), width, st);
 }
 
-// Batch-wide compressor projections: x_f32 [T, dim] -> pk/ps [T, width] (+ ape by position).
-void compressor_proj(const Dsv4Config& c, const CompressorWeights& cw, const Scratch& scr, const BatchDesc& b,
-                     hipStream_t st) {
+// Batch-wide compressor projections: x_f32 [T, dim] -> pk/ps [T, width] (+ ape by position). On the GEMV the ape
+// and one-row chunks' ring updates (rings ring_kv / ring_sc [slots][ring][width]) happen in its stores: returns true
+// then (compress_chunk's ring_done for those chunks).
+bool compressor_proj(const Dsv4Config& c, const CompressorWeights& cw, const Scratch& scr, const BatchDesc& b,
+                     hipStream_t st, float* ring_kv, float* ring_sc) {
   const int width = cw.width();
   float* pk = B<float>(scr, kPK);
   float* ps = B<float>(scr, kPS);
+  if (gemv_parts() && dense_gemv(b.T, c.dim) && b.T <= k::kGemvRowsCap) {
+    k::GemvRing rg{cw.ape.p<float>(), b.pos, cw.ratio, cw.ring(), ring_kv, ring_sc, {}};
+    std::fill(std::begin(rg.slot), std::end(rg.slot), -1);
+    for (const auto& ch : b.chunks)
+      if (ch.n == 1) rg.slot[ch.t0] = ch.slot;
+    const k::GemvPart parts[2] = {{cw.wkv.p<bf16>(), nullptr, pk, width, width},
+                                  {cw.wgate.p<bf16>(), nullptr, ps, width, width}};
+    k::gemv_bf16_f32out_parts(B<bf16>(scr, kA), c.dim, parts, 2, b.T, c.dim, st, &rg);
+    return true;
+  }
   dense_f32_2(B<bf16>(scr, kA), B<float>(scr, kAF), c.dim, cw.wkv.p<bf16>(), pk, width, width, cw.wgate.p<bf16>(), ps,
               width, width, b.T, c.dim, st);
   for (const auto& ch : b.chunks) k::add_ape(ps + size_t(ch.t0) * width, cw.ape.p<float>(), ch.s0, ch.n, cw.ratio, width, st);
+  return false;
 }
 
 // draft != null: a DSpark stage (ratio 0) over draft blocks instead of sequence chunks.
@@ -765,25 +796,32 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
       else k::fake_quant_fp4(qi, IH * ID, T, IH * ID, 32, st);
     }
-    dense_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
-    // weights_proj(x) * (softmax_scale * n_heads^-0.5): the Python double, applied as fp32.
+    // weights_proj(x) * (softmax_scale * n_heads^-0.5): the Python double, applied as fp32 (on the GEMV in its stores).
     const double wscale = (1.0 / std::sqrt(double(ID))) * (1.0 / std::sqrt(double(IH)));
-    k::scale_bf16(wi, float(wscale), size_t(T) * IH, st);
+    if (dense_gemv(T, D)) {
+      k::gemv_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st, float(wscale));
+    } else {
+      dense_bf16(a, D, w.idx_wproj.p<bf16>(), wi, IH, T, IH, D, st);
+      k::scale_bf16(wi, float(wscale), size_t(T) * IH, st);
+    }
     // Indexer compressor (projections batch-wide, rows per chunk).
-    compressor_proj(c, *w.idx_comp, scr, b, st);
+    const bool iring_done =
+        compressor_proj(c, *w.idx_comp, scr, b, st, cache.iring_kv.as<float>(), cache.iring_sc.as<float>());
     for (const auto& ch : b.chunks)
       compress_chunk(c, *w.idx_comp, B<float>(scr, kPK), B<float>(scr, kPS),
                      cache.iring_kv.as<float>() + size_t(ch.slot) * cache.iring * cache.iwidth,
                      cache.iring_sc.as<float>() + size_t(ch.slot) * cache.iring * cache.iwidth,
-                     k::PagedRows{}, paged_fp4(cache.idx, b, ch.slot), scr, rope, ch, st);
+                     k::PagedRows{}, paged_fp4(cache.idx, b, ch.slot), scr, rope, ch, st, iring_done && ch.n == 1);
   }
   if (w.ratio) {
-    compressor_proj(c, *w.comp, scr, b, st);
+    const bool ring_done =
+        compressor_proj(c, *w.comp, scr, b, st, cache.ring_kv.as<float>(), cache.ring_sc.as<float>());
     for (const auto& ch : b.chunks)
       compress_chunk(c, *w.comp, B<float>(scr, kPK), B<float>(scr, kPS),
                      cache.ring_kv.as<float>() + size_t(ch.slot) * cache.ring * cache.width,
                      cache.ring_sc.as<float>() + size_t(ch.slot) * cache.ring * cache.width,
-                     paged(cache.comp, b, ch.slot, kPageTokens / w.ratio, HD), k::PagedFp4{}, scr, rope, ch, st);
+                     paged(cache.comp, b, ch.slot, kPageTokens / w.ratio, HD), k::PagedFp4{}, scr, rope, ch, st,
+                     ring_done && ch.n == 1);
   }
 
   // Per chunk: indexer top-k, sparse attention, window ring.
@@ -942,9 +980,21 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   bf16* oa = B<bf16>(scr, kOA);
   bf16* ao = B<bf16>(scr, kAO);
   const int G = c.o_groups, R = c.o_lora, GK = H * HD / G;
-  dense_grouped_fp8w(o, w.wo_a.w.p<uint8_t>(), w.wo_a.s.p<uint8_t>(), oa, T, G, R, GK, st);
-  dump(L, b, "wo_b_in", oa, size_t(T) * G * R * 2, st);
-  k::act_quant_fp8(oa, G * R, qb, qs, T, G * R, 128, st);
+  if (dense_gemv(T, GK) && G * R <= 64 * 128) {  // the quantization by each segment's last block
+    k::gemv_grouped_fp8w(o, w.wo_a.w.p<uint8_t>(), w.wo_a.s.p<uint8_t>(), oa, T, G, R, GK, st,
+                         k::GemvQuant{qb, qs, scr.gemv_count.as<uint32_t>()});
+    dump(L, b, "wo_b_in", oa, size_t(T) * G * R * 2, st);
+  } else {
+    dense_grouped_fp8w(o, w.wo_a.w.p<uint8_t>(), w.wo_a.s.p<uint8_t>(), oa, T, G, R, GK, st);
+    dump(L, b, "wo_b_in", oa, size_t(T) * G * R * 2, st);
+    k::act_quant_fp8(oa, G * R, qb, qs, T, G * R, 128, st);
+  }
+  if (fast_elem() && dense_gemv(T, G * R)) {  // the mHC post-mix in the GEMV's stores
+    k::gemv_w8a8(qb, qs, w.wo_b.w.p<uint8_t>(), w.wo_b.s.p<uint8_t>(), ao, D, T, D, G * R, st,
+                 k::HcPostArgs{x, post, comb, c.hc_mult});
+    dump(L, b, "attn_out", ao, size_t(T) * D * 2, st);
+    return;
+  }
   dense_w8a8(qb, qs, w.wo_b.w.p<uint8_t>(), w.wo_b.s.p<uint8_t>(), ao, D, T, D, G * R, st);
   dump(L, b, "attn_out", ao, size_t(T) * D * 2, st);
   hc_post(ao, x, post, comb, x, T, c.hc_mult, D, st);
@@ -1139,10 +1189,21 @@ void moe_back(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   // Shared expert (fp8 weights, no routing weight), queued while the remote experts run: its buffers are
   // not the routed path's.
   bf16* shared = B<bf16>(scr, kShared);
-  dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);  // qb / qs: f's codes (norm_quant)
-  k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
-  k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
-  dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
+  if (gemv_parts() && dense_gemv(T, D) && dense_gemv(T, I) && I <= 32 * 128) {
+    // swiglu and the quantization by each segment's last block, the codes after f's (other blocks still read those)
+    uint8_t* q2 = qb + size_t(T) * D;
+    uint8_t* qs2 = qs + size_t(T) * (D / 128);
+    const k::GemvPart parts[2] = {{w.sw1.w.p<uint8_t>(), w.sw1.s.p<uint8_t>(), h1, I, I},
+                                  {w.sw3.w.p<uint8_t>(), w.sw3.s.p<uint8_t>(), h3, I, I}};
+    k::gemv_w8a8_glu(qb, qs, parts, T, D, c.swiglu_limit, k::GemvQuant{q2, qs2, scr.gemv_count.as<uint32_t>() + 64},
+                     st);
+    dense_w8a8(q2, qs2, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
+  } else {
+    dense_w8a8_2(qb, qs, w.sw1, h1, I, w.sw3, h3, I, T, D, st);  // qb / qs: f's codes (norm_quant)
+    k::swiglu(h1, h3, nullptr, hh, T, I, c.swiglu_limit, st);
+    k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
+    dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
+  }
   dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
   bf16* fo = B<bf16>(scr, kAO);
   if (md.combined && fast_elem()) {  // the remote rows read across the link, the mHC post-mix in the same launch

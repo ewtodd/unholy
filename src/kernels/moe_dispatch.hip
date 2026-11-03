@@ -376,11 +376,15 @@ __device__ void route_token_wave_ds(const MoeSmallArgs& a, int t, int lane) {
 #pragma unroll
       for (int i = 0; i < MAXV; ++i)
         if (lane + 32 * i < E && (key[i] > bv || bi == 0x7fffffff)) bv = key[i], bi = lane + 32 * i;
-      for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor(bv, o, 32);
-        const int oi = __shfl_xor(bi, o, 32);
+      const auto merge = [&](float ov, float oif) {
+        const int oi = __float_as_int(oif);
         if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
-      }
+      };
+      merge(xor_lane<16>(bv), xor_lane<16>(__int_as_float(bi)));
+      merge(xor_lane<8>(bv), xor_lane<8>(__int_as_float(bi)));
+      merge(xor_lane<4>(bv), xor_lane<4>(__int_as_float(bi)));
+      merge(xor_lane<2>(bv), xor_lane<2>(__int_as_float(bi)));
+      merge(xor_lane<1>(bv), xor_lane<1>(__int_as_float(bi)));
       chosen[k] = bi;
 #pragma unroll
       for (int i = 0; i < MAXV; ++i)

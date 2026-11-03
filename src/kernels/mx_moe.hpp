@@ -62,9 +62,20 @@ constexpr int kMxGemvTileRows = 8;
 // faster for several streams' verify steps and gives their rows the single-stream values.
 int mx_gemv_max_tokens();
 inline bool mx_use_gemv(int tokens) { return tokens <= mx_gemv_max_tokens(); }
+// mx_swiglu in the w1 / w3 GEMV's launch: the second of each (tile, 128-output segment)'s two blocks transforms the
+// tile's rows of it into hh (counters [ntiles][N / 128]: zero, left zero).
+struct MxGlu {
+  const float* w = nullptr;
+  const int32_t* row_expert = nullptr;
+  const uint8_t* const* s_tab = nullptr;  // w2's scales: rows whose expert is not here are skipped
+  bf16* hh = nullptr;
+  float limit = 0.0f;
+  uint32_t* counters = nullptr;
+};
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                      const int* ntiles_dev = nullptr, const uint8_t* const* w_tab2 = nullptr,
-                     const uint8_t* const* s_tab2 = nullptr, bf16* out2 = nullptr, int max_rows = kMxGemvTileRows);
+                     const uint8_t* const* s_tab2 = nullptr, bf16* out2 = nullptr, int max_rows = kMxGemvTileRows,
+                     const MxGlu& glu = {});
 
 }  // namespace unholy::kernels

@@ -223,7 +223,7 @@ __device__ __forceinline__ void hc_finish_token(const bf16* __restrict__ x, cons
   if (tid < 32) {
     constexpr int HC = 4;  // checked by the launcher
     const float rs = rsqrtf(m[MIX] / float(width) + norm_eps);
-    const int l = tid & 15, row0 = tid & ~3, col0 = (tid & 16) | (l & 3);
+    const int l = tid & 15;  // comb[l / 4][l % 4]: its row is the lanes of l's group of four, its column l % 4 + 4 j
     if (tid < HC) {
       const float mx = m[tid] * rs;
       pre[tid] = 1.0f / (1.0f + expf(-(mx * scale[0] + base[tid]))) + hc_eps;
@@ -235,25 +235,31 @@ __device__ __forceinline__ void hc_finish_token(const bf16* __restrict__ x, cons
     }
     const float mx = m[2 * HC + l] * rs;
     float c = mx * scale[2] + base[2 * HC + l];
-    const auto row = [&](float v, int k) { return __shfl(v, row0 + k, 32); };
-    const auto col = [&](float v, int j) { return __shfl(v, col0 + 4 * j, 32); };
+    // The row's and column's lanes through DPP and v_permlane16 (no LDS round trips as with __shfl).
+    const auto rows = [](float v, float r[4]) {
+      r[0] = quad_lane<0>(v), r[1] = quad_lane<1>(v), r[2] = quad_lane<2>(v), r[3] = quad_lane<3>(v);
+    };
     {  // softmax over the row
-      float mm = -INFINITY;
-      _Pragma("unroll") for (int k = 0; k < HC; ++k) mm = fmaxf(mm, row(c, k));
+      float r[4], mm = -INFINITY;
+      rows(c, r);
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) mm = fmaxf(mm, r[k]);
       const float e = expf(c - mm);
       float sum = 0.0f;
-      _Pragma("unroll") for (int k = 0; k < HC; ++k) sum += row(e, k);
+      rows(e, r);
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) sum += r[k];
       c = e / sum + hc_eps;
     }
     const auto col_norm = [&]() {
+      const float cv[4] = {quad_col<0>(c), quad_col<1>(c), quad_col<2>(c), quad_col<3>(c)};
       float cs = 0.0f;
-      _Pragma("unroll") for (int j = 0; j < HC; ++j) cs += col(c, j);
+      _Pragma("unroll") for (int j = 0; j < HC; ++j) cs += cv[j];
       c = c / (cs + hc_eps);
     };
     col_norm();
     for (int it = 0; it < iters - 1; ++it) {
-      float rsum = 0.0f;
-      _Pragma("unroll") for (int k = 0; k < HC; ++k) rsum += row(c, k);
+      float r[4], rsum = 0.0f;
+      rows(c, r);
+      _Pragma("unroll") for (int k = 0; k < HC; ++k) rsum += r[k];
       c = c / (rsum + hc_eps);
       col_norm();
     }

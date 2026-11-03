@@ -137,6 +137,19 @@ __device__ __forceinline__ float xor_lane(float x) {
     return __int_as_float(__builtin_amdgcn_update_dpp(i, i, 0x160 | O, 0xf, 0xf, false));  // row_xmask:O
 }
 
+// Lane I of each group of four lanes (DPP quad_perm broadcast).
+template <int I>
+__device__ __forceinline__ float quad_lane(float x) {
+  return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), I * 0x55, 0xf, 0xf, false));
+}
+
+// Lane (l % 4) + 4 J of each row of 16 lanes (v_permlane16: the columns of a 4 x 4 matrix held one entry per lane).
+template <int J>
+__device__ __forceinline__ float quad_col(float x) {
+  constexpr unsigned s = (4u * J) | (4u * J + 1) << 4 | (4u * J + 2) << 8 | (4u * J + 3) << 12, sel = s | s << 16;
+  return __uint_as_float(__builtin_amdgcn_permlane16(__float_as_uint(x), __float_as_uint(x), sel, sel, false, false));
+}
+
 // Wave32 reductions (RDNA HIP default wave size): butterflies over lane ^ 16, 8, 4, 2, 1.
 __device__ __forceinline__ float warp_sum(float v) {
   v += xor_lane<16>(v);
@@ -168,6 +181,12 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 
 // The mHC post-mix of column d of token t (hc_post_kernel, ref_elem.hip): stream j = bf16(post[j] * x + sum over i of
 // comb[i][j] * res[i]), with x = xv and res the token's hc stream rows [hc][dim] (out may be res: each column alone).
+// Stream j's value: post[j] * x + sum over i of comb[i][j] * res[i] (c[i] = comb[i][j]).
+__device__ __forceinline__ float hc_post_value(float xv, const float* r, const float* c, float pj, int hc) {
+  float s = 0.0f;
+  for (int i = 0; i < hc; ++i) s += c[i] * r[i];
+  return pj * xv + s;
+}
 __device__ __forceinline__ void hc_post_column(float xv, const bf16* res, const float* post, const float* comb,
                                                bf16* out, int hc, int dim, int t, int d) {
   const float* pt = post + size_t(t) * hc;
@@ -175,9 +194,9 @@ __device__ __forceinline__ void hc_post_column(float xv, const bf16* res, const 
   float r[4];
   for (int i = 0; i < hc; ++i) r[i] = bf16_to_f32(res[(size_t(t) * hc + i) * dim + d]);
   for (int j = 0; j < hc; ++j) {
-    float s = 0.0f;
-    for (int i = 0; i < hc; ++i) s += ct[i * hc + j] * r[i];
-    out[(size_t(t) * hc + j) * dim + d] = f32_to_bf16(pt[j] * xv + s);
+    float c[4];
+    for (int i = 0; i < hc; ++i) c[i] = ct[i * hc + j];
+    out[(size_t(t) * hc + j) * dim + d] = f32_to_bf16(hc_post_value(xv, r, c, pt[j], hc));
   }
 }
 
