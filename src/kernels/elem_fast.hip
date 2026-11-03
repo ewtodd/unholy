@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include "kernels/dev.hip.hpp"
+#include "kernels/elem_dev.hip.hpp"
 #include "rt/hip.hpp"
 
 namespace unholy::kernels {
@@ -83,79 +84,20 @@ __global__ __launch_bounds__(NT) void rmsnorm_quant_slices_kernel(const bf16* __
   }
 }
 
-// The kv row chain (kv_norm in place, rope on the last 2 * npair dims, fp8 fake quant of the others in
-// 64-blocks): rmsnorm_kernel, rope_kernel and act_quant_fp8_kernel (fake, block 64) of one row in one
-// block of 256 threads, each with its own thread partition and arithmetic.
+// kv_chain_row (elem_dev.hip.hpp): a block per row.
 __global__ __launch_bounds__(NT) void kv_chain_kernel(bf16* __restrict__ x, const bf16* __restrict__ w, int dim,
                                                       float eps, const int32_t* __restrict__ pos,
                                                       const float2* __restrict__ freqs, int npair) {
   __shared__ float red[32];
-  const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-  bf16* xr = x + size_t(row) * dim;
-  float ss = 0.0f;
-  for (int i = tid; i < dim; i += NT) {
-    const float v = bf16_to_f32(xr[i]);
-    ss += v * v;
-  }
-  ss = block_sum(ss, red);
-  const float r = rsqrtf(ss / float(dim) + eps);
-  for (int i = tid; i < dim; i += NT) {
-    const float t = bf16_to_f32(xr[i]) * r;
-    xr[i] = f32_to_bf16(bf16_to_f32(w[i]) * t);
-  }
-  __syncthreads();
-  const int off = dim - 2 * npair;
-  if (tid < npair) {  // rope_kernel, one head
-    const int p = pos[row];
-    bf16* e = xr + off + 2 * tid;
-    const float a = bf16_to_f32(e[0]), b = bf16_to_f32(e[1]);
-    const float2 f = freqs[size_t(p) * npair + tid];
-    const float c = f.x, s = f.y;
-    e[0] = f32_to_bf16(a * c - b * s);
-    e[1] = f32_to_bf16(a * s + b * c);
-  }
-  if (wave < off / 64) {  // act_quant_fp8_kernel, fake, block 64: wave = block, lane = 2 values
-    bf16* xb = xr + wave * 64;
-    float v[2];
-    float amax = 0.0f;
-    for (int i = 0; i < 2; ++i) {
-      v[i] = bf16_to_f32(xb[lane * 2 + i]);
-      amax = fmaxf(amax, fabsf(v[i]));
-    }
-    amax = fmaxf(warp_max(amax), 1e-4f);
-    const float sc = e8m0_to_f32(pow2_ceil_e8m0(amax * (1.0f / 448.0f)));
-    for (int i = 0; i < 2; ++i)
-      xb[lane * 2 + i] = f32_to_bf16(e4m3_to_f32(f32_to_e4m3(fminf(fmaxf(v[i] / sc, -448.0f), 448.0f))) * sc);
-  }
+  kv_chain_row(x + size_t(blockIdx.x) * dim, w, dim, eps, pos[blockIdx.x], freqs, npair, red);
 }
 
-// head_rms_bf16_kernel then rope_kernel of one (row, head): block of 128 threads.
+// head_rms_rope_head (elem_dev.hip.hpp) of one (row, head): block of 128 threads.
 __global__ __launch_bounds__(128) void head_rms_rope_kernel(bf16* __restrict__ x, int heads, int dim, float eps,
                                                             const int32_t* __restrict__ pos,
                                                             const float2* __restrict__ freqs, int npair) {
-  __shared__ float red[32];
-  const int row = blockIdx.x / heads, h = blockIdx.x % heads;
-  bf16* xr = x + size_t(blockIdx.x) * dim;
-  float ss = 0.0f;
-  for (int i = threadIdx.x; i < dim; i += 128) {
-    const float v = bf16_to_f32(xr[i]);
-    ss += round_bf16(v * v);
-  }
-  ss = block_sum(ss, red);
-  const float mean = round_bf16(ss / float(dim));
-  const float r = round_bf16(rsqrtf(round_bf16(mean + eps)));
-  for (int i = threadIdx.x; i < dim; i += 128) xr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * r);
-  __syncthreads();
-  (void)h;
-  if (int(threadIdx.x) < npair) {
-    const int p = pos[row], j = threadIdx.x;
-    bf16* e = xr + dim - 2 * npair + 2 * j;
-    const float a = bf16_to_f32(e[0]), b = bf16_to_f32(e[1]);
-    const float2 f = freqs[size_t(p) * npair + j];
-    const float c = f.x, s = f.y;
-    e[0] = f32_to_bf16(a * c - b * s);
-    e[1] = f32_to_bf16(a * s + b * c);
-  }
+  __shared__ float red[8];
+  head_rms_rope_head(x + size_t(blockIdx.x) * dim, dim, eps, pos[blockIdx.x / heads], freqs, npair, red);
 }
 
 }  // namespace

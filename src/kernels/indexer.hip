@@ -1,4 +1,5 @@
 #include "kernels/dev.hip.hpp"
+#include "kernels/elem_dev.hip.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <string>
@@ -91,14 +92,11 @@ __global__ void quant_q_fp4_kernel(const bf16* q, int rows, uint8_t* q8, uint8_t
 // The indexer's query chain in one launch: rope_kernel on each 128-dim head's last 2 * npair dims,
 // hadamard128_kernel, quant_q_fp4_kernel. Blocks of 4 waves, a wave per (row, head) segment, the
 // Hadamard's LDS butterflies and barriers as hadamard128_kernel, every value through the same operations.
-__global__ __launch_bounds__(128) void index_q_chain_kernel(bf16* q, size_t nseg, int heads, const int32_t* pos,
-                                                            const float2* freqs, int npair, uint8_t* q8, uint8_t* qe) {
-  __shared__ float buf[4][128];
-  const int local = threadIdx.x / 32, lane = threadIdx.x & 31;
-  const size_t seg = size_t(blockIdx.x) * 4 + local;
-  const bool valid = seg < nseg;
+// One wave's segment (b: its 128 floats of LDS); every wave of the block takes the barriers.
+__device__ __forceinline__ void index_q_segment(bf16* q, size_t seg, bool valid, int heads, const int32_t* pos,
+                                                const float2* freqs, int npair, uint8_t* q8, uint8_t* qe, float* b) {
+  const int lane = threadIdx.x & 31;
   bf16* p = q + seg * 128;
-  float* b = buf[local];
   if (valid) {
     for (int i = lane; i < 128; i += 32) b[i] = bf16_to_f32(p[i]);
     if (lane < npair) {  // rope_kernel: its bf16 outputs are what the Hadamard reads
@@ -152,6 +150,32 @@ __global__ __launch_bounds__(128) void index_q_chain_kernel(bf16* q, size_t nseg
     packed |= uint32_t(f32_to_e4m3(round_e2m1(fminf(fmaxf(v[i] / sc, -6.0f), 6.0f)) * rel)) << (8 * i);
   reinterpret_cast<uint32_t*>(q8 + seg * 128)[lane] = packed;
   if (lane == 0) qe[seg] = uint8_t(emax);
+}
+__global__ __launch_bounds__(128) void index_q_chain_kernel(bf16* q, size_t nseg, int heads, const int32_t* pos,
+                                                            const float2* freqs, int npair, uint8_t* q8, uint8_t* qe) {
+  __shared__ float buf[4][128];
+  const int local = threadIdx.x / 32;
+  const size_t seg = size_t(blockIdx.x) * 4 + local;
+  index_q_segment(q, seg, seg < nseg, heads, pos, freqs, npair, q8, qe, buf[local]);
+}
+
+// attn_row_chains: blocks [0, T * heads / 2) head_rms_rope (two heads per block, 128 threads each), then T blocks of
+// kv_chain, then index_q_chain's segments, 8 per block.
+__global__ __launch_bounds__(256) void attn_row_chains_kernel(AttnRowChains a) {
+  __shared__ float red[32];
+  __shared__ float buf[8][128];
+  const int nq = a.T * a.heads / 2, blk = blockIdx.x;
+  if (blk < nq) {
+    const int head = 2 * blk + int(threadIdx.x >> 7);
+    head_rms_rope_head(a.q + size_t(head) * a.dim, a.dim, a.eps, a.pos[head / a.heads], a.freqs, a.npair, red);
+  } else if (blk < nq + a.T) {
+    const int r = blk - nq;
+    kv_chain_row(a.kv + size_t(r) * a.kv_dim, a.kv_w, a.kv_dim, a.eps, a.pos[r], a.freqs, a.npair, red);
+  } else {
+    const size_t seg = size_t(blk - nq - a.T) * 8 + (threadIdx.x >> 5);
+    index_q_segment(a.qi, seg, seg < size_t(a.T) * a.iheads, a.iheads, a.pos, a.freqs, a.npair, a.q8, a.qe,
+                    buf[threadIdx.x >> 5]);
+  }
 }
 
 constexpr int QG = 4, KT = 128, IH = 64, ID = 128, NT = 256, PAD = 16;
@@ -385,49 +409,65 @@ __global__ __launch_bounds__(NT) void indexer_fp4_q_kernel(const uint8_t* __rest
 __device__ __forceinline__ uint32_t key16(uint16_t b) { return (b & 0x8000u) ? (~uint32_t(b) & 0xffffu) : (b | 0x8000u); }
 
 // One block per row: radix select on the 16-bit key (two 8-bit passes), then collect keys above the
-// threshold plus threshold ties by lowest index, and sort (key desc, index asc).
+// threshold plus threshold ties by lowest index, and sort (key desc, index asc). Rows of up to kTopkLdsKeys keys
+// are staged in LDS once (instead of five passes over L2); each pass's bin comes from a suffix scan of its histogram
+// (the highest bin >= 1 whose suffix reaches `need`, else 0, as a walk from the top finds it); rows of up to 65536
+// keys are ordered by rank on (key, 65535 - index) packed in 32 bits (the bitonic sort's order, without its 45
+// barrier-separated stages).
+constexpr int kTopkLdsKeys = 8192;
 __device__ __forceinline__ void topk_row(const uint16_t* __restrict__ row, int n, int k, int32_t* __restrict__ out) {
-  __shared__ uint32_t hist[256];
+  __shared__ uint32_t hist[257];
   __shared__ uint32_t prefix_sel, need_sel, nvalid, count_above;
-  __shared__ uint32_t sel_keys[1024];
+  __shared__ alignas(16) uint32_t sel_keys[1024];
   __shared__ int32_t sel_idx[1024];
+  __shared__ uint16_t skey[kTopkLdsKeys];
+  const int tid = threadIdx.x;
+  const bool lds = n <= kTopkLdsKeys;
   const uint32_t neg_inf_key = key16(kBf16NegInf);
-  if (threadIdx.x == 0) nvalid = count_above = 0;
+  if (tid == 0) nvalid = count_above = 0;
   __syncthreads();
   uint32_t local = 0;
-  for (int i = threadIdx.x; i < n; i += blockDim.x) local += key16(row[i]) > neg_inf_key;
+  for (int i = tid; i < n; i += blockDim.x) {
+    const uint32_t key = key16(row[i]);
+    if (lds) skey[i] = uint16_t(key);
+    local += key > neg_inf_key;
+  }
   atomicAdd(&nvalid, local);
   __syncthreads();
+  const auto key_at = [&](int i) -> uint32_t { return lds ? skey[i] : key16(row[i]); };
   const uint32_t want = min(uint32_t(k), nvalid);
   uint32_t prefix = 0, need = want;
   if (want > 0) {
     for (int pass = 1; pass >= 0; --pass) {
-      for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+      for (int b = tid; b < 257; b += blockDim.x) hist[b] = 0;
       __syncthreads();
-      for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const uint32_t key = key16(row[i]);
+      for (int i = tid; i < n; i += blockDim.x) {
+        const uint32_t key = key_at(i);
         if (key <= neg_inf_key) continue;
         if (pass == 0 && (key >> 8) != (prefix >> 8)) continue;
         atomicAdd(&hist[(key >> (pass * 8)) & 0xff], 1u);
       }
       __syncthreads();
-      if (threadIdx.x == 0) {
-        uint32_t cum = 0;
-        int b = 255;
-        for (; b > 0; --b) {
-          if (cum + hist[b] >= need) break;
-          cum += hist[b];
-        }
-        prefix_sel = prefix | (uint32_t(b) << (pass * 8));
-        need_sel = need - cum;
+      for (int d = 1; d < 256; d <<= 1) {  // inclusive suffix sums (blockDim.x == 256)
+        const uint32_t add = tid + d < 256 ? hist[tid + d] : 0;
+        __syncthreads();
+        hist[tid] += add;
+        __syncthreads();
+      }
+      if (tid == 0) prefix_sel = prefix, need_sel = need - hist[1];  // bin 0: the walk's end
+      __syncthreads();
+      if (tid >= 1 && hist[tid] >= need && hist[tid + 1] < need) {
+        prefix_sel = prefix | (uint32_t(tid) << (pass * 8));
+        need_sel = need - hist[tid + 1];
       }
       __syncthreads();
       prefix = prefix_sel;
       need = need_sel;
+      __syncthreads();
     }
   }
-  for (int i = threadIdx.x; i < n && want > 0; i += blockDim.x) {
-    const uint32_t key = key16(row[i]);
+  for (int i = tid; i < n && want > 0; i += blockDim.x) {
+    const uint32_t key = key_at(i);
     if (key > prefix && key > neg_inf_key) {
       const uint32_t slot = atomicAdd(&count_above, 1u);
       sel_keys[slot] = key;
@@ -435,14 +475,14 @@ __device__ __forceinline__ void topk_row(const uint16_t* __restrict__ row, int n
     }
   }
   __syncthreads();
-  if (threadIdx.x < 32 && want > 0) {  // ties at the threshold, lowest index first
+  if (tid < 32 && want > 0) {  // ties at the threshold, lowest index first
     const uint32_t base = count_above;
     uint32_t taken = 0;
     for (int i0 = 0; i0 < n && taken < need; i0 += 32) {
-      const int i = i0 + threadIdx.x;
-      const bool tie = i < n && key16(row[i]) == prefix;
+      const int i = i0 + tid;
+      const bool tie = i < n && key_at(i) == prefix;
       const uint64_t ballot = __ballot(tie);
-      const uint32_t before = __popcll(ballot & ((1ull << threadIdx.x) - 1));
+      const uint32_t before = __popcll(ballot & ((1ull << tid) - 1));
       if (tie && taken + before < need) {
         sel_keys[base + taken + before] = prefix;
         sel_idx[base + taken + before] = i;
@@ -451,9 +491,26 @@ __device__ __forceinline__ void topk_row(const uint16_t* __restrict__ row, int n
     }
   }
   __syncthreads();
+  if (n <= 65536) {  // rank of each candidate among (key desc, index asc): the number of candidates before it
+    for (int i = tid; i < int(want); i += blockDim.x) sel_keys[i] = sel_keys[i] << 16 | uint32_t(65535 - sel_idx[i]);
+    __syncthreads();
+    for (int i = tid; i < int(want); i += blockDim.x) {
+      const uint32_t mine = sel_keys[i];
+      int r = 0;
+      int j = 0;
+      for (; j + 4 <= int(want); j += 4) {
+        const uint4 c = *reinterpret_cast<const uint4*>(&sel_keys[j]);
+        r += (c.x > mine) + (c.y > mine) + (c.z > mine) + (c.w > mine);
+      }
+      for (; j < int(want); ++j) r += sel_keys[j] > mine;
+      out[r] = sel_idx[i];
+    }
+    for (int i = int(want) + tid; i < k; i += blockDim.x) out[i] = -1;
+    return;
+  }
   int size = 1;
   while (size < k) size <<= 1;
-  for (int i = threadIdx.x; i < size; i += blockDim.x)
+  for (int i = tid; i < size; i += blockDim.x)
     if (uint32_t(i) >= want) {
       sel_keys[i] = 0;
       sel_idx[i] = 0x7fffffff;
@@ -461,7 +518,7 @@ __device__ __forceinline__ void topk_row(const uint16_t* __restrict__ row, int n
   __syncthreads();
   for (int len = 2; len <= size; len <<= 1)
     for (int stride = len >> 1; stride > 0; stride >>= 1) {
-      for (int i = threadIdx.x; i < size; i += blockDim.x) {
+      for (int i = tid; i < size; i += blockDim.x) {
         const int j = i ^ stride;
         if (j > i) {
           const bool desc = (i & len) == 0;
@@ -478,7 +535,7 @@ __device__ __forceinline__ void topk_row(const uint16_t* __restrict__ row, int n
       }
       __syncthreads();
     }
-  for (int i = threadIdx.x; i < k; i += blockDim.x) out[i] = uint32_t(i) < want ? sel_idx[i] : -1;
+  for (int i = tid; i < k; i += blockDim.x) out[i] = uint32_t(i) < want ? sel_idx[i] : -1;
 }
 
 __global__ __launch_bounds__(256) void topk_bf16_kernel(const uint16_t* scores, int n, int k, int32_t* idx) {
@@ -758,6 +815,15 @@ void quant_q_fp4(const bf16* q, int T, int H, uint8_t* q8, uint8_t* qe, hipStrea
   const int rows = T * H;
   if (rows <= 0) return;
   quant_q_fp4_kernel<<<cdiv(size_t(rows) * 32, 256), 256, 0, st>>>(q, rows, q8, qe);
+  UH_CHECK_LAUNCH();
+}
+
+void attn_row_chains(const AttnRowChains& a, hipStream_t st) {
+  if (a.T <= 0) return;
+  if (a.heads % 2 || a.npair > 32 || a.kv_dim > 512 || (a.kv_dim - 2 * a.npair) % 64 || (a.kv_dim - 2 * a.npair) / 64 > 8)
+    throw std::runtime_error("attn_row_chains: shape");
+  const int blocks = a.T * a.heads / 2 + a.T + (a.qi ? int(cdiv(size_t(a.T) * a.iheads, 8)) : 0);
+  attn_row_chains_kernel<<<blocks, 256, 0, st>>>(a);
   UH_CHECK_LAUNCH();
 }
 

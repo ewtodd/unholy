@@ -72,10 +72,19 @@ struct MxGlu {
   float limit = 0.0f;
   uint32_t* counters = nullptr;
 };
+// remote_combine in the w2 GEMV's launch: each 128-output segment's last tile (of *ntiles_dev) sums every remote
+// token's pair rows over it into dst (counters [N / 128]: zero, left zero).
+struct MxSums {
+  const int32_t* u2p = nullptr;
+  const MoePlan* plan = nullptr;  // n_remote_tokens
+  int K = 0;
+  bf16* dst = nullptr;
+  uint32_t* counters = nullptr;
+};
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                      const int* ntiles_dev = nullptr, const uint8_t* const* w_tab2 = nullptr,
                      const uint8_t* const* s_tab2 = nullptr, bf16* out2 = nullptr, int max_rows = kMxGemvTileRows,
-                     const MxGlu& glu = {});
+                     const MxGlu& glu = {}, const MxSums& sums = {});
 
 }  // namespace unholy::kernels

@@ -42,6 +42,25 @@ void quant_q_fp4(const bf16* q, int T, int H, uint8_t* q8, uint8_t* qe, hipStrea
 // order, rounded to bf16; -inf for keys a query cannot see (j >= (pos + 1) / ratio). H must be 64.
 // The query chain of the fast indexer in one launch: rope (forward, the last 2 * npair dims of each
 // 128-dim head of q [T, H, 128]), hadamard128, then quant_q_fp4 into q8 / qe; q keeps the rotated bf16 values.
+// head_rms_rope on q [T][heads][dim], kv_chain on kv [T][kv_dim] (weights kv_w) and, with qi, index_q_chain on qi
+// [T][iheads][128] in one launch: each part's blocks, thread partitions and arithmetic as its own kernel's.
+struct AttnRowChains {
+  bf16* q = nullptr;
+  int heads = 0, dim = 0;
+  bf16* kv = nullptr;
+  const bf16* kv_w = nullptr;
+  int kv_dim = 0;
+  float eps = 0.0f;
+  int T = 0;
+  const int32_t* pos = nullptr;
+  const float2* freqs = nullptr;
+  int npair = 0;
+  bf16* qi = nullptr;
+  int iheads = 0;
+  uint8_t* q8 = nullptr;
+  uint8_t* qe = nullptr;
+};
+void attn_row_chains(const AttnRowChains& a, hipStream_t st);
 void index_q_chain(bf16* q, int T, int H, const int32_t* pos, const float2* freqs, int npair, uint8_t* q8, uint8_t* qe,
                    hipStream_t st);
 // From kIndexerQMinRows queries (prefill) each query's codes stay in a wave's registers across 1024 keys

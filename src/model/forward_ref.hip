@@ -316,7 +316,9 @@ Exl3MoeScratch make_exl3_moe_scratch(const Dsv4Config& c, int dev, int rows, boo
   s.tiles = rt::DeviceBuffer(dev, size_t(s.max_tiles) * sizeof(kernels::Exl3Tile));
   s.row_expert = rt::DeviceBuffer(dev, R * 4);
   if (exl3) s.yp = rt::DeviceBuffer(dev, R * size_t(std::max(c.dim, c.moe_inter)) * 4);  // the EXL3 GEMV's partials
-  s.counters = rt::DeviceBuffer(dev, size_t(std::max(s.max_tiles, 1)) * std::max(c.moe_inter / 128, 1) * 4);
+  // [max_tiles][moe_inter / 128] for the GLU, then [dim / 128] for the token sums
+  s.counters =
+      rt::DeviceBuffer(dev, (size_t(std::max(s.max_tiles, 1)) * std::max(c.moe_inter / 128, 1) + c.dim / 128) * 4);
   UH_CHECK(hipMemset(s.counters.data(), 0, s.counters.size()));
   return s;
 }
@@ -400,10 +402,22 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
     else k::mx_grouped_gemm(a...);
   };
   const int rows = std::min(P / c.n_active, k::kExl3TileRows);  // an expert has at most one row per token
-  lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
-  k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
+  if (gemv && I % 128 == 0) {  // the SwiGLU transform in the w1 / w3 launch
+    k::mx_grouped_gemv(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u,
+                       rows, k::MxGlu{rw, row_expert, tab(2, 1), hh, c.swiglu_limit, sc.counters.as<uint32_t>()});
+  } else {
+    lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
+    k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
+  }
   if (!u2p) {
     lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), out, D, D, st, ntiles_dev, nullptr, nullptr, nullptr, rows);
+    return;
+  }
+  if (gemv && D % 128 == 0) {  // the token sums by each segment's last tile
+    k::mx_grouped_gemv(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), xa, D, D, st, ntiles_dev, nullptr, nullptr, nullptr,
+                       rows, {},
+                       k::MxSums{u2p, plan, c.n_active, out,
+                                 sc.counters.as<uint32_t>() + size_t(std::max(sc.max_tiles, 1)) * std::max(I / 128, 1)});
     return;
   }
   lin(hh, I, tiles, max_tiles, tab(2, 0), tab(2, 1), xa, D, D, st, ntiles_dev, nullptr, nullptr, nullptr, rows);  // xa is free after the up GEMMs
@@ -774,9 +788,12 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   if (w.has_indexer) dense_w8a8_2(qb, qs, w.wq_b, q, H * HD, w.idx_wq_b, qi, IH * ID, T, c.q_lora, st);
   else dense_w8a8(qb, qs, w.wq_b.w.p<uint8_t>(), w.wq_b.s.p<uint8_t>(), q, H * HD, T, H * HD, c.q_lora, st);
   dump(L, b, "wq_b_out", q, size_t(T) * H * HD * 2, st);
-  if (fast_elem()) {  // the same three-kernel chains, fused per (row, head) / row
-    k::head_rms_rope(q, T, H, HD, c.norm_eps, pos, freqs, rd / 2, st);
-    k::kv_chain(kv, w.kv_norm.p<bf16>(), T, HD, c.norm_eps, pos, freqs, rd / 2, st);
+  // The indexer's query chain (rope, Hadamard, fp4 codes) in the same launch as q's and kv's when it applies.
+  const bool iq_chain = w.has_indexer && fast_indexer() && fast_elem() && ID == 128;
+  if (fast_elem()) {  // the same three-kernel chains, fused per (row, head) / row, in one launch
+    k::attn_row_chains(k::AttnRowChains{q, H, HD, kv, w.kv_norm.p<bf16>(), HD, c.norm_eps, T, pos, freqs, rd / 2,
+                                        iq_chain ? qi : nullptr, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS)},
+                       st);
   } else {
     k::head_rms_bf16(q, T, H, HD, c.norm_eps, st);
     k::rope(q, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, false, st);
@@ -788,9 +805,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   // Indexer inputs (token-parallel; qi from the wq_b launch above); per-chunk scores/top-k below.
   if (w.ratio && !fast_dense()) k::cast_bf16_f32(a, B<float>(scr, kAF), size_t(T) * D, st);  // reference GEMMs' input
   if (w.has_indexer) {
-    if (fast_indexer() && fast_elem() && ID == 128) {  // rope, Hadamard and the fp4 codes in one launch
-      k::index_q_chain(qi, T, IH, pos, freqs, rd / 2, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);
-    } else {
+    if (!iq_chain) {
       k::rope(qi, IH * ID, T, IH, ID, ID - rd, rd / 2, pos, freqs, false, st);
       k::hadamard128(qi, size_t(T) * IH * ID / 128, st);
       if (fast_indexer()) k::quant_q_fp4(qi, T, IH, B<uint8_t>(scr, kQC), B<uint8_t>(scr, kQCS), st);

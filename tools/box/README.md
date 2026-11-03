@@ -34,6 +34,7 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `glm-oracle.sh [DIR] [flags]` | the same for GLM-5.3-Flash: transformers' glm5_next on the FP8 release, layer-streamed; also writes the routing counts; `--dump-topk` saves the DSA selections, `--prefill-chunk N` splits long prompts |
 | `validate.sh [--baseline]` | resident-model logits vs the baseline (bit-identical expected) and vs the oracle; keep `MARGIN` fixed so the expert placement matches |
 | `curve.sh LABEL` | `unholy-curve` to 512k: prefill by depth, decode probes |
+| `ab.sh BUILD_A BUILD_B [ROUNDS]` | decode timing of two builds' `unholy-curve`, alternating (a second tree: `/work/unholy-base`, synced without its `.git`) |
 | `bench.sh LABEL [flags]` | `unholy-bench` |
 | `serve.sh [flags]` | the perf tree's server with the production flags on port 8300, foreground |
 | `sweep.sh LABEL [flags]` | that server + check-source `gsm8k-chat` at 1 / 2 / 4 / 8 requests (check-source pinned in `env.sh`) |

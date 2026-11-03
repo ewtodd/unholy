@@ -550,7 +550,7 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
                                                         const uint8_t* const* w_tab, const uint8_t* const* s_tab,
                                                         bf16* out, int ldo, int N, const int* ntiles_dev,
                                                         const uint8_t* const* w_tab2, const uint8_t* const* s_tab2,
-                                                        bf16* out2, MxGlu glu) {
+                                                        bf16* out2, MxGlu glu, MxSums sums) {
   bf16* const g_out = out;
   if (blockIdx.z) {  // the second projection on the same inputs (w1 and w3 in one launch)
     w_tab = w_tab2;
@@ -615,6 +615,42 @@ __global__ __launch_bounds__(MV_NT) void mx_gemv_kernel(const bf16* __restrict__
       const float v = acc[m] + xor_lane<1>(acc[m]);
       if ((lane & 1) == 0) out[size_t(tile.row0 + m) * ldo + nt * 16 + (lane >> 1)] = f32_to_bf16(v);
     }
+  if (sums.dst) {  // the segment's last tile: remote_combine_kernel's sums over its 128 columns
+    __shared__ bool last;
+    uint32_t* cnt = sums.counters + blockIdx.x;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) last = atomicAdd(cnt, 1u) == uint32_t(ntiles_dev ? *ntiles_dev : int(gridDim.y)) - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (tid == 0) *cnt = 0;
+    const int U = sums.plan->n_remote_tokens;
+    for (int i = tid; i < U * 16; i += MV_NT) {  // (token, 8 columns)
+      const int u = i / 16, d = blockIdx.x * 128 + (i % 16) * 8;
+      float acc[8] = {};
+      for (int j = 0; j < sums.K; ++j) {
+        const int p = sums.u2p[size_t(u) * sums.K + j];
+        if (p < 0) continue;
+        uint32_t w[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          w[q] = __hip_atomic_load(reinterpret_cast<const uint32_t*>(out + size_t(p) * ldo + d) + q, __ATOMIC_RELAXED,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          acc[2 * q] += bf16_to_f32(uint16_t(w[q]));
+          acc[2 * q + 1] += bf16_to_f32(uint16_t(w[q] >> 16));
+        }
+      }
+      uint32_t o[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) o[q] = uint32_t(f32_to_bf16(acc[2 * q])) | (uint32_t(f32_to_bf16(acc[2 * q + 1])) << 16);
+      *reinterpret_cast<uint4*>(sums.dst + size_t(u) * N + d) = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+    __threadfence_system();
+    return;
+  }
   if (!glu.hh) return;
   // The segment's second block: mx_transform_wave_kernel<2>'s arithmetic on the tile's rows (a wave per row).
   __shared__ bool second;
@@ -778,13 +814,15 @@ void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, c
 
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev,
-                     const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2, int, const MxGlu& glu) {
+                     const uint8_t* const* w_tab2, const uint8_t* const* s_tab2, bf16* out2, int, const MxGlu& glu,
+                     const MxSums& sums) {
   if (ntiles <= 0) return;
   if (K % MV_KC || N % 16) throw std::runtime_error("mx_grouped_gemv: K % 512 or N % 16");
   if (glu.hh && (!out2 || N % 128 || ldo != N)) throw std::runtime_error("mx_grouped_gemv: glu shape");
+  if (sums.dst && (out2 || glu.hh || N % 128)) throw std::runtime_error("mx_grouped_gemv: sums shape");
   mx_gemv_kernel<<<dim3((N / 16 + 7) / 8, ntiles, out2 ? 2 : 1), MV_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo,
                                                                                   N, ntiles_dev, w_tab2, s_tab2, out2,
-                                                                                  glu);
+                                                                                  glu, sums);
   UH_CHECK_LAUNCH();
 }
 
