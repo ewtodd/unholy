@@ -1488,3 +1488,41 @@ position on Qwen3.8-27B. Even at 0.85 the best width (3) would give ~1.36x, abou
 or a port bug (no run of a reference implementation on the same inputs yet).
 - Decision (owner): stop after F1; MTP stays GLM's drafter. DFlash2 fits dense targets (radiance's Qwen3.8-27B),
   where a wide verify costs about one step.
+
+## 2026-11-03 — DSV4 decode: card-side fusions, split attention, multi-row GEMVs (32.3 -> 27.2 ms/token, bit-identical)
+
+Single-stream decode (unholy-curve, production placement) at 4k: one-token steps 32.3 -> 27.2 ms, six-token steps
+(DSpark's verify at --spec-drafts 5, the served shape) 58.7 -> 52.5 ms; 32k one-token 33.8 -> 29.7 (c0cb2a2). Commits
+9cd6a48 .. (this entry). Every step bit-identical: validate against the saved baseline, curve decode logits of one-,
+two- and six-token steps against 863eff2, eb c8 48/48 with the reference's draft acceptance (9347 / 12152); GLM's
+decode logits (8k, 32 steps) against 863eff2 for the shared kernels.
+
+- A fresh trace (the 10-27 one predated most of that day's work) showed decode card-bound, not APU-bound: in the
+  median layer the APU's chain (145 us under the profiler) ends ~45 us before the card's work in the MoE window, and
+  the cards' ~1.3 ms of "waiting" at the join is the stream wait's own latency and the tails of a few layers. So
+  APU-side work does not pay here: a spin kernel instead of the APU stream's wait packet (~11 us from the card's flag
+  to the APU's first kernel) changed nothing (30.2 vs 30.1 ms), and was dropped.
+- Decode attention ran on 1 workgroup (window and HCA layers, 25-28 us) or 4-5 (CSA, 15 + 53 us). The split path
+  now runs every decode-sized call with phase 2 on 16 workgroups per query (16 heads x a quarter of the dims): row
+  pointers from phase 1, loads three key blocks ahead with exact wait counts (branch-free; a zero row for masked
+  entries; barriers that wait for LDS only, since __syncthreads waits for every outstanding global load), and the
+  softmax of block b + 1 on two waves while two others run P V of block b. CSA 4k 81 -> 26 us, window 25 -> 14,
+  HCA 512k 436 -> 105 (unholy-attn-test). The output rope and one-row window updates moved into it.
+- Launches per step ~1770 -> ~1100 by folding small kernels into their producers: the router's routing, the fp8
+  token inputs and the APU's request flag into the dispatch; the combine reads the APU's rows across the link and
+  does the mHC post-mix; wo_b's post-mix, the compressors' ape and ring updates and the indexer weights' scale in the
+  GEMVs' stores; act_quant, the shared expert's and the card experts' SwiGLU by each segment's last block
+  (counters); q's, kv's and the indexer query's row chains in one launch.
+- Epilogue operands must load before the K loop: two dependent loads in the stores added their latency to every
+  wave of a multi-round grid (wo_b 42 -> 46 us); taking the address of a by-value kernel argument put it in
+  scratch (36 -> 52 us). With both fixed the same fusions gave -0.8 ms instead of +0.3.
+- hc_finish's Sinkhorn on DPP / v_permlane16 instead of __shfl (GLM's mHC shares it: the same values), and the
+  indexer's top-k with its row in LDS, the radix bins from suffix scans and a rank sort (decode 33 -> ~12 us).
+- Dense GEMVs at 2-8 rows (verify steps): every wave (one column) re-read all rows' activations from L2, ~6x the
+  weights' bytes at 6 rows; wo_b took 61 / 85 / 114 us at 1 / 4 / 8 rows. Each 512-input step's rows now go through
+  LDS once per block, prefetched a step ahead (one LDS-only barrier per step): wo_b 70 / 77 us at 4 / 8, wq_a 35 ->
+  16 us at 8, the compressors 35 -> 20, the router 19 -> 12. Not for the LM head (its re-reads hit L1; 5% slower
+  staged) nor wo_a's grouped GEMV (slower at 8 rows). The skinny WMMA kernels are faster still at 4-16 rows (wo_b 61
+  us at 8) but give verify rows other values than a one-token step's (the GEMV's rows do not depend on the row
+  count), which would let speculative and plain decoding diverge: the owner's call, not taken.
+- Single runs of unholy-curve vary by ~0.3 ms/token: tools/box/ab.sh alternates two builds.

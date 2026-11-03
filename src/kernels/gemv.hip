@@ -49,38 +49,87 @@ __device__ __forceinline__ void store(TOut* c, size_t i, float v) {
 // MAXM with uniform guards (m < M). fp8 decodes use gfx12's conversion instructions (dev::e4m3x4_to_f32):
 // the bit decode made the W8A8 GEMV ALU-bound (~380 GB/s at one row, ~85 GB/s at eight).
 
+__device__ __forceinline__ void cvt16_fp8(const uint4 q, float* v) {
+  e4m3x4_to_f32(q.x, v);
+  e4m3x4_to_f32(q.y, v + 4);
+  e4m3x4_to_f32(q.z, v + 8);
+  e4m3x4_to_f32(q.w, v + 12);
+}
+
 // W8A8: the wave's columns n0 .. n0 + C - 1 (< N).
-template <int C, int R>
+// kLds (M >= 2; every wave of the block calls it, valid: the wave has columns): the activation rows of each
+// 512-input step and their scales come from LDS, staged once per block a step ahead (each thread's share of step
+// s + 1 loads while step s is computed, then one barrier), instead of every wave loading them: at 6 rows those
+// loads were ~6x the weights' bytes. The same values and arithmetic.
+template <int C, int R, bool kLds = false>
 __device__ __forceinline__ void w8a8_cols(const uint8_t* a, const uint8_t* sa, const uint8_t* w, const uint8_t* sw,
                                           bf16* c, int ldc, int M, int N, int K, int n0, int lane,
-                                          const HcPostArgs& hp) {
-  const int nc = min(C, N - n0), nkb = K / 128;
+                                          const HcPostArgs& hp, bool valid = true) {
+  const int nc = valid ? min(C, N - n0) : 0, nkb = K / 128;
+  constexpr int PF = (R * 32 + NT - 1) / NT;  // 16-byte pieces of a step's rows per thread
+  uint8_t(*sA)[R][512] = nullptr;
+  float(*sS)[R][4] = nullptr;
+  uint4 pa[PF] = {};
+  float ps = 0.0f;
+  const auto prefetch = [&](int k0) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      const int piece = int(threadIdx.x) + i * NT, m = piece >> 5;
+      if (m < M) pa[i] = *reinterpret_cast<const uint4*>(a + size_t(m) * K + k0 + (piece & 31) * 16);
+    }
+    if (int(threadIdx.x) < M * 4) ps = e8m0_to_f32(sa[size_t(threadIdx.x >> 2) * nkb + k0 / 128 + (threadIdx.x & 3)]);
+  };
+  const auto stage = [&](int buf) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      const int piece = int(threadIdx.x) + i * NT, m = piece >> 5;
+      if (m < M) *reinterpret_cast<uint4*>(&sA[buf][m][(piece & 31) * 16]) = pa[i];
+    }
+    if (int(threadIdx.x) < M * 4) sS[buf][threadIdx.x >> 2][threadIdx.x & 3] = ps;
+  };
+  if constexpr (kLds) {
+    __shared__ alignas(16) uint8_t lds_a[2][R][512];
+    __shared__ float lds_s[2][R][4];
+    sA = lds_a;
+    sS = lds_s;
+    prefetch(0);
+    stage(0);
+    lds_barrier();
+  }
   // hp.x (C == 1, M <= 8, hc == 4): lane 4 m + j holds row m's stream j at this column, its post weight and comb
   // column, loaded before the K loop (in the stores they would add their latency to every wave's tail).
   const int hm = lane >> 2, hj = lane & 3;
   float hr = 0.0f, hpj = 0.0f, hcj[4] = {};
-  if (hp.x && hm < M) {
+  if (valid && hp.x && hm < M) {
     hr = bf16_to_f32(hp.x[(size_t(hm) * 4 + hj) * N + n0]);
     hpj = hp.post[hm * 4 + hj];
 #pragma unroll
     for (int i = 0; i < 4; ++i) hcj[i] = hp.comb[hm * 16 + i * 4 + hj];
   }
   float acc[C][R] = {};
-  for (int k = lane * 16; k < K; k += 512) {
+  for (int k0 = 0, step = 0; k0 < K; k0 += 512, ++step) {
+    const int k = k0 + lane * 16, kb = k / 128, buf = step & 1;
     float wv[C][16], ws[C];
-    const int kb = k / 128;
 #pragma unroll
     for (int j = 0; j < C; ++j)
       if (j < nc) {
         load16_fp8(w + size_t(n0 + j) * K + k, wv[j]);
         ws[j] = e8m0_to_f32(sw[size_t((n0 + j) / 128) * nkb + kb]);
       }
+    if constexpr (kLds) {
+      if (k0 + 512 < K) prefetch(k0 + 512);
+    }
 #pragma unroll
     for (int m = 0; m < R; ++m) {
-      if (m >= M) break;
-      float av[16];
-      load16_fp8(a + size_t(m) * K + k, av);
-      const float sm = e8m0_to_f32(sa[size_t(m) * nkb + kb]);
+      if (m >= M || nc == 0) break;
+      float av[16], sm;
+      if constexpr (kLds) {
+        cvt16_fp8(*reinterpret_cast<const uint4*>(&sA[buf][m][lane * 16]), av);
+        sm = sS[buf][m][lane >> 3];
+      } else {
+        load16_fp8(a + size_t(m) * K + k, av);
+        sm = e8m0_to_f32(sa[size_t(m) * nkb + kb]);
+      }
 #pragma unroll
       for (int j = 0; j < C; ++j) {
         if (j >= nc) break;
@@ -90,7 +139,14 @@ __device__ __forceinline__ void w8a8_cols(const uint8_t* a, const uint8_t* sa, c
         acc[j][m] += part * (sm * ws[j]);
       }
     }
+    if constexpr (kLds) {
+      if (k0 + 512 < K) {
+        stage(buf ^ 1);
+        lds_barrier();
+      }
+    }
   }
+  if (nc == 0) return;
 #pragma unroll
   for (int j = 0; j < C; ++j)
 #pragma unroll
@@ -144,7 +200,12 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_kernel(const uint8_t* a, const u
                                                        const uint8_t* sw, bf16* c, int ldc, int M, int N, int K,
                                                        HcPostArgs hp) {
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C;
-  if (n0 < N) w8a8_cols<C, R>(a, sa, w, sw, c, ldc, M, N, K, n0, threadIdx.x & 31, hp);
+  if (M >= 2) {
+    if (int(blockIdx.x) * WAVES * C < N)  // blocks with a column: all their waves take the staging's barriers
+      w8a8_cols<C, R, true>(a, sa, w, sw, c, ldc, M, N, K, n0, threadIdx.x & 31, hp, n0 < N);
+  } else if (n0 < N) {
+    w8a8_cols<C, R>(a, sa, w, sw, c, ldc, M, N, K, n0, threadIdx.x & 31, hp);
+  }
 }
 // gemv_w8a8_parts_kernel on [gate; up] (two parts of width I), then each segment's last block (of 32: 16 per part):
 // swiglu_kernel's arithmetic and the quantization of its products (a wave per row).
@@ -157,8 +218,12 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_glu_kernel(const uint8_t* a, con
   n0 -= part * I;
   if (n0 >= I) return;  // pad blocks (whole blocks: I % 8 == 0)
   const GemvPart& p = ps.p[part];
-  w8a8_cols<1, R>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, I, K, n0,
-                  threadIdx.x & 31, HcPostArgs{});
+  if (M >= 2)
+    w8a8_cols<1, R, true>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, I, K, n0,
+                          threadIdx.x & 31, HcPostArgs{});
+  else
+    w8a8_cols<1, R>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, I, K, n0,
+                    threadIdx.x & 31, HcPostArgs{});
   const int seg = n0 / 128, lane = threadIdx.x & 31;
   if (!last_block(gq.counters + seg, 32)) return;
   const bf16* g = static_cast<const bf16*>(ps.p[0].c);
@@ -189,36 +254,91 @@ __global__ __launch_bounds__(NT) void gemv_w8a8_parts_kernel(const uint8_t* a, c
   int n0 = blockIdx.x * WAVES + (threadIdx.x >> 5), i = 0;
   while (i + 1 < ps.n && n0 >= ps.p[i].N) n0 -= ps.p[i++].N;
   const GemvPart& p = ps.p[i];
-  if (n0 < p.N)
+  if (M >= 2) {
+    int cols = 0;
+    for (int q = 0; q < ps.n; ++q) cols += ps.p[q].N;
+    if (int(blockIdx.x) * WAVES < cols)
+      w8a8_cols<1, R, true>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, p.N, K,
+                            n0, threadIdx.x & 31, HcPostArgs{}, n0 < p.N);
+  } else if (n0 < p.N) {
     w8a8_cols<1, R>(a, sa, static_cast<const uint8_t*>(p.w), p.sw, static_cast<bf16*>(p.c), p.ldc, M, p.N, K, n0,
                     threadIdx.x & 31, HcPostArgs{});
+  }
 }
 
 // bf16 weights x bf16 activations: the wave's columns n0 .. n0 + C - 1 (< N).
 // scale != 0 (bf16 outputs): scale_bf16 on each output. ring (fp32 outputs, C == 1, part: its index): rg's stores,
 // row m's position and ape value loaded into lane m before the K loop.
-template <int C, int R, typename TOut>
+// bf16 activation rows for 512-input steps in LDS, staged a step ahead (bf16_cols' kLds path, as w8a8_cols'): row m
+// at a + m * lda; each thread's 16-byte pieces of step s + 1 load while step s is computed.
+template <int R>
+struct Bf16Stage {
+  static constexpr int PF = (R * 64 + NT - 1) / NT;
+  uint16_t (*s)[R][512];
+  uint4 pa[PF];
+  __device__ __forceinline__ void prefetch(const bf16* a, size_t lda, int M, int k0) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      const int piece = int(threadIdx.x) + i * NT, m = piece >> 6;
+      if (m < M) pa[i] = *reinterpret_cast<const uint4*>(a + size_t(m) * lda + k0 + (piece & 63) * 8);
+    }
+  }
+  __device__ __forceinline__ void stage(int buf, int M) {
+#pragma unroll
+    for (int i = 0; i < PF; ++i) {
+      const int piece = int(threadIdx.x) + i * NT, m = piece >> 6;
+      if (m < M) *reinterpret_cast<uint4*>(&s[buf][m][(piece & 63) * 8]) = pa[i];
+    }
+  }
+  __device__ __forceinline__ void load(int buf, int m, int lane, float* v) const {
+    const uint4 q0 = *reinterpret_cast<const uint4*>(&s[buf][m][lane * 16]);
+    const uint4 q1 = *reinterpret_cast<const uint4*>(&s[buf][m][lane * 16 + 8]);
+    const uint32_t w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      v[2 * i] = __uint_as_float(w[i] << 16);
+      v[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
+    }
+  }
+};
+
+// kLds (M >= 2, R <= 16; every wave of the block calls it, valid: the wave has columns): the activations through
+// Bf16Stage. The same values and arithmetic.
+template <int C, int R, typename TOut, bool kLds = false>
 __device__ __forceinline__ void bf16_cols(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M, int N, int K,
                                           int n0, int lane, float scale = 0.0f, bool ring = false, GemvRing rg = {},
-                                          int part = 0) {
-  const int nc = min(C, N - n0);
+                                          int part = 0, bool valid = true) {
+  const int nc = valid ? min(C, N - n0) : 0;
+  Bf16Stage<R> sg;
+  if constexpr (kLds) {
+    __shared__ alignas(16) uint16_t lds_a[2][R][512];
+    sg.s = lds_a;
+    sg.prefetch(a, lda, M, 0);
+    sg.stage(0, M);
+    lds_barrier();
+  }
   int rpos = 0;
   float rape = 0.0f;
-  if (ring && lane < M) {
+  if (valid && ring && lane < M) {
     rpos = rg.pos[lane];
     if (part == 1) rape = rg.ape[size_t(rpos % rg.ratio) * N + n0];
   }
   float acc[C][R] = {};
-  for (int k = lane * 16; k < K; k += 512) {
+  for (int k0 = 0, step = 0; k0 < K; k0 += 512, ++step) {
+    const int k = k0 + lane * 16, buf = step & 1;
     float wv[C][16];
 #pragma unroll
     for (int j = 0; j < C; ++j)
       if (j < nc) load16_bf16(w + size_t(n0 + j) * K + k, wv[j]);
+    if constexpr (kLds) {
+      if (k0 + 512 < K) sg.prefetch(a, lda, M, k0 + 512);
+    }
 #pragma unroll
     for (int m = 0; m < R; ++m) {
-      if (m >= M) break;
+      if (m >= M || nc == 0) break;
       float av[16];
-      load16_bf16(a + size_t(m) * lda + k, av);
+      if constexpr (kLds) sg.load(buf, m, lane, av);
+      else load16_bf16(a + size_t(m) * lda + k, av);
 #pragma unroll
       for (int j = 0; j < C; ++j) {
         if (j >= nc) break;
@@ -226,7 +346,14 @@ __device__ __forceinline__ void bf16_cols(const bf16* a, int lda, const bf16* w,
         for (int i = 0; i < 16; ++i) acc[j][m] = fmaf(av[i], wv[j][i], acc[j][m]);
       }
     }
+    if constexpr (kLds) {
+      if (k0 + 512 < K) {
+        sg.stage(buf ^ 1, M);
+        lds_barrier();
+      }
+    }
   }
+  if (nc == 0) return;
 #pragma unroll
   for (int j = 0; j < C; ++j)
 #pragma unroll
@@ -251,6 +378,13 @@ template <int C, int R, typename TOut>
 __global__ __launch_bounds__(NT) void gemv_bf16_kernel(const bf16* a, int lda, const bf16* w, TOut* c, int ldc, int M,
                                                        int N, int K, float scale) {
   const int n0 = (blockIdx.x * WAVES + (threadIdx.x >> 5)) * C;
+  if constexpr (R <= 16) {
+    if (M >= 2 && N <= 65536) {  // not the LM head: its waves' activation reads hit in L1 already (5% slower staged)
+      if (int(blockIdx.x) * WAVES * C < N)  // blocks with a column: all their waves take the staging's barriers
+        bf16_cols<C, R, TOut, true>(a, lda, w, c, ldc, M, N, K, n0, threadIdx.x & 31, scale, false, {}, 0, n0 < N);
+      return;
+    }
+  }
   if (n0 < N) bf16_cols<C, R, TOut>(a, lda, w, c, ldc, M, N, K, n0, threadIdx.x & 31, scale);
 }
 // K < 512 (K % 64 == 0; KDA's low-rank gate projections, K = 128): a wave per 8 columns, 4 lanes per column, each
@@ -303,6 +437,16 @@ __global__ __launch_bounds__(NT) void gemv_bf16_parts_kernel(const bf16* a, int 
   int n0 = blockIdx.x * WAVES + (threadIdx.x >> 5), i = 0;
   while (i + 1 < ps.n && n0 >= ps.p[i].N) n0 -= ps.p[i++].N;
   const GemvPart& p = ps.p[i];
+  if constexpr (R <= 16) {
+    if (M >= 2) {
+      int cols = 0;
+      for (int q = 0; q < ps.n; ++q) cols += ps.p[q].N;
+      if (int(blockIdx.x) * WAVES < cols)
+        bf16_cols<1, R, TOut, true>(a, lda, static_cast<const bf16*>(p.w), static_cast<TOut*>(p.c), p.ldc, M, p.N, K,
+                                    n0, threadIdx.x & 31, 0.0f, rg.ape != nullptr, rg, i, n0 < p.N);
+      return;
+    }
+  }
   if (n0 < p.N)
     bf16_cols<1, R, TOut>(a, lda, static_cast<const bf16*>(p.w), static_cast<TOut*>(p.c), p.ldc, M, p.N, K, n0,
                           threadIdx.x & 31, 0.0f, rg.ape != nullptr, rg, i);
