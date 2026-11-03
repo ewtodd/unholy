@@ -139,9 +139,13 @@ void ApuExperts::run(int layer, const std::vector<Job>& jobs) {
 // it, runs the remote tiles, raises done; join() makes the card stream wait for done. Flags are
 // sequence numbers (>= waits), so no reset is needed and nothing blocks the host.
 void ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
+  UH_CHECK(hipStreamWriteValue32(card_st, req_flag_, seq_ + 1, 0));
+  enqueue_flagged(layer, card_st, P);
+}
+
+void ApuExperts::enqueue_flagged(int layer, hipStream_t, int P) {
   const auto& w = *layers_->at(size_t(layer));
   ++seq_;
-  UH_CHECK(hipStreamWriteValue32(card_st, req_flag_, seq_, 0));
   rt::DeviceGuard g(dev_);
   UH_CHECK(hipStreamWaitValue32(st_, req_flag_, seq_, hipStreamWaitValueGte, 0xffffffffu));
   if (!w.exl3_experts && quant_in_)  // the card sent compact fp8 inputs (moe_device_dispatch)

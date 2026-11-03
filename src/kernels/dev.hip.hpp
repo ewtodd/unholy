@@ -26,6 +26,17 @@ __device__ __forceinline__ global_ptr<T> as_global(const T* p) {
   return (global_ptr<T>)p;
 }
 
+// A workgroup barrier for LDS only. __syncthreads() also waits for the wave's outstanding global loads (gfx12:
+// s_wait_loadcnt_dscnt 0), so loads issued a step ahead of their use drain at every barrier. Callers must not need
+// global memory ordered by it.
+__device__ __forceinline__ void lds_barrier() {
+#if defined(UH_GFX12)
+  asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#else
+  __syncthreads();
+#endif
+}
+
 __device__ __forceinline__ float bf16_to_f32(bf16 v) { return __uint_as_float(uint32_t(v) << 16); }
 
 // Round-to-nearest-even (NaN preserved as quiet NaN).

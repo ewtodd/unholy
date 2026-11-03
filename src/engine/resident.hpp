@@ -41,6 +41,9 @@ class ApuExperts final : public model::RemoteExperts {
   bool quant_in() const override { return quant_in_; }
   bool combine_out() const override { return combine_out_; }
   void enqueue(int layer, hipStream_t card_st, int P) override;
+  uint32_t* req_flag() override { return req_flag_; }
+  uint32_t next_req() const override { return seq_ + 1; }
+  void enqueue_flagged(int layer, hipStream_t card_st, int P) override;
   void join(hipStream_t card_st) override;
   int device() const { return dev_; }
   hipStream_t stream() const { return st_; }

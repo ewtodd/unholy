@@ -6,6 +6,7 @@
 
 #include <cstdint>
 
+#include "kernels/elem_fast.hpp"
 #include "kernels/exl3_moe.hpp"
 
 namespace unholy::kernels {
@@ -59,6 +60,12 @@ void copy_remote_partial(const uint16_t* src, uint16_t* dst, const MoePlan* plan
 // remote0 + tok2u[t]) + shared[t]), fp32 accumulation.
 void moe_combine_partial(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan, const int32_t* tok2u,
                          const uint16_t* shared, uint16_t* out, int T, int K, int dim, hipStream_t st);
+// The same sums with token t's remote partial read from remote row tok2u[t] (remote_combine's dst, across the link)
+// instead of copied into pair_out first (copy_remote_partial), over (token, 256-column) workgroups; hp.x set: also
+// the mHC post-mix of the combined row into the token's streams (hc_post_slices' arithmetic).
+void moe_combine_partial_link(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan, const int32_t* tok2u,
+                              const uint16_t* remote, const uint16_t* shared, uint16_t* out, int T, int K, int dim,
+                              hipStream_t st, const HcPostArgs& hp = {});
 // Those tokens' rows of x [T, dim] as the experts' input transform fake-quantizes them (mx_xform_in:
 // e4m3 per value, e8m0 scale per 128) -> codes [U, dim] + scale exponents [U, dim / 128]. The remote side
 // rebuilds exactly the bf16 values it would have computed from the pair rows, from 1 + 1/128 bytes per
@@ -95,6 +102,22 @@ struct MoeSmallArgs {
   const uint16_t* x = nullptr;
   int dim = 0;
   uint16_t* x_dst = nullptr;
+  // DSV4's routing in the same launch (null: sel / wt are inputs): route_fast's sqrt-softplus scores plus bias
+  // (ds_bias_vl for image tokens, ids >= vocab), its top K in selection order (a hash layer: its tid2eid row) and
+  // weights, the same values, a wave per token. route_scale as above.
+  const float* ds_logits = nullptr;
+  const float* ds_bias = nullptr;
+  const float* ds_bias_vl = nullptr;
+  const int32_t* ds_tid2eid = nullptr;
+  const int32_t* ids = nullptr;
+  int vocab = 0;
+  // quant_remote_tokens in the same launch (null q_dst: not here): the remote tokens' rows of x -> q_dst / qs_dst.
+  uint8_t* q_dst = nullptr;
+  uint8_t* qs_dst = nullptr;
+  // The remote side's request flag, stored (system scope) after every write above, instead of the card stream's
+  // hipStreamWriteValue32 (RemoteExperts::enqueue_flagged). Null: not here.
+  uint32_t* req_flag = nullptr;
+  uint32_t req_value = 0;
 };
 void moe_dispatch_small(const MoeSmallArgs& a, hipStream_t st);
 void copy_remote_meta(const float* ewt, const int32_t* row_expert, float* w_dst, int32_t* e_dst, const MoePlan* plan,

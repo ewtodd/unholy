@@ -876,6 +876,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
     }
     return akv;
   };
+  bool o_roped = false;  // the split attention applied the output's rope
   if (distinct && batched_attention()) {
     if (w.has_indexer) indexer(nullptr);
     k::AttnBatch ab;
@@ -892,6 +893,15 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
     ab.ratio = w.ratio;
     ab.comp_idx = w.has_indexer ? idx : nullptr;
     ab.vis = b.vis;
+    // A decode-sized step (one launch): the split path also applies the output's rope and the one-row chunks'
+    // window updates (bit-identical, two launches fewer).
+    static const bool dumping = std::getenv("UNHOLY_DUMP") != nullptr;  // sa_o is captured before the rope
+    const bool extras = !draft && !b.chunks.empty() && T <= 16 && rd == 64 && !b.vis && !dumping;
+    if (extras) {
+      ab.rope = freqs;
+      ab.ring_out = cache.window_rows.as<bf16>();
+    }
+    bool all_split = true;
     int queries = 0, max_total = 0;  // of the launch being built
     for (size_t i = 0; i < b.chunks.size(); ++i) {
       const auto& ch = b.chunks[i];
@@ -902,17 +912,20 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
       if (ab.nchunks == k::AttnBatch::kMax || i + 1 == b.chunks.size()) {
         // Decode-sized: the split path (same results, more workgroups), its scores in the indexer's score
         // buffer (free again: the top-k has read it).
-        const bool split = split_attention() && queries <= 16 && max_total >= 256 &&
+        const bool split = split_attention() && queries <= 16 &&
                            k::sparse_attn_wmma_batch_split(q, pos, ab, w.sink.p<float>(), o, scale, max_total,
                                                            B<float>(scr, kISc), scr.bufs[kISc].size() / 4, st);
         if (!split) k::sparse_attn_wmma_batch(q, pos, ab, w.sink.p<float>(), o, scale, st);
+        all_split &= split;
         ab.nchunks = 0;
         queries = max_total = 0;
       }
     }
+    o_roped = extras && all_split;
     for (const auto& ch : b.chunks)
-      k::window_update(kv + size_t(ch.t0) * HD, cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD, ch.s0,
-                       ch.n, HD, st);
+      if (!o_roped || ch.n > 1)
+        k::window_update(kv + size_t(ch.t0) * HD, cache.window_rows.as<bf16>() + size_t(ch.slot) * c.window * HD,
+                         ch.s0, ch.n, HD, st);
   } else {
     for (const auto& ch : b.chunks) {
       if (w.has_indexer) indexer(&ch);
@@ -923,7 +936,7 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
     }
   }
   dump(L, b, "sa_o", o, size_t(T) * H * HD * 2, st);
-  k::rope(o, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, true, st);
+  if (!o_roped) k::rope(o, H * HD, T, H, HD, HD - rd, rd / 2, pos, freqs, true, st);
 
   // o: grouped wo_a (bf16 einsum on dequantized fp8 weights), then wo_b.
   bf16* oa = B<bf16>(scr, kOA);
@@ -946,8 +959,10 @@ struct MoeDispatch {
   bool remote = false;    // remote experts were enqueued
   bool combined = false;  // their outputs come back combined per token (moe_combine_partial)
 };
+// logits: the router's, routed in the dispatch launch (dispatch_routes) instead of before.
 MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, const bf16* f,
-                                const int32_t* sel, const float* wt, int T, hipStream_t st, RemoteExperts* remote) {
+                                const int32_t* sel, const float* wt, int T, hipStream_t st, RemoteExperts* remote,
+                                const float* logits = nullptr, const int32_t* ids = nullptr) {
   const int D = c.dim, E = c.n_experts, K = c.n_active, P = T * K;
   const auto& ds = scr.dispatch;
   int32_t* count = ds.count.as<int32_t>();
@@ -989,10 +1004,37 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
                        any_remote ? remote->p2u_host : nullptr, combined ? remote->u2p_host : nullptr,
                        any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
                        any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
+    if (logits) {
+      ma.ds_logits = logits;
+      ma.ds_bias = w.gate_bias.p<float>();
+      ma.ds_bias_vl = w.gate_bias_vl ? w.gate_bias_vl.p<float>() : nullptr;
+      ma.ds_tid2eid = w.hash ? w.tid2eid.p<int32_t>() : nullptr;
+      ma.ids = ids;
+      ma.vocab = c.vocab;
+      ma.route_scale = c.route_scale;
+    }
+    // A few tokens' fp8 inputs and the remote side's request in the same launch (the quantization's waves would
+    // take longer than its own launch at more tokens).
+    const bool flag = qin && !gathered && T <= 8 && remote->req_flag();
+    if (flag) {
+      ma.x = f;
+      ma.dim = D;
+      ma.q_dst = remote->inq_host;
+      ma.qs_dst = remote->ins_host;
+      ma.req_flag = remote->req_flag();
+      ma.req_value = remote->next_req();
+    }
     k::moe_dispatch_small(ma, st);
     if (gathered) k::gather_rows(f, eidx, pair_in, P, D, st);
-    if (qin) k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
+    if (qin && !flag) k::quant_remote_tokens(f, D, tok2u + T, plan, remote->inq_host, remote->ins_host, T, st);
+    if (any_remote && flag) {
+      remote->enqueue_flagged(w.layer, st, P);
+      exl3_moe_forward_dev(c, w, f, ewt, row_expert, lt, ds.max_tiles, &plan->n_local_tiles, P, scr.exl3, pair_out, st,
+                           eidx);
+      return {any_remote, combined};
+    }
   } else {
+    if (logits) throw std::runtime_error("moe: routing in the dispatch needs its single-block launch");
     k::moe_count(sel, T, K, count, E, st, hist);
     k::moe_plan(count, w.resident.as<uint8_t>(), E, P, plan, lt, rtl, off, fill, ds.max_tiles, st, tile_rows);
     k::moe_scatter(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx, st);
@@ -1024,20 +1066,29 @@ MoeDispatch moe_device_dispatch(const Dsv4Config& c, const LayerWeights& w, cons
   return {any_remote, combined};
 }
 
-// The card stream waits for the remote experts and takes their outputs into the pair-output rows.
+// The card stream waits for the remote experts and takes their outputs into the pair-output rows (link: combined
+// outputs stay in the remote side's rows, for moe_combine_partial_link).
 void moe_device_join(const Dsv4Config& c, const Scratch& scr, const MoeDispatch& md, int T, hipStream_t st,
-                     RemoteExperts* remote) {
+                     RemoteExperts* remote, bool link = false) {
   if (!md.remote) return;
   const auto* plan = dispatch_plan(scr);
   bf16* pair_out = B<bf16>(scr, kPairOut);
   remote->join(st);
+  if (md.combined && link) return;
   if (md.combined) k::copy_remote_partial(remote->out_host, pair_out, plan, c.dim, T, st);
   else k::copy_remote_rows(remote->out_host, pair_out, plan, c.dim, T * c.n_active, st);
 }
 
-// The MoE half's front: the FFN's HC mixing, norm (f and its fp8 codes for the shared expert), router (sel, wt).
+// The device dispatch routes in its own launch (moe_dispatch_small: route_fast's values) for decode-sized steps.
+bool dispatch_routes(const Dsv4Config& c, int T) {
+  static const bool dumping = std::getenv("UNHOLY_DUMP") != nullptr;  // gate_out is captured before the dispatch
+  return fast_dense() && !dumping && T <= k::kMoeSmallMaxTokens && c.n_active <= 8 && c.n_experts <= 256;
+}
+
+// The MoE half's front: the FFN's HC mixing, norm (f and its fp8 codes for the shared expert), router (logits, then
+// sel / wt unless the dispatch routes).
 void moe_front(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf16* x, const BatchDesc& b,
-               hipStream_t st) {
+               hipStream_t st, bool route = true) {
   const int D = c.dim, E = c.n_experts, K = c.n_active, T = b.T, L = w.layer;
   bf16* y = B<bf16>(scr, kY);
   bf16* f = B<bf16>(scr, kA);
@@ -1060,6 +1111,7 @@ void moe_front(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, b
   float* wt = B<float>(scr, kWt);
   if (!fast_dense()) k::cast_bf16_f32(f, af, size_t(T) * D, st);  // the reference GEMM's input
   dense_f32(f, af, D, w.gate_w.p<bf16>(), lg, E, T, E, D, st);
+  if (!route) return;
   (fast_dense() ? k::route_fast : k::route)(lg, w.gate_bias.p<float>(), w.hash ? w.tid2eid.p<int32_t>() : nullptr, b.ids,
                                            sel, wt, T, E, K, c.route_scale, st,
                                            w.gate_bias_vl ? w.gate_bias_vl.p<float>() : nullptr, c.vocab);
@@ -1092,8 +1144,15 @@ void moe_back(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   k::act_quant_fp8(hh, I, qb, qs, T, I, 128, st);
   dense_w8a8(qb, qs, w.sw2.w.p<uint8_t>(), w.sw2.s.p<uint8_t>(), shared, D, T, D, I, st);
   dump(L, b, "shared_out", shared, size_t(T) * D * 2, st);
-  moe_device_join(c, scr, md, T, st, remote);
   bf16* fo = B<bf16>(scr, kAO);
+  if (md.combined && fast_elem()) {  // the remote rows read across the link, the mHC post-mix in the same launch
+    moe_device_join(c, scr, md, T, st, remote, true);
+    k::moe_combine_partial_link(pair_out, dpidx, dispatch_plan(scr), B<int32_t>(scr, kRTok), remote->out_host, shared,
+                                fo, T, K, D, st, k::HcPostArgs{x, post, comb, c.hc_mult});
+    dump(L, b, "ffn_out", fo, size_t(T) * D * 2, st);
+    return;
+  }
+  moe_device_join(c, scr, md, T, st, remote);
   if (md.combined)
     k::moe_combine_partial(pair_out, dpidx, dispatch_plan(scr), B<int32_t>(scr, kRTok), shared, fo, T, K, D, st);
   else
@@ -1108,13 +1167,14 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   bf16* f = B<bf16>(scr, kA);
   int32_t* sel = B<int32_t>(scr, kSel);
   float* wt = B<float>(scr, kWt);
-  moe_front(c, w, scr, x, b, st);
   const bool device_path = device_moe(c, w, remote);
+  const bool fused_route = device_path && dispatch_routes(c, T);
+  moe_front(c, w, scr, x, b, st, !fused_route);
   int32_t* dpidx = B<int32_t>(scr, kPairIdx);
   bf16* pair_out = B<bf16>(scr, kPairOut);
   MoeDispatch md;
   if (device_path) {
-    md = moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote);
+    md = moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote, fused_route ? B<float>(scr, kLG) : nullptr, b.ids);
   } else {
     // Expert-major pairs (ascending expert id): pair p computes expert e on token t into row p of the
     // pair-output buffer; pidx[t][j] lists token t's pairs in ascending expert order for the combine.
@@ -1250,9 +1310,10 @@ bool moe_split_ok(const Dsv4Config& c, const LayerWeights& w, const RemoteExpert
 MoeStarted layer_moe_start(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, uint16_t* x,
                            const BatchDesc& b, hipStream_t st, RemoteExperts* remote) {
   if (!device_moe(c, w, remote)) throw std::runtime_error("layer_moe_start: the device MoE path only");
-  moe_front(c, w, scr, x, b, st);
+  const bool fused_route = dispatch_routes(c, b.T);
+  moe_front(c, w, scr, x, b, st, !fused_route);
   const MoeDispatch md = moe_device_dispatch(c, w, scr, B<bf16>(scr, kA), B<int32_t>(scr, kSel), B<float>(scr, kWt),
-                                             b.T, st, remote);
+                                             b.T, st, remote, fused_route ? B<float>(scr, kLG) : nullptr, b.ids);
   return {md.remote, md.combined};
 }
 

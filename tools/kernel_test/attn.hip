@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     }
     {  // the split path: bit for bit the fused kernel's output, and its time
       const int max_total = keys;
-      const size_t s_floats = size_t(T) * H * ((max_total + 15) / 16 * 16);
+      const size_t s_floats = size_t(T) * (H + 2) * ((max_total + 15) / 16 * 16) + 256;
       rt::DeviceBuffer sbuf(dev, s_floats * 4), o_split(dev, size_t(T) * H * D * 2);
       const auto run = [&]() {
         if (!k::sparse_attn_wmma_split(q.as<uint16_t>(), pos.as<int32_t>(), kv, sink.as<float>(), o_split.as<uint16_t>(), T,
@@ -159,6 +159,54 @@ int main(int argc, char** argv) {
       UH_CHECK(hipEventElapsedTime(&ms, e0, e1));
       std::printf(", split %7.1f us (%zu / %zu outputs identical to fused)", 1e3 * ms / reps, same, c2.size());
       all_same &= same == c2.size();
+      // The batch entry with the decode extras: the output rope and the one-row window update, against the fused
+      // kernel's output through rope_kernel and window_update_kernel.
+      std::vector<float> fv(size_t(T) * 64);
+      for (auto& x : fv) x = nd(rng);
+      auto freqs = upload(dev, fv);  // positions [s0, depth)
+      const float2* fbase = freqs.as<float2>() - size_t(s0) * 32;
+      rt::DeviceBuffer o_rope(dev, size_t(T) * H * D * 2), ring_ref(dev, size_t(128) * D * 2),
+          ring_b(dev, size_t(128) * D * 2);
+      UH_CHECK(hipMemcpy(o_rope.data(), o_fast.data(), o_rope.size(), hipMemcpyDeviceToDevice));
+      UH_CHECK(hipMemcpy(ring_ref.data(), ring.data(), ring_ref.size(), hipMemcpyDeviceToDevice));
+      UH_CHECK(hipMemcpy(ring_b.data(), ring.data(), ring_b.size(), hipMemcpyDeviceToDevice));
+      k::rope(o_rope.as<uint16_t>(), H * D, T, H, D, D - 64, 32, pos.as<int32_t>(), fbase, true, st);
+      if (T == 1) k::window_update(ckv.as<uint16_t>(), ring_ref.as<uint16_t>(), s0, T, D, st);
+      k::AttnBatch ab;
+      ab.kv = ckv.as<uint16_t>();
+      ab.ring = ring.as<uint16_t>();
+      ab.ring_stride = size_t(128) * D;
+      if (c.ratio) {
+        ab.comp_pool = pool.as<uint16_t>();
+        ab.rows_per_page = rpp;
+        ab.row_stride = D;
+      }
+      ab.tables = tab.as<int32_t>();
+      ab.max_pages = pages;
+      ab.ratio = c.ratio;
+      ab.comp_idx = c.topk ? idx.as<int32_t>() : nullptr;
+      ab.rope = fbase;
+      ab.ring_out = ring_b.as<uint16_t>();
+      ab.c[ab.nchunks++] = {0, T, s0, 0, ncomp, 0};
+      if (!k::sparse_attn_wmma_batch_split(q.as<uint16_t>(), pos.as<int32_t>(), ab, sink.as<float>(), o_split.as<uint16_t>(),
+                                           scale, max_total, sbuf.as<float>(), s_floats, st))
+        throw std::runtime_error("batch split refused");
+      UH_CHECK(hipStreamSynchronize(st));
+      std::vector<uint16_t> r1(c2.size()), r2(c2.size()), w1(size_t(128) * D), w2(w1.size());
+      UH_CHECK(hipMemcpy(r1.data(), o_rope.data(), r1.size() * 2, hipMemcpyDeviceToHost));
+      UH_CHECK(hipMemcpy(r2.data(), o_split.data(), r2.size() * 2, hipMemcpyDeviceToHost));
+      UH_CHECK(hipMemcpy(w1.data(), ring_ref.data(), w1.size() * 2, hipMemcpyDeviceToHost));
+      UH_CHECK(hipMemcpy(w2.data(), ring_b.data(), w2.size() * 2, hipMemcpyDeviceToHost));
+      const bool rope_same = r1 == r2, ring_same = w1 == w2;
+      if (!rope_same) {
+        size_t nd = 0, first = 0;
+        for (size_t i = 0; i < r1.size(); ++i)
+          if (r1[i] != r2[i] && !nd++) first = i;
+        std::printf(" [%zu differ, first t %zu h %zu d %zu: %04x vs %04x, unroped %04x]", nd, first / (H * D), first / D % H,
+                    first % D, r1[first], r2[first], b[first]);
+      }
+      std::printf("; batch + rope %s, window update %s", rope_same ? "identical" : "DIFFERS", ring_same ? "identical" : "DIFFERS");
+      all_same &= rope_same && ring_same;
     }
     std::printf("\n");
   }

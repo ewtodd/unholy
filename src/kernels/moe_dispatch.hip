@@ -252,29 +252,50 @@ __global__ void moe_combine_partial_kernel(const uint16_t* pair_out, const int32
   }
 }
 
+__global__ __launch_bounds__(256) void moe_combine_partial_link_kernel(const uint16_t* pair_out, const int32_t* pidx,
+                                                                       const MoePlan* plan, const int32_t* tok2u,
+                                                                       const uint16_t* remote, const uint16_t* shared,
+                                                                       uint16_t* out, int K, int dim, HcPostArgs hp) {
+  const int t = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
+  if (d >= dim) return;
+  const int r0 = plan->remote0, u = tok2u[t];
+  float acc = 0.0f;
+  for (int j = 0; j < K; ++j) {
+    const int p = pidx[size_t(t) * K + j];
+    if (p < r0) acc += bf16_to_f32(pair_out[size_t(p) * dim + d]);
+  }
+  if (u >= 0) acc += bf16_to_f32(remote[size_t(u) * dim + d]);
+  acc += bf16_to_f32(shared[size_t(t) * dim + d]);
+  const uint16_t o = f32_to_bf16(acc);
+  out[size_t(t) * dim + d] = o;
+  if (hp.x) hc_post_column(bf16_to_f32(o), hp.x, hp.post, hp.comb, hp.x, hp.hc, dim, t, d);
+}
+
 // Wave = one 128-value segment of one compact token (4 values per lane): the scale as
 // fake_quant_fp8_block computes it, the codes packed into one 4-byte store per lane (a 128-byte run per
 // wave). Grid-stride over (token, segment) with one system-scope fence per block at the end: a fence per
 // segment (131k blocks per layer) made the kernel wait on bus round trips.
+__device__ __forceinline__ void quant_token_segment(const uint16_t* x, int dim, const int32_t* u2t, uint8_t* q,
+                                                    uint8_t* s, int u, int seg, int lane) {
+  const uint2 raw = reinterpret_cast<const uint2*>(x + size_t(u2t[u]) * dim + seg * 128)[lane];
+  const float v[4] = {bf16_to_f32(uint16_t(raw.x)), bf16_to_f32(uint16_t(raw.x >> 16)), bf16_to_f32(uint16_t(raw.y)),
+                      bf16_to_f32(uint16_t(raw.y >> 16))};
+  float a = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  a = fmaxf(warp_max(a), 1e-4f);
+  const uint8_t e = pow2_ceil_e8m0(a * (1.0f / 448.0f));
+  const float sc = e8m0_to_f32(e);
+  uint32_t packed = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) packed |= uint32_t(f32_to_e4m3(fminf(fmaxf(v[k] / sc, -448.0f), 448.0f))) << (8 * k);
+  reinterpret_cast<uint32_t*>(q + size_t(u) * dim + seg * 128)[lane] = packed;
+  if (lane == 0) s[size_t(u) * (dim / 128) + seg] = e;
+}
 __global__ __launch_bounds__(256) void quant_remote_tokens_kernel(const uint16_t* x, int dim, const int32_t* u2t,
                                                                   const MoePlan* plan, uint8_t* q, uint8_t* s) {
   const int lane = threadIdx.x & 31, nwave = blockDim.x >> 5, segs = dim / 128;
   const size_t n = size_t(plan->n_remote_tokens) * segs;
-  for (size_t w = size_t(blockIdx.x) * nwave + (threadIdx.x >> 5); w < n; w += size_t(gridDim.x) * nwave) {
-    const int u = int(w / segs), seg = int(w % segs);
-    const uint2 raw = reinterpret_cast<const uint2*>(x + size_t(u2t[u]) * dim + seg * 128)[lane];
-    const float v[4] = {bf16_to_f32(uint16_t(raw.x)), bf16_to_f32(uint16_t(raw.x >> 16)), bf16_to_f32(uint16_t(raw.y)),
-                        bf16_to_f32(uint16_t(raw.y >> 16))};
-    float a = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-    a = fmaxf(warp_max(a), 1e-4f);
-    const uint8_t e = pow2_ceil_e8m0(a * (1.0f / 448.0f));
-    const float sc = e8m0_to_f32(e);
-    uint32_t packed = 0;
-#pragma unroll
-    for (int k = 0; k < 4; ++k) packed |= uint32_t(f32_to_e4m3(fminf(fmaxf(v[k] / sc, -448.0f), 448.0f))) << (8 * k);
-    reinterpret_cast<uint32_t*>(q + size_t(u) * dim + seg * 128)[lane] = packed;
-    if (lane == 0) s[size_t(u) * segs + seg] = e;
-  }
+  for (size_t w = size_t(blockIdx.x) * nwave + (threadIdx.x >> 5); w < n; w += size_t(gridDim.x) * nwave)
+    quant_token_segment(x, dim, u2t, q, s, int(w / segs), int(w % segs), lane);
   __threadfence_system();
 }
 
@@ -328,6 +349,57 @@ __device__ void route_token_wave(const MoeSmallArgs& a, int t, int lane) {
   }
 }
 
+// route_block_kernel for token t on one wave: the same scores and keys, the same top K in selection order (the
+// largest key, the lowest index among equals: the reduction order does not matter), the same weights (summed in
+// selection order).
+__device__ void route_token_wave_ds(const MoeSmallArgs& a, int t, int lane) {
+  constexpr int MAXV = 8;  // E <= 256
+  const int E = a.E, K = a.K;
+  const bool image = a.ds_bias_vl && a.ids[t] >= a.vocab;
+  const float* bias = image ? a.ds_bias_vl : a.ds_bias;
+  const int32_t* tid2eid = image ? nullptr : a.ds_tid2eid;
+  const float* lr = a.ds_logits + size_t(t) * E;
+  const auto score = [](float x) { return sqrtf(x > 20.0f ? x : log1pf(expf(x))); };
+  int chosen[8];
+  if (tid2eid) {
+    for (int k = 0; k < K; ++k) chosen[k] = tid2eid[size_t(a.ids[t]) * K + k];
+  } else {
+    float key[MAXV];
+#pragma unroll
+    for (int i = 0; i < MAXV; ++i) {
+      const int e = lane + 32 * i;
+      key[i] = e < E ? score(lr[e]) + bias[e] : -INFINITY;
+    }
+    for (int k = 0; k < K; ++k) {
+      float bv = -INFINITY;
+      int bi = 0x7fffffff;
+#pragma unroll
+      for (int i = 0; i < MAXV; ++i)
+        if (lane + 32 * i < E && (key[i] > bv || bi == 0x7fffffff)) bv = key[i], bi = lane + 32 * i;
+      for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor(bv, o, 32);
+        const int oi = __shfl_xor(bi, o, 32);
+        if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+      }
+      chosen[k] = bi;
+#pragma unroll
+      for (int i = 0; i < MAXV; ++i)
+        if (lane + 32 * i == bi) key[i] = -INFINITY;
+    }
+  }
+  if (lane == 0) {
+    float w[8], sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      w[k] = score(lr[chosen[k]]);
+      sum += w[k];
+    }
+    for (int k = 0; k < K; ++k) {
+      const_cast<int32_t*>(a.sel)[size_t(t) * K + k] = chosen[k];
+      const_cast<float*>(a.wt)[size_t(t) * K + k] = (w[k] / sum) * a.route_scale;
+    }
+  }
+}
+
 // moe_count + moe_plan + moe_scatter + remote_tokens + stage_remote for a step of <= 32 tokens, in one
 // block of NE threads (256 or 512, NE >= E); with route_logits the routing first, with x_dst the remote rows' copy
 // last: the counts, offsets and fill counters live in LDS (count / off /
@@ -342,6 +414,9 @@ __global__ __launch_bounds__(NE) void moe_dispatch_small_kernel(MoeSmallArgs a) 
   const int E = a.E, K = a.K, T = a.T;
   if (a.route_logits) {
     for (int t = tid >> 5; t < T; t += NE / 32) route_token_wave(a, t, lane);
+    __syncthreads();
+  } else if (a.ds_logits) {
+    for (int t = tid >> 5; t < T; t += NE / 32) route_token_wave_ds(a, t, lane);
     __syncthreads();
   }
   scnt[tid] = 0;
@@ -459,7 +534,16 @@ __global__ __launch_bounds__(NE) void moe_dispatch_small_kernel(MoeSmallArgs a) 
           reinterpret_cast<const uint4*>(a.x + size_t(a.u2t[u]) * a.dim)[c];
     }
   }
+  if (a.q_dst) {  // quant_remote_tokens_kernel
+    const int segs = a.dim / 128;
+    for (int w = tid >> 5; w < pl.n_remote_tokens * segs; w += NE / 32)
+      quant_token_segment(a.x, a.dim, a.u2t, a.q_dst, a.qs_dst, w / segs, w % segs, lane);
+  }
   __threadfence_system();
+  if (a.req_flag) {
+    __syncthreads();
+    if (tid == 0) __hip_atomic_store(a.req_flag, a.req_value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
 }
 
 }  // namespace
@@ -491,6 +575,15 @@ void moe_combine_partial(const uint16_t* pair_out, const int32_t* pidx, const Mo
   const int sl = row_slices(T, dim);
   moe_combine_partial_kernel<<<dim3(T, sl), 256, 0, st>>>(pair_out, pidx, plan, tok2u, shared, out, K, dim,
                                                           (dim + sl - 1) / sl);
+  UH_CHECK_LAUNCH();
+}
+
+void moe_combine_partial_link(const uint16_t* pair_out, const int32_t* pidx, const MoePlan* plan, const int32_t* tok2u,
+                              const uint16_t* remote, const uint16_t* shared, uint16_t* out, int T, int K, int dim,
+                              hipStream_t st, const HcPostArgs& hp) {
+  if (T <= 0) return;
+  moe_combine_partial_link_kernel<<<dim3(T, (dim + 255) / 256), 256, 0, st>>>(pair_out, pidx, plan, tok2u, remote,
+                                                                              shared, out, K, dim, hp);
   UH_CHECK_LAUNCH();
 }
 

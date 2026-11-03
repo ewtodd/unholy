@@ -184,6 +184,11 @@ class RemoteExperts {
   // preceding work; join() orders the card stream's following work after it. No host waits.
   virtual bool can_enqueue() const { return false; }
   virtual void enqueue(int layer, hipStream_t card_st, int P) { throw std::runtime_error("enqueue unsupported"); }
+  // enqueue() for when a card kernel already stored next_req() to req_flag() (system scope, after its writes),
+  // instead of the card stream's write. Null req_flag(): unsupported.
+  virtual uint32_t* req_flag() { return nullptr; }
+  virtual uint32_t next_req() const { return 0; }
+  virtual void enqueue_flagged(int layer, hipStream_t card_st, int P) { throw std::runtime_error("enqueue unsupported"); }
   virtual void join(hipStream_t card_st) { throw std::runtime_error("join unsupported"); }
   kernels::MoePlan* plan_host = nullptr;
   kernels::Exl3Tile* tiles_host = nullptr;

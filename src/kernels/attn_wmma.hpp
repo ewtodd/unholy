@@ -26,6 +26,10 @@ struct AttnBatch {
   int max_pages = 0, rows_per_page = 0, row_stride = 0, ratio = 0;
   const int32_t* comp_idx = nullptr;
   const int32_t* vis = nullptr;
+  // The split path only (sparse_attn_wmma_batch_split): rope_kernel's inverse rope of the output's last 64 dims of
+  // each head (freqs [pos][32]), and window_update of every one-row chunk into ring_out (the rings, writable).
+  const float2* rope = nullptr;
+  bf16* ring_out = nullptr;
   int nchunks = 0;
   AttnChunk c[kMax];
 };
@@ -33,10 +37,11 @@ void sparse_attn_wmma_batch(const bf16* q, const int32_t* pos, const AttnBatch& 
                             float scale, hipStream_t st);
 
 // The same results split across more workgroups (decode-sized calls): every head's scores of every key
-// block in parallel (into S: [queries][64][ldS] floats, ldS = max_total rounded up to 16), then per query
-// four workgroups, one per quarter of the output dims, each running the softmax state of all heads and P V
-// for its quarter. Bit-identical to the fused kernel. max_total: the most entries of any query (window +
-// compressed rows). false (nothing launched) when S is too small or for DSpark calls.
+// block in parallel (into S: [queries][64][ldS] floats, ldS = max_total rounded up to 16, then the entries'
+// row pointers, [queries][ldS]), then per query sixteen workgroups, one per (16 heads, quarter of the output
+// dims), each running the softmax state of its heads and P V for its outputs. Bit-identical to the fused
+// kernel. max_total: the most entries of any query (window + compressed rows). false (nothing launched) when
+// S (s_floats >= queries * ldS * 66 + 256) is too small or for DSpark calls.
 bool sparse_attn_wmma_split(const bf16* q, const int32_t* pos, AttnKv kv, const float* sink, bf16* o, int T, float scale,
                             int max_total, float* S, size_t s_floats, hipStream_t st);
 bool sparse_attn_wmma_batch_split(const bf16* q, const int32_t* pos, const AttnBatch& b, const float* sink, bf16* o,
