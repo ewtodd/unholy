@@ -1463,3 +1463,26 @@ ISTA's GSQ-RCO builds measure lower at every size when re-measured with more sam
 on ISTA's three benchmarks, not 99.8%); ISTA's IQ2_XS was deleted, its IQ1_M kept for the APU-only test. The ~41 GB
 go to the SSD tier or come from a smaller build's experts; the D4 oracle checks the KL independently of both
 quantizers.
+
+## 2026-11-03 — DFlash2 for GLM, F1: acceptance on our GLM is below MTP's
+
+`docs/PLAN-dflash2-glm.md` F1. `incoai/GLM-5.3-Flash-DFlash2` (bf582e4) in plain PyTorch (`tools/ref/dflash2_ref.py`,
+ported from z-lab/dflash; selftest: z-lab's attention mask, context K/V per position vs all at once, the selector's
+lattice walk vs z-lab's greedy loop), replayed as greedy speculative decoding over 32 continuations of our served GLM
+(build B; `unholy-glm-features`, features = the hc-stream mean after layers 5, 14, 24, 33, 42): 16 codegen48 requests
+(8,192 tokens, all inside thinking, mostly the model reciting the stdlib file it rewrites) and 16 GSM8K requests
+(3,379 tokens, thinking and answer). Speedup = tokens per step / (verify cost of 2026-10-29 + 0.15 for the draft):
+
+| width | tokens / step | speedup | code | math |
+|---:|---:|---:|---:|---:|
+| 2 | 1.74 | 1.13x | 1.11x | 1.17x |
+| 3 | 2.17 | 1.15x | 1.12x | 1.24x |
+| 4 | 2.37 | 1.03x | 0.99x | 1.14x |
+| 6 | 2.51 | 0.81x | 0.77x | 0.91x |
+| 8 | 2.54 | 0.68x | 0.65x | 0.77x |
+
+MTP on the same basis: 1.30x (one draft, 83-86% accepted; 1.2x measured served). DFlash2's first draft is accepted
+72-74% of the time, later positions 0.59 / 0.51 / 0.47 / 0.40 / 0.38 conditionally; incoai's blog implies ~0.85 per
+position on Qwen3.8-27B. Even at 0.85 the best width (3) would give ~1.36x, about MTP: each verified token costs
+~12.5 ms of APU expert streaming here. Unconfirmed: whether the 0.73 is the drafter on a 4.05 bpw target, our capture,
+or a port bug (no run of a reference implementation on the same inputs yet).
