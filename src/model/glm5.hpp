@@ -258,6 +258,10 @@ void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm
 void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, std::span<Glm5PagedCache> cache,
                       const Glm5Scratch& scr, uint16_t* x, const Glm5Batch& b, hipStream_t st, RemoteExperts* remote,
                       RemoteExperts* remote2 = nullptr);
+// Hidden-state capture for a speculative drafter (DFlash2's context features): after each of `layers`, the mean of
+// the batch rows' hc streams (bf16) into dst [layer index][row][dim], device-visible memory (e.g. pinned host) with
+// room for max_rows rows per layer. One capture for the process; dst null turns it off.
+void glm5_set_feature_capture(const std::vector<int>& layers, uint16_t* dst, int max_rows);
 // Routed experts of `w` that this device holds, over the pair rows of the tiles (*ntiles_dev of max_tiles run): in
 // bf16 [P, dim] with routing weights rw [P] and row_expert [P] -> out bf16 [P, dim] for the tiles' rows. The tiles'
 // rows lie in [*row0_dev, *row1_dev) when given (a MoePlan's local block [0, remote0) or remote block [remote0, P)).

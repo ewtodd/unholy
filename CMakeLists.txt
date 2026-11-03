@@ -179,6 +179,9 @@ target_link_libraries(unholy-exl3-gemm-test PRIVATE unholy_ref)
 add_executable(unholy-curve tools/bench/curve.hip)
 target_link_libraries(unholy-curve PRIVATE unholy_engine)
 
+add_executable(unholy-glm-features tools/glm_features/main.hip)
+target_link_libraries(unholy-glm-features PRIVATE unholy_engine)
+
 add_executable(unholy-vit-test tools/kernel_test/vision.hip)
 target_link_libraries(unholy-vit-test PRIVATE unholy_glm)
 add_executable(unholy-dspark-test tools/kernel_test/dspark.hip)

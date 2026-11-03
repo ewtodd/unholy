@@ -590,6 +590,32 @@ void glm5_layer_forward_fast(const Glm5Config& c, const Glm5LayerWeights& w, Glm
   layer_post(c, w, s, x, p, st, false);
 }
 
+namespace {
+
+struct FeatureCapture {
+  std::vector<int> layers;
+  uint16_t* dst = nullptr;
+  int max_rows = 0;
+};
+FeatureCapture g_capture;
+
+// After layer `layer`'s FFN for rows [r0, r0 + n): their hc-stream mean into the capture, if it wants this layer.
+void capture_rows(const Glm5Config& c, int layer, const uint16_t* x, int r0, int n, hipStream_t st) {
+  if (!g_capture.dst) return;
+  for (size_t j = 0; j < g_capture.layers.size(); ++j) {
+    if (g_capture.layers[j] != layer) continue;
+    if (r0 + n > g_capture.max_rows) throw std::runtime_error("glm5 feature capture: more rows than its buffer");
+    k::hc_mean(x + size_t(r0) * c.hc_mult * c.dim, g_capture.dst + (j * size_t(g_capture.max_rows) + r0) * c.dim, n,
+               c.hc_mult, c.dim, st);
+  }
+}
+
+}  // namespace
+
+void glm5_set_feature_capture(const std::vector<int>& layers, uint16_t* dst, int max_rows) {
+  g_capture = {layers, dst, max_rows};
+}
+
 void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, std::span<Glm5PagedCache> cache,
                       const Glm5Scratch& s, uint16_t* x, const Glm5Batch& b, hipStream_t st, RemoteExperts* remote,
                       RemoteExperts* remote2) {
@@ -602,6 +628,7 @@ void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, 
       layer_pre(c, w[size_t(i)], cache[size_t(i)], s, x, p, st, false);
       layer_start(c, w[size_t(i)], s, p, st);
       layer_post(c, w[size_t(i)], s, x, p, st, false);
+      capture_rows(c, w[size_t(i)].layer, x, 0, b.T, st);
     }
     return;
   }
@@ -617,11 +644,13 @@ void glm5_layers_fast(const Glm5Config& c, std::span<const Glm5LayerWeights> w, 
     layer_pre(c, wi, cache[size_t(i)], s, x, p[1], st);
     layer_start(c, wi, s, p[1], st);
     layer_post(c, wi, s, x, p[0], st, true);
+    capture_rows(c, wi.layer, x, p[0].m.r0, p[0].m.T, st);
     if (i + 1 < n) {
       layer_pre(c, w[size_t(i) + 1], cache[size_t(i) + 1], s, x, p[0], st);
       layer_start(c, w[size_t(i) + 1], s, p[0], st);
     }
     layer_post(c, wi, s, x, p[1], st, true);
+    capture_rows(c, wi.layer, x, p[1].m.r0, p[1].m.T, st);
   }
 }
 
