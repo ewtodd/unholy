@@ -3,6 +3,13 @@
 Date: 2026-11-03. The owner's decision, against DECISIONS 2026-10-29 (which judged it not worth building). The first
 milestone measures what decides it, DFlash2's acceptance on our GLM, before any engine work.
 
+**Status: stopped after F1 (owner, 2026-11-03).** On our GLM the drafter lands 1.74 / 2.17 / 2.54 tokens per step at
+widths 2 / 3 / 8, at best 1.15x plain decode against MTP's ~1.3x (DECISIONS 2026-11-03). The cost is the box, not
+only the drafter: every verified token streams ~2 GB of cold experts on the APU (~12.5 ms), so even Qwen-level
+acceptance would only reach ~1.3x. DFlash2 pays where verifying 8 tokens costs about as much as 1, i.e. dense
+models such as radiance's Qwen3.8-27B. What F1 left behind: the hidden-state capture (`glm5_set_feature_capture`),
+`unholy-glm-features`, `tools/box/mkdflash-prompts.py` and `tools/ref/dflash2_ref.py`.
+
 ## What DFlash2 is
 
 `incoai/GLM-5.3-Flash-DFlash2` (CC BY-NC-ND 4.0: local use only, no published derivatives), revision `bf582e4`, on

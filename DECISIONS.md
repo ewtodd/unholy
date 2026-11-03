@@ -1486,3 +1486,5 @@ MTP on the same basis: 1.30x (one draft, 83-86% accepted; 1.2x measured served).
 position on Qwen3.8-27B. Even at 0.85 the best width (3) would give ~1.36x, about MTP: each verified token costs
 ~12.5 ms of APU expert streaming here. Unconfirmed: whether the 0.73 is the drafter on a 4.05 bpw target, our capture,
 or a port bug (no run of a reference implementation on the same inputs yet).
+- Decision (owner): stop after F1; MTP stays GLM's drafter. DFlash2 fits dense targets (radiance's Qwen3.8-27B),
+  where a wide verify costs about one step.
