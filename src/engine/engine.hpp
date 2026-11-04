@@ -17,6 +17,13 @@
 // saves at every page it completes (each superseding the last). A new request takes the deepest
 // boundary its tokens match, restores the snapshot into its slot and computes the rest.
 //
+// Snapshots can spill to disk (cfg.snapshot_dir, disk_snapshots): when fewer than a couple are free in
+// RAM, the least recently used cached one is written to a slot of a preallocated file and its RAM slot
+// freed (rolling decode snapshots that a later one superseded are dropped instead). A request whose
+// deepest match is on disk reads it back into a free RAM slot and waits (loading) until that completes;
+// one I/O thread does the reads and writes, the engine loop only polls for completions. Disk entries do
+// not outlive the engine (their pages live in VRAM).
+//
 // Token-level stops (EOS, stop token ids, max_tokens, the context limit) are decided here; text-level
 // stop strings belong to the frontend, which aborts the request when it sees one.
 #pragma once
@@ -116,6 +123,12 @@ struct EngineConfig {
   // changes which rows share a step, and a row's values depend on its step's size (GEMVs up to 8 rows, WMMA
   // GEMMs above), so the tokens differ from the original engine's for the same requests.
   bool decode_split = false;
+  // Prefix snapshots on disk: a file of disk_snapshots slots in snapshot_dir (a filesystem where O_DIRECT
+  // works, not the NVMe); off when either is unset. Any I/O error logs once and turns the tier off.
+  std::string snapshot_dir;
+  int disk_snapshots = 0;
+  int save_wait_ms = 1000;  // a save at a prompt's last boundary waits this long for a RAM slot that loses nothing, then is skipped
+  std::function<void(bool write)> io_hook;  // tests: runs on the I/O thread before each operation
 };
 
 struct EngineStats {
@@ -123,6 +136,8 @@ struct EngineStats {
   uint64_t prompt_tokens = 0, cached_tokens = 0;  // admitted prompt tokens, those served from the cache
   int running = 0, waiting = 0, free_pages = 0, total_pages = 0;  // free: unused or cached-unreferenced
   int cached_pages = 0, snapshots = 0;
+  int free_snapshots = 0, disk_snapshots = 0, disk_slots = 0, snapshot_io = 0;  // RAM unused or cached-unreferenced; on disk; capacity; I/Os in flight
+  uint64_t spills = 0, disk_hits = 0, disk_read_bytes = 0, disk_write_bytes = 0;
   uint64_t spec_steps = 0, spec_drafted = 0, spec_accepted = 0;  // verify chunks, drafts in them, accepted
   std::array<uint64_t, 8> spec_pos_drafted{}, spec_pos_accepted{};  // by draft position
   double busy_seconds = 0;
@@ -163,8 +178,35 @@ class Engine {
   void hash_pages(Seq& s, int npages);
   void match_prefix(Seq& s);
   void register_pages(Seq& s);
+  bool droppable(int id) const;
   int take_snapshot();
   void put_snapshot(int id);
+  void settle_snapshot(int id);
+  void set_cut(Seq& s);
+  void drop_prefix(Seq& s);
+  void unref_pages(Seq& s);
+  // Disk tier.
+  struct IoOp {
+    bool write = false;
+    int snap = 0, dslot = 0;
+    uint64_t id = 0, sum = 0;  // sum: of a read's expected bytes
+    std::vector<std::pair<uint8_t*, size_t>> segs;
+  };
+  struct IoDone {
+    IoOp op;
+    bool ok = false;
+    uint64_t sum = 0;  // of a write's bytes
+    std::string err;
+  };
+  void init_disk();
+  void disk_fail(const std::string& why);
+  int take_disk_slot();
+  void put_disk(int d);
+  void queue_io(bool write, int snap, int dslot, uint64_t id, uint64_t sum);
+  void start_load(Seq& s);
+  bool poll_io();  // true if any operation finished
+  void spill();
+  void io_loop();
   void commit_snapshot(Seq& s, int id, int end);
   void clear_cache();
   bool save_at(const Seq& s, int end, bool decode) const;
@@ -217,6 +259,14 @@ class Engine {
     uint64_t hash = 0;
     int refs = 0;
     bool cached = false;
+    bool io = false;     // being written to or read from disk: not evictable, not takeable
+    bool stale = false;  // a rolling decode snapshot a later one superseded: dropped, not spilled
+    std::list<int>::iterator lru;
+  };
+  struct DiskInfo {  // a slot of the snapshot file
+    uint64_t hash = 0, sum = 0;  // sum: checksum of the bytes written, checked on read
+    int refs = 0;                // reads in progress
+    bool valid = false;
     std::list<int>::iterator lru;
   };
   bool cache_on_ = false;
@@ -229,6 +279,23 @@ class Engine {
   std::vector<int> free_snaps_;
   std::list<int> snap_lru_;
   std::unordered_map<uint64_t, int> snap_by_hash_;
+  bool disk_on_ = false;
+  int fd_ = -1, spill_reserve_ = 0, io_pending_ = 0, spills_out_ = 0;
+  bool direct_ = false;  // O_DIRECT (else buffered, pages dropped after each I/O)
+  size_t slot_bytes_ = 0;
+  std::string path_;
+  std::vector<DiskInfo> disk_;
+  std::vector<int> free_disk_;
+  std::list<int> disk_lru_;
+  std::unordered_map<uint64_t, int> disk_by_hash_;
+  uint64_t io_ids_ = 0;
+  std::mutex io_mu_;  // the queue and the completions; never held while taking mu_
+  std::condition_variable io_cv_;
+  std::deque<IoOp> io_q_;
+  std::vector<IoDone> io_done_;
+  bool io_stop_ = false;
+  std::atomic<bool> io_ready_{false};  // a completion is waiting (set under mu_, so the loop cannot miss it)
+  std::thread io_thread_;
   std::vector<int32_t> tables_;
   bool tables_dirty_ = true;
   std::vector<float> logits_;

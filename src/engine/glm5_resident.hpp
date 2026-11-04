@@ -111,6 +111,10 @@ class Glm5ResidentModel final : public StepModel {
   int page_tokens() const override { return kernels::kGlmPageRows; }
   int max_inflight() const override { return 2; }
   int num_snapshots() const override { return snapshots_; }
+  void snapshot_host(int id, std::vector<std::pair<uint8_t*, size_t>>& segs) const override {
+    for (int k = 0; k < 2; ++k)
+      if (snap_bytes_[k] > 0) segs.emplace_back(snap_host_[k] + size_t(id) * snap_bytes_[k], snap_bytes_[k]);
+  }
   int draft_block() const override { return mtp_ ? 1 : 0; }
   int max_verify() const override { return mtp_ ? 2 : 0; }
   bool whole_image_blocks() const override { return false; }
@@ -174,9 +178,10 @@ class Glm5ResidentModel final : public StepModel {
     uint16_t* emb_host = nullptr;    // MTP: [max_tokens][dim] embeddings of the step's cache rows
     uint16_t* img_host = nullptr;    // vision: [max_tokens][dim] the step's image rows
     hipEvent_t handoff = nullptr, consumed = nullptr, done = nullptr;
+    hipEvent_t saved = nullptr;  // card 0: the step's state saves done (recorded when the engine reads them)
     uint64_t ticket = 0;
     int rows = 0;
-    bool busy = false;
+    bool busy = false, saved_wait = false;
   };
   Flight flight_[2];
   // Prefix snapshots: per card, the slot slices of the per-slot state (KDA conv / recurrent, card 1: the MTP hidden

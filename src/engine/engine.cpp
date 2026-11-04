@@ -1,7 +1,15 @@
 #include "engine/engine.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <stdexcept>
 
 namespace unholy::engine {
@@ -44,6 +52,12 @@ struct Engine::Seq {
   int registered = 0;            // leading pages entered in the cache (or found there)
   int done_pos = 0;              // positions whose steps have completed
   int restore = -1;              // snapshot to load into the slot with the next chunk
+  bool loading = false;          // its restore snapshot is being read from disk (load_id): not scheduled until done
+  int load_dslot = -1;           // the disk slot it reads (a reference on it), once matched
+  uint64_t load_id = 0, load_hash = 0;
+  bool cached_by_load = false;   // its first admission counted the disk prefix as cached tokens
+  bool waiting_slot = false;       // its save at the prompt's last boundary waits for a RAM slot (since slot_wait)
+  std::chrono::steady_clock::time_point slot_wait;
   int cut = 0;                   // the prompt's last page boundary: a prefill chunk ends there to save state
   int last_save = 0;             // position of the last state save
   int rolling = -1;              // the snapshot decoding saved last, superseded by the next
@@ -74,12 +88,14 @@ Engine::Engine(StepModel& model, EngineConfig cfg, bool start) : model_(model), 
     snap_info_.resize(size_t(model_.num_snapshots()));
     for (int s = model_.num_snapshots() - 1; s >= 0; --s) free_snaps_.push_back(s);
   }
+  if (cache_on_) init_disk();
   slots_ = model_.max_slots();
   if (cfg_.max_running > 0) slots_ = std::min(slots_, cfg_.max_running);
   for (int s = slots_ - 1; s >= 0; --s) free_slots_.push_back(s);
   for (int p = model_.num_pages() - 1; p >= 0; --p) free_pages_.push_back(p);
   tables_.assign(size_t(model_.max_slots()) * model_.max_pages_per_seq(), 0);
   stats_.total_pages = stats_.free_pages = model_.num_pages();
+  stats_.disk_slots = disk_on_ ? cfg_.disk_snapshots : 0;
   if (start) thread_ = std::thread([this] { loop(); });
 }
 
@@ -100,6 +116,18 @@ Engine::~Engine() {
   for (auto& s : incoming_) finish(*s, FinishReason::Abort);
   for (auto& s : waiting_) finish(*s, FinishReason::Abort);
   for (auto& s : running_) finish(*s, FinishReason::Abort);
+  if (io_thread_.joinable()) {
+    {
+      std::lock_guard lk(io_mu_);
+      io_stop_ = true;
+    }
+    io_cv_.notify_all();
+    io_thread_.join();
+  }
+  if (fd_ >= 0) {
+    ::close(fd_);
+    ::unlink(path_.c_str());
+  }
 }
 
 uint64_t Engine::submit(GenRequest req, Sink sink) {
@@ -163,7 +191,7 @@ void Engine::finish(Seq& s, FinishReason r, const std::string& err) {
   s.out = GenOutput{};
 }
 
-void Engine::release(Seq& s) {
+void Engine::unref_pages(Seq& s) {
   // Tail first: a sequence's last pages become evictable before its first ones.
   for (auto it = s.pages.rbegin(); it != s.pages.rend(); ++it) {
     PageInfo& pi = page_info_[size_t(*it)];
@@ -172,6 +200,14 @@ void Engine::release(Seq& s) {
     else free_pages_.push_back(*it);
   }
   s.pages.clear();
+}
+
+void Engine::release(Seq& s) {
+  unref_pages(s);
+  // A started read keeps its disk slot and RAM slot until it completes (poll_io); one not started gives them back.
+  if (s.load_dslot >= 0 && !s.loading) put_disk(s.load_dslot);
+  s.load_dslot = -1;
+  s.loading = false;
   if (s.restore >= 0) put_snapshot(s.restore);
   s.restore = -1;
   if (s.slot >= 0) free_slots_.push_back(s.slot);
@@ -235,7 +271,7 @@ void Engine::match_prefix(Seq& s) {
   const int limit = (int(s.tokens.size()) - 1) / page_tokens_;
   if (!cache_on_ || limit <= 0) return;
   hash_pages(s, limit);
-  int best = 0, snap = -1;
+  int best = 0, snap = -1, dbest = 0, dslot = -1;  // the deepest RAM snapshot; the deepest one only on disk
   for (int i = 0; i < limit; ++i) {
     if (!page_by_hash_.count(s.hashes[size_t(i)])) break;
     // Never resume inside a whole image block: its tokens see the whole block.
@@ -247,17 +283,39 @@ void Engine::match_prefix(Seq& s) {
     if (const auto it = snap_by_hash_.find(s.hashes[size_t(i)]); it != snap_by_hash_.end()) {
       best = i + 1;
       snap = it->second;
+    } else if (const auto dt = disk_on_ ? disk_by_hash_.find(s.hashes[size_t(i)]) : disk_by_hash_.end();
+               dt != disk_by_hash_.end()) {
+      dbest = i + 1;
+      dslot = dt->second;
     }
   }
-  if (best == 0) return;
+  // A disk hit deeper than the RAM ones is read into a free RAM slot (none: the RAM hit, if any, is used).
+  const bool from_disk = dbest > best && !free_snaps_.empty();
+  if (from_disk) {
+    best = dbest;
+    snap = free_snaps_.back();
+    free_snaps_.pop_back();
+    SnapInfo& si = snap_info_[size_t(snap)];
+    si.refs = 1;
+    si.cached = si.stale = false;
+    DiskInfo& di = disk_[size_t(dslot)];
+    if (di.refs++ == 0) disk_lru_.erase(di.lru);
+    s.load_dslot = dslot;
+    s.load_hash = s.hashes[size_t(best - 1)];
+  } else if (best == 0) {
+    return;
+  }
   for (int i = 0; i < best; ++i) {
     const int32_t p = page_by_hash_.at(s.hashes[size_t(i)]);
     PageInfo& pi = page_info_[size_t(p)];
     if (pi.refs++ == 0) evictable_.erase(pi.lru);
     s.pages.push_back(p);
   }
-  SnapInfo& si = snap_info_[size_t(snap)];
-  if (si.refs++ == 0) snap_lru_.erase(si.lru);
+  if (!from_disk) {
+    SnapInfo& si = snap_info_[size_t(snap)];
+    if (si.refs++ == 0 && !si.io) snap_lru_.erase(si.lru);  // (a spilling one is not in the LRU)
+    si.stale = false;
+  }
   s.restore = snap;
   s.computed = s.done_pos = s.last_save = best * page_tokens_;
   s.registered = best;
@@ -280,16 +338,31 @@ void Engine::register_pages(Seq& s) {
   s.registered = full;
 }
 
+// A cached snapshot that can be discarded without losing the prefix (it is superseded, or the disk has it).
+bool Engine::droppable(int id) const {
+  const SnapInfo& si = snap_info_[size_t(id)];
+  return si.stale || disk_by_hash_.count(si.hash) > 0;
+}
+
 int Engine::take_snapshot() {
   int id;
   if (!free_snaps_.empty()) {
     id = free_snaps_.back();
     free_snaps_.pop_back();
+  } else if (disk_on_) {  // only a cached snapshot that loses nothing: superseded, or already on disk
+    const auto it = std::find_if(snap_lru_.begin(), snap_lru_.end(), [&](int i) { return droppable(i); });
+    if (it == snap_lru_.end()) return -1;
+    id = *it;
+    snap_lru_.erase(it);
+    snap_by_hash_.erase(snap_info_[size_t(id)].hash);
+    snap_info_[size_t(id)].cached = false;
+    snap_info_[size_t(id)].stale = false;
   } else if (!snap_lru_.empty()) {
     id = snap_lru_.front();
     snap_lru_.pop_front();
     snap_by_hash_.erase(snap_info_[size_t(id)].hash);
     snap_info_[size_t(id)].cached = false;
+    snap_info_[size_t(id)].stale = false;
   } else {
     return -1;
   }
@@ -299,7 +372,13 @@ int Engine::take_snapshot() {
 
 void Engine::put_snapshot(int id) {
   SnapInfo& si = snap_info_[size_t(id)];
-  if (--si.refs > 0) return;
+  if (--si.refs > 0 || si.io) return;  // an I/O in flight settles it when it completes
+  settle_snapshot(id);
+}
+
+// An unreferenced snapshot with no I/O in flight: cached (evictable) or free.
+void Engine::settle_snapshot(int id) {
+  SnapInfo& si = snap_info_[size_t(id)];
   if (si.cached) si.lru = snap_lru_.insert(snap_lru_.end(), id);
   else free_snaps_.push_back(id);
 }
@@ -313,6 +392,23 @@ bool Engine::save_at(const Seq& s, int end, bool decode) const {
   const int pages = end / page_tokens_;
   const int stride = page_tokens_ * (pages <= 256 ? 16 : pages <= 1024 ? 64 : 256);
   return end - s.last_save >= stride;
+}
+
+// The prompt's last page boundary, where a prefill chunk ends to save state (0: none past the cached prefix).
+void Engine::set_cut(Seq& s) {
+  s.cut = (int(s.tokens.size()) - 1) / page_tokens_ * page_tokens_;
+  for (const GenImage& im : s.req.images)  // not inside a whole image block
+    if (model_.whole_image_blocks() && s.cut > im.start && s.cut < im.start + im.len) s.cut = im.start / page_tokens_ * page_tokens_;
+  if (s.cut <= s.computed) s.cut = 0;
+}
+
+// A prefix whose snapshot could not be read: the sequence starts over from position 0 in its slot.
+void Engine::drop_prefix(Seq& s) {
+  unref_pages(s);
+  if (s.restore >= 0) put_snapshot(s.restore);
+  s.restore = -1;
+  s.computed = s.done_pos = s.registered = s.last_save = 0;
+  set_cut(s);
 }
 
 void Engine::preempt(Seq& s) {
@@ -377,6 +473,7 @@ void Engine::intake() {
 
 bool Engine::iterate() {
   intake();
+  const bool polled = poll_io();
   const auto t_start = std::chrono::steady_clock::now();
   const int budget0 = cfg_.max_batch_tokens;
 
@@ -397,21 +494,18 @@ bool Engine::iterate() {
     free_slots_.pop_back();
     write_table(s);
     s.admitted = ++admit_counter_;
-    if (cache_on_) {
-      s.cut = (int(s.tokens.size()) - 1) / page_tokens_ * page_tokens_;
-      for (const GenImage& im : s.req.images)  // not inside a whole image block
-        if (model_.whole_image_blocks() && s.cut > im.start && s.cut < im.start + im.len) s.cut = im.start / page_tokens_ * page_tokens_;
-      if (s.cut <= s.computed) s.cut = 0;
-    }
+    if (cache_on_) set_cut(s);
     if (!s.admitted_once) {
       s.admitted_once = true;
       s.t_admit = std::chrono::steady_clock::now();
       s.cached = s.computed;
+      s.cached_by_load = s.load_dslot >= 0;
       s.out.cached_tokens = s.cached;
       std::lock_guard lk(stats_mu_);
       stats_.prompt_tokens += uint64_t(s.n_prompt);
       stats_.cached_tokens += uint64_t(s.cached);
     }
+    if (s.load_dslot >= 0) start_load(s);
     running_.push_back(std::move(waiting_.front()));
     waiting_.pop_front();
   }
@@ -430,6 +524,7 @@ bool Engine::iterate() {
       completed = true;
     }
   }
+  spill();
   // Counts refreshed on every path (an abort during intake can empty the running set).
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
   std::lock_guard lk(stats_mu_);
@@ -439,7 +534,10 @@ bool Engine::iterate() {
   stats_.free_pages = available_pages();
   stats_.cached_pages = int(page_by_hash_.size());
   stats_.snapshots = int(snap_by_hash_.size());
-  return submitted || completed;
+  stats_.free_snapshots = int(free_snaps_.size() + snap_lru_.size());
+  stats_.disk_snapshots = int(disk_by_hash_.size());
+  stats_.snapshot_io = io_pending_;
+  return submitted || completed || polled;
 }
 
 // Plans and submits one step over the sequences that are not waiting for logits: decoding sequences
@@ -449,6 +547,11 @@ bool Engine::submit_step(int budget0) {
   std::vector<InFlight::Item> plan;
   const auto build = [&]() {
     plan.clear();
+    int musts = 0, snap_budget = 0;  // saves at a prompt's last boundary planned; RAM slots they can take
+    if (disk_on_) {
+      snap_budget = int(free_snaps_.size());
+      for (const int id : snap_lru_) snap_budget += droppable(id);
+    }
     int budget = budget0, logit_rows = model_.max_logit_rows();
     const auto rem = [](const Seq* s) { return int(s->tokens.size()) - s->computed; };
     // Plans up to `cap` (<= budget) tokens of s.
@@ -474,6 +577,18 @@ bool Engine::submit_step(int budget0) {
       if (n <= 0) return;
       const bool logits = n == remaining;
       if (logits && logit_rows == 0) return;
+      // With the disk tier a save at the prompt's last boundary needs a RAM slot that loses nothing (a free one, or a
+      // droppable one): when there is none and slots are about to free (spills, steps), wait for them instead.
+      if (disk_on_ && !decode && s.cut > 0 && s.computed + n == s.cut) {
+        if (musts >= snap_budget && (io_pending_ > 0 || !inflight_.empty())) {
+          // (not for long: a stalled disk must not hold a request back; the save is then skipped)
+          const auto t = std::chrono::steady_clock::now();
+          if (!s.waiting_slot) s.waiting_slot = true, s.slot_wait = t;
+          if (t - s.slot_wait < std::chrono::milliseconds(cfg_.save_wait_ms)) return;
+        }
+        ++musts;
+      }
+      s.waiting_slot = false;
       // Decoding with drafts: verify as many as the step, the context and max_tokens allow.
       int k = 0;
       if (decode && spec_on_ && !s.drafts.empty()) {
@@ -491,7 +606,7 @@ bool Engine::submit_step(int budget0) {
     std::vector<Seq*> prefills, decodes;
     for (auto& sp : running_) {
       Seq& s = *sp;
-      if (s.awaiting_logits || s.abort_pending || s.done || rem(&s) <= 0) continue;
+      if (s.awaiting_logits || s.abort_pending || s.done || s.loading || rem(&s) <= 0) continue;
       (rem(&s) > 1 ? prefills : decodes).push_back(&s);
     }
     // Two micro-batches (cfg_.decode_split): a step takes half of the decoders, counting those of the step
@@ -560,6 +675,10 @@ bool Engine::submit_step(int budget0) {
   if (plan.empty()) return false;
 
   StepInput in;
+  in.sync_saves = disk_on_;  // spills read the saves from host memory
+  if (disk_on_)  // the saves at a prompt's last boundary take their slots before the others do
+    for (auto& it : plan)
+      if (cache_on_ && it.end == it.s->cut && save_at(*it.s, it.end, it.n == 1 || it.ndraft > 0)) it.save = take_snapshot();
   for (auto& it : plan) {
     Seq& s = *it.s;
     if (!alloc_pages(s, s.computed + it.n)) throw std::logic_error("engine: page accounting");
@@ -570,7 +689,7 @@ bool Engine::submit_step(int budget0) {
       s.restore = -1;
     }
     if (cache_on_ && save_at(s, it.end, it.n == 1 || it.ndraft > 0)) {
-      it.save = take_snapshot();
+      if (it.save < 0) it.save = take_snapshot();
       if (it.save >= 0) {
         in.save.push_back({s.slot, it.save});
         s.last_save = it.end;
@@ -768,6 +887,17 @@ void Engine::fail_all(const std::string& why) {
 
 // Forgets every cached page and snapshot (after a failed step the device contents are unknown).
 void Engine::clear_cache() {
+  // Disk reads and writes in flight finish first (an error path: blocking here is fine).
+  while (io_pending_ > 0) {
+    if (!poll_io()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  disk_by_hash_.clear();
+  disk_lru_.clear();
+  free_disk_.clear();
+  for (size_t i = disk_.size(); i-- > 0;) {
+    disk_[i] = DiskInfo{};
+    free_disk_.push_back(int(i));
+  }
   for (const int32_t p : evictable_) {
     page_info_[size_t(p)].cached = false;
     free_pages_.push_back(p);
@@ -799,9 +929,10 @@ void Engine::commit_snapshot(Seq& s, int id, int end) {
   if (s.rolling >= 0 && s.rolling != id) {
     const auto f = snap_by_hash_.find(s.rolling_hash);
     SnapInfo& old = snap_info_[size_t(s.rolling)];
-    if (f != snap_by_hash_.end() && f->second == s.rolling && old.refs == 0) {
+    if (f != snap_by_hash_.end() && f->second == s.rolling && old.refs == 0 && !old.io) {
       snap_lru_.erase(old.lru);
       old.lru = snap_lru_.insert(snap_lru_.begin(), s.rolling);
+      old.stale = true;
     }
   }
   s.rolling = id;
@@ -814,12 +945,289 @@ void Engine::loop() {
       std::unique_lock lk(mu_);
       cv_.wait(lk, [&] {
         return stop_ || !incoming_.empty() || !aborts_.empty() || !running_.empty() || !waiting_.empty() ||
-               !inflight_.empty();
+               !inflight_.empty() || io_ready_;
       });
       if (stop_) return;
     }
-    iterate();
+    // Nothing to do but wait for the disk (sequences loading): sleep until a read finishes or work arrives.
+    if (!iterate() && io_pending_ > 0) {
+      std::unique_lock lk(mu_);
+      cv_.wait_for(lk, std::chrono::milliseconds(2),
+                   [&] { return stop_ || !incoming_.empty() || !aborts_.empty() || io_ready_; });
+    }
   }
+}
+
+namespace {
+// 64 bits over a buffer (8 independent lanes; the I/O thread checks what it read against what it wrote).
+uint64_t sum_bytes(const uint8_t* p, size_t n) {
+  uint64_t h[8];
+  for (int l = 0; l < 8; ++l) h[l] = 0x9e3779b97f4a7c15ull * uint64_t(l + 1);
+  size_t i = 0;
+  for (; i + 64 <= n; i += 64)
+    for (int l = 0; l < 8; ++l) {
+      uint64_t w;
+      std::memcpy(&w, p + i + size_t(l) * 8, 8);
+      h[l] = (h[l] ^ w) * 0xff51afd7ed558ccdull;
+      h[l] ^= h[l] >> 32;
+    }
+  uint64_t t = n;
+  for (int l = 0; l < 8; ++l) t = mix64(t + h[l]);
+  for (; i < n; ++i) t = mix64(t + p[i]);
+  return t;
+}
+}  // namespace
+
+void Engine::disk_fail(const std::string& why) {
+  if (!disk_on_) return;
+  disk_on_ = false;
+  std::fprintf(stderr, "engine: snapshot disk tier off: %s\n", why.c_str());
+}
+
+// Creates the file (truncated, preallocated) and starts the I/O thread. Failures turn the tier off.
+void Engine::init_disk() {
+  if (cfg_.disk_snapshots <= 0 && cfg_.snapshot_dir.empty()) return;
+  if (cfg_.disk_snapshots <= 0 || cfg_.snapshot_dir.empty()) {
+    std::fprintf(stderr, "engine: snapshot disk tier needs both a directory and a slot count; off\n");
+    return;
+  }
+  disk_on_ = true;
+  std::vector<std::pair<uint8_t*, size_t>> segs;
+  model_.snapshot_host(0, segs);
+  size_t bytes = 0;
+  bool aligned = true;
+  for (const auto& [p, n] : segs) {
+    bytes += n;
+    aligned &= uintptr_t(p) % 4096 == 0 && n % 4096 == 0;
+  }
+  if (bytes == 0) return disk_fail("the model's snapshots are not in host memory");
+  slot_bytes_ = bytes;
+  std::error_code ec;
+  std::filesystem::create_directories(cfg_.snapshot_dir, ec);
+  path_ = cfg_.snapshot_dir + "/snapshots.bin";
+  direct_ = aligned;
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | (direct_ ? O_DIRECT : 0), 0600);
+  if (fd_ < 0 && direct_ && errno == EINVAL) {  // tmpfs and the like
+    direct_ = false;
+    fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  }
+  if (fd_ < 0) return disk_fail("open " + path_ + ": " + std::strerror(errno));
+  const off_t total = off_t(slot_bytes_) * cfg_.disk_snapshots;
+  if (const int e = ::posix_fallocate(fd_, 0, total); e == EOPNOTSUPP || e == EINVAL) {
+    if (::ftruncate(fd_, total) != 0) return disk_fail(std::string("ftruncate: ") + std::strerror(errno));
+  } else if (e != 0) {
+    return disk_fail(std::string("allocating ") + std::to_string(total >> 20) + " MiB in " + path_ + ": " + std::strerror(e));
+  }
+  disk_.resize(size_t(cfg_.disk_snapshots));
+  for (int d = cfg_.disk_snapshots - 1; d >= 0; --d) free_disk_.push_back(d);
+  spill_reserve_ = std::clamp(model_.num_snapshots() - 1, 1, 2);
+  io_thread_ = std::thread([this] { io_loop(); });
+  std::fprintf(stderr, "engine: snapshot disk tier: %d slots of %.1f MB in %s (%s), %d RAM snapshots kept free\n",
+               cfg_.disk_snapshots, double(slot_bytes_) / 1e6, path_.c_str(),
+               direct_ ? "O_DIRECT" : "buffered, pages dropped after each I/O", spill_reserve_);
+}
+
+// The I/O thread: one operation at a time, in queue order.
+void Engine::io_loop() {
+  for (;;) {
+    IoDone d;
+    {
+      std::unique_lock lk(io_mu_);
+      io_cv_.wait(lk, [&] { return io_stop_ || !io_q_.empty(); });
+      if (io_stop_) return;
+      d.op = std::move(io_q_.front());
+      io_q_.pop_front();
+    }
+    if (cfg_.io_hook) cfg_.io_hook(d.op.write);
+    d.ok = true;
+    const off_t base = off_t(d.op.dslot) * off_t(slot_bytes_);
+    off_t off = base;
+    uint64_t sum = 0;
+    for (const auto& [p, n] : d.op.segs) {
+      for (size_t done = 0; done < n;) {
+        const ssize_t r = d.op.write ? ::pwrite(fd_, p + done, n - done, off + off_t(done))
+                                     : ::pread(fd_, p + done, n - done, off + off_t(done));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) {
+          d.ok = false;
+          d.err = std::string(d.op.write ? "write" : "read") + " of snapshot slot " + std::to_string(d.op.dslot) + ": " +
+                  (r < 0 ? std::strerror(errno) : "end of file");
+          break;
+        }
+        done += size_t(r);
+      }
+      if (!d.ok) break;
+      off += off_t(n);
+      sum = mix64(sum ^ sum_bytes(p, n));
+    }
+    if (!direct_) ::posix_fadvise(fd_, base, off_t(slot_bytes_), POSIX_FADV_DONTNEED);
+    if (d.ok && d.op.write) d.sum = sum;
+    if (d.ok && !d.op.write && sum != d.op.sum) {
+      d.ok = false;
+      d.err = "snapshot slot " + std::to_string(d.op.dslot) + " read back differently from what was written";
+    }
+    {
+      std::lock_guard lk(io_mu_);
+      io_done_.push_back(std::move(d));
+    }
+    {
+      std::lock_guard lk(mu_);
+      io_ready_ = true;
+    }
+    cv_.notify_all();
+  }
+}
+
+void Engine::queue_io(bool write, int snap, int dslot, uint64_t id, uint64_t sum) {
+  IoOp op;
+  op.write = write;
+  op.snap = snap;
+  op.dslot = dslot;
+  op.id = id;
+  op.sum = sum;
+  model_.snapshot_host(snap, op.segs);
+  ++io_pending_;
+  {
+    std::lock_guard lk(io_mu_);
+    io_q_.push_back(std::move(op));
+  }
+  io_cv_.notify_one();
+}
+
+// Reads the sequence's disk snapshot into the RAM slot match_prefix took; the sequence waits (loading).
+void Engine::start_load(Seq& s) {
+  SnapInfo& si = snap_info_[size_t(s.restore)];
+  si.io = true;
+  si.hash = s.load_hash;
+  s.loading = true;
+  s.load_id = ++io_ids_;
+  queue_io(false, s.restore, s.load_dslot, s.load_id, disk_[size_t(s.load_dslot)].sum);
+  std::lock_guard lk(stats_mu_);
+  ++stats_.disk_hits;
+}
+
+int Engine::take_disk_slot() {
+  int d;
+  if (!free_disk_.empty()) {
+    d = free_disk_.back();
+    free_disk_.pop_back();
+  } else if (!disk_lru_.empty()) {  // (slots being read are not in the LRU)
+    d = disk_lru_.front();
+    disk_lru_.pop_front();
+    disk_by_hash_.erase(disk_[size_t(d)].hash);
+    disk_[size_t(d)].valid = false;
+  } else {
+    return -1;
+  }
+  return d;
+}
+
+void Engine::put_disk(int d) {
+  DiskInfo& di = disk_[size_t(d)];
+  if (--di.refs == 0 && di.valid) di.lru = disk_lru_.insert(disk_lru_.end(), d);
+}
+
+// Keeps spill_reserve_ RAM snapshots free: the least recently used cached ones are written to disk (their RAM
+// slots go free when the write completes), or dropped when a later rolling snapshot superseded them or the disk
+// has them already. Only unreferenced cached snapshots are in the LRU, so none is being saved into or restored.
+void Engine::spill() {
+  if (!disk_on_) return;
+  while (int(free_snaps_.size()) + spills_out_ < spill_reserve_ && !snap_lru_.empty()) {
+    const int id = snap_lru_.front();
+    SnapInfo& si = snap_info_[size_t(id)];
+    const auto dt = disk_by_hash_.find(si.hash);
+    if (si.stale || dt != disk_by_hash_.end()) {
+      if (dt != disk_by_hash_.end() && disk_[size_t(dt->second)].refs == 0) {  // used again: the disk copy too
+        disk_lru_.erase(disk_[size_t(dt->second)].lru);
+        disk_[size_t(dt->second)].lru = disk_lru_.insert(disk_lru_.end(), dt->second);
+      }
+      snap_lru_.pop_front();
+      snap_by_hash_.erase(si.hash);
+      si.cached = si.stale = false;
+      free_snaps_.push_back(id);
+      continue;
+    }
+    const int d = take_disk_slot();
+    if (d < 0) break;  // every disk slot is being read
+    snap_lru_.pop_front();
+    si.io = true;
+    ++spills_out_;
+    queue_io(true, id, d, 0, 0);
+  }
+}
+
+// Handles the finished disk operations; true if there were any.
+bool Engine::poll_io() {
+  io_ready_ = false;  // before taking the completions: one that lands after sets it again
+  if (io_pending_ == 0) return false;
+  std::vector<IoDone> done;
+  {
+    std::lock_guard lk(io_mu_);
+    done.swap(io_done_);
+  }
+  for (IoDone& d : done) {
+    --io_pending_;
+    SnapInfo& si = snap_info_[size_t(d.op.snap)];
+    si.io = false;
+    if (!d.ok) disk_fail(d.err);
+    if (!d.op.write) {
+      const int dslot = d.op.dslot;
+      const uint64_t h = disk_[size_t(dslot)].hash;
+      put_disk(dslot);
+      Seq* seq = nullptr;  // none if it was preempted, aborted or finished meanwhile
+      for (auto& r : running_)
+        if (r->loading && r->load_id == d.op.id) seq = r.get();
+      if (d.ok) {
+        si.hash = h;
+        if (snap_by_hash_.emplace(h, d.op.snap).second) si.cached = true;  // the RAM copy is cached too
+        std::lock_guard lk(stats_mu_);
+        stats_.disk_read_bytes += slot_bytes_;
+      }
+      if (seq) {
+        seq->loading = false;
+        seq->load_dslot = -1;
+        seq->load_id = 0;
+        if (!d.ok) {  // recomputed from the start
+          drop_prefix(*seq);
+          if (seq->cached_by_load) {
+            std::lock_guard lk(stats_mu_);
+            stats_.cached_tokens -= uint64_t(seq->cached);
+            seq->cached = seq->out.cached_tokens = 0;
+            seq->cached_by_load = false;
+          }
+        }
+      } else if (si.refs == 0) {
+        settle_snapshot(d.op.snap);
+      }
+    } else {
+      --spills_out_;
+      DiskInfo& di = disk_[size_t(d.op.dslot)];
+      const bool stored = d.ok && disk_on_ && disk_by_hash_.emplace(si.hash, d.op.dslot).second;
+      if (stored) {
+        di.hash = si.hash;
+        di.sum = d.sum;
+        di.valid = true;
+        di.refs = 0;
+        di.lru = disk_lru_.insert(disk_lru_.end(), d.op.dslot);
+        std::lock_guard lk(stats_mu_);
+        ++stats_.spills;
+        stats_.disk_write_bytes += slot_bytes_;
+      } else {
+        free_disk_.push_back(d.op.dslot);
+      }
+      if (si.refs == 0) {  // (a request that hit it meanwhile keeps the RAM copy; it is cached again when released)
+        if (stored) {
+          if (const auto f = snap_by_hash_.find(si.hash); f != snap_by_hash_.end() && f->second == d.op.snap)
+            snap_by_hash_.erase(f);
+          si.cached = false;
+          free_snaps_.push_back(d.op.snap);
+        } else {
+          settle_snapshot(d.op.snap);
+        }
+      }
+    }
+  }
+  return !done.empty();
 }
 
 }  // namespace unholy::engine

@@ -431,6 +431,7 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
     {
       rt::DeviceGuard g(card_[0].dev);
       UH_CHECK(hipEventCreateWithFlags(&f.handoff, hipEventDisableTiming));
+      UH_CHECK(hipEventCreateWithFlags(&f.saved, hipEventDisableTiming));
     }
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventCreateWithFlags(&f.consumed, hipEventDisableTiming));
@@ -449,8 +450,8 @@ Glm5ResidentModel::Glm5ResidentModel(const model::Glm5Config& c, const model::Ch
           add(pc.state, pc.state.size() / size_t(geo.max_slots));
         }
       if (k == 1 && mtp_) add(h_last_, size_t(c.dim) * 2);
-      snap_bytes_[k] = off;
-      pinned(&snap_host_[k], off * size_t(snapshots_));
+      snap_bytes_[k] = (off + 4095) / 4096 * 4096;  // whole 4 KiB pages per block: the disk tier moves them with O_DIRECT
+      pinned(&snap_host_[k], snap_bytes_[k] * size_t(snapshots_));
     }
   }
 }
@@ -474,7 +475,7 @@ Glm5ResidentModel::~Glm5ResidentModel() {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.io_host),
                     static_cast<void*>(f.tables_host), static_cast<void*>(f.emb_host), static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
-    for (hipEvent_t e : {f.handoff, f.consumed, f.done})
+    for (hipEvent_t e : {f.handoff, f.saved, f.consumed, f.done})
       if (e) (void)hipEventDestroy(e);
   }
 }
@@ -662,6 +663,8 @@ uint64_t Glm5ResidentModel::submit(const StepInput& in) {
       k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.handoff, cd.st));
       state_copies(0, in.save, true);  // after the handoff: card 1 need not wait for it
+      f.saved_wait = in.sync_saves && !in.save.empty();
+      if (f.saved_wait) UH_CHECK(hipEventRecord(f.saved, cd.st));
     }
   }
   Card& cd = card_[1];
@@ -784,6 +787,11 @@ void Glm5ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {
   {
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventSynchronize(f.done));
+  }
+  if (f.saved_wait) {  // card 0 saves after its handoff, which card 1 does not wait for
+    rt::DeviceGuard g(card_[0].dev);
+    UH_CHECK(hipEventSynchronize(f.saved));
+    f.saved_wait = false;
   }
   out.resize(size_t(f.rows) * c_.vocab);
   std::memcpy(out.data(), f.logits_host, out.size() * 4);

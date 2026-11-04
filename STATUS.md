@@ -76,7 +76,7 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
 - [x] decode latency (DECISIONS 2026-10-14/15): single-stream 56.7 -> 34.2 ms/token at 4k, 87.6 -> 44.8 ms at
       512k (W8A8 GEMV fp8 decode, single-workgroup kernels spread, attention staging bank conflict and split
       across workgroups, top-k on several workgroups for long rows, fewer launches); bit-identical logits
-- [ ] disk tier for the prefix cache
+- [x] disk tier for the prefix cache: `--snapshot-dir DIR --disk-snapshots N` (snapshots spilled to /work, DECISIONS 2026-11-03)
 - [x] decode scaling: one attention / top-k launch for all chunks, skinny WMMA GEMMs for verify steps of 9-64
       rows and the APU's expert GEMM with the weights in registers (all bit-identical); serve's defaults add
       more hot experts, 64-token expert GEMVs and the drafter's WMMA attention (noise-level changes): GSM8K

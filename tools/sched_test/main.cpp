@@ -8,15 +8,24 @@
 // chunk changes the hash. With prefix caching on, half the requests extend an earlier prompt (or prompt
 // and reply), and the fake keeps per-slot state (a running hash of the slot's tokens) that snapshots
 // save and restore: a restore that does not match the pages it continues over, or a chunk that does
-// not continue the restored state, fails.
+// not continue the restored state, fails. The snapshots are bytes in aligned host buffers (StepModel::
+// snapshot_host) that encode the state, so the disk tier's cases can check that what comes back from the
+// file is what was saved.
 //
-//   unholy-sched-test [--requests N] [--seed S]
+//   unholy-sched-test [--requests N] [--seed S] [--disk-dir DIR]
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unistd.h>
 #include <unordered_map>
 
 #include "engine/engine.hpp"
@@ -46,8 +55,19 @@ class FakeModel final : public StepModel {
             int draft_block)
       : inflight_(inflight), slots_(slots), ppseq_(pages_per_seq), pages_(pages), page_(page_tokens), max_tokens_(max_tokens),
         snapshots_(snapshots), draft_block_(draft_block), store_(size_t(pages) * page_tokens, -1),
-        len_(size_t(slots), 0), state_(size_t(slots), kFnvBasis), snaps_(size_t(snapshots)), backup_(size_t(slots)) {}
+        len_(size_t(slots), 0), state_(size_t(slots), kFnvBasis), backup_(size_t(slots)) {
+    if (snapshots > 0) {
+      host_ = static_cast<uint8_t*>(std::aligned_alloc(4096, size_t(snapshots) * kSnapBytes));
+      std::memset(host_, 0, size_t(snapshots) * kSnapBytes);
+    }
+  }
+  ~FakeModel() override { std::free(host_); }
   int num_snapshots() const override { return snapshots_; }
+  // Two 4 KiB regions per snapshot (as the real ones are per card).
+  void snapshot_host(int id, std::vector<std::pair<uint8_t*, size_t>>& segs) const override {
+    segs.emplace_back(host_ + size_t(id) * kSnapBytes, 4096);
+    segs.emplace_back(host_ + size_t(id) * kSnapBytes + 4096, 4096);
+  }
   int draft_block() const override { return draft_block_; }
   int max_verify() const override { return draft_block_ ? draft_block_ + 1 : 0; }
   // Restores truncate the slot back to the accepted prefix (they must match the last backup); drafts
@@ -117,8 +137,7 @@ class FakeModel final : public StepModel {
     std::vector<bool> seen(size_t(slots_), false);
     std::vector<int> chunk_of_row(in.ids.size());
     for (const StateOp& r : in.restore) {
-      const Snap& sn = snaps_.at(size_t(r.snapshot));
-      if (!sn.valid) throw std::runtime_error("fake: restore of an unsaved snapshot");
+      const Snap sn = load_snap(r.snapshot);
       state_[size_t(r.slot)] = sn.state;
       len_[size_t(r.slot)] = sn.len;
       uint64_t h = kFnvBasis;  // the pages the slot continues over must hold what the state saw
@@ -180,7 +199,7 @@ class FakeModel final : public StepModel {
     }
     for (const StateOp& sv : in.save) {
       if (len_[size_t(sv.slot)] % page_ != 0) throw std::runtime_error("fake: save off a page boundary");
-      snaps_.at(size_t(sv.snapshot)) = {state_[size_t(sv.slot)], len_[size_t(sv.slot)], true};
+      store_snap(sv.snapshot, {state_[size_t(sv.slot)], len_[size_t(sv.slot)]});
       ++saves;
     }
   }
@@ -200,13 +219,37 @@ class FakeModel final : public StepModel {
   int slots_, ppseq_, pages_, page_, max_tokens_, snapshots_, draft_block_;
   std::vector<int32_t> store_, tables_;
   std::vector<int> len_;
+  // A snapshot's bytes: a magic, the state and the length, then words derived from the state and their index, so a
+  // slot that was overwritten, torn, or read from the wrong place fails the check in load_snap.
+  static constexpr size_t kSnapBytes = 8192;
+  static constexpr uint64_t kMagic = 0x534e415046414b45ull;
   struct Snap {
     uint64_t state = 0;
     int len = 0;
-    bool valid = false;
   };
+  static uint64_t word(uint64_t state, size_t i) {
+    uint64_t x = state + 0x9e3779b97f4a7c15ull * (i + 1);
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+  }
+  void store_snap(int id, const Snap& sn) {
+    uint64_t* w = reinterpret_cast<uint64_t*>(host_ + size_t(id) * kSnapBytes);
+    w[0] = kMagic;
+    w[1] = sn.state;
+    w[2] = uint64_t(sn.len);
+    for (size_t i = 3; i < kSnapBytes / 8; ++i) w[i] = word(sn.state, i);
+  }
+  Snap load_snap(int id) const {
+    if (id < 0 || id >= snapshots_) throw std::runtime_error("fake: bad snapshot id");
+    const uint64_t* w = reinterpret_cast<const uint64_t*>(host_ + size_t(id) * kSnapBytes);
+    if (w[0] != kMagic) throw std::runtime_error("fake: restore of an unsaved snapshot");
+    for (size_t i = 3; i < kSnapBytes / 8; ++i)
+      if (w[i] != word(w[1], i)) throw std::runtime_error("fake: restored snapshot bytes differ from what was saved");
+    return {w[1], int(w[2])};
+  }
+  uint8_t* host_ = nullptr;
   std::vector<uint64_t> state_;
-  std::vector<Snap> snaps_;
   struct Backup {
     int s0 = 0, n = 0;
   };
@@ -270,14 +313,517 @@ std::pair<int, int> race(PrefillOrder order, int threshold, bool adaptive) {
   return {done_long, done_short};
 }
 
+// ---- The disk tier ------------------------------------------------------------------------------------------
+
+struct Workload {
+  std::vector<std::vector<int32_t>> prompts;
+  std::vector<int> max_tokens;
+};
+
+// Requests that share prefixes: `groups` bases of 6-15 pages, each request one base (whole, or its first pages) and a
+// few new tokens, so a base's snapshots are needed again long after more snapshots than the RAM holds were saved.
+Workload make_workload(uint64_t seed, int n, int groups, int page) {
+  std::mt19937_64 rng(seed);
+  std::vector<std::vector<int32_t>> base;
+  for (int g = 0; g < groups; ++g) {
+    base.emplace_back();
+    const int len = page * (6 + int(rng() % 10));
+    for (int i = 0; i < len; ++i) base.back().push_back(int32_t(2 + rng() % (kVocab - 2)));
+  }
+  Workload w;
+  for (int i = 0; i < n; ++i) {
+    std::vector<int32_t> p = base[rng() % size_t(groups)];
+    if (rng() % 3 == 0) p.resize(size_t(page) * (1 + rng() % (p.size() / size_t(page))));
+    const int extra = 1 + int(rng() % 30);
+    for (int k = 0; k < extra; ++k) p.push_back(int32_t(2 + rng() % (kVocab - 2)));
+    w.prompts.push_back(std::move(p));
+    w.max_tokens.push_back(1 + int(rng() % 24));
+  }
+  return w;
+}
+
+struct Run {
+  std::vector<Result> res;
+  std::vector<int> cached;
+  EngineStats st;
+  int steps = 0, restores = 0, saves = 0;
+  bool ok = true;
+  std::string err;
+};
+
+double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+// Drives `eng` until `done()` (sleeping while it waits for the disk); false on a timeout.
+template <class F>
+bool drive(Engine& eng, F done, double timeout_s = 60) {
+  const double t0 = now_s();
+  while (!done()) {
+    if (!eng.iterate()) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    if (now_s() - t0 > timeout_s) return false;
+  }
+  return true;
+}
+// The workload through an engine with `ram` snapshots and (dir, slots) of disk; `abort_every`: a recent request is
+// aborted every n-th pass of the loop; `read_delay_us`: the I/O thread sleeps before each read.
+// pass of the loop a recent request; `read_delay_us`: the I/O thread sleeps before each read.
+Run run_workload(const Workload& w, int ram, const std::string& dir, int slots, int nspec = 0, int abort_every = 0,
+                 int read_delay_us = 0) {
+  Run r;
+  const int page = 16;
+  FakeModel model(8, 64, 2048, page, 256, 2, ram, nspec ? 5 : 0);
+  EngineConfig ec;
+  ec.max_batch_tokens = 256;
+  ec.spec_drafts = nspec;
+  ec.snapshot_dir = dir;
+  ec.disk_snapshots = slots;
+  if (read_delay_us > 0)
+    ec.io_hook = [read_delay_us](bool write) {
+      if (!write) std::this_thread::sleep_for(std::chrono::microseconds(read_delay_us));
+    };
+  std::mt19937_64 rng(7);
+  const size_t n = w.prompts.size();
+  r.res.resize(n);
+  r.cached.assign(n, 0);
+  std::vector<uint64_t> ids;
+  try {
+    Engine eng(model, ec, false);
+    size_t sub = 0;
+    const auto all_done = [&] {
+      const auto s = eng.stats();
+      return sub == n && s.running + s.waiting == 0;
+    };
+    const double t0 = now_s();
+    while (!all_done()) {
+      for (int b = int(rng() % 4); b > 0 && sub < n; --b, ++sub) {
+        GenRequest q;
+        q.prompt = w.prompts[sub];
+        q.max_tokens = w.max_tokens[sub];
+        q.sampling.temperature = 0.0f;
+        Result* out = &r.res[sub];
+        int* cached = &r.cached[sub];
+        ids.push_back(eng.submit(std::move(q), [out, cached](GenOutput&& o) {
+          out->tokens.insert(out->tokens.end(), o.tokens.begin(), o.tokens.end());
+          if (o.finished) {
+            out->finished = true;
+            out->reason = o.reason;
+            *cached = o.cached_tokens;
+          }
+        }));
+      }
+      if (abort_every > 0 && !ids.empty() && rng() % size_t(abort_every) == 0)  // one of the last few: often a loading one
+        eng.abort(ids[ids.size() - 1 - rng() % std::min<size_t>(ids.size(), 6)]);
+      // The fake model's steps take no time, so the disk would never keep up: give an operation in flight a moment
+      // (a real step takes tens of milliseconds, a spill about a hundred).
+      if (!eng.iterate() || eng.stats().snapshot_io > 0) std::this_thread::sleep_for(std::chrono::microseconds(300));
+      if (now_s() - t0 > 120) throw std::runtime_error("timeout:\n" + eng.debug_state());
+    }
+    eng.iterate();  // drain: the last spills
+    if (!drive(eng, [&] { return eng.stats().snapshot_io == 0; })) throw std::runtime_error("I/O never finished");
+    r.st = eng.stats();
+  } catch (const std::exception& e) {
+    r.ok = false;
+    r.err = e.what();
+  }
+  r.steps = model.steps;
+  r.restores = model.restores;
+  r.saves = model.saves;
+  return r;
+}
+
+// A run against the reference outputs (and `base`, a run with unlimited RAM, when given); returns the failures.
+int check_run(const char* name, const Workload& w, const Run& r, const Run* base, int ram, bool expect_disk, int disk_slots) {
+  int bad = 0;
+  if (!r.ok) {
+    std::printf("  %s: exception: %s\n", name, r.err.c_str());
+    return 1;
+  }
+  int aborted = 0;
+  for (size_t i = 0; i < w.prompts.size(); ++i) {
+    const Result& x = r.res[i];
+    FinishReason why;
+    const auto want = reference(w.prompts[i], w.max_tokens[i], 64 * 16, why);
+    if (!x.finished) {
+      ++bad;
+      std::printf("  %s: request %zu never finished\n", name, i);
+    } else if (x.reason == FinishReason::Abort) {
+      ++aborted;
+      if (x.tokens.size() > want.size() || !std::equal(x.tokens.begin(), x.tokens.end(), want.begin())) ++bad;
+    } else if (x.tokens != want || x.reason != why) {
+      if (++bad <= 3) std::printf("  %s: request %zu differs from the reference\n", name, i);
+    } else if (base && base->res[i].reason != FinishReason::Abort && x.tokens != base->res[i].tokens) {
+      if (++bad <= 3) std::printf("  %s: request %zu differs from the unlimited-RAM run\n", name, i);
+    }
+  }
+  if (r.st.free_pages != r.st.total_pages) std::printf("  %s: page leak\n", name), ++bad;
+  if (r.st.free_snapshots != ram) std::printf("  %s: %d of %d RAM snapshots unreferenced at the end\n", name, r.st.free_snapshots, ram), ++bad;
+  if (r.st.disk_snapshots > disk_slots) std::printf("  %s: more disk entries than slots\n", name), ++bad;
+  if (expect_disk) {
+    if (r.st.spills == 0 || r.st.disk_hits == 0 || r.st.disk_read_bytes == 0 || r.st.disk_write_bytes == 0) {
+      std::printf("  %s: no spills or no disk hits (%llu, %llu)\n", name, (unsigned long long)r.st.spills,
+                  (unsigned long long)r.st.disk_hits);
+      ++bad;
+    }
+  } else if (r.st.spills != 0 || r.st.disk_hits != 0) {
+    std::printf("  %s: disk activity with the tier off\n", name), ++bad;
+  }
+  std::printf("%-26s ram %4d disk %3d: %d requests (%d aborted), %d steps, %d restores, %d saves, cached %llu of %llu "
+              "tokens, spills %llu, disk hits %llu, on disk %d, read %.1f MB, written %.1f MB: %s\n",
+              name, ram, disk_slots, int(w.prompts.size()), aborted, r.steps, r.restores, r.saves,
+              (unsigned long long)r.st.cached_tokens, (unsigned long long)r.st.prompt_tokens,
+              (unsigned long long)r.st.spills, (unsigned long long)r.st.disk_hits, r.st.disk_snapshots,
+              double(r.st.disk_read_bytes) / 1e6, double(r.st.disk_write_bytes) / 1e6, bad ? "BAD" : "ok");
+  return bad;
+}
+
+// A prompt of `len` tokens, different for each `k` from its first page on.
+std::vector<int32_t> distinct_prompt(int k, int len) {
+  std::vector<int32_t> p;
+  for (int i = 0; i < len; ++i) p.push_back(int32_t(2 + (uint64_t(k) * 7919 + uint64_t(i) * 104729 + uint64_t(i) * uint64_t(i) * uint64_t(k)) % (kVocab - 2)));
+  return p;
+}
+
+// A prefix on disk is read back while other requests keep running; a corrupt file is noticed and the request
+// recomputed (the tier turns itself off).
+int blocking_tests(const std::string& dir, bool corrupt) {
+  int bad = 0;
+  std::atomic<bool> gate{false};  // reads wait for it
+  const std::string file = dir + "/snapshots.bin";
+  FakeModel model(4, 64, 1024, 16, 128, 2, 3, 0);
+  EngineConfig ec;
+  ec.max_batch_tokens = 128;
+  ec.snapshot_dir = dir;
+  ec.save_wait_ms = 5;
+  ec.disk_snapshots = 16;
+  ec.io_hook = [&](bool write) {
+    if (write) return;
+    for (int i = 0; i < 5000 && !gate; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (corrupt) {
+      const int fd = ::open(file.c_str(), O_RDWR);
+      const uint64_t junk = ~0ull;
+      for (int d = 0; fd >= 0 && d < 16; ++d) (void)!::pwrite(fd, &junk, 8, off_t(d) * 8192 + 16);
+      if (fd >= 0) ::close(fd);
+    }
+  };
+  struct Open {  // never leave the I/O thread waiting
+    std::atomic<bool>& g;
+    ~Open() { g = true; }
+  } opener{gate};
+  try {
+    Engine eng(model, ec, false);
+    std::vector<std::unique_ptr<Result>> res;
+    std::vector<int> cached;
+    cached.reserve(64);
+    std::vector<std::vector<int32_t>> prompts;
+    const auto submit = [&](std::vector<int32_t> p, int max_tokens) {
+      GenRequest q;
+      q.prompt = p;
+      q.max_tokens = max_tokens;
+      q.sampling.temperature = 0.0f;
+      prompts.push_back(p);
+      res.push_back(std::make_unique<Result>());
+      cached.push_back(0);
+      Result* out = res.back().get();
+      int* c = &cached.back();
+      eng.submit(std::move(q), [out, c](GenOutput&& o) {
+        out->tokens.insert(out->tokens.end(), o.tokens.begin(), o.tokens.end());
+        if (o.finished) {
+          out->finished = true;
+          out->reason = o.reason;
+          *c = o.cached_tokens;
+        }
+      });
+      return res.size() - 1;
+    };
+    // Six distinct prompts of 12 pages + 3 tokens, one at a time: three RAM snapshots keep one beyond the free pair.
+    for (int k = 1; k <= 6; ++k) {
+      const size_t i = submit(distinct_prompt(k, 195), 1);
+      if (!drive(eng, [&] { return res[i]->finished; })) throw std::runtime_error("phase 1 timed out");
+      if (!drive(eng, [&] { return eng.stats().snapshot_io == 0; })) throw std::runtime_error("spills never finished");
+    }
+    if (!drive(eng, [&] { return eng.stats().snapshot_io == 0; })) throw std::runtime_error("spills never finished");
+    const auto s1 = eng.stats();
+    if (s1.spills < 3) {
+      std::printf("  blocking: only %llu spills\n", (unsigned long long)s1.spills);
+      ++bad;
+    }
+    // The first prompt again, extended: its snapshot is on disk only, the read waits at the gate. Meanwhile a fresh
+    // prompt must run to its end.
+    std::vector<int32_t> again = distinct_prompt(1, 195);
+    for (int k = 0; k < 5; ++k) again.push_back(int32_t(2 + 31 * k));
+    const size_t a = submit(again, 3);
+    const size_t q = submit(distinct_prompt(9, 300), 20);
+    int iters = 0;
+    while (!res[q]->finished && iters < 4000) {
+      eng.iterate();
+      ++iters;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    const auto s2 = eng.stats();
+    if (!res[q]->finished || res[a]->finished || s2.disk_hits != s1.disk_hits + 1 || s2.running != 1) {
+      std::printf("  blocking: fresh request finished %d after %d iterations, loading one finished %d, disk hits %llu, "
+                  "running %d\n", int(res[q]->finished), iters, int(res[a]->finished), (unsigned long long)s2.disk_hits, s2.running);
+      ++bad;
+    }
+    // Not even a step is spent on the loading sequence while its read is out.
+    const int steps_before = model.steps;
+    for (int i = 0; i < 50; ++i) eng.iterate();
+    if (model.steps != steps_before || res[a]->finished) {
+      std::printf("  blocking: the loading sequence was scheduled\n");
+      ++bad;
+    }
+    gate = true;
+    if (!drive(eng, [&] { return res[a]->finished; })) throw std::runtime_error("the loading request never finished");
+    const auto s3 = eng.stats();
+    for (const size_t i : {a, q}) {
+      FinishReason why;
+      const auto want = reference(prompts[i], i == a ? 3 : 20, 64 * 16, why);
+      if (res[i]->tokens != want || res[i]->reason != why) {
+        std::printf("  blocking: request %zu differs from the reference\n", i);
+        ++bad;
+      }
+    }
+    if (!corrupt && (cached[a] != 192 || s3.disk_read_bytes == 0)) {
+      std::printf("  blocking: %d cached tokens, %llu bytes read\n", cached[a], (unsigned long long)s3.disk_read_bytes);
+      ++bad;
+    }
+    if (corrupt && (cached[a] != 0 || s3.disk_read_bytes != 0)) {
+      std::printf("  corrupt: %d cached tokens counted, %llu bytes read\n", cached[a], (unsigned long long)s3.disk_read_bytes);
+      ++bad;
+    }
+    // Afterwards: with the tier off (corrupt) nothing more is spilled; with it on, the engine still works.
+    const auto sp = eng.stats().spills;
+    for (int k = 10; k < 16; ++k) {
+      const size_t i = submit(distinct_prompt(k, 195), 2);
+      if (!drive(eng, [&] { return res[i]->finished; })) throw std::runtime_error("phase 3 timed out");
+      FinishReason why;
+      if (res[i]->tokens != reference(prompts[i], 2, 64 * 16, why)) ++bad;
+    }
+    drive(eng, [&] { return eng.stats().snapshot_io == 0; });
+    if (corrupt ? eng.stats().spills != sp : eng.stats().spills == sp) {
+      std::printf("  %s: spills %llu -> %llu\n", corrupt ? "corrupt" : "blocking", (unsigned long long)sp,
+                  (unsigned long long)eng.stats().spills);
+      ++bad;
+    }
+    std::printf("%-26s fresh request done in %d iterations while a read was out; spills %llu, disk hits %llu, read %.1f MB: %s\n",
+                corrupt ? "disk corrupted" : "loading does not block", iters, (unsigned long long)eng.stats().spills,
+                (unsigned long long)eng.stats().disk_hits, double(eng.stats().disk_read_bytes) / 1e6, bad ? "BAD" : "ok");
+  } catch (const std::exception& e) {
+    std::printf("  blocking: exception: %s\n", e.what());
+    ++bad;
+  }
+  return bad;
+}
+
+// A request aborted while its snapshot is being read: the read finishes into its RAM slot, which is then cached (not
+// freed under the read, not leaked), and the next request with that prefix is served from it.
+int abort_loading_test(const std::string& dir) {
+  int bad = 0;
+  std::atomic<bool> gate{false};
+  FakeModel model(4, 64, 1024, 16, 128, 2, 3, 0);
+  EngineConfig ec;
+  ec.max_batch_tokens = 128;
+  ec.snapshot_dir = dir;
+  ec.disk_snapshots = 16;
+  ec.io_hook = [&](bool write) {
+    for (int i = 0; i < 5000 && !write && !gate; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  };
+  struct Open {
+    std::atomic<bool>& g;
+    ~Open() { g = true; }
+  } opener{gate};
+  try {
+    Engine eng(model, ec, false);
+    Result r[3];
+    int cached[3] = {0, 0, 0};
+    uint64_t id[3] = {0, 0, 0};
+    const auto submit = [&](int i, std::vector<int32_t> p) {
+      GenRequest q;
+      q.prompt = std::move(p);
+      q.max_tokens = 3;
+      q.sampling.temperature = 0.0f;
+      id[i] = eng.submit(std::move(q), [&r, &cached, i](GenOutput&& o) {
+        r[i].tokens.insert(r[i].tokens.end(), o.tokens.begin(), o.tokens.end());
+        if (o.finished) {
+          r[i].finished = true;
+          r[i].reason = o.reason;
+          cached[i] = o.cached_tokens;
+        }
+      });
+    };
+    gate = true;
+    for (int k = 1; k <= 6; ++k) {
+      GenRequest q;
+      q.prompt = distinct_prompt(k, 195);
+      q.max_tokens = 1;
+      q.sampling.temperature = 0.0f;
+      bool fin = false;
+      eng.submit(std::move(q), [&fin](GenOutput&& o) { fin |= o.finished; });
+      if (!drive(eng, [&] { return fin; }) || !drive(eng, [&] { return eng.stats().snapshot_io == 0; }))
+        throw std::runtime_error("setup timed out");
+    }
+    gate = false;
+    std::vector<int32_t> again = distinct_prompt(1, 195);
+    again.push_back(5);
+    submit(0, again);
+    for (int i = 0; i < 20; ++i) eng.iterate();
+    const auto s1 = eng.stats();
+    eng.abort(id[0]);
+    for (int i = 0; i < 5; ++i) eng.iterate();
+    if (s1.disk_hits == 0 || !r[0].finished || r[0].reason != FinishReason::Abort || eng.stats().running != 0 ||
+        eng.stats().snapshot_io < 1) {  // (the read, and a spill queued behind it)
+      std::printf("  abort while loading: hits %llu, finished %d, running %d, I/Os %d\n", (unsigned long long)s1.disk_hits,
+                  int(r[0].finished), eng.stats().running, eng.stats().snapshot_io);
+      ++bad;
+    }
+    gate = true;
+    if (!drive(eng, [&] { return eng.stats().snapshot_io == 0; })) throw std::runtime_error("the read never finished");
+    submit(1, again);
+    if (!drive(eng, [&] { return r[1].finished; })) throw std::runtime_error("the second request never finished");
+    const auto s2 = eng.stats();
+    FinishReason why;
+    if (r[1].tokens != reference(again, 3, 64 * 16, why) || cached[1] != 192 || s2.disk_hits != s1.disk_hits ||
+        s2.free_snapshots != 3 || s2.disk_read_bytes == 0) {
+      std::printf("  abort while loading: second request cached %d tokens, disk hits %llu -> %llu, %d RAM snapshots unreferenced\n",
+                  cached[1], (unsigned long long)s1.disk_hits, (unsigned long long)s2.disk_hits, s2.free_snapshots);
+      ++bad;
+    }
+    std::printf("%-26s the abandoned read's RAM slot was cached and served the next request: %s\n", "abort while loading",
+                bad ? "BAD" : "ok");
+  } catch (const std::exception& e) {
+    std::printf("  abort while loading: exception: %s\n", e.what());
+    ++bad;
+  }
+  return bad;
+}
+
+// The GLM pattern: 256-token pages, 3072-token prefill steps, 2 RAM snapshots, a prompt of 32791 tokens with decode
+// after it, then followers that share its first 32768 tokens. Every follower must resume at 32768: the snapshot at the
+// prompt's last boundary may not be lost to the saves (every 16 pages, rolling decode ones) made while spills are out.
+int glm_pattern_test(const std::string& dir, int write_ms, int step_ms) {
+  int bad = 0;
+  FakeModel model(4, 160, 1200, 256, 3072, 2, 2, 0);
+  EngineConfig ec;
+  ec.max_batch_tokens = 3072;
+  ec.snapshot_dir = dir;
+  ec.disk_snapshots = 64;
+  ec.io_hook = [write_ms](bool write) {
+    if (write) std::this_thread::sleep_for(std::chrono::milliseconds(write_ms));
+  };
+  try {
+    Engine eng(model, ec, false);
+    std::vector<int32_t> base = distinct_prompt(3, 32791);
+    Result r[5];
+    int cached[5] = {};
+    std::vector<std::vector<int32_t>> prompts;
+    const auto submit = [&](int i, std::vector<int32_t> p, int max_tokens) {
+      GenRequest q;
+      prompts.push_back(p);
+      q.prompt = std::move(p);
+      q.max_tokens = max_tokens;
+      q.sampling.temperature = 0.0f;
+      eng.submit(std::move(q), [&r, &cached, i](GenOutput&& o) {
+        r[i].tokens.insert(r[i].tokens.end(), o.tokens.begin(), o.tokens.end());
+        if (o.finished) {
+          r[i].finished = true;
+          r[i].reason = o.reason;
+          cached[i] = o.cached_tokens;
+        }
+      });
+    };
+    const auto run_until = [&](auto done) {
+      const double t0 = now_s();
+      while (!done()) {
+        if (!eng.iterate()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+        if (now_s() - t0 > 120) throw std::runtime_error("timeout");
+      }
+    };
+    submit(0, base, 700);  // decode crosses pages: rolling saves
+    run_until([&] { return r[0].finished; });
+    for (int i = 1; i <= 4; ++i) {
+      std::vector<int32_t> p(base.begin(), base.begin() + 32768);
+      for (int k = 0; k < 10; ++k) p.push_back(int32_t(2 + (i * 37 + k * 11) % 400));
+      submit(i, p, 2);
+      run_until([&] { return r[i].finished; });
+    }
+    for (int i = 1; i <= 4; ++i) {
+      FinishReason why;
+      if (cached[i] != 32768 || r[i].tokens != reference(prompts[size_t(i)], 2, 160 * 256, why)) {
+        std::printf("  glm pattern: follower %d resumed at %d\n", i, cached[i]);
+        ++bad;
+      }
+    }
+    const auto st = eng.stats();
+    std::printf("%-26s write %d ms, step %d ms: followers resumed at %d %d %d %d, spills %llu, disk hits %llu: %s\n",
+                "GLM save pattern", write_ms, step_ms, cached[1], cached[2], cached[3], cached[4],
+                (unsigned long long)st.spills, (unsigned long long)st.disk_hits, bad ? "BAD" : "ok");
+  } catch (const std::exception& e) {
+    std::printf("  glm pattern: exception: %s\n", e.what());
+    ++bad;
+  }
+  return bad;
+}
+
+int disk_tests(uint64_t seed, int n_req, const std::string& base_dir) {
+  char tmpl[512];
+  std::snprintf(tmpl, sizeof tmpl, "%s/snap-disk-test-XXXXXX", base_dir.c_str());
+  if (!mkdtemp(tmpl)) {
+    std::printf("mkdtemp(%s): %s\n", tmpl, std::strerror(errno));
+    return 1;
+  }
+  const std::string dir = tmpl;
+  int bad = 0;
+  const Workload w = make_workload(seed, std::max(n_req, 120), 12, 16);
+  const int plenty = 4000;  // never short of RAM snapshots
+  const Run unlimited = run_workload(w, plenty, "", 0);
+  bad += check_run("unlimited RAM", w, unlimited, nullptr, plenty, false, 0);
+  // The tier set up but not used must be today's behaviour bit for bit: same steps, same cache hits.
+  const Run off_dir = run_workload(w, plenty, dir, 0);
+  const Run idle_disk = run_workload(w, plenty, dir, 64);
+  bad += check_run("dir without slots", w, off_dir, &unlimited, plenty, false, 0);
+  bad += check_run("disk, RAM never short", w, idle_disk, &unlimited, plenty, false, 64);
+  for (const Run* r : {&off_dir, &idle_disk})
+    if (r->steps != unlimited.steps || r->restores != unlimited.restores || r->saves != unlimited.saves ||
+        r->st.cached_tokens != unlimited.st.cached_tokens) {
+      std::printf("  not the same run as without the tier\n");
+      ++bad;
+    }
+  const Run ram_only = run_workload(w, 3, "", 0);
+  bad += check_run("3 RAM, no disk", w, ram_only, &unlimited, 3, false, 0);
+  const Run few = run_workload(w, 3, dir, 200);
+  bad += check_run("3 RAM, 200 disk", w, few, &unlimited, 3, true, 200);
+  if (few.st.cached_tokens <= ram_only.st.cached_tokens) {
+    std::printf("  the disk tier added no cache hits (%llu vs %llu cached tokens)\n", (unsigned long long)few.st.cached_tokens,
+                (unsigned long long)ram_only.st.cached_tokens);
+    ++bad;
+  }
+  const Run tiny = run_workload(w, 3, dir, 10);  // disk slots evicted too
+  bad += check_run("3 RAM, 10 disk", w, tiny, &unlimited, 3, true, 10);
+  const Run two = run_workload(w, 2, dir, 64, 0, 0, 200);
+  bad += check_run("2 RAM, 64 disk", w, two, &unlimited, 2, true, 64);
+  const Run spec = run_workload(w, 3, dir, 200, 4);
+  bad += check_run("3 RAM, 200 disk, spec 4", w, spec, nullptr, 3, true, 200);
+  const Run aborts = run_workload(w, 3, dir, 64, 0, 3, 300);  // aborts while reads are out
+  bad += check_run("3 RAM, 64 disk, aborts", w, aborts, nullptr, 3, true, 64);
+  bad += blocking_tests(dir, false);
+  bad += blocking_tests(dir, true);
+  bad += abort_loading_test(dir);
+  bad += glm_pattern_test(dir, 20, 5);
+  bad += glm_pattern_test(dir, 5, 5);
+  ::rmdir(dir.c_str());
+  return bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   int n_req = 300;
   uint64_t seed = 1;
+  std::string disk_dir = "/tmp";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--requests") && i + 1 < argc) n_req = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
+    else if (!std::strcmp(argv[i], "--disk-dir") && i + 1 < argc) disk_dir = argv[++i];
   }
   int failures = 0;
   // Configurations: (slots, pages per seq, pool pages, page tokens, step tokens, batch budget).
@@ -478,6 +1024,7 @@ int main(int argc, char** argv) {
     }
     failures += bad;
   }
+  failures += disk_tests(seed, n_req, disk_dir);
   // A 2000-token prompt (64-token steps: ~32 steps of prefill), then a 20-token one a step later.
   // Shortest-first and the threshold let the short one finish within a few steps; FCFS queues it behind
   // the whole long prefill (vLLM's default).

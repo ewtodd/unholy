@@ -135,6 +135,9 @@ against that reference: bit-identical where the math allows, ulp-level where it 
   delta-attention recurrent states, ~148 MB a sequence).
   That
   state is snapshotted to pinned host memory at page boundaries, so a cached prefix is resumed exactly.
+  With `--snapshot-dir DIR --disk-snapshots N` the least recently used snapshots spill to a preallocated file
+  on a disk (O_DIRECT, one I/O thread; a disk hit is read back while other requests run), so the pinned
+  RAM can stay small (`--prefix-snapshots 2`) and many more prefixes stay resumable.
 - **Speculative decoding** with each checkpoint's drafter: DeepSeek-V4-Flash's 3-stage DSpark block drafter,
   its drafts filtered by its confidence head; GLM-5.3-Flash's MTP layer, one draft per step, with the
   recurrent state rolled back when the draft is rejected. Drafts are verified with exact speculative

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace unholy::engine {
@@ -62,6 +63,7 @@ struct StepInput {
   std::vector<int32_t> ids, pos;     // [T]
   std::vector<int32_t> logit_rows;   // batch rows whose logits are wanted
   std::vector<StateOp> restore, save;
+  bool sync_saves = false;  // wait() returns only once the saves are complete in host memory (the engine reads them)
   std::vector<RingBackup> backup;
   std::vector<ImageRows> image_rows;
   std::vector<ImageSpan> image_spans;
@@ -79,6 +81,9 @@ class StepModel {
   virtual int page_tokens() const = 0;
   virtual int max_inflight() const { return 1; }
   virtual int num_snapshots() const { return 0; }  // 0: no prefix reuse
+  // The pinned host regions holding snapshot `id`, in a fixed order, each 4096-byte aligned and a multiple of 4096
+  // long (the engine moves them to and from disk). None: the snapshots cannot go to disk.
+  virtual void snapshot_host(int id, std::vector<std::pair<uint8_t*, size_t>>& segs) const { (void)id, (void)segs; }
   virtual int draft_block() const { return 0; }    // tokens one draft proposes; 0: no drafter
   virtual int max_verify() const { return 0; }     // longest verify chunk (1 + drafts) backups cover
   virtual bool whole_image_blocks() const { return true; }  // see ImageRows

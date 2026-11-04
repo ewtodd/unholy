@@ -92,6 +92,10 @@ class ResidentModel final : public StepModel {
   int num_pages() const override { return geo_.num_pages; }
   int page_tokens() const override { return model::kPageTokens; }
   int num_snapshots() const override { return snapshots_; }
+  void snapshot_host(int id, std::vector<std::pair<uint8_t*, size_t>>& segs) const override {
+    for (int k = 0; k < 2; ++k)
+      if (snap_bytes_[k] > 0) segs.emplace_back(snap_host_[k] + size_t(id) * snap_bytes_[k], snap_bytes_[k]);
+  }
   // The vision tower (on the APU, loaded when the checkpoint has one): the embedding rows of one image's
   // block, [block len][dim] bf16. Thread-safe; runs alongside the steps.
   bool has_vision() const { return vision_ != nullptr; }
@@ -149,9 +153,10 @@ class ResidentModel final : public StepModel {
     hipEvent_t handoff2 = nullptr;  // card 0: the second micro-batch's rows written
     hipEvent_t consumed = nullptr;  // card 1: x_host read
     hipEvent_t done = nullptr;      // card 1: logits_host written
+    hipEvent_t saved = nullptr;     // card 0: the step's state saves done (recorded when the engine reads them)
     uint64_t ticket = 0;
     int rows = 0;
-    bool busy = false;
+    bool busy = false, saved_wait = false;
   };
   Flight flight_[2];
   // Slot-state snapshots: per card, the slot slices of each layer's window rows and (ratio-4 layers)

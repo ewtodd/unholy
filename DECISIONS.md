@@ -1601,3 +1601,26 @@ counts (tools/bench/gufo_routed.hip, IQ2_XXS gate+up): 18.9 / 23.1 / 20.8 TFLOPS
   2391 -> 2433 (+1.8%); decode unchanged; validate bit-identical; eb c8 48/48 tokens and logprobs against eb-fuse9,
   74.8 -> 75.4 tok/s. The APU's expert time fell ~7% but prefill only ~1.5-2%: since the dequant and double-buffer
   change, the APU is no longer the only limit of DSV4 prefill (to be traced).
+
+## 2026-11-03 — prefix snapshots on disk (`/work`), off by default
+
+GLM's snapshots are 148 MB of pinned host memory each (26 in production with the vision tower, 3.85 GB); the owner wants
+many more, on `/work` (the SATA RAID 0), never the NVMe.
+
+- `--snapshot-dir DIR --disk-snapshots N` (EngineConfig `snapshot_dir`, `disk_snapshots`, `save_wait_ms`): one
+  preallocated file of N slots, O_DIRECT (buffered + DONTNEED when refused), one I/O thread with pread / pwrite (no
+  io_uring: the service's 8 MiB memlock limit). Write-back on eviction: while fewer than R (1-2) RAM snapshots are
+  free, the least-recently-used unreferenced cached one goes to the LRU disk slot, its RAM slot freed once written;
+  stale rolling snapshots and hashes already on disk are dropped. A disk hit reads into a free RAM slot while that
+  sequence waits; the engine loop never blocks. An unspilled cached snapshot is never discarded to make room:
+  ordinary saves are skipped when no slot is free or droppable, a prompt's last-boundary save waits up to
+  `save_wait_ms` (1 s). Reads are checksummed; any error turns the tier off. Snapshot blocks are padded to whole
+  4 KiB pages; with the tier on, card 0's saves (after its handoff) are waited for before the engine reads them.
+- unholy-sched-test: FakeModel snapshots checked byte for byte on every restore; the old 180 cases byte-identical;
+  3 RAM + 200 disk: 34.9k of 52.6k prompt tokens cached (2.9k RAM-only), outputs as with unlimited RAM; a GLM-like
+  pattern (a 32791-token prompt, four followers) resumed at 32768 every time (30720 / 32768 / 32768 / 32768 before the
+  back-pressure fix).
+- Box: tier off, validate bit-identical, eb c8 48/48. Tier on, 2 RAM + 64 disk on `/work`: DSV4 and GLM perf-depth
+  (8k / 32k documents, five requests each) 10 / 10 responses identical to RAM-only, every follow-up at the deepest
+  boundary (GLM's 32k follow-ups 0.28-0.41 s TTFT against 0.28-0.30 s RAM-only).
+- The service needs a writable directory under `/work` and the two flags (NixOS module).

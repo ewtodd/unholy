@@ -376,6 +376,7 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
       rt::DeviceGuard g(card_[0].dev);
       UH_CHECK(hipEventCreateWithFlags(&f.handoff, hipEventDisableTiming));
       UH_CHECK(hipEventCreateWithFlags(&f.handoff2, hipEventDisableTiming));
+      UH_CHECK(hipEventCreateWithFlags(&f.saved, hipEventDisableTiming));
     }
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventCreateWithFlags(&f.consumed, hipEventDisableTiming));
@@ -445,8 +446,8 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
           add(lc.iring_sc, size_t(lc.iring) * lc.iwidth * 4);
         }
       }
-      snap_bytes_[k] = off;
-      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&snap_host_[k]), off * size_t(snapshots_),
+      snap_bytes_[k] = (off + 4095) / 4096 * 4096;  // whole 4 KiB pages per block: the disk tier moves them with O_DIRECT
+      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&snap_host_[k]), snap_bytes_[k] * size_t(snapshots_),
                              hipHostMallocPortable | hipHostMallocMapped));
     }
   }
@@ -576,7 +577,7 @@ ResidentModel::~ResidentModel() {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.ids_host),
                     static_cast<void*>(f.tables_host), static_cast<void*>(f.vis_host), static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
-    for (hipEvent_t e : {f.handoff, f.handoff2, f.consumed, f.done})
+    for (hipEvent_t e : {f.handoff, f.handoff2, f.saved, f.consumed, f.done})
       if (e) (void)hipEventDestroy(e);
   }
 }
@@ -905,6 +906,10 @@ uint64_t ResidentModel::submit(const StepInput& in) {
       model::dspark_main_kv(c_, dw_, dcache_, cd.scratch, cd.rope, mh_.as<uint16_t>(), cap_rows + cap_max_,
                             cap_rows + 2 * cap_max_, ncap, cd.st);
     state_copies(k, in.save, true);
+    if (k == 0) {  // card 0 saves after its handoffs, which card 1 does not wait for
+      f.saved_wait = in.sync_saves && !in.save.empty();
+      if (f.saved_wait) UH_CHECK(hipEventRecord(f.saved, cd.st));
+    }
     if (timing) t_enq[k] = std::chrono::steady_clock::now();
   }
   // Head on card 1 for the requested rows.
@@ -943,6 +948,11 @@ void ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {
   {
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventSynchronize(f.done));
+  }
+  if (f.saved_wait) {
+    rt::DeviceGuard g(card_[0].dev);
+    UH_CHECK(hipEventSynchronize(f.saved));
+    f.saved_wait = false;
   }
   if (canary_ && canary_->count != canary_seen_) {
     const unsigned now = canary_->count;

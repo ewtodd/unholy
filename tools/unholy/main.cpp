@@ -4,6 +4,7 @@
 //   unholy serve --model DIR [--exl3 DIR] [--profile FILE] [--host H] [--port P]
 //                [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]
 //                [--max-batch-tokens N] [--api-key KEY] [--http-threads N] [--max-tokens-default N]
+//                [--snapshot-dir DIR --disk-snapshots N]
 //
 // The KV cache is one pool of --kv-tokens positions (pages of 256) shared by all requests, as in vLLM:
 // a request takes pages as it grows, up to --max-model-len; --max-num-seqs caps the requests running at
@@ -16,6 +17,13 @@
 // 0 turns prefix caching off) slot-state snapshots at page boundaries, so a request that repeats an earlier
 // one's prefix (the next turn of a chat, a shared system prompt) starts from the deepest matching boundary
 // instead of position 0.
+//
+// --snapshot-dir DIR --disk-snapshots N (both or neither; off by default) add a disk tier for those snapshots: a
+// preallocated file DIR/snapshots.bin of N snapshot slots (O_DIRECT; use the SATA array, not the NVMe; created and
+// truncated at start, removed at exit). When fewer than two RAM snapshots are free the least recently used ones are
+// written there and their RAM slots freed, so --prefix-snapshots can be small (the pinned RAM) and N large; a request
+// whose deepest match is on disk reads it back (a few hundred ms for GLM's 148 MB) while the others keep running. An
+// I/O error logs once and turns the tier off.
 //
 // --spec-drafts N (default 0: off) turns on speculative decoding with the checkpoint's DSpark drafter
 // (its mtp.* stages: dense parts on card 1, ~10 GB of routed experts on the APU): each decode step
@@ -88,6 +96,7 @@ int usage() {
                "                    [--served-model-name NAME] [--max-num-seqs N] [--max-model-len N] [--kv-tokens N]\n"
                "                    [--max-batch-tokens N] [--api-key KEY] [--http-threads N]\n"
                "                    [--max-tokens-default N] [--card-margin-gb G] [--prefix-snapshots N]\n"
+               "                    [--snapshot-dir DIR --disk-snapshots N]\n"
                "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
                "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
                "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n"
@@ -148,6 +157,11 @@ std::string engine_line(const engine::EngineStats& a, const engine::EngineStats&
              b.cached_pages);
   if (b.prompt_tokens > a.prompt_tokens)
     out += fmt(" | prefix hit %.1f%%", 100.0 * d(a.cached_tokens, b.cached_tokens) / d(a.prompt_tokens, b.prompt_tokens));
+  if (b.disk_slots > 0)
+    out += fmt(" | snapshots %d unreferenced in RAM, %d/%d on disk, spilled %llu, disk hits %llu, read %.0f MB, written %.0f MB",
+               b.free_snapshots, b.disk_snapshots, b.disk_slots, (unsigned long long)(b.spills - a.spills),
+               (unsigned long long)(b.disk_hits - a.disk_hits), d(a.disk_read_bytes, b.disk_read_bytes) / 1e6,
+               d(a.disk_write_bytes, b.disk_write_bytes) / 1e6);
   if (b.preemptions > a.preemptions) out += fmt(" | preempted %llu", (unsigned long long)(b.preemptions - a.preemptions));
   if (spec && b.spec_steps > a.spec_steps) {
     const double drafted = d(a.spec_drafted, b.spec_drafted), accepted = d(a.spec_accepted, b.spec_accepted);
@@ -170,6 +184,8 @@ struct Options {
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
   long long kv_tokens = 0;
   int prefix_snapshots = -1;  // -1: the model's default (DSV4 128, GLM 32)
+  std::string snapshot_dir;
+  int disk_snapshots = 0;
   int spec_drafts = 0;
   bool vision = true;
   float spec_min_conf = 0.5f;
@@ -202,6 +218,8 @@ int run_server(engine::StepModel& model, const text::Tokenizer& tok, const text:
   ecfg.long_prefill_threshold = o.long_prefill_threshold;
   ecfg.long_prefill_adaptive = o.long_prefill_adaptive;
   ecfg.decode_split = o.decode_split;
+  ecfg.snapshot_dir = o.snapshot_dir;
+  ecfg.disk_snapshots = o.disk_snapshots;
   engine::Engine eng(model, ecfg);
   // Logs while there is traffic, plus the interval after it ends (throughput back to zero). A jthread
   // declared after the engine: stopped and joined before the engine goes away.
@@ -437,6 +455,8 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--max-model-len" || a == "--max-seq") o.max_seq = std::stoi(v);
     else if (a == "--kv-tokens") o.kv_tokens = std::stoll(v);
     else if (a == "--prefix-snapshots") o.prefix_snapshots = std::stoi(v);
+    else if (a == "--snapshot-dir") o.snapshot_dir = v;
+    else if (a == "--disk-snapshots") o.disk_snapshots = std::stoi(v);
     else if (a == "--spec-drafts") o.spec_drafts = std::stoi(v);
     else if (a == "--vision") o.vision = v != "0" && v != "off" && v != "false";
     else if (a == "--spec-min-conf") o.spec_min_conf = std::stof(v);
@@ -455,7 +475,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--exact") o.exact = v != "0" && v != "off" && v != "false";
     else return usage();
   }
-  if (o.model_dir.empty()) return usage();
+  if (o.model_dir.empty() || o.snapshot_dir.empty() != (o.disk_snapshots <= 0)) return usage();
   // The kernel options of the default (not --exact) trade; an explicit environment setting wins. Before
   // anything reads them (they are read once).
   if (!o.exact) {
