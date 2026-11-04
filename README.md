@@ -54,19 +54,20 @@ attention.
 <!---->
 ## Performance
 <!---->
-Measured on that machine, behind the PCIe switch (October 2026). Both models through `unholy serve` with
-their production settings, measured the same way (`docs/bench/compare-perf-dsv4-glm-2026-10-24.txt`):
+Measured on that machine, behind the PCIe switch. Both models through `unholy serve` with their production
+settings, measured the same way: DeepSeek-V4-Flash on 2026-11-03 (`docs/bench/perf-dsv4-2026-11-03.txt`),
+GLM-5.3-Flash on 2026-10-24 (`docs/bench/compare-perf-dsv4-glm-2026-10-24.txt`):
 <!---->
 | | DeepSeek-V4-Flash | GLM-5.3-Flash |
 |---|---|---|
-| prefill, one request, unique text (time to first token) | 1681 tok/s at 8k, 1752 at 32k, 1763 at 128k, 1742 at 512k (295 s) | 1037 tok/s at 8k, 1249 at 32k, 1425 at 128k, 1476 at 512k (355 s) |
-| decode, one stream, production drafting | 33-36 tok/s to 128k, 30-32 at 256-512k (DSpark, 5 drafts, 55-86% accepted) | 24-25 tok/s from 8k to 512k (MTP, 1 draft, 75-94% accepted) |
-| GSM8K chat, engine-batch, 1 / 2 / 4 / 8 requests | 37.9 / 48.2 / 55.6 / 64.2 tok/s | 25.8 / 32.1 / 36.5 / 50.2 tok/s |
+| prefill, one request, unique text (time to first token) | 1837 tok/s at 8k, 2187 at 32k, 2194 at 128k, 1929 at 512k (266 s) | 1037 tok/s at 8k, 1249 at 32k, 1425 at 128k, 1476 at 512k (355 s) |
+| decode, one stream, production drafting | 37-41 tok/s to 128k, 35-37 at 256-512k (DSpark, 5 drafts, 55-86% accepted) | 24-25 tok/s from 8k to 512k (MTP, 1 draft, 75-94% accepted) |
+| GSM8K chat, engine-batch, 1 / 2 / 4 / 8 requests | 42.0 / 53.9 / 64.3 / 74.8 tok/s | 25.8 / 32.1 / 36.5 / 50.2 tok/s |
 <!---->
-DeepSeek-V4-Flash's own curves (`unholy-curve`, one sequence in 4096-token chunks; before the two-part prefill
-steps, which add 17% at 64k): prefill 2463 tok/s at 32k depth, 2012 at 128k, 1702 at 256k, 1212 at 491k,
-1406 averaged over 0-512k; decode without speculation 29.4 tok/s at 4k depth, 22.4 at 512k. Its check-source
-GSM8K chat sweep: 31.6 / 54.3 / 69.9 / 85.5 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests.
+DeepSeek-V4-Flash's own curves (`unholy-curve`, one sequence in 4096-token chunks, 2026-11-03): prefill 2540 tok/s
+averaged over 0-64k, 2349 over 0-256k; decode without speculation 34.4 tok/s at 4k depth, 32.1 at 64k, 29.9 at
+256k. Its check-source GSM8K chat sweep (2026-10-15): 31.6 / 54.3 / 69.9 / 85.5 tok/s aggregate at 1 / 2 / 4 / 8
+concurrent requests.
 <!---->
 For DeepSeek-V4-Flash, `unholy serve` trades bit-identical outputs for speed by default: more hot experts on
 the cards (the scratch the native path never touches), the experts' GEMVs for verify steps of up to 64 tokens
