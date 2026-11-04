@@ -405,6 +405,9 @@ void mx_moe_forward_dev_q(const Dsv4Config& c, const LayerWeights& w, const uint
   if (gemv && I % 128 == 0) {  // the SwiGLU transform in the w1 / w3 launch
     k::mx_grouped_gemv(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u,
                        rows, k::MxGlu{rw, row_expert, tab(2, 1), hh, c.swiglu_limit, sc.counters.as<uint32_t>()});
+  } else if (!gemv && k::mx_gemm_glu() && I % 128 == 0) {  // w1 / w3 in one block with the SwiGLU in the epilogue
+    k::mx_grouped_gemm_glu(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), tab(1, 0), tab(1, 1), I,
+                           k::MxGlu{rw, row_expert, tab(2, 1), hh, c.swiglu_limit, nullptr}, st, ntiles_dev);
   } else {
     lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
     k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);
@@ -447,6 +450,9 @@ void exl3_moe_forward_dev(const Dsv4Config& c, const LayerWeights& w, const uint
     if (gemv && I % 128 == 0) {  // the SwiGLU transform in the w1 / w3 launch
       k::mx_grouped_gemv(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u,
                          rows, k::MxGlu{rw, row_expert, tab(2, 1), hh, c.swiglu_limit, s.counters.as<uint32_t>()});
+    } else if (!gemv && k::mx_gemm_glu() && I % 128 == 0) {  // w1 / w3 in one block with the SwiGLU in the epilogue
+      k::mx_grouped_gemm_glu(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), tab(1, 0), tab(1, 1), I,
+                             k::MxGlu{rw, row_expert, tab(2, 1), hh, c.swiglu_limit, nullptr}, st, ntiles_dev);
     } else {
       lin(xa, D, tiles, max_tiles, tab(0, 0), tab(0, 1), g, I, I, st, ntiles_dev, tab(1, 0), tab(1, 1), u, rows);  // w1, w3
       k::mx_swiglu(g, u, rw, row_expert, tab(2, 1), hh, P, I, c.swiglu_limit, st);

@@ -5,9 +5,10 @@
 // which takes three passes over the 37-row tile, and 64), bit for bit, and their times.
 //
 //   unholy-mx-test [--experts 16] [--rows-mean 96] [--K 4096] [--N 2048] [--dev 0]
-//     [--counts FILE] [--reps 3] [--gemm-only 1] [--no-ref 1] [--check-dequant 1]
+//     [--counts FILE] [--reps 3] [--gemm-only 1] [--no-ref 1] [--check-dequant 1] [--glu 1]
 // (mode 0 only: --counts, rows per expert from FILE (E = their number); --reps; --no-ref skips the reference;
-// --check-dequant: mx_dequant32_perm against mx_dequant32_lut, all scales x all values, on the device)
+// --check-dequant: mx_dequant32_perm against mx_dequant32_lut, all scales x all values, on the device;
+// --glu 1: gfx11, w1 / w3 GEMM + mx_swiglu against mx_grouped_gemm_glu, bit for bit and timed)
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -43,7 +44,7 @@ float from_bf16(uint16_t b) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  int E_opt = 16, rows_mean = 96, K = 4096, N = 2048, dev = 0, reps = 3, gemm_only = 0, no_ref = 0, check_dequant = 0;
+  int E_opt = 16, rows_mean = 96, K = 4096, N = 2048, dev = 0, reps = 3, gemm_only = 0, no_ref = 0, check_dequant = 0, glu = 0;
   std::vector<int> file_counts;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
@@ -55,6 +56,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--counts: no integers in %s\n", argv[i + 1]);
         return 2;
       }
+    } else if (a == "--glu") {
+      glu = v;
     } else if (a == "--check-dequant") {
       check_dequant = v;
     } else if (a == "--reps") reps = std::max(v, 1);
@@ -254,6 +257,71 @@ int main(int argc, char** argv) {
         std::printf("  rb with A in one buffer: %.3f ms (%.1f TFLOPS), %s\n", td,
                     2.0 * P * double(K) * N / (td / 1e3) / 1e12, od == o[1] ? "bit-identical" : "DIFFERENT");
       }
+    }
+    if (mode == 0 && glu && !k::mx_gemm_rb()) std::printf("GLU: skipped (gfx11 register-B tiles only)\n");
+    if (mode == 0 && glu && k::mx_gemm_rb()) {  // w1 / w3 + mx_swiglu against the fused kernel (gfx11)
+      // w3 of expert e is the tile-major copy of expert e + 1's weights; w2's scale table (which rows are resident) is
+      // null for every third expert; random route weights, limit 10.
+      std::vector<const uint8_t*> w3tab(static_cast<size_t>(E)), s3tab(static_cast<size_t>(E)), s2tab(static_cast<size_t>(E));
+      for (int e = 0; e < E; ++e) {
+        w3tab[size_t(e)] = wtab[size_t((e + 1) % E)];
+        s3tab[size_t(e)] = stab[size_t((e + 1) % E)];
+        s2tab[size_t(e)] = e % 3 == 2 ? nullptr : stab[size_t(e)];
+      }
+      std::vector<float> hwt(static_cast<size_t>(P));
+      for (auto& v : hwt) v = 0.5f + float(rng() % 1000) / 1000.0f;
+      rt::DeviceBuffer w3t(dev, size_t(E) * 8), s3t(dev, size_t(E) * 8), s2t(dev, size_t(E) * 8), dwt(dev, size_t(P) * 4),
+          gb(dev, size_t(P) * N * 2), ub(dev, size_t(P) * N * 2), hold(dev, size_t(P) * N * 2), hnew(dev, size_t(P) * N * 2);
+      UH_CHECK(hipMemcpy(w3t.data(), w3tab.data(), size_t(E) * 8, hipMemcpyHostToDevice));
+      UH_CHECK(hipMemcpy(s3t.data(), s3tab.data(), size_t(E) * 8, hipMemcpyHostToDevice));
+      UH_CHECK(hipMemcpy(s2t.data(), s2tab.data(), size_t(E) * 8, hipMemcpyHostToDevice));
+      UH_CHECK(hipMemcpy(dwt.data(), hwt.data(), size_t(P) * 4, hipMemcpyHostToDevice));
+      const auto* w3p = w3t.as<const uint8_t*>();
+      const auto* s3p = s3t.as<const uint8_t*>();
+      const auto* s2p = s2t.as<const uint8_t*>();
+      const float limit = 10.0f;
+      const auto tm = [&](auto&& f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) f();
+        UH_CHECK(hipDeviceSynchronize());
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+      };
+      const auto gemm_old = [&] {
+        k::mx_grouped_gemm(xa.as<uint16_t>(), K, dt.as<k::Exl3Tile>(), int(tiles.size()), wtp, stp, gb.as<uint16_t>(), N, N,
+                           nullptr, nullptr, w3p, s3p, ub.as<uint16_t>());
+      };
+      const auto swiglu_old = [&] {
+        k::mx_swiglu(gb.as<uint16_t>(), ub.as<uint16_t>(), dwt.as<float>(), re.as<int32_t>(), s2p, hold.as<uint16_t>(), P, N,
+                     limit, nullptr);
+      };
+      const auto fused = [&] {
+        k::mx_grouped_gemm_glu(xa.as<uint16_t>(), K, dt.as<k::Exl3Tile>(), int(tiles.size()), wtp, stp, w3p, s3p, N,
+                               k::MxGlu{dwt.as<float>(), re.as<int32_t>(), s2p, hnew.as<uint16_t>(), limit, nullptr}, nullptr);
+      };
+      k::mx_gemm_force_rb(1);
+      UH_CHECK(hipMemset(hold.data(), 0, hold.size()));
+      gemm_old();
+      swiglu_old();
+      UH_CHECK(hipDeviceSynchronize());
+      const double t_gemm = tm(gemm_old), t_swi = tm(swiglu_old);
+      std::vector<uint16_t> ho(size_t(P) * N), hn(size_t(P) * N);
+      UH_CHECK(hipMemcpy(ho.data(), hold.data(), ho.size() * 2, hipMemcpyDeviceToHost));
+      double t_f[2];
+      bool same = true;
+      for (int v = 0; v < 2; ++v) {  // A double-buffered / one buffer
+        k::mx_gemm_rb_double_buffer(1 - v);
+        UH_CHECK(hipMemset(hnew.data(), 0, hnew.size()));
+        fused();
+        UH_CHECK(hipDeviceSynchronize());
+        UH_CHECK(hipMemcpy(hn.data(), hnew.data(), hn.size() * 2, hipMemcpyDeviceToHost));
+        same &= hn == ho;
+        t_f[v] = tm(fused);
+      }
+      k::mx_gemm_rb_double_buffer(-1);
+      k::mx_gemm_force_rb(-1);
+      all_same &= same;
+      std::printf("GLU: old %.3f ms (GEMM %.3f + swiglu %.3f), fused %.3f ms (DB on), %.3f ms (DB off): %s\n",
+                  t_gemm + t_swi, t_gemm, t_swi, t_f[0], t_f[1], same ? "bit-identical" : "DIFFERENT");
     }
     if (mode == 0 && std::getenv("MX_TEST_SKINNY")) {  // experiment: the skinny kernel on prefill tiles
       const auto go = [&] {

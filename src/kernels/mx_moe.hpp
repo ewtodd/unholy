@@ -77,6 +77,12 @@ struct MxGlu {
   float limit = 0.0f;
   uint32_t* counters = nullptr;
 };
+// gfx11 (register-B tiles, N % 128 == 0): w1 and w3 in one block per (tile, 128 columns) -- A staged once, 16 waves --
+// with mx_swiglu in the epilogue: hh (ldo N) is bit-identical to mx_grouped_gemm with out2 + mx_swiglu. glu.hh, w,
+// row_expert, s_tab and limit are used (counters are not). On by default on gfx11 (UNHOLY_MX_GLU=0: the GEMM with out2
+// + mx_swiglu); mx_gemm_force_glu: 1 / 0 forces it on / off, -1 restores the default.
+bool mx_gemm_glu();
+void mx_gemm_force_glu(int on);
 // remote_combine in the w2 GEMV's launch: each 128-output segment's last tile (of *ntiles_dev) sums every remote
 // token's pair rows over it into dst (counters [N / 128]: zero, left zero).
 struct MxSums {
@@ -86,6 +92,9 @@ struct MxSums {
   bf16* dst = nullptr;
   uint32_t* counters = nullptr;
 };
+void mx_grouped_gemm_glu(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w1_tab,
+                         const uint8_t* const* s1_tab, const uint8_t* const* w3_tab, const uint8_t* const* s3_tab, int N,
+                         const MxGlu& glu, hipStream_t st, const int* ntiles_dev = nullptr);
 void mx_grouped_gemv(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
                      const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                      const int* ntiles_dev = nullptr, const uint8_t* const* w_tab2 = nullptr,

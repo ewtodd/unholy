@@ -1586,3 +1586,18 @@ counts (tools/bench/gufo_routed.hip, IQ2_XXS gate+up): 18.9 / 23.1 / 20.8 TFLOPS
 - No single item of the 1.3 ms above the weight stream dominates (loads, staging, fragment reads, barriers 4-8% each;
   the WMMAs not overlapping the stream 25%): EXL3 v2 is near what its structure allows at 28 rows per expert. A
   larger gain needs another expert format (or more expert room on the cards), not kernel work.
+
+## 2026-11-03 — w1 / w3 in one block with the SwiGLU epilogue (gfx11 MXFP4 prefill, bit-identical)
+
+- `mx_gemm_rb_glu_kernel`: 16 waves per (tile, 128 columns), waves 0-7 w1 and 8-15 w3, each running
+  `mx_gemm_rb_kernel`'s per-wave code, A staged once for both (double-buffered); the epilogue goes through LDS in
+  32-row chunks (the bf16 g / u tiles), then a wave per (row, 128-value segment) applies `mx_swiglu`'s arithmetic
+  (clamp, SwiGLU, route weight, bf16, fp8 fake quantization) into hh. 144 VGPRs, 36 KB of LDS. `UNHOLY_MX_GLU=0`: the
+  w1 / w3 GEMM + mx_swiglu as before.
+- APU, the up half (w1 + w3 + SwiGLU), `unholy-mx-test --glu 1`: 9.00 -> 8.09 ms at 28 rows per expert (DSV4's APU
+  counts, 2048-row part), 13.24 -> 12.16 at 57, 20.25 -> 18.63 at 32 uniform, 2.71 -> 2.29 at 16; bit-identical.
+  With A in one buffer 9.82 ms (slower than before).
+- End to end against 003e5ad, two rounds each: unholy-curve prefill to 64k 2532 -> 2569 tok/s (+1.5%), to 256k
+  2391 -> 2433 (+1.8%); decode unchanged; validate bit-identical; eb c8 48/48 tokens and logprobs against eb-fuse9,
+  74.8 -> 75.4 tok/s. The APU's expert time fell ~7% but prefill only ~1.5-2%: since the dequant and double-buffer
+  change, the APU is no longer the only limit of DSV4 prefill (to be traced).
