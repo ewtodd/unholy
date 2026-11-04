@@ -6,8 +6,10 @@ checkpoint's chat_template.jinja (rendering) and vLLM's GLM-4.7 parser (completi
 Rendering: golden conversations plus random ones over every message shape the template handles. The reference
 gets tool-call arguments as objects (vLLM converts JSON text before rendering; unholy does that itself, so half
 the random cases send it text). Parsing: random completions through vLLM's Glm47MoeParser.parse and through
-unholy's parser fed in random chunk sizes. Cases on the documented deviations (calls to undeclared tools, calls
-cut off by the length limit) are counted separately, not compared.
+unholy's parser fed in random chunk sizes. Cases on the documented deviations are counted separately, not
+compared: calls cut off by the length limit, and calls to undeclared tools, which vLLM drops (validate_tool_names)
+and unholy on purpose does not: a valid name is emitted like any other call, anything else comes back as raw
+content (DECISIONS 2026-11-04). tools/text_test/glm_parse_test.cpp covers those, without vLLM.
 """
 import argparse
 import copy
@@ -225,7 +227,7 @@ def compare_parse(binary, tok, n, r):
         declared = {t.get("function", t)["name"] for t in tools}
         if tools and any(seg.split("<arg_key>")[0].split("</tool_call>")[0].strip() not in declared
                          for seg in text_.split("<tool_call>")[1:]):
-            skipped += 1  # documented deviation: calls to undeclared tools
+            skipped += 1  # documented deviation: vLLM drops calls to undeclared tools, unholy keeps them
             continue
         cases.append({"text": text_, "chunk": r.choice([1, 2, 3, 7, 64, 1 << 20]), "tools": tools})
         refs.append({"reasoning": reasoning or "", "content": content_ or "",

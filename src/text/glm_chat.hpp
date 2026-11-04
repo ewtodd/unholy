@@ -13,9 +13,11 @@
 // <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> with the values coerced to the
 // tool schema's types (vllm/tool_parsers/utils.coerce_to_schema_type). Differences, all from streaming or
 // deliberate: content that has text before a tool call keeps its leading whitespace (vLLM strips it once it
-// has seen the call; a stream has already sent it), calls to tools the request did not declare are dropped
-// without reordering the content around them, and a call cut off by the length limit gets valid JSON.
-// Verified against transformers and vLLM by tools/ref/glm_chat_compare.py.
+// has seen the call; a stream has already sent it), a call cut off by the length limit gets valid JSON, and
+// calls to tools the request did not declare are not dropped: with a valid name ([A-Za-z0-9_-]{1,64}) they are
+// emitted like any other, otherwise the raw block goes back in the content (ParsedDelta::log says which).
+// Verified against transformers and vLLM by tools/ref/glm_chat_compare.py; tools/text_test/glm_parse_test.cpp
+// covers the undeclared cases, which that comparison cannot.
 #pragma once
 #include <string>
 #include <string_view>
@@ -56,7 +58,7 @@ class Glm5OutputParser final : public ChatParser {
   void emit_call(bool partial, ParsedDelta& out);
 
   State state_ = State::Reasoning;
-  bool tools_seen_ = false;  // a call has started: content after it is dropped (vLLM)
+  bool tools_seen_ = false;  // a call has started: content after it is dropped (vLLM), unless it came back as content
   std::string buf_;          // not yet processed
   std::string hold_r_;       // trailing whitespace of the reasoning (dropped at the end: it is right-stripped)
   std::string hold_c_;       // whitespace of the content not yet followed by other text (dropped if a call follows)

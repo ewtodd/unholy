@@ -604,6 +604,23 @@ bool tool_declared(const Value& tools, std::string_view name) {
   return false;
 }
 
+// [A-Za-z0-9_-]{1,64}: clients keep the names they are given and replay them, and a strict upstream can reject
+// any other in the history.
+bool tool_name_ok(std::string_view s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (const char c : s)
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+      return false;
+  return true;
+}
+
+// The first n bytes of s, without splitting a UTF-8 character.
+std::string_view utf8_prefix(std::string_view s, size_t n) {
+  if (s.size() <= n) return s;
+  while (n > 0 && (static_cast<unsigned char>(s[n]) >> 6) == 2) --n;
+  return s.substr(0, n);
+}
+
 }  // namespace
 
 std::string glm5_render(const Value& messages, const Value* tools, const Glm5Options& opt,
@@ -716,11 +733,31 @@ void Glm5OutputParser::text_out(std::string_view s, ParsedDelta& out) {
 }
 
 void Glm5OutputParser::emit_call(bool partial, ParsedDelta& out) {
-  const std::string name(py_strip(name_));
+  const std::string written = std::move(name_);  // as generated: name_ holds the whole block when it has no <arg_key>
+  const std::string name(py_strip(written));
   name_.clear();
   const std::string raw = std::move(args_);
   args_.clear();
-  if (tools_.is_array() && !tool_declared(tools_, name)) return;  // vLLM: validate_tool_names
+  // vLLM's validate_tool_names drops these; here nothing the model generated may vanish silently.
+  if (tools_.is_array() && !tool_declared(tools_, name)) {
+    if (name.empty() && raw.empty()) return;  // <tool_call></tool_call>: no call
+    if (!tool_name_ok(name)) {
+      // No name a client could keep: the block goes back in the content, and the content carries on after it
+      // unless a real call came first.
+      std::string block(kCallOpen);
+      block += written;
+      block += raw;
+      if (!partial) block += kCallClose;
+      out.content += call_ws_;
+      out.content += block;
+      content_text_ = true;
+      tools_seen_ = n_calls_ > 0;
+      out.log.push_back("tool call with an invalid name returned as content: " +
+                        Value(std::string(utf8_prefix(block, 200))).dump());
+      return;
+    }
+    out.log.push_back("call to undeclared tool passed through: " + name);
+  }
   Value params = convert_args(raw, partial);
   if (const Value* props = tools_.is_array() ? tool_properties(tools_, name) : nullptr)
     for (auto& [k, v] : params.members())

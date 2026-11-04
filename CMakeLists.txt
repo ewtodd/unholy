@@ -61,6 +61,8 @@ target_link_libraries(unholy_text PUBLIC PkgConfig::PCRE2)
 
 add_executable(unholy-text-test tools/text_test/main.cpp)
 target_link_libraries(unholy-text-test PRIVATE unholy_text)
+add_executable(unholy-glm-parse-test tools/text_test/glm_parse_test.cpp)
+target_link_libraries(unholy-glm-parse-test PRIVATE unholy_text)
 
 # Image preprocessing for the vision encoder (decode, PIL-exact resize, patches, token layout). No device code.
 add_library(unholy_vision STATIC src/vision/image.cpp)

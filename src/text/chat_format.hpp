@@ -31,6 +31,7 @@ struct ParsedDelta {
   std::string reasoning;
   std::string content;
   std::vector<ToolCall> tool_calls;
+  std::vector<std::string> log;  // lines for the server's log, which adds the request id (not sent to the client)
   bool empty() const { return reasoning.empty() && content.empty() && tool_calls.empty(); }
 };
 

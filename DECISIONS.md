@@ -1624,3 +1624,37 @@ many more, on `/work` (the SATA RAID 0), never the NVMe.
   (8k / 32k documents, five requests each) 10 / 10 responses identical to RAM-only, every follow-up at the deepest
   boundary (GLM's 32k follow-ups 0.28-0.41 s TTFT against 0.28-0.30 s RAM-only).
 - The service needs a writable directory under `/work` and the two flags (NixOS module).
+
+## 2026-11-04 — GLM: calls to undeclared tools no longer vanish (departs from vLLM)
+
+Glm5OutputParser copied vLLM's `validate_tool_names`: a call whose name was not in the request's tools was dropped
+(recorded as deliberate in d4e1efd), `saw_tool_calls()` stayed false, and `tools_seen_` dropped the content after it.
+Production, 2026-11-04 09:29:48: `stop`, 354 completion tokens, and the client got no reasoning, content or calls; a
+son-of-anton turn ended silently. A clean 200 with nothing in it cannot be told from an empty reply, and son-of-anton
+re-sending it cannot recover a dropped call. The raw text was never logged, so which shape that was is unknown: a name
+not in the list, or a declared name with arguments not in `<arg_key>` form (`name_` then holds everything up to
+`</tool_call>`). The DSV4 parser never validated names and is unchanged.
+
+- Name not declared and valid (`[A-Za-z0-9_-]{1,64}`): emitted like any other call, on the `</tool_call>` path and the
+  partial path in `finish()`, so `finish_reason` is `tool_calls` (`length` if cut off, as for any call) and the client
+  can answer "unknown tool" and let the model correct itself.
+- Otherwise no call (clients store names and replay them; a strict upstream can reject an invalid name in history,
+  which would wedge the session): the raw block, `<tool_call>` through `</tool_call>` as generated, goes in the content
+  with the whitespace before it. Unless a real call came first, the content carries on after the block.
+- Either way one line on stderr, in `journalctl -u unholy-glm`, with the id of the request log:
+  `10:51:31 request chatcmpl-...: call to undeclared tool passed through: strace`, or
+  `... tool call with an invalid name returned as content: "<tool_call>execute_code {...` (the block's first 200 bytes
+  on whole characters, JSON-escaped so it stays one line). The parser has no request id: it fills `ParsedDelta::log` and
+  `TextState` writes the lines, which covers streaming and non-streaming in one place. The log will tell which shapes
+  occur; JSON arguments are deliberately not salvaged until it does.
+- Unchanged: declared calls (a declared name is checked first, whatever its characters), requests without tools (any
+  name is a call, as before), a bare `<tool_call>` with or without `</tool_call>` (no call, nothing logged; content after
+  a closed one is still dropped; a block with arguments but no name is not bare and comes back as content), content
+  after an emitted call (dropped, as vLLM).
+- `tools/text_test/glm_parse_cases.json` + `unholy-glm-parse-test`: 44 cases at chunks 1 / 5 / whole, no vLLM, GPU or
+  ROCm (the compile line is in the test). 132 / 132; on cbda888's parser 30 of the cases fail and the controls pass.
+  `glm_chat_compare.py` cannot cover this (it skips undeclared cases); cbda888 against this parser on its completion
+  generator: 152,026 / 152,026 with declared calls and 200,000 / 200,000 without tools byte-identical.
+- OpenAIServer + Engine over HTTP with a scripted fake model and a byte tokenizer (not checked in), streaming and not:
+  cbda888 gives `stop` and nothing for an undeclared call, as production did; now `tool_calls` with the call, and a raw
+  block with `stop`. A history replaying both outcomes renders (200).

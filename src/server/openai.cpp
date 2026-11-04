@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <ctime>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -173,6 +174,16 @@ Params parse_params(const Value& req, bool chat, int default_max_tokens) {
   return p;
 }
 
+// One line on stderr, local time first like the request log.
+void log_line(const std::string& line) {
+  const std::time_t t = std::time(nullptr);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  char ts[16];
+  std::strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
+  std::fprintf(stderr, "%s %s\n", ts, line.c_str());
+}
+
 Value usage_json(int prompt, int completion, int cached) {
   Value u = Value::object();
   u.set("prompt_tokens", Value(prompt));
@@ -206,9 +217,10 @@ struct OpenAIServer::Impl {
     text::Detokenizer detok;
     StopMatcher stop;
     std::unique_ptr<text::ChatParser> parser;  // chat only
+    std::string id;                            // the request, in the log
     TextState(const text::Tokenizer& t, const text::ChatFormat& f, std::vector<std::string> stops, bool chat, bool thinking,
-              const Value* tools)
-        : detok(t, true), stop(std::move(stops)) {
+              const Value* tools, std::string request_id)
+        : detok(t, true), stop(std::move(stops)), id(std::move(request_id)) {
       if (chat) parser = f.parser(thinking, tools);
     }
     // Feeds tokens; returns new raw text (completions) or fills the parsed delta (chat).
@@ -227,10 +239,17 @@ struct OpenAIServer::Impl {
       }
       emit(safe, raw, d);
       if (parser) parser->finish(d);
+      flush_log(d);
     }
     void emit(const std::string& s, std::string& raw, text::ParsedDelta& d) {
       if (parser) parser->feed(s, d);
       else raw += s;
+      flush_log(d);
+    }
+    // Streaming and non-streaming both come through here; collect()'s delta lives on, so the lines leave it.
+    void flush_log(text::ParsedDelta& d) {
+      for (const std::string& line : d.log) log_line("request " + id + ": " + line);
+      d.log.clear();
     }
   };
 
@@ -318,7 +337,7 @@ struct OpenAIServer::Impl {
                                " tokens; the prompt has " + std::to_string(gen.prompt.size()));
     const uint64_t rid = eng.submit(std::move(gen), [ch](engine::GenOutput&& o) { ch->push(std::move(o)); });
     auto state = std::make_shared<TextState>(tok, fmt, job->p.stop, job->chat, job->thinking,
-                                             job->tools.is_null() ? nullptr : &job->tools);
+                                             job->tools.is_null() ? nullptr : &job->tools, job->id);
     if (job->p.stream) stream(job, ch, state, rid, res);
     else collect(job, ch, state, rid, req, res);
   }
