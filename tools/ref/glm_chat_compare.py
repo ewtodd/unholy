@@ -7,15 +7,17 @@ Rendering: golden conversations plus random ones over every message shape the te
 gets tool-call arguments as objects (vLLM converts JSON text before rendering; unholy does that itself, so half
 the random cases send it text). Parsing: random completions through vLLM's Glm47MoeParser.parse and through
 unholy's parser fed in random chunk sizes. Cases on the documented deviations are counted separately, not
-compared: calls cut off by the length limit, and calls to undeclared tools, which vLLM drops (validate_tool_names)
-and unholy on purpose does not: a valid name is emitted like any other call, anything else comes back as raw
-content (DECISIONS 2026-11-04). tools/text_test/glm_parse_test.cpp covers those, without vLLM.
+compared: calls cut off by the length limit, calls to undeclared tools, which vLLM drops (validate_tool_names)
+and unholy on purpose does not (a valid name is emitted like any other call), and invalid names, which vLLM emits
+as calls on a request without tools and unholy returns as raw content, with or without tools (DECISIONS
+2026-11-04). tools/text_test/glm_parse_test.cpp covers those, without vLLM.
 """
 import argparse
 import copy
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -209,6 +211,23 @@ def completion(r, tools):
     return "".join(parts)
 
 
+def call_names(text_):
+    """The names as the parser reads them: up to <arg_key> or </tool_call>, a call running to its </tool_call>."""
+    names, p = [], text_.find("<tool_call>")
+    while p >= 0:
+        p += len("<tool_call>")
+        names.append(re.split("<arg_key>|</tool_call>", text_[p:], maxsplit=1)[0].strip())
+        p = text_.find("</tool_call>", p)
+        p = text_.find("<tool_call>", p) if p >= 0 else -1
+    return names
+
+
+def deviates(text_, tools):
+    """A call unholy treats differently from vLLM on purpose: undeclared with tools, an invalid name without."""
+    declared = {t.get("function", t)["name"] for t in tools}
+    return any(n not in declared if tools else not re.fullmatch("[A-Za-z0-9_-]{1,64}", n) for n in call_names(text_))
+
+
 def compare_parse(binary, tok, n, r):
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.parser.glm47_moe import Glm47MoeParser
@@ -224,10 +243,8 @@ def compare_parse(binary, tok, n, r):
         text_ = completion(r, tools)
         req = ChatCompletionRequest(model="glm", messages=[{"role": "user", "content": "x"}], tools=tools or None)
         reasoning, content_, calls = Glm47MoeParser(tok, tools=req.tools).parse(text_, req, enable_auto_tools=True)
-        declared = {t.get("function", t)["name"] for t in tools}
-        if tools and any(seg.split("<arg_key>")[0].split("</tool_call>")[0].strip() not in declared
-                         for seg in text_.split("<tool_call>")[1:]):
-            skipped += 1  # documented deviation: vLLM drops calls to undeclared tools, unholy keeps them
+        if deviates(text_, tools):
+            skipped += 1
             continue
         cases.append({"text": text_, "chunk": r.choice([1, 2, 3, 7, 64, 1 << 20]), "tools": tools})
         refs.append({"reasoning": reasoning or "", "content": content_ or "",
@@ -243,7 +260,7 @@ def compare_parse(binary, tok, n, r):
         else:
             print(f"MISMATCH parse:\n  text     {c['text']!r}\n  expected {e}\n  got      {g}")
     print(f"parse: {same + lead}/{len(cases)} identical ({lead} of them up to the content's leading whitespace "
-          f"before a call; {skipped} with calls to undeclared tools not compared)")
+          f"before a call; {skipped} with undeclared or invalid tool names not compared)")
     return same + lead == len(cases)
 
 

@@ -714,11 +714,7 @@ void Glm5OutputParser::finish(ParsedDelta& out) {
   if (!tools_seen_) out.content += hold_c_;  // no call followed: the content is kept as it was
   hold_c_.clear();
   hold_r_.clear();
-  if (state_ == State::ToolName && py_strip(name_).empty()) {  // a bare <tool_call>: no call
-    if (content_text_) out.content += call_ws_;
-  } else if (state_ == State::ToolName || state_ == State::ToolArgs) {
-    emit_call(true, out);
-  }
+  if (state_ == State::ToolName || state_ == State::ToolArgs) emit_call(true, out);
 }
 
 // Reasoning / content text; whitespace is held until other text follows it.
@@ -738,9 +734,13 @@ void Glm5OutputParser::emit_call(bool partial, ParsedDelta& out) {
   name_.clear();
   const std::string raw = std::move(args_);
   args_.clear();
-  // vLLM's validate_tool_names drops these; here nothing the model generated may vanish silently.
-  if (tools_.is_array() && !tool_declared(tools_, name)) {
-    if (name.empty() && raw.empty()) return;  // <tool_call></tool_call>: no call
+  if (name.empty() && raw.empty()) {  // a bare <tool_call>, closed or not: no call, and the content carries on
+    if (content_text_) out.content += call_ws_;
+    tools_seen_ = n_calls_ > 0;
+    return;
+  }
+  // vLLM's validate_tool_names drops undeclared names; here nothing the model generated may vanish silently.
+  if (!tools_.is_array() || !tool_declared(tools_, name)) {
     if (!tool_name_ok(name)) {
       // No name a client could keep: the block goes back in the content, and the content carries on after it
       // unless a real call came first.
@@ -756,7 +756,7 @@ void Glm5OutputParser::emit_call(bool partial, ParsedDelta& out) {
                         Value(std::string(utf8_prefix(block, 200))).dump());
       return;
     }
-    out.log.push_back("call to undeclared tool passed through: " + name);
+    if (tools_.is_array()) out.log.push_back("call to undeclared tool passed through: " + name);
   }
   Value params = convert_args(raw, partial);
   if (const Value* props = tools_.is_array() ? tool_properties(tools_, name) : nullptr)

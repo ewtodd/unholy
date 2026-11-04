@@ -1638,23 +1638,26 @@ not in the list, or a declared name with arguments not in `<arg_key>` form (`nam
 - Name not declared and valid (`[A-Za-z0-9_-]{1,64}`): emitted like any other call, on the `</tool_call>` path and the
   partial path in `finish()`, so `finish_reason` is `tool_calls` (`length` if cut off, as for any call) and the client
   can answer "unknown tool" and let the model correct itself.
-- Otherwise no call (clients store names and replay them; a strict upstream can reject an invalid name in history,
-  which would wedge the session): the raw block, `<tool_call>` through `</tool_call>` as generated, goes in the content
-  with the whitespace before it. Unless a real call came first, the content carries on after the block.
+- A name neither declared nor valid is no call, on a request without tools too, where vLLM emits it (clients store
+  names and replay them; a strict upstream can reject an invalid name in history, which would wedge the session): the
+  raw block, `<tool_call>` through `</tool_call>` as generated, goes in the content with the whitespace before it.
+  Unless a real call came first, the content carries on after the block.
 - Either way one line on stderr, in `journalctl -u unholy-glm`, with the id of the request log:
   `10:51:31 request chatcmpl-...: call to undeclared tool passed through: strace`, or
   `... tool call with an invalid name returned as content: "<tool_call>execute_code {...` (the block's first 200 bytes
   on whole characters, JSON-escaped so it stays one line). The parser has no request id: it fills `ParsedDelta::log` and
   `TextState` writes the lines, which covers streaming and non-streaming in one place. The log will tell which shapes
   occur; JSON arguments are deliberately not salvaged until it does.
-- Unchanged: declared calls (a declared name is checked first, whatever its characters), requests without tools (any
-  name is a call, as before), a bare `<tool_call>` with or without `</tool_call>` (no call, nothing logged; content after
-  a closed one is still dropped; a block with arguments but no name is not bare and comes back as content), content
-  after an emitted call (dropped, as vLLM).
-- `tools/text_test/glm_parse_cases.json` + `unholy-glm-parse-test`: 44 cases at chunks 1 / 5 / whole, no vLLM, GPU or
-  ROCm (the compile line is in the test). 132 / 132; on cbda888's parser 30 of the cases fail and the controls pass.
-  `glm_chat_compare.py` cannot cover this (it skips undeclared cases); cbda888 against this parser on its completion
-  generator: 152,026 / 152,026 with declared calls and 200,000 / 200,000 without tools byte-identical.
+- A bare `<tool_call>`, closed or not, is no call and is not logged, without tools too (a closed one used to be a call
+  named ""), and the content carries on after it, as after a raw block. A block with arguments but no name is not bare
+  and comes back as content.
+- Unchanged: declared calls (a declared name is checked first, whatever its characters), valid names on requests without
+  tools (a call, not logged), content after an emitted call (dropped, as vLLM).
+- `tools/text_test/glm_parse_cases.json` + `unholy-glm-parse-test`: 57 cases at chunks 1 / 5 / whole, no vLLM, GPU or
+  ROCm (the compile line is in the test). 171 / 171; on cbda888's parser 40 of the cases fail and the controls pass.
+  `glm_chat_compare.py` cannot cover this: `deviates()` skips those cases, and reads names as the parser does (a name
+  runs on through a `<tool_call>` inside it). cbda888 against this parser on its completion generator, outside those
+  cases: 152,969 / 152,969 with tools and 154,536 / 154,536 without byte-identical.
 - OpenAIServer + Engine over HTTP with a scripted fake model and a byte tokenizer (not checked in), streaming and not:
   cbda888 gives `stop` and nothing for an undeclared call, as production did; now `tool_calls` with the call, and a raw
   block with `stop`. A history replaying both outcomes renders (200).
