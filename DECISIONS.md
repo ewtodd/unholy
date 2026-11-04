@@ -1559,3 +1559,19 @@ counts (tools/bench/gufo_routed.hip, IQ2_XXS gate+up): 18.9 / 23.1 / 20.8 TFLOPS
   The LUT fix does not apply (its decode is the trellis); w1 / w3 in one block would.
 - Next: w1 / w3 in one block with the SwiGLU epilogue (as the decode GEMV's MxGlu). The weight stream caps this
   kernel at ~25 TFLOPS at 28 rows.
+
+## 2026-11-03 — GLM's EXL3 expert GEMM on the APU: where its time goes; register-B does not pay
+
+- Measured at GLM's APU row counts (tools/box/mkcounts.py on the broad profile and the GLM plan: layer 24 of a
+  1536-row part, 211 experts, 28 rows mean; layers 12, 36 and the w2 shape alike): v2 7.00 ms, 14.2 TFLOPS.
+  Throwaway ablations: no trellis decode 6.54, no WMMA 5.27, neither 5.05 against 3.69 ms for streaming the weights
+  (unlike the MXFP4 kernel, whose skeleton sat at its weight stream), no A staging 6.47, no barriers 6.59, no output
+  transform 6.91; A double-buffered 8.32 (58 KB of LDS, fewer blocks). Counters: few LDS bank conflicts, 18% of wave
+  cycles waiting. The descriptor reserves 217 VGPRs (`.amdhsa_next_free_vgpr`) for 132 used (the v1 GEMM 241); the
+  40 KB of LDS caps occupancy first.
+- Register-B v2 for gfx11 (each lane decodes its own column's trellis steps straight into the WMMA layout,
+  step(k, n) = 8 (4 (n & 7) + ((k & 7) >> 1)) + 4 (n >> 3) + 2 (k >> 3) + (k & 1), halves swapped with permlanex16; no
+  sB, no sW): bit-identical for BITS 2-6 but 8.18 ms (+15%), 7.29 with A double-buffered (+3%): per-lane trellis
+  loads (25 per slab against 14), 183 VGPRs, LDS still 34 KB (the epilogue's sC). As on 2026-10-27, not adopted.
+- unholy-exl3-gemm-test: --counts FILE, --reps, --gemm-only, --no-v1.
+- Next: where GLM prefill's APU time goes, from a trace, before more GEMM work.

@@ -4,10 +4,13 @@
 //
 //   unholy-exl3-gemm-test [--experts 64] [--rows-mean 96] [--K 4096] [--N 2048] [--bits 3] [--dev 0] [--gemv-rows R]
 //                         [--gemv-tiles T]
+//                         [--counts FILE] [--reps N] [--gemm-only 1] [--no-v1 1]
 //
 // The decode GEMV runs on one tile per expert of R rows (0: 1-8 at random); UH_DUMP_GEMV=FILE writes its output (bf16)
 // for comparisons between builds. With T, also back-to-back GEMVs of T tiles each (output transform in the launch)
 // that rotate over the experts, so their weights come from memory rather than the last-level cache, as in decode.
+// --counts: the GEMM part's rows per expert from FILE (whitespace-separated; E = their number). --reps: v2 timing runs
+// (default 3). --gemm-only skips the GEMV and dense-linear parts, --no-v1 the v1 kernel.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -15,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <cstring>
 #include <random>
 #include <string>
@@ -32,6 +36,8 @@ uint16_t f2h(float f) { return uint16_t(__half_as_ushort(__float2half(f))); }
 
 int main(int argc, char** argv) {
   int E = 64, rows_mean = 96, K = 4096, N = 2048, bits = 3, dev = 0, gemv_rows = 0, gemv_tiles = 0;
+  int reps = 3, gemm_only = 0, no_v1 = 0;
+  std::string counts_file;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     const int v = std::atoi(argv[i + 1]);
@@ -43,14 +49,29 @@ int main(int argc, char** argv) {
     else if (a == "--dev") dev = v;
     else if (a == "--gemv-rows") gemv_rows = v;
     else if (a == "--gemv-tiles") gemv_tiles = v;
+    else if (a == "--reps") reps = std::max(1, v);
+    else if (a == "--gemm-only") gemm_only = v;
+    else if (a == "--no-v1") no_v1 = v;
+    else if (a == "--counts") counts_file = argv[i + 1];
   }
   const char* dump = std::getenv("UH_DUMP_OUT");  // write v2's output (bf16) there
   UH_CHECK(hipSetDevice(dev));
   std::mt19937_64 rng(1);
+  std::vector<int> file_counts;
+  if (!counts_file.empty()) {
+    std::ifstream f(counts_file);
+    for (int c; f >> c;) file_counts.push_back(c);
+    if (file_counts.empty()) {
+      std::fprintf(stderr, "--counts: no integers in %s\n", counts_file.c_str());
+      return 2;
+    }
+    E = int(file_counts.size());
+  }
   std::vector<int> counts(static_cast<size_t>(E));
   int P = 0;
-  for (auto& c : counts) {
-    c = int(rng() % uint64_t(2 * rows_mean + 1));
+  for (size_t ci = 0; ci < counts.size(); ++ci) {
+    int& c = counts[ci];
+    c = file_counts.empty() ? int(rng() % uint64_t(2 * rows_mean + 1)) : file_counts[ci];
     P += c;
   }
   // Tile lists: v1 runs of <= 64 rows, v2 of <= 128.
@@ -87,27 +108,28 @@ int main(int argc, char** argv) {
   const auto* trt = dtab.as<const uint16_t*>();
   const auto* svt = dstab.as<const uint16_t*>();
 
-  auto time = [&](auto fn) {
+  auto time = [&](auto fn, int nrep = 3) {
     fn();
     UH_CHECK(hipDeviceSynchronize());
     const auto t0 = std::chrono::steady_clock::now();
-    for (int r = 0; r < 3; ++r) fn();
+    for (int r = 0; r < nrep; ++r) fn();
     UH_CHECK(hipDeviceSynchronize());
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 3;
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / nrep;
   };
-  const double ms1 = time([&] {
+  const double ms1 = no_v1 ? 0.0 : time([&] {
     k::exl3_grouped_gemm_v1(dx.as<uint16_t>(), K, dt1.as<k::Exl3Tile>(), int(t1.size()), trt, svt, bits,
                             o1.as<uint16_t>(), N, N, nullptr);
   });
   const double ms2 = time([&] {
     k::exl3_grouped_gemm(dx.as<uint16_t>(), K, dt2.as<k::Exl3Tile>(), int(t2.size()), trt, svt, bits,
                          o2.as<uint16_t>(), N, N, nullptr);
-  });
+  }, reps);
   std::vector<uint16_t> a(size_t(P) * N), b(size_t(P) * N);
   UH_CHECK(hipMemcpy(a.data(), o1.data(), a.size() * 2, hipMemcpyDeviceToHost));
   UH_CHECK(hipMemcpy(b.data(), o2.data(), b.size() * 2, hipMemcpyDeviceToHost));
   size_t diff = 0;
-  for (size_t i = 0; i < a.size(); ++i) diff += a[i] != b[i];
+  if (!no_v1)
+    for (size_t i = 0; i < a.size(); ++i) diff += a[i] != b[i];
   if (dump)
     if (FILE* fd = std::fopen(dump, "wb")) {
       std::fwrite(b.data(), 2, b.size(), fd);
@@ -116,7 +138,7 @@ int main(int argc, char** argv) {
   // Decode path: GEMV on tiles of <= 8 rows vs the GEMM on the same rows (different summation order).
   double gemv_ms = 0, maxrel = 0, gemv_fused_ms = 0;
   size_t gemv_fused_diff = 0;
-  {
+  if (!gemm_only) {
     std::vector<k::Exl3Tile> tv;
     int rowsv = 0;
     for (int e = 0; e < E; ++e) {
@@ -194,15 +216,17 @@ int main(int argc, char** argv) {
         std::fclose(fd);
       }
   }
-  std::printf("GEMV (E=%d tiles of %s rows): %.3f ms, %.0f G weights/s, %.0f GB/s of weights; rel L2 vs GEMM %.2e\n",
-              E, gemv_rows > 0 ? std::to_string(gemv_rows).c_str() : "1-8", gemv_ms,
-              double(E) * K * N / 1e9 / (gemv_ms / 1e3), double(E) * K * N * bits / 8 / 1e9 / (gemv_ms / 1e3), maxrel);
-  std::printf("GEMV with the output transform in the launch: %.3f ms; %zu outputs differ\n", gemv_fused_ms,
-              gemv_fused_diff);
+  if (!gemm_only) {
+    std::printf("GEMV (E=%d tiles of %s rows): %.3f ms, %.0f G weights/s, %.0f GB/s of weights; rel L2 vs GEMM %.2e\n",
+                E, gemv_rows > 0 ? std::to_string(gemv_rows).c_str() : "1-8", gemv_ms,
+                double(E) * K * N / 1e9 / (gemv_ms / 1e3), double(E) * K * N * bits / 8 / 1e9 / (gemv_ms / 1e3), maxrel);
+    std::printf("GEMV with the output transform in the launch: %.3f ms; %zu outputs differ\n", gemv_fused_ms,
+                gemv_fused_diff);
+  }
   // The fused dense linear (exl3_linear_gemv) against exl3_xform_in + exl3_grouped_gemv on expert 0's weights.
   size_t fused_diff = 0;
   double sep_ms = 0, fused_ms = 0;
-  {
+  if (!gemm_only) {
     const int rows = gemv_rows > 0 ? gemv_rows : 1;
     std::vector<uint16_t> hxb(size_t(rows) * K), hsuh(K);
     for (auto& v : hxb) {
@@ -244,9 +268,13 @@ int main(int argc, char** argv) {
                 fused_ms, fused_diff);
   }
   const double gw = double(E) * K * N / 1e9;  // weights per expert pass
-  std::printf("E=%d P=%d K=%d N=%d bits=%d: v1 %.2f ms (%zu tiles), v2 %.2f ms (%zu tiles) -> %.2fx; "
-              "v2 %.0f G weights/s, %.1f TFLOPS; outputs %zu / %zu differ\n",
-              E, P, K, N, bits, ms1, t1.size(), ms2, t2.size(), ms1 / ms2, gw / (ms2 / 1e3),
-              2.0 * P * double(K) * N / (ms2 / 1e3) / 1e12, diff, a.size());
+  if (no_v1)
+    std::printf("E=%d P=%d K=%d N=%d bits=%d: v2 %.2f ms (%zu tiles); v2 %.0f G weights/s, %.1f TFLOPS\n", E, P, K, N,
+                bits, ms2, t2.size(), gw / (ms2 / 1e3), 2.0 * P * double(K) * N / (ms2 / 1e3) / 1e12);
+  else
+    std::printf("E=%d P=%d K=%d N=%d bits=%d: v1 %.2f ms (%zu tiles), v2 %.2f ms (%zu tiles) -> %.2fx; "
+                "v2 %.0f G weights/s, %.1f TFLOPS; outputs %zu / %zu differ\n",
+                E, P, K, N, bits, ms1, t1.size(), ms2, t2.size(), ms1 / ms2, gw / (ms2 / 1e3),
+                2.0 * P * double(K) * N / (ms2 / 1e3) / 1e12, diff, a.size());
   return diff || fused_diff || gemv_fused_diff ? 1 : 0;
 }
