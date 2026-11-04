@@ -1574,4 +1574,15 @@ counts (tools/bench/gufo_routed.hip, IQ2_XXS gate+up): 18.9 / 23.1 / 20.8 TFLOPS
   sB, no sW): bit-identical for BITS 2-6 but 8.18 ms (+15%), 7.29 with A double-buffered (+3%): per-lane trellis
   loads (25 per slab against 14), 183 VGPRs, LDS still 34 KB (the epilogue's sC). As on 2026-10-27, not adopted.
 - unholy-exl3-gemm-test: --counts FILE, --reps, --gemm-only, --no-v1.
-- Next: where GLM prefill's APU time goes, from a trace, before more GEMM work.
+- GLM prefill trace (unholy-curve, 64k in 3072-token steps, curve placement 53.1% on the cards; rocprofv3, the last
+  46 s): the APU computes 92.8% of the time and its EXL3 expert GEMM alone covers 86.8%; the transforms and the
+  partial combine are ~6% of its compute. The cards compute 62.6 / 65.7% and wait (mostly on the APU) 27-28%. So GLM
+  prefill follows this GEMM about one for one, with ~1.5x of card headroom.
+- More throwaway ablations at the same counts (production 6.99 ms): no trellis loads 6.68, no B round trip through LDS
+  7.08 (no cost), no A fragment reads 6.50. 32-input slabs (bit-identical, half the A and B LDS): 8.60 ms, 8.59 with A
+  double-buffered (+23%: twice the per-slab overhead; LDS only falls to 35 KB, the epilogue's sC sets it).
+  `.amdhsa_next_free_vgpr` follows the LDS-limited occupancy (217 for every variant at 35-43 KB whatever its real
+  count, 241 at 59 KB): the compiler pads to the occupancy bound, harmless.
+- No single item of the 1.3 ms above the weight stream dominates (loads, staging, fragment reads, barriers 4-8% each;
+  the WMMAs not overlapping the stream 25%): EXL3 v2 is near what its structure allows at 28 rows per expert. A
+  larger gain needs another expert format (or more expert room on the cards), not kernel work.
