@@ -78,8 +78,20 @@ with_gpus() {
   mode=$(cat /var/lib/llm-mode/mode 2>/dev/null || echo ds4)
   trap 'llm-mode "'"$mode"'" >/dev/null' EXIT
   trap 'exit 130' INT TERM
+  # A refused stop (polkit denies it from a non-interactive ssh session) must not run CMD next to the live service,
+  # also when the caller has no `set -e`.
+  local u up=
   # shellcheck disable=SC2046
-  systemctl stop $(llm_units)
+  systemctl stop $(llm_units) || up=1
+  for u in $(llm_units); do
+    case "$(systemctl is-active "$u")" in inactive | failed) ;; *) up=1 ;; esac
+  done
+  if [ -n "$up" ]; then
+    echo "with_gpus: the llm-mode services did not stop; not running: $*" >&2
+    llm-mode "$mode" >/dev/null || true
+    trap - EXIT INT TERM
+    return 1
+  fi
   "$@" || rc=$?
   llm-mode "$mode" >/dev/null
   trap - EXIT INT TERM

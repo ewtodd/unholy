@@ -89,7 +89,8 @@ nix develop -c ./build/unholy serve --model /scratch/dsv4-ve --exl3 /scratch/mod
       DECISIONS 2026-10-15
 - [ ] multi-stream decode and prefill are bound by the cold experts' bytes on the APU (65-82% busy): more
       routing on the cards (scratch went 3.21 -> 2.24 GB per card; KV pool size is the other lever) or a
-      faster APU grouped GEMM (now 11-27 TFLOPS of ~59 at 16-256 rows per expert, B in registers)
+      faster APU grouped GEMM (MXFP4: 18.8 TFLOPS at 28 rows per expert, 26.9 at 57, after the v_perm dequant
+      and double-buffered A; its weight stream caps it at ~25 at 28 rows. DECISIONS 2026-11-03)
 - [x] two steps in flight (card pipelining): 16k prefill 1087 -> 1680 tok/s
 - [x] routing profile from our own traffic (`data/expert_profile_unholy_mixed.txt`, default for runs)
 

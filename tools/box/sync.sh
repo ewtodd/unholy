@@ -7,7 +7,7 @@ here=$(cd "$(dirname "$0")/../.." && pwd)
 host=${BOX_HOST:-son-of-anton}
 tree=${BOX_TREE:-/work/unholy-perf}
 
-rsync -a --delete --exclude /build/ --exclude /.git/ --exclude /result "$here/" "$host:$tree/"
+rsync -a --delete --exclude /build/ --exclude /.git --exclude /result "$here/" "$host:$tree/"
 rev=$(git -C "$here" rev-parse --short HEAD)
 git -C "$here" diff --quiet HEAD || rev="$rev+dirty"
 ssh "$host" "echo $rev > $tree/.synced-rev"

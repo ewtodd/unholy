@@ -45,6 +45,40 @@ __device__ __forceinline__ void mx_dequant32_lut(const uint4 q, uint8_t s, const
   }
 }
 
+// The same values as mx_dequant32_lut without LDS. A nonzero magnitude m's half is T_m = (bf16(e2m1(m)) + adj) mod
+// 2^16 with the sign xor-ed into bit 15 (adding 0x8000 is an xor), zero stays +-0: T_0 = 0. T_1..T_7 come from packed
+// adds; their high and low bytes form two 8-byte tables in two registers each, which v_perm_b32 indexes four
+// nibbles at a time (selector byte 0-3: the low register's byte, 4-7: the high one's). Selectors and signs are the
+// words' nibbles; two rounds of perms interleave the bytes into the output words.
+typedef unsigned short u16x2_t __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ void mx_dequant32_perm(const uint4 q, uint8_t s, uint32_t out[16]) {
+  const uint32_t adj = ((uint32_t(s) - 127u) << 7) & 0xffffu;
+  const u16x2_t add = {uint16_t(adj), uint16_t(adj)};
+  const uint32_t t1 = __builtin_bit_cast(uint32_t, u16x2_t{0x3F00, 0x3F00} + add);  // T1 (both halves)
+  const uint32_t t23 = __builtin_bit_cast(uint32_t, u16x2_t{0x3F80, 0x3FC0} + add);
+  const uint32_t t45 = __builtin_bit_cast(uint32_t, u16x2_t{0x4000, 0x4040} + add);
+  const uint32_t t67 = __builtin_bit_cast(uint32_t, u16x2_t{0x4080, 0x40C0} + add);
+  // Bytes m = 0..3 / 4..7 of the high bytes (H) and low bytes (L) of T_m; selector 0x0c is a zero byte (T_0).
+  const uint32_t hlo = __builtin_amdgcn_perm(t23, t1, 0x0705010cu), llo = __builtin_amdgcn_perm(t23, t1, 0x0604000cu);
+  const uint32_t hhi = __builtin_amdgcn_perm(t67, t45, 0x07050301u), lhi = __builtin_amdgcn_perm(t67, t45, 0x06040200u);
+  const uint32_t w[4] = {q.x, q.y, q.z, q.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t sl = w[i] & 0x07070707u, sh = (w[i] >> 4) & 0x07070707u;  // magnitudes: low / high nibbles
+    // Per code byte j: low nibble -> bytes ll / hl (the half's low / high byte), high nibble -> lh / hh.
+    const uint32_t hl = __builtin_amdgcn_perm(hhi, hlo, sl) ^ ((w[i] << 4) & 0x80808080u);
+    const uint32_t ll = __builtin_amdgcn_perm(lhi, llo, sl);
+    const uint32_t hh = __builtin_amdgcn_perm(hhi, hlo, sh) ^ (w[i] & 0x80808080u);
+    const uint32_t lh = __builtin_amdgcn_perm(lhi, llo, sh);
+    const uint32_t a01 = __builtin_amdgcn_perm(hl, ll, 0x05010400u), a23 = __builtin_amdgcn_perm(hl, ll, 0x07030602u);
+    const uint32_t b01 = __builtin_amdgcn_perm(hh, lh, 0x05010400u), b23 = __builtin_amdgcn_perm(hh, lh, 0x07030602u);
+    out[4 * i] = __builtin_amdgcn_perm(b01, a01, 0x05040100u);
+    out[4 * i + 1] = __builtin_amdgcn_perm(b01, a01, 0x07060302u);
+    out[4 * i + 2] = __builtin_amdgcn_perm(b23, a23, 0x05040100u);
+    out[4 * i + 3] = __builtin_amdgcn_perm(b23, a23, 0x07060302u);
+  }
+}
+
 // Thread per (chunk, output, byte of the slab): 32 code bytes, then scales.
 __global__ void mx_repack_kernel(const uint8_t* w, const uint8_t* s, uint8_t* tw, uint8_t* ts, int N, int K) {
   const size_t gid = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
@@ -282,10 +316,13 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_kernel(const bf16* __restrict__
 // lane % 16, input half lane / 16; the same LUT code and values as there, reading those 16 code bytes
 // directly) and takes the other half from the lane 16 away (permlanex16): every lane then holds what its
 // WMMA B fragments need (gfx11: all 16 inputs of a k step in both half-waves; gfx12: 8 of them per
-// half-wave). No B in LDS: A alone (20 KB) leaves room for three blocks per CU instead of one. Used on gfx11
-// (the APU); on gfx12 it is bit-identical too but slower than mx_gemm_kernel<2> (41 vs 54 TFLOPS at 96 rows
-// per expert with two column tiles per wave), so the cards keep that.
-template <int CW>
+// half-wave). No B in LDS. Used on gfx11 (the APU); on gfx12 it is bit-identical too but slower than
+// mx_gemm_kernel<2> (41 vs 54 TFLOPS at 96 rows per expert with two column tiles per wave), so the cards keep that.
+// The dequant is mx_dequant32_perm: the LUT's random-index reads cost ~2 bank-conflict cycles each. DB (the
+// default): A double-buffered in LDS (36 KB), one barrier per slab: the WMMAs read buffer k & 1 while the thread
+// stores slab k + 1's A into the other one. On the APU at 28 rows per expert (DSV4's cold experts in a 2048-row
+// part) 5.84 -> 4.43 ms, 14.2 -> 18.8 TFLOPS (unholy-mx-test --counts; DECISIONS 2026-11-03).
+template <int CW, bool DB>
 __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restrict__ xa, int K,
                                                            const Exl3Tile* __restrict__ tiles,
                                                            const uint8_t* const* w_tab, const uint8_t* const* s_tab,
@@ -298,11 +335,8 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restric
     out = out2;
   }
   constexpr int AROW = MX_KS + MX_PAD;
-  __shared__ alignas(16) uint16_t sA[MX_BM][AROW];
-  __shared__ uint32_t sLut[256], sNz[256];
+  __shared__ alignas(16) uint16_t sA[DB ? 2 : 1][MX_BM][AROW];
   if (ntiles_dev && int(blockIdx.y) >= *ntiles_dev) return;
-  mx_build_lut(sLut, sNz);
-  __syncthreads();
   const Exl3Tile tile = tiles[blockIdx.y];
   const int n0 = blockIdx.x * MX_BN * CW;
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
@@ -334,19 +368,27 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restric
       rs[cw] = sbase[chunk * 32 + bc * 2 + bh];
     }
   };
-  load(0);
-  for (int k0 = 0; k0 < K; k0 += MX_KS) {
+  auto store_a = [&](int buf) {
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       const int idx = tid + q * MX_NT, r = idx >> 3, c = (idx & 7) * 8;
-      if (r < arows) *reinterpret_cast<uint4*>(&sA[r][c]) = ra[q];
+      if (r < arows) *reinterpret_cast<uint4*>(&sA[buf][r][c]) = ra[q];
     }
+  };
+  load(0);
+  if (DB) {
+    store_a(0);
+    __syncthreads();
+  }
+  for (int k0 = 0; k0 < K; k0 += MX_KS) {
+    if (!DB) store_a(0);
+    [[maybe_unused]] uint16_t(*const sAk)[AROW] = sA[DB ? (k0 / MX_KS) & 1 : 0];
     // h[cw][0]: the column's inputs 0-31 of the slab, h[cw][1]: 32-63 (bf16 pairs).
     uint32_t h[CW][2][16];
 #pragma unroll
     for (int cw = 0; cw < CW; ++cw) {
       uint32_t d[16];
-      mx_dequant32_lut(rw[cw], rs[cw], sLut, sNz, d);
+      mx_dequant32_perm(rw[cw], rs[cw], d);
 #pragma unroll
       for (int i = 0; i < 16; ++i) {
         const uint32_t o = __builtin_amdgcn_permlanex16(d[i], d[i], 0x76543210u, 0xfedcba98u, false, false);
@@ -355,7 +397,7 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restric
       }
     }
     if (k0 + MX_KS < K) load(k0 + MX_KS);
-    __syncthreads();  // A from every thread
+    if (!DB) __syncthreads();  // A from every thread
 #pragma unroll
     for (int kt = 0; kt < MX_KS / 16; ++kt) {
 #if defined(UH_GFX12)
@@ -369,7 +411,7 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restric
 #pragma unroll
       for (int i = 0; i < 8; ++i)
         if (i < mtiles) {
-          const bf16x8_t afv = *reinterpret_cast<const bf16x8_t*>(&sA[i * 16 + (lane & 15)][kt * 16 + bh * 8]);
+          const bf16x8_t afv = *reinterpret_cast<const bf16x8_t*>(&sAk[i * 16 + (lane & 15)][kt * 16 + bh * 8]);
 #pragma unroll
           for (int cw = 0; cw < CW; ++cw)
             acc[cw][i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(afv, bfv[cw], acc[cw][i]);
@@ -386,7 +428,7 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restric
 #pragma unroll
       for (int i = 0; i < 8; ++i)
         if (i < mtiles) {
-          const uint16_t* pa = &sA[i * 16 + (lane & 15)][kt * 16];
+          const uint16_t* pa = &sAk[i * 16 + (lane & 15)][kt * 16];
           const bf16x8_t a0 = *reinterpret_cast<const bf16x8_t*>(pa), a1 = *reinterpret_cast<const bf16x8_t*>(pa + 8);
           const bf16x16_t afv = __builtin_shufflevector(a0, a1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 #pragma unroll
@@ -394,7 +436,14 @@ __global__ __launch_bounds__(MX_NT) void mx_gemm_rb_kernel(const bf16* __restric
         }
 #endif
     }
-    __syncthreads();  // before the next slab overwrites A
+    if (DB) {
+      if (k0 + MX_KS < K) {
+        store_a(((k0 / MX_KS) + 1) & 1);  // slab k + 1's A (loaded above) into the other buffer
+        __syncthreads();                  // from every thread; every WMMA read of this buffer is done
+      }
+    } else {
+      __syncthreads();  // before the next slab overwrites A
+    }
   }
 #pragma unroll
   for (int cw = 0; cw < CW; ++cw) {
@@ -754,7 +803,7 @@ int mx_gemm_cols(int N) {
 }
 
 namespace {
-int g_rb = -1;
+int g_rb = -1, g_rb_db = -1;
 // gfx11 on the current device.
 bool dev_gfx11() {
   static int by_dev[64] = {};
@@ -767,6 +816,28 @@ bool dev_gfx11() {
   }
   return by_dev[dev] == 2;
 }
+// Test: mx_dequant32_perm against mx_dequant32_lut (LUT in LDS as in the kernels) for every scale byte (block) and
+// every value (thread): pass 0 has the value in all 16 code bytes, pass 1 a different byte at each position.
+__global__ void mx_check_dequant_kernel(unsigned long long* bad) {
+  __shared__ uint32_t sLut[256], sNz[256];
+  mx_build_lut(sLut, sNz);
+  __syncthreads();
+  const uint32_t v = threadIdx.x;
+  unsigned long long n = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+    uint32_t w[4];
+    for (int i = 0; i < 4; ++i) {
+      w[i] = 0;
+      for (int j = 0; j < 4; ++j) w[i] |= (pass ? (v + 17u * (4 * i + j)) & 0xffu : v) << (8 * j);
+    }
+    const uint4 q = {w[0], w[1], w[2], w[3]};
+    uint32_t a[16], b[16];
+    mx_dequant32_lut(q, uint8_t(blockIdx.x), sLut, sNz, a);
+    mx_dequant32_perm(q, uint8_t(blockIdx.x), b);
+    for (int i = 0; i < 16; ++i) n += a[i] != b[i];
+  }
+  if (n) atomicAdd(bad, n);
+}
 }  // namespace
 
 void mx_gemm_force_rb(int on) { g_rb = on; }
@@ -776,6 +847,28 @@ bool mx_gemm_rb() {
     return !v || std::string(v) != "0";
   }();
   return dev_gfx11() && (g_rb < 0 ? env : g_rb > 0);
+}
+
+void mx_gemm_rb_double_buffer(int on) { g_rb_db = on; }
+static bool mx_gemm_rb_db() {
+  static const bool env = [] {
+    const char* v = std::getenv("UNHOLY_MX_RB_DB");
+    return !v || std::string(v) != "0";
+  }();
+  return g_rb_db < 0 ? env : g_rb_db > 0;
+}
+
+unsigned long long mx_check_dequant(unsigned long long* total) {
+  unsigned long long* bad;
+  UH_CHECK(hipMalloc(&bad, 8));
+  UH_CHECK(hipMemset(bad, 0, 8));
+  mx_check_dequant_kernel<<<256, 256>>>(bad);
+  UH_CHECK_LAUNCH();
+  unsigned long long n = 0;
+  UH_CHECK(hipMemcpy(&n, bad, 8, hipMemcpyDeviceToHost));
+  UH_CHECK(hipFree(bad));
+  *total = 2ull * 256 * 256 * 16;
+  return n;
 }
 
 bool mx_skinny_enabled() {
@@ -792,8 +885,13 @@ void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, c
   if (ntiles <= 0) return;
   if (K % MX_KS || N % MX_BN) throw std::runtime_error("mx_grouped_gemm: K % 64 or N % 128");
   if (mx_gemm_rb()) {  // gfx11: also ahead of the skinny kernel on decode tiles (182 vs 162 GB/s)
-    mx_gemm_rb_kernel<1><<<dim3(N / MX_BN, ntiles, out2 ? 2 : 1), MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N,
-                                                                                 ntiles_dev, w_tab2, s_tab2, out2);
+    const dim3 grid(N / MX_BN, ntiles, out2 ? 2 : 1);
+    if (mx_gemm_rb_db())
+      mx_gemm_rb_kernel<1, true><<<grid, MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N, ntiles_dev, w_tab2,
+                                                         s_tab2, out2);
+    else
+      mx_gemm_rb_kernel<1, false><<<grid, MX_NT, 0, st>>>(xa, K, tiles, w_tab, s_tab, out, ldo, N, ntiles_dev, w_tab2,
+                                                          s_tab2, out2);
   } else if (max_rows <= 64 && K % (2 * MX_KS) == 0 && mx_skinny_enabled()) {
     const dim3 grid(N / 64, ntiles, out2 ? 2 : 1);
     if (max_rows <= 16)

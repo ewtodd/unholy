@@ -1526,3 +1526,36 @@ decode logits (8k, 32 steps) against 863eff2 for the shared kernels.
   us at 8) but give verify rows other values than a one-token step's (the GEMV's rows do not depend on the row
   count), which would let speculative and plain decoding diverge: the owner's call, not taken.
 - Single runs of unholy-curve vary by ~0.3 ms/token: tools/box/ab.sh alternates two builds.
+
+## 2026-11-03 — the APU's MXFP4 expert GEMM: v_perm dequant, A double-buffered (DSV4 prefill +14-15%, bit-identical)
+
+Prefill is bound by the APU (99.6-99.8% busy, 2026-10-27). gufo's V4.1-Flash prefill on one Strix Halo looked 2-3x
+faster per FLOP than our APU experts; most of that is V4.1's layout (its decoder layers 20-39 run over the prompt's
+last 140 rows only, DeepInfer's "compact" default). Its routed FP16 kernel on this APU at the same per-expert row
+counts (tools/bench/gufo_routed.hip, IQ2_XXS gate+up): 18.9 / 23.1 / 20.8 TFLOPS against ours 14.0 / 21.0 / 15.4 at
+28 / 57 / 32 rows.
+
+- Measured (tools/box/apu-gemm.sh; `unholy-mx-test --counts` with DSV4's APU cold experts of one layer in a 2048-row
+  part: 175 experts, 28 rows mean, tools/box/mkcounts.py): 5.95 ms, 14.0 TFLOPS. The 779 MB of MXFP4 weights alone
+  are 3.25 ms at 240 GB/s. Ablations (throwaway variants): no WMMA, with or without the dequant, 3.77 ms (the
+  weight stream: the matrix work does not overlap it); no dequant 4.55; no A staging 4.93; no barriers 5.20.
+  rocprofv3 counters work on gfx1151: SIMDs ~53% busy at ~8 waves each, ~2 LDS bank-conflict cycles per LDS
+  instruction (the LUT's random indices).
+- `mx_dequant32_perm` (rb kernel only): T_m = bf16(e2m1(m)) + the scale's exponent offset mod 2^16 for m = 1..7
+  (T_0 = 0), split into high and low bytes as two 8-byte tables in registers, looked up four at a time with v_perm;
+  the sign is an XOR (adding 0x8000 mod 2^16). The same bits as the LUT for every scale and code byte
+  (`--check-dequant 1`: 0 of 2,097,152 words differ; a host emulation agrees). Per slab 145 VALU + 16 LDS -> 106 VALU.
+- A double-buffered (36 KB of LDS, 217 VGPRs): one barrier per slab; faster despite fewer waves.
+  `UNHOLY_MX_RB_DB=0` keeps one buffer and two barriers.
+- Kernel, paused box, two rounds: 5.84 -> 4.43 ms at 28 rows (14.2 -> 18.8 TFLOPS), 7.91 -> 6.27 at 57
+  (21.2 -> 26.9), 13.0 -> 9.85 at 32 uniform (15.9 -> 20.9); the perm dequant alone 4.95 / 6.97 / 10.9 ms.
+- End to end against the perf tree (c0cb2a2+dirty): unholy-curve prefill averaged to 64k 2229 -> 2540 tok/s
+  (+14.0%, two rounds each), to 256k 2044 -> 2349 (+14.9%); decode unchanged. validate 133,416,960 / 133,416,960
+  logits bit-identical (KL 4.191e-3, top-1 98.26%); eb c8 48/48 tokens and logprobs against eb-fuse9, drafts
+  9347 / 12152, 65.8 -> 74.8 tok/s. Every other kernel's ISA is unchanged on gfx1151 and gfx1201.
+- Not adopted: weights prefetched 2 / 4 slabs ahead in a register ring (6.08 / 6.16 ms vs 5.95: latency is not the
+  limit).
+- GLM's EXL3 v2 GEMM at ~28 rows: 13.6 TFLOPS, 224 VGPRs, 40 KB LDS, few LDS conflicts, 18% of wave cycles waiting.
+  The LUT fix does not apply (its decode is the trellis); w1 / w3 in one block would.
+- Next: w1 / w3 in one block with the SwiGLU epilogue (as the decode GEMV's MxGlu). The weight stream caps this
+  kernel at ~25 TFLOPS at 28 rows.

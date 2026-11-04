@@ -45,3 +45,6 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `trace-summary.py TRACE [flags]` | a rocprofv3 kernel trace (csv): per device, busy time and kernels by total time |
 | `trace-grids.py TRACE [flags]` | the same trace by kernel and grid (blocks, VGPRs, LDS), flagging grids that fill a card's wave slots exactly |
 | `isa.sh SRC ARCH OUT.s` | a source file's device assembly with the build's flags |
+| `mkcounts.py PROFILE TOPK HOT0 HOT1 SPLIT ROWS LAYER SEED` | per-expert row counts of the APU's cold experts in one layer of a ROWS-row step part (routing profile + the planner's greedy hot set), for `unholy-mx-test --counts` / `gufo-routed-bench --counts` |
+| `gufo-routed.sh` | build gufo's FP16 routed-expert benchmark (`tools/bench/gufo_routed.hip`) into `$BUILD/gufo-routed-bench`; gufo's MIT kernel is compiled from a checkout (`GUFO_SRC`, default `/work/src/gufo`, pinned rev, cloned if missing), not vendored |
+| `apu-gemm.sh LABEL` | APU routed-GEMM benchmark: `unholy-mx-test` at synthetic rows and at per-expert row counts (`$BOX_DATA/apu0`), rocprofv3 counters, then gufo's kernel on the same counts; `summary.txt` has the key lines |

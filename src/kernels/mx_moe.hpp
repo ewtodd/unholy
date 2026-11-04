@@ -49,11 +49,16 @@ void mx_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, c
                      const int* ntiles_dev = nullptr, const uint8_t* const* w_tab2 = nullptr,
                      const uint8_t* const* s_tab2 = nullptr, bf16* out2 = nullptr, int max_rows = kExl3TileRows);
 bool mx_skinny_enabled();
-// gfx11: the 128-row tiles keep the weights in registers (each lane dequantizes half a slab and swaps with
-// its partner lane) instead of LDS, three blocks per CU instead of one; bit-identical (UNHOLY_MX_GEMM_RB=0:
-// the LDS kernel). Tests: 1 / 0 forces it on / off (gfx11 only), -1 restores the default.
+// gfx11: the 128-row tiles keep the weights in registers (each lane dequantizes half a slab with v_perm table
+// lookups, no LDS, and swaps with its partner lane) and double-buffer A (one barrier per slab); bit-identical
+// (UNHOLY_MX_GEMM_RB=0: the LDS kernel). Tests: 1 / 0 forces it on / off (gfx11 only), -1 restores the default.
 bool mx_gemm_rb();
 void mx_gemm_force_rb(int on);
+// Test: mx_dequant32_perm against mx_dequant32_lut over every scale byte and value; returns the mismatching words
+// (of *total).
+unsigned long long mx_check_dequant(unsigned long long* total);
+void mx_gemm_rb_double_buffer(int on);  // gfx11 register-B tiles: one barrier per slab (A double-buffered);
+                                        // -1: UNHOLY_MX_RB_DB (default on; 0: two barriers, A in one buffer)
 // The same for tiles of <= kMxGemvTileRows rows (decode): a wave per output column, K across the lanes.
 // Each row's result does not depend on the tile it is in, so steps of up to mx_gemv_max_tokens() tokens
 // plan their experts in tiles of kMxGemvTileRows rows and every row gets what a one-token step gives it.

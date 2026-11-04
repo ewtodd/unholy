@@ -5,6 +5,9 @@
 // which takes three passes over the 37-row tile, and 64), bit for bit, and their times.
 //
 //   unholy-mx-test [--experts 16] [--rows-mean 96] [--K 4096] [--N 2048] [--dev 0]
+//     [--counts FILE] [--reps 3] [--gemm-only 1] [--no-ref 1] [--check-dequant 1]
+// (mode 0 only: --counts, rows per expert from FILE (E = their number); --reps; --no-ref skips the reference;
+// --check-dequant: mx_dequant32_perm against mx_dequant32_lut, all scales x all values, on the device)
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -13,6 +16,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -39,25 +43,46 @@ float from_bf16(uint16_t b) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  int E = 16, rows_mean = 96, K = 4096, N = 2048, dev = 0;
+  int E_opt = 16, rows_mean = 96, K = 4096, N = 2048, dev = 0, reps = 3, gemm_only = 0, no_ref = 0, check_dequant = 0;
+  std::vector<int> file_counts;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     const int v = std::atoi(argv[i + 1]);
-    if (a == "--experts") E = v;
+    if (a == "--counts") {
+      std::ifstream f(argv[i + 1]);
+      for (int c; f >> c;) file_counts.push_back(c);
+      if (file_counts.empty()) {
+        std::fprintf(stderr, "--counts: no integers in %s\n", argv[i + 1]);
+        return 2;
+      }
+    } else if (a == "--check-dequant") {
+      check_dequant = v;
+    } else if (a == "--reps") reps = std::max(v, 1);
+    else if (a == "--gemm-only") gemm_only = v;
+    else if (a == "--no-ref") no_ref = v;
+    else if (a == "--experts") E_opt = v;
     else if (a == "--rows-mean") rows_mean = v;
     else if (a == "--K") K = v;
     else if (a == "--N") N = v;
     else if (a == "--dev") dev = v;
   }
   UH_CHECK(hipSetDevice(dev));
+  if (check_dequant) {
+    unsigned long long total = 0;
+    const unsigned long long bad = k::mx_check_dequant(&total);
+    std::printf("dequant perm vs lut: %llu mismatches of %llu\n", bad, total);
+    if (bad) return 1;
+  }
   std::mt19937_64 rng(3);
   std::normal_distribution<float> nd(0.0f, 1.0f);
   bool all_same = true;
-  for (int mode = 0; mode < 3; ++mode) {  // 0: GEMM (prefill tiles), 1: GEMV (<= 8 rows), 2: GEMM, decode tiles
+  for (int mode = 0; mode < (gemm_only ? 1 : 3); ++mode) {  // 0: GEMM (prefill tiles), 1: GEMV (<= 8 rows), 2: GEMM, decode tiles
+    const int E = mode == 0 && !file_counts.empty() ? int(file_counts.size()) : E_opt;
     std::vector<int> counts(static_cast<size_t>(E));
     int P = 0;
-    for (auto& c : counts) {
-      c = mode == 2 ? 1 + int(rng() % 3) : mode ? 1 + int(rng() % 8) : int(rng() % uint64_t(2 * rows_mean + 1));
+    for (size_t ci = 0; ci < counts.size(); ++ci) {
+      int& c = counts[ci];
+      c = mode == 0 && !file_counts.empty() ? file_counts[ci] : mode == 2 ? 1 + int(rng() % 3) : mode ? 1 + int(rng() % 8) : int(rng() % uint64_t(2 * rows_mean + 1));
       P += c;
     }
     if (mode == 2) {
@@ -106,12 +131,13 @@ int main(int argc, char** argv) {
     const auto* stp = st.as<const uint8_t*>();
 
     // Reference, expert by expert.
-    k::act_quant_fp8(dx.as<uint16_t>(), K, qb.as<uint8_t>(), qs.as<uint8_t>(), P, K, 128, nullptr);
-    for (int e = 0, row = 0; e < E; row += counts[size_t(e)], ++e)
+    const bool ref_on = !(mode == 0 && no_ref);
+    if (ref_on) k::act_quant_fp8(dx.as<uint16_t>(), K, qb.as<uint8_t>(), qs.as<uint8_t>(), P, K, 128, nullptr);
+    for (int e = 0, row = 0; ref_on && e < E; row += counts[size_t(e)], ++e)
       if (counts[size_t(e)] > 0)
         k::gemm_a8w4(qb.as<uint8_t>() + size_t(row) * K, qs.as<uint8_t>() + size_t(row) * (K / 128), wref[size_t(e)],
                      sref[size_t(e)], ref.as<uint16_t>() + size_t(row) * N, N, counts[size_t(e)], N, K, nullptr);
-    if (mode == 0) {  // the reference on the tiled copy must give the same bits as on the original
+    if (mode == 0 && ref_on) {  // the reference on the tiled copy must give the same bits as on the original
       rt::DeviceBuffer ref2(dev, size_t(P) * N * 2);
       for (int e = 0, row = 0; e < E; row += counts[size_t(e)], ++e)
         if (counts[size_t(e)] > 0)
@@ -166,21 +192,28 @@ int main(int argc, char** argv) {
     run();
     UH_CHECK(hipDeviceSynchronize());
     const auto t0 = std::chrono::steady_clock::now();
-    for (int r = 0; r < 3; ++r) run();
+    const int nrep = mode == 0 ? reps : 3;
+    for (int r = 0; r < nrep; ++r) run();
     UH_CHECK(hipDeviceSynchronize());
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 3;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / nrep;
     std::vector<uint16_t> a(size_t(P) * N), b(size_t(P) * N);
-    UH_CHECK(hipMemcpy(a.data(), ref.data(), a.size() * 2, hipMemcpyDeviceToHost));
     UH_CHECK(hipMemcpy(b.data(), out.data(), b.size() * 2, hipMemcpyDeviceToHost));
+    if (!ref_on) {
+      const double bytes = double(E) * N * K * (0.5 + 1.0 / 32);
+      std::printf("GEMM: E=%d P=%d K=%d N=%d: %.3f ms (%.0f GB/s of weights, %.1f TFLOPS); no reference\n", E, P, K, N,
+                  ms, bytes / (ms / 1e3) / 1e9, 2.0 * P * double(K) * N / (ms / 1e3) / 1e12);
+    }
+    if (ref_on) UH_CHECK(hipMemcpy(a.data(), ref.data(), a.size() * 2, hipMemcpyDeviceToHost));
     double num = 0, den = 0;
     size_t same = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
+    for (size_t i = 0; ref_on && i < a.size(); ++i) {
       const double x = from_bf16(a[i]), y = from_bf16(b[i]);
       num += (x - y) * (x - y);
       den += x * x;
       same += a[i] == b[i];
     }
     const double bytes = double(E) * N * K * (0.5 + 1.0 / 32);
+    if (ref_on)
     std::printf("%s: E=%d P=%d K=%d N=%d: %.3f ms (%.0f GB/s of weights, %.1f TFLOPS); rel L2 vs reference %.2e, "
                 "%.1f%% bit-identical\n",
                 mode ? "GEMV" : "GEMM", E, P, K, N, ms, bytes / (ms / 1e3) / 1e9, 2.0 * P * double(K) * N / (ms / 1e3) / 1e12,
@@ -196,15 +229,31 @@ int main(int argc, char** argv) {
         o[v].resize(size_t(P) * N);
         UH_CHECK(hipMemcpy(o[v].data(), out.data(), o[v].size() * 2, hipMemcpyDeviceToHost));
         const auto t1 = std::chrono::steady_clock::now();
-        for (int r = 0; r < 3; ++r) run();
+        for (int r = 0; r < reps; ++r) run();
         UH_CHECK(hipDeviceSynchronize());
-        t[v] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / 3;
+        t[v] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / reps;
       }
       k::mx_gemm_force_rb(-1);
       all_same &= o[0] == o[1];
       std::printf("  tiles, B in LDS / in registers (gfx11): %.3f / %.3f ms (%.1f / %.1f TFLOPS), %s\n", t[0], t[1],
                   2.0 * P * double(K) * N / (t[0] / 1e3) / 1e12, 2.0 * P * double(K) * N / (t[1] / 1e3) / 1e12,
                   o[0] == o[1] ? "bit-identical" : "DIFFERENT");
+      if (k::mx_gemm_rb()) {  // A in one buffer, two barriers per slab, against the default (double-buffered) output
+        k::mx_gemm_rb_double_buffer(0);
+        UH_CHECK(hipMemset(out.data(), 0, out.size()));
+        run();
+        UH_CHECK(hipDeviceSynchronize());
+        std::vector<uint16_t> od(size_t(P) * N);
+        UH_CHECK(hipMemcpy(od.data(), out.data(), od.size() * 2, hipMemcpyDeviceToHost));
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) run();
+        UH_CHECK(hipDeviceSynchronize());
+        const double td = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count() / reps;
+        k::mx_gemm_rb_double_buffer(-1);
+        all_same &= od == o[1];
+        std::printf("  rb with A in one buffer: %.3f ms (%.1f TFLOPS), %s\n", td,
+                    2.0 * P * double(K) * N / (td / 1e3) / 1e12, od == o[1] ? "bit-identical" : "DIFFERENT");
+      }
     }
     if (mode == 0 && std::getenv("MX_TEST_SKINNY")) {  // experiment: the skinny kernel on prefill tiles
       const auto go = [&] {
