@@ -38,6 +38,7 @@ add_library(unholy_host STATIC
   src/model/family.cpp
   src/model/exl3.cpp
   src/model/native.cpp
+  src/model/expert_pack.cpp
 )
 target_include_directories(unholy_host PUBLIC src third_party)
 
@@ -194,3 +195,11 @@ add_executable(unholy-gemv-test tools/kernel_test/gemv.hip)
 target_link_libraries(unholy-gemv-test PRIVATE unholy_ref)
 add_executable(unholy-attn-test tools/kernel_test/attn.hip)
 target_link_libraries(unholy-attn-test PRIVATE unholy_ref)
+
+# Expert pack (docs/PLAN-strix-only.md): the routed experts in the grouped kernels' layout, one slot per expert.
+add_executable(unholy-expert-pack tools/expert_pack/main.cpp)
+target_link_libraries(unholy-expert-pack PRIVATE unholy_host Threads::Threads)
+add_executable(unholy-expert-pack-check tools/expert_pack/gpu_check.hip)
+target_link_libraries(unholy-expert-pack-check PRIVATE unholy_ref)
+add_executable(unholy-stream-test tools/stream_test/main.hip)
+target_link_libraries(unholy-stream-test PRIVATE unholy_ref Threads::Threads)

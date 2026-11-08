@@ -906,6 +906,12 @@ void mx_repack(uint8_t* w, uint8_t* s, int N, int K, uint8_t* tmp, hipStream_t s
   UH_CHECK(hipMemcpyAsync(s, tmp + wb, sb, hipMemcpyDeviceToDevice, st));
 }
 
+void mx_repack_to(const uint8_t* w, const uint8_t* s, uint8_t* tw, uint8_t* ts, int N, int K, hipStream_t st) {
+  if (N % 16 || K % 64) throw std::runtime_error("mx_repack_to: N % 16 or K % 64");
+  mx_repack_kernel<<<int((size_t(N) * K / 2 + 255) / 256), 256, 0, st>>>(w, s, tw, ts, N, K);
+  UH_CHECK_LAUNCH();
+}
+
 void mx_xform_in(const bf16* x, int ldx, const int32_t* row_expert, const uint8_t* const* s_tab, bf16* xa, int P,
                  int K, hipStream_t st, const int32_t* x_rows) {
   if (P <= 0) return;
