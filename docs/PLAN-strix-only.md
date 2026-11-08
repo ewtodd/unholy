@@ -288,4 +288,5 @@ A USB4 NVMe enclosure adds ~3 GB/s but takes a port the two-Strix link would use
 3. GPU windows as needed for P0.
 4. The bar is quality, not a speed number: is full-precision DSV4 better than V4.1 IQ1_M? Measured (Q0 below)
    before the engine work past P0.
-5. Radiance: the two flags plus the small checkpoint spill patch to `/work`, applied from the flake.
+5. Radiance: the small checkpoint spill patch to `/work`, applied from the flake, with 2 RAM checkpoint slots and the
+   embedding in VRAM (owner accepts KV ~510k -> ~475k tokens per card for the 2.37 GiB of host RAM).
