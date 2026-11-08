@@ -5,8 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <string>
 
 #include "kernels/gemm_wmma.hpp"
@@ -31,6 +34,74 @@ struct ResidentModel::Vision {
 };
 
 namespace k = unholy::kernels;
+
+// The routing trace. File: "UHROUTE1", u16 n_layers, n_mtp, n_active, n_experts; then records of
+//   u32 magic 0x31525455, u8 kind (0 target step, 1 drafter block), u8 pad, u16 layers, u16 layer0, u16 n_active,
+//   u32 pad, u64 step, u32 rows, u32 cut (a two-part step's first row of part 2; 0: whole),
+//   TraceRow[rows] (16 bytes), then uint8 ids[layers][rows][n_active].
+struct ResidentModel::Trace {
+  struct Header {
+    uint32_t magic;
+    uint8_t kind, pad;
+    uint16_t layers, layer0, k;
+    uint32_t pad3;
+    uint64_t step;
+    uint32_t rows, cut;
+  };
+  static_assert(sizeof(Header) == 32 && sizeof(TraceRow) == 16);
+  std::FILE* fp = nullptr;
+  uint8_t* host[3] = {nullptr, nullptr, nullptr};  // per flight, then the drafter: [n_layers + n_mtp][stride][K]
+  int stride[3] = {0, 0, 0};
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::vector<uint8_t>> q;
+  bool stop = false;
+  std::thread th;
+  void run() {
+    std::unique_lock lk(mu);
+    for (;;) {
+      cv.wait(lk, [&] { return stop || !q.empty(); });
+      if (q.empty()) break;
+      auto b = std::move(q.front());
+      q.pop_front();
+      lk.unlock();
+      std::fwrite(b.data(), 1, b.size(), fp);
+      lk.lock();
+      if (q.empty()) std::fflush(fp);
+    }
+    std::fflush(fp);
+  }
+  void push(std::vector<uint8_t>&& b) {
+    {
+      std::lock_guard lk(mu);
+      q.push_back(std::move(b));
+    }
+    cv.notify_one();
+  }
+  ~Trace() {
+    {
+      std::lock_guard lk(mu);
+      stop = true;
+    }
+    cv.notify_one();
+    if (th.joinable()) th.join();
+    if (fp) std::fclose(fp);
+    for (uint8_t* p : host)
+      if (p) (void)hipHostFree(p);
+  }
+};
+
+void ResidentModel::trace_emit(uint8_t kind, uint64_t step, uint32_t cut, int layer0, int layers, const uint8_t* ids,
+                               int stride, const std::vector<TraceRow>& rows) {
+  const size_t n = rows.size(), K = size_t(c_.n_active);
+  std::vector<uint8_t> b(sizeof(Trace::Header) + n * sizeof(TraceRow) + size_t(layers) * n * K);
+  Trace::Header h{0x31525455u, kind, 0, uint16_t(layers), uint16_t(layer0), uint16_t(K), 0, step, uint32_t(n), cut};
+  std::memcpy(b.data(), &h, sizeof h);
+  std::memcpy(b.data() + sizeof h, rows.data(), n * sizeof(TraceRow));
+  uint8_t* o = b.data() + sizeof h + n * sizeof(TraceRow);
+  for (int l = 0; l < layers; ++l) std::memcpy(o + size_t(l) * n * K, ids + size_t(layer0 + l) * size_t(stride) * K, n * K);
+  trace_->push(std::move(b));
+}
 
 // ---------------------------------------------------------------------------------------------------
 // ApuExperts
@@ -426,6 +497,23 @@ ResidentModel::ResidentModel(const model::Dsv4Config& c, const model::Checkpoint
                    static_cast<void*>(f.x_host + size_t(max_tokens) * c.hc_mult * c.dim), static_cast<void*>(f.logits_host),
                    static_cast<void*>(f.ids_host), static_cast<void*>(f.tables_host));
   }
+  if (const char* path = std::getenv("UNHOLY_ROUTING_TRACE"); path && *path) {
+    trace_ = std::make_unique<Trace>();
+    trace_->fp = std::fopen(path, "wb");
+    if (!trace_->fp) throw std::runtime_error(std::string("UNHOLY_ROUTING_TRACE: cannot open ") + path);
+    const int nl = c.n_layers + c.n_mtp;
+    trace_->stride[0] = trace_->stride[1] = max_tokens;
+    trace_->stride[2] = std::max(1, c.dspark_block) * geo.max_slots;
+    for (int i = 0; i < 3; ++i)
+      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&trace_->host[i]), size_t(nl) * trace_->stride[i] * c.n_active,
+                             hipHostMallocPortable | hipHostMallocMapped));
+    std::fwrite("UHROUTE1", 1, 8, trace_->fp);
+    const uint16_t hd[4] = {uint16_t(c.n_layers), uint16_t(dspark_ ? c.n_mtp : 0), uint16_t(c.n_active),
+                            uint16_t(c.n_experts)};
+    std::fwrite(hd, 2, 4, trace_->fp);
+    trace_->th = std::thread([t = trace_.get()] { t->run(); });
+    std::fprintf(stderr, "routing trace -> %s\n", path);
+  }
   if (snapshots_ > 0) {
     for (int k = 0; k < 2; ++k) {
       size_t off = 0;
@@ -540,14 +628,24 @@ void ResidentModel::draft(const std::vector<RingRestore>& restore, const std::ve
     k::copy_kernel(d_tok_.data(), tok, size_t(R) * (Bk + 1) * 4, dst_);
     dd.ids = d_in_.as<int32_t>();
     dd.pos = d_in_.as<int32_t>() + T;
-    for (size_t s = 0; s < dw_.stages.size(); ++s)
-      model::dspark_stage(c_, dw_.stages[s], dcache_[s], dscr_, cd.rope, d_x_.as<uint16_t>(), dd, dst_, dchan_.get());
+    {
+      const model::RoutingTraceSink ts(trace_ ? trace_->host[2] : nullptr, trace_ ? trace_->stride[2] : 0, 0);
+      for (size_t s = 0; s < dw_.stages.size(); ++s)
+        model::dspark_stage(c_, dw_.stages[s], dcache_[s], dscr_, cd.rope, d_x_.as<uint16_t>(), dd, dst_, dchan_.get());
+    }
     model::dspark_head(c_, dw_, dscr_, d_x_.as<uint16_t>(), head_.as<uint16_t>(), R, d_logits_.as<float>(),
                        d_tok_.as<int32_t>(), d_conf_.as<float>(), dst_);
     k::copy_kernel(tok, d_tok_.data(), size_t(R) * (Bk + 1) * 4, dst_);
     k::copy_kernel(d_conf_host_, d_conf_.data(), size_t(T) * 4, dst_);
   }
   UH_CHECK(hipStreamSynchronize(dst_));
+  if (trace_ && R > 0) {
+    std::vector<TraceRow> rows;
+    for (int r = 0; r < R; ++r)
+      for (int i = 0; i < Bk; ++i)
+        rows.push_back({0, uint32_t(reqs[size_t(r)].start + 1 + i), uint16_t(reqs[size_t(r)].slot), 3, 0});
+    trace_emit(1, steps_, 0, c_.n_layers, c_.n_mtp, trace_->host[2], trace_->stride[2], rows);
+  }
   const int32_t* tok = d_io_host_ + 2 * T;
   for (int r = 0; r < R; ++r)
     for (int i = 1; i <= Bk; ++i) tokens.push_back(tok[r * (Bk + 1) + i]);
@@ -733,6 +831,15 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     k::copy_kernel(cap_dev_.data(), cap, size_t(cap_max_) * 3 * 4, card_[1].st);
   }
   if (!in.backup.empty() && !dspark_) throw std::runtime_error("step: verify chunks without a drafter");
+  uint8_t* const trace_base = trace_ ? trace_->host[ticket % 2] : nullptr;
+  f.trace_rows.clear();
+  if (trace_) {
+    for (const Chunk& ch : in.chunks)
+      for (int i = 0; i < ch.n; ++i)
+        f.trace_rows.push_back({ch.seq, uint32_t(ch.s0 + i), uint16_t(ch.slot), ch.kind, 0});
+    f.trace_step = steps_;
+    f.trace_cut = 0;
+  }
   // Two decode micro-batches within a step (UNHOLY_MICROBATCH=1; off by default): a step of decode / verify
   // chunks of distinct sequences runs as two halves of its chunks, and card 0 hands the first half to card 1
   // before computing the second, so the cards work on different halves at once. Every kernel path is chosen
@@ -775,6 +882,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
     for (int k = 0; ok && k < 2; ++k)
       for (const auto& w : card_[k].w) ok = ok && model::moe_split_ok(c_, w, chan_[k].get());
     if (ok) cut = two_part_cut(in.chunks, T, int(chan2_[0]->capacity_rows / size_t(c_.n_active)));
+    f.trace_cut = uint32_t(cut);
   }
   std::chrono::steady_clock::time_point t_enq[2];
   for (int k = 0; k < 2; ++k) {
@@ -833,6 +941,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
       };
       const auto start = [&](size_t i, int p) {
         const model::ScratchPart sp(p, r0[p], c_.n_active, c_.dim);
+        const model::RoutingTraceSink ts(trace_base, max_tokens_, r0[p]);
         started[p] = model::layer_moe_start(c_, cd.w[i], cd.scratch, x + size_t(r0[p]) * row, bd[p], cd.st,
                                             p == 0 ? chan_[k].get() : chan2_[k].get());
       };
@@ -887,6 +996,7 @@ uint64_t ResidentModel::submit(const StepInput& in) {
       b.block_tables = cd.tables.as<int32_t>();
       b.vis = in.image_spans.empty() ? nullptr : cd.vis.as<int32_t>() + 2 * pt.r0;
       const model::ClassRows whole_step(parts.size() > 1 ? T : 0);  // 0: no override
+      const model::RoutingTraceSink ts(trace_base, max_tokens_, pt.r0);
       for (size_t i = 0; i < cd.layers.size(); ++i) {
         model::layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.rope, cd.x.as<uint16_t>() + xoff, b, cd.st,
                              chan_[k].get());
@@ -953,6 +1063,10 @@ void ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {
     rt::DeviceGuard g(card_[0].dev);
     UH_CHECK(hipEventSynchronize(f.saved));
     f.saved_wait = false;
+  }
+  if (trace_ && !f.trace_rows.empty()) {
+    trace_emit(0, f.trace_step, f.trace_cut, 0, c_.n_layers, trace_->host[ticket % 2], trace_->stride[0], f.trace_rows);
+    f.trace_rows.clear();
   }
   if (canary_ && canary_->count != canary_seen_) {
     const unsigned now = canary_->count;

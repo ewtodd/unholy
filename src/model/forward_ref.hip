@@ -373,6 +373,18 @@ void exl3_moe_forward(const Dsv4Config& c, const LayerWeights& w, const uint16_t
 namespace {
 thread_local int g_class_rows = 0;
 }
+namespace {
+struct TraceDest {
+  uint8_t* base = nullptr;
+  int stride = 0, row0 = 0;
+};
+thread_local TraceDest g_trace;
+}  // namespace
+RoutingTraceSink::RoutingTraceSink(uint8_t* base, int stride, int row0)
+    : prev_base_(g_trace.base), prev_stride_(g_trace.stride), prev_row0_(g_trace.row0) {
+  g_trace = {base, stride, row0};
+}
+RoutingTraceSink::~RoutingTraceSink() { g_trace = {prev_base_, prev_stride_, prev_row0_}; }
 int class_rows(int rows) { return g_class_rows > 0 ? g_class_rows : rows; }
 ClassRows::ClassRows(int rows) : prev_(g_class_rows) { g_class_rows = rows; }
 ClassRows::~ClassRows() { g_class_rows = prev_; }
@@ -1021,6 +1033,12 @@ void attention_half(const Dsv4Config& c, const LayerWeights& w, LayerCache& cach
   hc_post(ao, x, post, comb, x, T, c.hc_mult, D, st);
 }
 
+// The routing trace's copy of layer w's picks for the T rows of this call (device sel).
+void trace_routes(const Dsv4Config& c, const LayerWeights& w, const int32_t* sel, int T, hipStream_t st) {
+  if (!g_trace.base) return;
+  k::moe_trace(sel, T * c.n_active, g_trace.base + (size_t(w.layer) * g_trace.stride + g_trace.row0) * c.n_active, st);
+}
+
 // Routing -> pair rows -> experts entirely on the device (EXL3 fast path). Pair rows are laid out
 // resident experts first, then remote ones; the remote block goes to the remote side through pinned
 // memory with stream-ordered flags, so the host only enqueues.
@@ -1257,6 +1275,7 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
   MoeDispatch md;
   if (device_path) {
     md = moe_device_dispatch(c, w, scr, f, sel, wt, T, st, remote, fused_route ? B<float>(scr, kLG) : nullptr, b.ids);
+    trace_routes(c, w, sel, T, st);
   } else {
     // Expert-major pairs (ascending expert id): pair p computes expert e on token t into row p of the
     // pair-output buffer; pidx[t][j] lists token t's pairs in ascending expert order for the combine.
@@ -1267,6 +1286,10 @@ void moe_half(const Dsv4Config& c, const LayerWeights& w, const Scratch& scr, bf
     UH_CHECK(hipStreamSynchronize(st));
     std::vector<int> count(size_t(E), 0), off(size_t(E) + 1, 0);
     for (int32_t e : hsel) ++count[size_t(e)];
+    if (g_trace.base) {
+      uint8_t* dst = g_trace.base + (size_t(L) * g_trace.stride + g_trace.row0) * K;
+      for (size_t i = 0; i < hsel.size(); ++i) dst[i] = uint8_t(hsel[i]);
+    }
     if (g_expert_hist) {
       if (g_expert_hist->size() <= size_t(L)) g_expert_hist->resize(size_t(L) + 1);
       auto& hl = (*g_expert_hist)[size_t(L)];
@@ -1396,6 +1419,7 @@ MoeStarted layer_moe_start(const Dsv4Config& c, const LayerWeights& w, const Scr
   moe_front(c, w, scr, x, b, st, !fused_route);
   const MoeDispatch md = moe_device_dispatch(c, w, scr, B<bf16>(scr, kA), B<int32_t>(scr, kSel), B<float>(scr, kWt),
                                              b.T, st, remote, fused_route ? B<float>(scr, kLG) : nullptr, b.ids);
+  trace_routes(c, w, B<int32_t>(scr, kSel), b.T, st);
   return {md.remote, md.combined};
 }
 

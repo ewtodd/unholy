@@ -722,7 +722,8 @@ bool Engine::submit_step(int budget0) {
       }
     }
     if (it.end == s.cut) s.cut = 0;
-    in.chunks.push_back({s.slot, s.computed, it.n, t0});
+    in.chunks.push_back({s.slot, s.computed, it.n, t0, s.id,
+                         uint8_t(it.ndraft > 0 ? Chunk::Verify : it.n == 1 && it.logits ? Chunk::Decode : Chunk::Prefill)});
     for (const GenImage& im : s.req.images) {  // whole blocks lie wholly inside chunks (planning above)
       const int a = std::max(im.start, s.computed), e = std::min(im.start + im.len, s.computed + it.n - it.ndraft);
       if (a >= e) continue;

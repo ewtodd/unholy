@@ -29,6 +29,12 @@ __global__ void moe_count_kernel(const int32_t* sel, int n, int32_t* count, uint
   if (hist) atomicAdd(&hist[sel[i]], 1u);
 }
 
+// UNHOLY_ROUTING_TRACE: the router's picks as bytes, straight into pinned host memory.
+__global__ void moe_trace_kernel(const int32_t* sel, int n, uint8_t* dst) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = uint8_t(sel[i]);
+}
+
 // One block of NE threads (256 or 512), thread e for expert e (E <= NE): block-wide scans of the pair rows and
 // tiles of the resident group and the remote group give the same offsets and tile order as walking the experts
 // in order, resident ones first.
@@ -612,6 +618,11 @@ void moe_dispatch_small(const MoeSmallArgs& a, hipStream_t st) {
   if (a.T > kMoeSmallMaxTokens || a.K > 8 || a.E > 512) throw std::runtime_error("moe_dispatch_small: shape");
   if (a.E <= 256) moe_dispatch_small_kernel<256><<<1, 256, 0, st>>>(a);
   else moe_dispatch_small_kernel<512><<<1, 512, 0, st>>>(a);
+  UH_CHECK_LAUNCH();
+}
+
+void moe_trace(const int32_t* sel, int n, uint8_t* dst, hipStream_t st) {
+  moe_trace_kernel<<<(n + 255) / 256, 256, 0, st>>>(sel, n, dst);
   UH_CHECK_LAUNCH();
 }
 

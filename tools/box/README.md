@@ -48,3 +48,9 @@ ssh son-of-anton /work/unholy-perf/tools/box/validate.sh --baseline
 | `mkcounts.py PROFILE TOPK HOT0 HOT1 SPLIT ROWS LAYER SEED` | per-expert row counts of the APU's cold experts in one layer of a ROWS-row step part (routing profile + the planner's greedy hot set), for `unholy-mx-test --counts` / `gufo-routed-bench --counts` |
 | `gufo-routed.sh` | build gufo's FP16 routed-expert benchmark (`tools/bench/gufo_routed.hip`) into `$BUILD/gufo-routed-bench`; gufo's MIT kernel is compiled from a checkout (`GUFO_SRC`, default `/work/src/gufo`, pinned rev, cloned if missing), not vendored |
 | `apu-gemm.sh LABEL` | APU routed-GEMM benchmark: `unholy-mx-test` at synthetic rows and at per-expert row counts (`$BOX_DATA/apu0`), rocprofv3 counters, then gufo's kernel on the same counts; `summary.txt` has the key lines |
+
+Routing traces (docs/PLAN-strix-only.md, P0.1): `UNHOLY_ROUTING_TRACE=FILE` on the DSV4 resident path records every
+step's and draft block's router picks. `trace-validate.sh` (resident-test logits, trace off vs on, bit for bit),
+`trace-serve.sh` (a short real trace and the histogram check against `/unholy/routing_profile`),
+`routing-trace.py summary TRACE` (reader), `replay-chat.py` (a recorded conversation replayed turn by turn
+against a server), and `tools/sim/cache_sim.py` (replays traces through cache policies; `test_cache_sim.py`).

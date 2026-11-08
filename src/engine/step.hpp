@@ -19,6 +19,10 @@ namespace unholy::engine {
 
 struct Chunk {
   int slot = 0, s0 = 0, n = 0, t0 = 0;
+  // Only for the routing trace (UNHOLY_ROUTING_TRACE): the request's id and what the chunk is.
+  enum Kind : uint8_t { Prefill = 0, Decode = 1, Verify = 2 };
+  uint64_t seq = 0;
+  uint8_t kind = Prefill;
 };
 
 // Prefix reuse: a snapshot holds a slot's unpaged state (window ring, compressor rings) as it was at a

@@ -141,6 +141,18 @@ class ResidentModel final : public StepModel {
   std::unique_ptr<rt::Arena> card_arena_[2], apu_arena_;  // weights (256 MiB slabs)
   rt::DeviceBuffer embed_, head_, norm_, hc_fn_, hc_scale_, hc_base_;  // embed on card 0, the rest card 1
   rt::DeviceBuffer hrows_, hb_, hf_, logits_, rows_idx_;              // head scratch on card 1
+  // Routing trace (UNHOLY_ROUTING_TRACE=FILE; off: trace_ is null and nothing runs): the picks of every MoE layer
+  // of every step and draft, to a file by a writer thread.
+  struct TraceRow {
+    uint64_t seq;
+    uint32_t pos;
+    uint16_t slot;
+    uint8_t kind, pad;  // 0 prefill, 1 decode, 2 verify, 3 drafter
+  };
+  struct Trace;
+  std::unique_ptr<Trace> trace_;
+  void trace_emit(uint8_t kind, uint64_t step, uint32_t cut, int layer0, int layers, const uint8_t* ids, int stride,
+                  const std::vector<TraceRow>& rows);
   // Per in-flight step (ticket % 2): pinned staging and the events ordering the two cards.
   struct Flight {
     uint16_t* x_host = nullptr;   // residual handoff card 0 -> card 1
@@ -157,6 +169,9 @@ class ResidentModel final : public StepModel {
     uint64_t ticket = 0;
     int rows = 0;
     bool busy = false, saved_wait = false;
+    std::vector<TraceRow> trace_rows;  // UNHOLY_ROUTING_TRACE: the step's rows
+    uint32_t trace_cut = 0;
+    uint64_t trace_step = 0;
   };
   Flight flight_[2];
   // Slot-state snapshots: per card, the slot slices of each layer's window rows and (ratio-4 layers)

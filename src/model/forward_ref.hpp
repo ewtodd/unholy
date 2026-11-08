@@ -93,6 +93,21 @@ class ScratchPart {
   int prev_[4];
 };
 
+// Routing trace (UNHOLY_ROUTING_TRACE): while a RoutingTraceSink is alive on this thread, every MoE layer that
+// routes copies its picks (uint8 [rows][n_active]) to base + (layer * stride + row0) * n_active in pinned host
+// memory, stream-ordered after the router. No sink: nothing is launched.
+class RoutingTraceSink {
+ public:
+  RoutingTraceSink(uint8_t* base, int stride, int row0);
+  ~RoutingTraceSink();
+  RoutingTraceSink(const RoutingTraceSink&) = delete;
+  RoutingTraceSink& operator=(const RoutingTraceSink&) = delete;
+
+ private:
+  uint8_t* prev_base_;
+  int prev_stride_, prev_row0_;
+};
+
 // Scratch for computing one routed expert over up to `rows` tokens (any device).
 struct ExpertScratch {
   rt::DeviceBuffer qb, qs, h1, h3, hh, xf, y2;

@@ -21,6 +21,8 @@ struct MoePlan {
 
 // count[e] += pairs routed to e (count is zero on entry: zeroed at allocation, then by moe_plan); also
 // accumulated into hist[e] (a running routing histogram) if given.
+// dst[i] = sel[i] as a byte, i < n (dst: pinned host memory; the routing trace).
+void moe_trace(const int32_t* sel, int n, uint8_t* dst, hipStream_t st);
 void moe_count(const int32_t* sel, int T, int K, int32_t* count, int E, hipStream_t st, uint32_t* hist = nullptr);
 // `resident` [E]: 1 = this device holds the expert. Clears `fill`, and `count` for the next moe_count.
 // Tiles hold <= tile_rows rows.
