@@ -113,7 +113,9 @@ against that reference: bit-identical where the math allows, ulp-level where it 
 <!---->
 - **OpenAI-compatible server** (`unholy serve`):
   - endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize`, `/detokenize`,
-    `/health`, `/metrics` (Prometheus);
+    `/health`, `/metrics` (Prometheus: engine counters, plus `unholy_info`, `unholy_slots`, `unholy_context_tokens`,
+    `unholy_kv_usage_ratio` and the per-stream `unholy_{prefill,decode}_sequence_seconds_total` and
+    `unholy_first_token{_seconds,s}_total` that llmtop reads);
   - request features: SSE streaming with keepalives, tool calls, reasoning (`reasoning` and
     `reasoning_content`; `reasoning_effort` none/low/high/max, and low/high/max for GLM-5.3-Flash, which
     always thinks), stop strings, logprobs, usage with `cached_tokens`;

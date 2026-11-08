@@ -46,6 +46,7 @@ struct Engine::Seq {
   // Request log.
   std::chrono::steady_clock::time_point t_submit, t_admit, t_first;
   bool first_token = false;
+  bool first_token_counted = false;  // its first delivered token is in the first_token_seconds counter
   int preemptions = 0, spec_steps = 0, spec_drafted = 0, spec_accepted = 0;
   // Prefix cache.
   std::vector<uint64_t> hashes;  // chained hash of each full page of `tokens`, computed as needed
@@ -95,6 +96,7 @@ Engine::Engine(StepModel& model, EngineConfig cfg, bool start) : model_(model), 
   for (int p = model_.num_pages() - 1; p >= 0; --p) free_pages_.push_back(p);
   tables_.assign(size_t(model_.max_slots()) * model_.max_pages_per_seq(), 0);
   stats_.total_pages = stats_.free_pages = model_.num_pages();
+  stats_.slots = slots_;
   stats_.disk_slots = disk_on_ ? cfg_.disk_snapshots : 0;
   if (start) thread_ = std::thread([this] { loop(); });
 }
@@ -187,8 +189,20 @@ void Engine::finish(Seq& s, FinishReason r, const std::string& err) {
     l.spec_accepted = s.spec_accepted;
     cfg_.on_finish(l);
   }
-  if (s.sink) s.sink(std::move(s.out));
+  if (s.sink) {
+    note_first_token(s);
+    s.sink(std::move(s.out));
+  }
   s.out = GenOutput{};
+}
+
+void Engine::note_first_token(Seq& s) {
+  if (s.first_token_counted || s.out.tokens.empty()) return;
+  s.first_token_counted = true;
+  const double d = std::chrono::duration<double>(std::chrono::steady_clock::now() - s.t_submit).count();
+  std::lock_guard lk(stats_mu_);
+  stats_.first_token_seconds += d;
+  ++stats_.first_tokens;
 }
 
 void Engine::unref_pages(Seq& s) {
@@ -475,6 +489,7 @@ bool Engine::iterate() {
   intake();
   const bool polled = poll_io();
   const auto t_start = std::chrono::steady_clock::now();
+  iter_prefill_seqs_ = iter_decode_seqs_ = 0;
   const int budget0 = cfg_.max_batch_tokens;
 
   // Admission: a free slot, pages for the request's first chunk (after any cached prefix), and a page of
@@ -529,6 +544,17 @@ bool Engine::iterate() {
   const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
   std::lock_guard lk(stats_mu_);
   if (submitted || completed) stats_.busy_seconds += dt;
+  // Sequence-seconds, paired with the token counters complete_step() bumps in this same iteration: the
+  // step that completed here carried iter_prefill_seqs_ sequences contributing prefill tokens and
+  // iter_decode_seqs_ contributing decode tokens, and this iteration's dt is the time the engine spent to
+  // retire it. With max_inflight > 1 a step is submitted in one iteration and completes in a later one, so
+  // charging the running sequences at submit time would pair time with tokens that arrive later; charging
+  // the completing step's own sequences keeps delta decode_tokens / delta decode_seq_seconds equal to the
+  // tokens per sequence per second (each iteration retires one step, so dt is one step interval). A
+  // sequence counts toward decode only when the step fed it exactly its decode row(s) with logits (the
+  // same split as prefill_tokens / decode_tokens). Waiting sequences are in no step: neither phase.
+  stats_.prefill_seq_seconds += dt * iter_prefill_seqs_;
+  stats_.decode_seq_seconds += dt * iter_decode_seqs_;
   stats_.running = int(running_.size());
   stats_.waiting = int(waiting_.size());
   stats_.free_pages = available_pages();
@@ -818,7 +844,9 @@ void Engine::complete_step() {
         else put_snapshot(it.save);  // saved past a rejected draft: not the sequence's state
       }
     }
-    (it.n == 1 + it.ndraft && it.logits ? decode : prefill) += it.ndraft ? 1 + accepted : it.n;
+    const bool is_decode = it.n == 1 + it.ndraft && it.logits;
+    (is_decode ? decode : prefill) += it.ndraft ? 1 + accepted : it.n;
+    ++(is_decode ? iter_decode_seqs_ : iter_prefill_seqs_);
     if (!it.logits) continue;
     s.awaiting_logits = false;
     s.drafts.clear();
@@ -859,6 +887,7 @@ void Engine::complete_step() {
       finish(*s, r);
     } else if (!s->done && !s->out.tokens.empty()) {
       s->out.completion_tokens = s->generated();
+      note_first_token(*s);
       s->sink(std::move(s->out));
       s->out = GenOutput{};
       s->out.prompt_tokens = s->n_prompt;

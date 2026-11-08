@@ -141,6 +141,14 @@ struct EngineStats {
   uint64_t spec_steps = 0, spec_drafted = 0, spec_accepted = 0;  // verify chunks, drafts in them, accepted
   std::array<uint64_t, 8> spec_pos_drafted{}, spec_pos_accepted{};  // by draft position
   double busy_seconds = 0;
+  // Observability for llmtop (counters only; nothing here feeds back into scheduling).
+  // Sum over sequences of the wall seconds of the engine iterations in which a step carrying that
+  // sequence completed, by the phase the sequence contributed to that step (see iterate()).
+  double prefill_seq_seconds = 0, decode_seq_seconds = 0;
+  // Requests whose first generated token reached the sink, and the sum of (that moment - submit()).
+  double first_token_seconds = 0;
+  uint64_t first_tokens = 0;
+  int slots = 0;  // sequences run at once (the model slots, capped by max_running)
 };
 
 class Engine {
@@ -215,6 +223,7 @@ class Engine {
   void finish(Seq& s, FinishReason r, const std::string& err = "");
   bool submit_step(int budget);
   void complete_step();
+  void note_first_token(Seq& s);  // before a sink call: counts the request first delivered token once
   void fail_all(const std::string& why);
 
   struct InFlight {
@@ -303,6 +312,7 @@ class Engine {
 
   mutable std::mutex stats_mu_;
   EngineStats stats_;
+  int iter_prefill_seqs_ = 0, iter_decode_seqs_ = 0;  // sequences of the step completed in this iterate()
   std::thread thread_;
 };
 

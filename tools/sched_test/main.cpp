@@ -29,6 +29,7 @@
 #include <unordered_map>
 
 #include "engine/engine.hpp"
+#include "server/metrics.hpp"
 
 using namespace unholy::engine;
 
@@ -51,6 +52,7 @@ int32_t next_token(const std::vector<int32_t>& seq) {
 
 class FakeModel final : public StepModel {
  public:
+  std::chrono::microseconds wait_delay{0};  // each wait() takes this long (the device time of a step)
   FakeModel(int slots, int pages_per_seq, int pages, int page_tokens, int max_tokens, int inflight, int snapshots,
             int draft_block)
       : inflight_(inflight), slots_(slots), ppseq_(pages_per_seq), pages_(pages), page_(page_tokens), max_tokens_(max_tokens),
@@ -126,6 +128,7 @@ class FakeModel final : public StepModel {
     return next_++;
   }
   void wait(uint64_t ticket, std::vector<float>& logits) override {
+    if (wait_delay.count() > 0) std::this_thread::sleep_for(wait_delay);
     if (pending_.empty() || pending_.front().first != ticket) throw std::runtime_error("fake: out-of-order wait");
     logits = std::move(pending_.front().second);
     pending_.pop_front();
@@ -814,6 +817,95 @@ int disk_tests(uint64_t seed, int n_req, const std::string& base_dir) {
   return bad;
 }
 
+// The sequence-seconds, first-token and /metrics counters llmtop reads. Each wait() takes 3 ms, so a step is
+// ~3 ms whatever the batch: one sequence decoding N tokens over T seconds of decode steps gives N/T, and so
+// does each of several sequences decoding together (the per-stream speed), while the aggregate is nseq times it.
+int metrics_test() {
+  int bad = 0;
+  for (const int depth : {1, 2})
+    for (const int nseq : {1, 4}) {
+      FakeModel model(8, 64, 512, 16, 256, depth, 0, 0);
+      model.wait_delay = std::chrono::microseconds(3000);
+      EngineConfig ec;
+      ec.max_batch_tokens = 256;
+      Engine eng(model, ec, false);
+      std::vector<Result> res(size_t(nseq) + 1);
+      int with_tokens = 0;
+      for (int i = 0; i < nseq; ++i) {
+        GenRequest q;
+        for (int k = 0; k < 8; ++k) q.prompt.push_back(int32_t(2 + (i * 13 + k * 7) % 400));
+        q.max_tokens = 40;
+        q.ignore_eos = true;
+        q.sampling.temperature = 0.0f;
+        Result* out = &res[size_t(i)];
+        eng.submit(std::move(q), [out](GenOutput&& o) {
+          out->tokens.insert(out->tokens.end(), o.tokens.begin(), o.tokens.end());
+          if (o.finished) out->finished = true;
+        });
+      }
+      // A request aborted before the engine ever ran it produces no token: not counted.
+      {
+        GenRequest q;
+        q.prompt = {2, 3, 4};
+        q.max_tokens = 5;
+        const uint64_t id = eng.submit(std::move(q), [](GenOutput&&) {});
+        eng.abort(id);
+      }
+      const bool ok = drive(eng, [&] { return eng.stats().running + eng.stats().waiting == 0 && eng.stats().steps > 0; });
+      for (int i = 0; i < nseq; ++i) with_tokens += !res[size_t(i)].tokens.empty();
+      const auto s = eng.stats();
+      const double dec_rate = s.decode_seq_seconds > 0 ? double(s.decode_tokens) / s.decode_seq_seconds : 0;
+      const double pre_rate = s.prefill_seq_seconds > 0 ? double(s.prefill_tokens) / s.prefill_seq_seconds : 0;
+      std::printf("%-26s depth %d, %d seq: decode %.0f tok/s per stream (%llu tokens / %.3f s), prefill %.0f tok/s, "
+                  "first tokens %llu (%.3f s), busy %.3f s\n",
+                  "sequence-seconds", depth, nseq, dec_rate, (unsigned long long)s.decode_tokens, s.decode_seq_seconds,
+                  pre_rate, (unsigned long long)s.first_tokens, s.first_token_seconds, s.busy_seconds);
+      bool good = ok && s.prefill_seq_seconds > 0 && s.decode_seq_seconds > 0 && s.first_tokens == uint64_t(with_tokens) &&
+                  with_tokens == nseq && s.first_token_seconds > 0 && s.slots == 8;
+      // ~333 tok/s per stream with 3 ms steps; sleeps overshoot, never undershoot.
+      good = good && dec_rate > 150 && dec_rate < 340;
+      // A sequence is in one phase at a time and the engine thread is one: seconds cannot exceed busy x sequences.
+      good = good && s.prefill_seq_seconds + s.decode_seq_seconds <= s.busy_seconds * nseq * 1.001;
+      // Mean time to first token: at least the prefill step, far under the whole run.
+      good = good && s.first_token_seconds / double(s.first_tokens) >= 0.003 &&
+             s.first_token_seconds / double(s.first_tokens) < s.busy_seconds;
+      if (!good) {
+        std::printf("  sequence-seconds / first-token counters inconsistent\n");
+        ++bad;
+      }
+    }
+  // The text.
+  {
+    EngineStats s;
+    s.slots = 4;
+    s.total_pages = 200;
+    s.free_pages = 50;
+    s.prefill_seq_seconds = 1.5;
+    s.decode_seq_seconds = 2.25;
+    s.first_token_seconds = 0.75;
+    s.first_tokens = 3;
+    const std::string t = unholy::server::format_metrics(s, 8192, "a\"b\\c\nd", 7, 1);
+    const char* want[] = {"unholy_info{model=\"a\\\"b\\\\c\\nd\"} 1\n", "unholy_slots 4\n", "unholy_context_tokens 8192\n",
+                          "unholy_kv_usage_ratio 0.750000\n", "unholy_prefill_sequence_seconds_total 1.500\n",
+                          "unholy_decode_sequence_seconds_total 2.250\n", "unholy_first_token_seconds_total 0.750\n",
+                          "unholy_first_tokens_total 3\n", "unholy_http_requests_total 7\n", "unholy_http_errors_total 1\n",
+                          "unholy_steps_total 0\n", "unholy_busy_seconds_total 0.000\n", "unholy_free_pages 50\n",
+                          "unholy_spec_accepted_total 0\n", "unholy_cached_snapshots 0\n"};
+    for (const char* w : want)
+      if (t.find(w) == std::string::npos) {
+        std::printf("  /metrics text lacks: %s", w);
+        ++bad;
+      }
+    EngineStats z;
+    if (unholy::server::format_metrics(z, 1, "m", 0, 0).find("unholy_kv_usage_ratio 0.000000\n") == std::string::npos) {
+      std::printf("  kv usage with an empty pool is not 0\n");
+      ++bad;
+    }
+    std::printf("%-26s %s\n", "/metrics text", bad ? "BAD" : "ok");
+  }
+  return bad;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1025,6 +1117,7 @@ int main(int argc, char** argv) {
     failures += bad;
   }
   failures += disk_tests(seed, n_req, disk_dir);
+  failures += metrics_test();
   // A 2000-token prompt (64-token steps: ~32 steps of prefill), then a 20-token one a step later.
   // Shortest-first and the threshold let the short one finish within a few steps; FCFS queues it behind
   // the whole long prefill (vLLM's default).

@@ -1661,3 +1661,24 @@ not in the list, or a declared name with arguments not in `<arg_key>` form (`nam
 - OpenAIServer + Engine over HTTP with a scripted fake model and a byte tokenizer (not checked in), streaming and not:
   cbda888 gives `stop` and nothing for an undeclared call, as production did; now `tool_calls` with the call, and a raw
   block with `stop`. A history replaying both outcomes renders (200).
+
+## 2026-11-08 — /metrics for llmtop: per-stream seconds, first token, engine info
+
+llmtop (the terminal monitor) scrapes `/metrics` every second. Aggregate tok/s is `delta tokens / delta wall`, but
+what one request experiences needs the time sequences spent in each phase, so the engine now counts it:
+
+- `unholy_prefill_sequence_seconds_total`, `unholy_decode_sequence_seconds_total`: in the `iterate()` that completes
+  a step, that iteration's `dt` (the one `busy_seconds` already adds) times the step's sequences in each phase. The
+  phase split is the one `prefill_tokens` / `decode_tokens` already use, and the time is charged at the same
+  completion, so with `max_inflight` 2 (submit in one iteration, complete in another) `delta decode_tokens / delta
+  decode_sequence_seconds` is still tokens per sequence per second. Waiting requests count toward neither.
+- `unholy_first_token_seconds_total` / `unholy_first_tokens_total`: submit() to the first generated token handed to
+  the sink, once per request; a request that never delivers a token is not counted.
+- Gauges: `unholy_info{model=...} 1`, `unholy_slots`, `unholy_context_tokens`, `unholy_kv_usage_ratio`
+  ((total - free) / total pages; cached-unreferenced pages count as free).
+- The text is built by `format_metrics()` (`src/server/metrics.hpp`, no device) into a `std::string`; the 2048-byte
+  buffer was nearly full. Existing lines keep their names and values.
+
+Changes nothing served: counters under `stats_mu_` and text. `unholy-sched-test` (`metrics_test`) checks the
+counters against a fake model with 3 ms steps (326 tok/s per stream with 1 and with 4 sequences, depth 1 and 2) and
+the text, including label escaping.

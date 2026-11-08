@@ -1,4 +1,5 @@
 #include "server/openai.hpp"
+#include "server/metrics.hpp"
 
 #include <httplib.h>
 
@@ -752,21 +753,8 @@ struct OpenAIServer::Impl {
                }));
     svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
       const auto s = eng.stats();
-      char buf[2048];
-      std::snprintf(buf, sizeof(buf),
-                    "unholy_steps_total %llu\nunholy_prefill_tokens_total %llu\nunholy_decode_tokens_total %llu\n"
-                    "unholy_preemptions_total %llu\nunholy_busy_seconds_total %.3f\nunholy_running %d\n"
-                    "unholy_waiting %d\nunholy_free_pages %d\nunholy_total_pages %d\nunholy_http_requests_total %llu\n"
-                    "unholy_http_errors_total %llu\nunholy_prompt_tokens_total %llu\nunholy_cached_prompt_tokens_total %llu\n"
-                    "unholy_cached_pages %d\nunholy_cached_snapshots %d\nunholy_spec_verify_steps_total %llu\n"
-                    "unholy_spec_drafted_total %llu\nunholy_spec_accepted_total %llu\n",
-                    (unsigned long long)s.steps, (unsigned long long)s.prefill_tokens,
-                    (unsigned long long)s.decode_tokens, (unsigned long long)s.preemptions, s.busy_seconds, s.running,
-                    s.waiting, s.free_pages, s.total_pages, (unsigned long long)requests.load(),
-                    (unsigned long long)errors.load(), (unsigned long long)s.prompt_tokens,
-                    (unsigned long long)s.cached_tokens, s.cached_pages, s.snapshots, (unsigned long long)s.spec_steps,
-                    (unsigned long long)s.spec_drafted, (unsigned long long)s.spec_accepted);
-      res.set_content(buf, "text/plain; version=0.0.4");
+      res.set_content(format_metrics(s, eng.max_context(), cfg.model_name, requests.load(), errors.load()),
+                      "text/plain; version=0.0.4");
     });
   }
 };
