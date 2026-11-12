@@ -10,9 +10,13 @@
 #include <cstdio>
 #include <ctime>
 #include <deque>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <random>
+#include <stdexcept>
+#include <type_traits>
 
 #include "text/chat_format.hpp"
 #include "text/json.hpp"
@@ -128,18 +132,22 @@ struct Params {
   bool echo = false;
 };
 
-Params parse_params(const Value& req, bool chat, int default_max_tokens) {
+bool sampling_in_range(const engine::SamplingParams& s) {
+  return s.temperature >= 0 && s.top_p > 0 && s.top_p <= 1 && s.min_p >= 0 && s.min_p <= 1 && s.repetition_penalty > 0;
+}
+
+// def: the server's defaults (the checkpoint's generation_config.json) for the sampling fields a request omits.
+Params parse_params(const Value& req, bool chat, int default_max_tokens, const engine::SamplingParams& def) {
   Params p;
   auto& s = p.gen.sampling;
-  s.temperature = float(num(req, "temperature", 1.0));
-  s.top_p = float(num(req, "top_p", 1.0));
-  s.top_k = int(num(req, "top_k", 0));
-  s.min_p = float(num(req, "min_p", 0.0));
+  s.temperature = float(num(req, "temperature", def.temperature));
+  s.top_p = float(num(req, "top_p", def.top_p));
+  s.top_k = int(num(req, "top_k", def.top_k));
+  s.min_p = float(num(req, "min_p", def.min_p));
   s.presence_penalty = float(num(req, "presence_penalty", 0.0));
   s.frequency_penalty = float(num(req, "frequency_penalty", 0.0));
-  s.repetition_penalty = float(num(req, "repetition_penalty", 1.0));
-  if (s.temperature < 0 || s.top_p <= 0 || s.top_p > 1 || s.min_p < 0 || s.min_p > 1 || s.repetition_penalty <= 0)
-    throw HttpError(400, "sampling parameter out of range");
+  s.repetition_penalty = float(num(req, "repetition_penalty", def.repetition_penalty));
+  if (!sampling_in_range(s)) throw HttpError(400, "sampling parameter out of range");
   if (const Value* v = req.find("seed"); v && v->is_number()) s.seed = uint64_t(v->as_int());
   const Value* mt = chat ? req.find("max_completion_tokens") : nullptr;
   if (!mt || mt->is_null()) mt = req.find("max_tokens");
@@ -199,6 +207,39 @@ Value usage_json(int prompt, int completion, int cached) {
 std::string sse(const Value& v) { return "data: " + v.dump() + "\n\n"; }
 
 }  // namespace
+
+// ---- sampling defaults --------------------------------------------------------------------------
+
+engine::SamplingParams generation_config_defaults(const std::string& model_dir, std::string& taken) {
+  engine::SamplingParams s;
+  taken.clear();
+  const std::string path = model_dir + "/generation_config.json";
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return s;
+  const std::string text{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+  Value cfg;
+  try {
+    cfg = json::parse(text);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(path + ": " + e.what());
+  }
+  auto take = [&](const char* key, auto& field) {
+    const Value* v = cfg.is_object() ? cfg.find(key) : nullptr;
+    if (!v || v->is_null()) return;
+    if (!v->is_number()) throw std::runtime_error(path + ": '" + key + "' is not a number");
+    field = static_cast<std::remove_reference_t<decltype(field)>>(v->as_double());
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%s%s %g", taken.empty() ? "" : ", ", key, v->as_double());
+    taken += buf;
+  };
+  take("temperature", s.temperature);
+  take("top_p", s.top_p);
+  take("top_k", s.top_k);
+  take("min_p", s.min_p);
+  take("repetition_penalty", s.repetition_penalty);
+  if (!sampling_in_range(s)) throw std::runtime_error(path + ": sampling value out of range");
+  return s;
+}
 
 // ---- the server ---------------------------------------------------------------------------------
 
@@ -610,7 +651,7 @@ struct OpenAIServer::Impl {
     Value body = parse_body(req);
     auto job = std::make_shared<Job>();
     job->chat = true;
-    job->p = parse_params(body, true, cfg.default_max_tokens);
+    job->p = parse_params(body, true, cfg.default_max_tokens, cfg.sampling);
     if (const Value* tc = body.find("tool_choice"); tc && tc->is_string() && tc->str() == "none") body.erase("tools");
     if (const Value* t = body.find("tools"); t && t->is_array()) job->tools = *t;
     const text::RenderedChat r = fmt.render(body);
@@ -665,7 +706,7 @@ struct OpenAIServer::Impl {
     check_auth(req);
     const Value body = parse_body(req);
     auto job = std::make_shared<Job>();
-    job->p = parse_params(body, false, cfg.default_max_tokens);
+    job->p = parse_params(body, false, cfg.default_max_tokens, cfg.sampling);
     const Value& pr = body.at("prompt");
     if (pr.is_string()) {
       job->prompt_text = pr.str();

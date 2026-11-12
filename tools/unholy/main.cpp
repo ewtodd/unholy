@@ -53,6 +53,10 @@
 // 10; 0: off) while there is traffic, the engine's throughput, queue, KV pool use, prefix-cache hit rate
 // and draft acceptance (rate, mean tokens per verify step, by draft position) over the interval.
 //
+// Sampling: a request's temperature / top_p / top_k / min_p / repetition_penalty, and for the ones it leaves out
+// the --model directory's generation_config.json values, as vLLM's default --generation-config auto does (GLM-5.3-Flash:
+// top_p 0.95; DSV4: temperature 1, top_p 1, the same as no file). Logged once at start.
+//
 // --model is the native checkpoint directory (config, tokenizer, dense weights); --exl3 the EXL3
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
 // planner (src/engine/plan.hpp) for the requested cache geometry.
@@ -495,6 +499,13 @@ int serve(int argc, char** argv, bool plan_only) {
   // Side files of GLM quants: exllamav3 keeps the MTP layer in mtp.safetensors; vision.safetensors holds the release's
   // bf16 vision tower (tools/box/extract-glm-vision.py).
   auto ck = model::Checkpoint::open(o.model_dir, {"mtp.safetensors", "vision.safetensors"});
+  if (!plan_only) {
+    std::string taken;
+    o.scfg.sampling = server::generation_config_defaults(o.model_dir, taken);
+    std::printf("sampling defaults for requests that omit them: %s\n",
+                taken.empty() ? "temperature 1, top_p 1 (no generation_config.json values)"
+                              : (taken + " (generation_config.json)").c_str());
+  }
   switch (model::detect_family(ck->config())) {
     case model::Family::Dsv4:
       return serve_dsv4(o, std::move(ck), plan_only, sigs);

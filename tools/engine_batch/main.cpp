@@ -71,7 +71,9 @@ double num(const Value& req, std::string_view key, double def) {
   return v && v->is_number() ? v->as_double() : def;
 }
 
-// server/openai.cpp parse_params (chat), the generation fields.
+// server/openai.cpp parse_params (chat), the generation fields, with the neutral defaults: serve's
+// generation_config.json defaults are not applied here (this file also builds against older trees), so request
+// files state their sampling.
 engine::GenRequest gen_request(const Value& body, const text::Tokenizer& tok, const text::ChatFormat& fmt) {
   engine::GenRequest g;
   auto& s = g.sampling;

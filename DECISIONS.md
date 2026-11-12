@@ -1682,3 +1682,30 @@ what one request experiences needs the time sequences spent in each phase, so th
 Changes nothing served: counters under `stats_mu_` and text. `unholy-sched-test` (`metrics_test`) checks the
 counters against a fake model with 3 ms steps (326 tok/s per stream with 1 and with 4 sequences, depth 1 and 2) and
 the text, including label escaping.
+
+## 2026-11-12 — sampling defaults from generation_config.json (vLLM's --generation-config auto)
+
+The owner saw GLM-5.3-Flash reasoning in Chinese in the son-of-anton harness and in opencode. Nothing in the serving
+path had changed: the deployed unholy build (son-of-anton system 333+, since 2026-11-08 19:13), the GLM template and
+parser (last change 2026-11-04), maitred's GLM entry and binary, and opencode (1.19.5, config byte-identical) were all
+unchanged. What both clients send: no `top_p` and no `temperature` for GLM. The harness's wire request has no `top_p`
+field; opencode's built-in per-model defaults match only `glm-4.6` / `glm-4.7`. unholy then used its own defaults,
+temperature 1 and **top_p 1**, while the checkpoint's `generation_config.json` says top_p 0.95 and vLLM applies that
+file by default (`--generation-config auto`) to the fields a request leaves out. So GLM sampled the full tail. Because
+the harness has sent `reasoning_content` back since 2026-11-05 and the template keeps every turn's thinking
+(`clear_thinking` false, as upstream), a single drift into Chinese stays in every later prompt of that conversation.
+
+Now `unholy serve` reads `--model DIR/generation_config.json` at start (`server::generation_config_defaults`):
+temperature, top_p, top_k, min_p and repetition_penalty where the file sets them become the defaults for requests
+that omit them, as in vLLM (max_new_tokens is not read; presence/frequency penalties stay 0). Logged once at start.
+A value that is not a number or is out of range stops the server at start instead of failing every request.
+
+- GLM-5.3-Flash (`glm53-flash-exl3-4.05bpw`): temperature 1, **top_p 0.95** (was 1). Requests that state their
+  sampling are unchanged.
+- DSV4 (`/scratch/dsv4-ve`): temperature 1, top_p 1, the same as before.
+- `unholy-engine-batch` keeps the neutral defaults (it builds against older trees too); request files state their
+  sampling.
+
+Checked on son-of-anton (CPU only, service untouched): `unholy_server` and serve's main compile; a throwaway test of
+the loader on both real model directories, a missing file, nulls / top_k / min_p / repetition_penalty, and four bad
+files (string, top_p 1.5, temperature -1, not JSON): all as above. No served A/B yet (needs the GPUs).

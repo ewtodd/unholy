@@ -27,6 +27,8 @@ struct ServerConfig {
   std::string api_key;  // empty: no auth
   int threads = 64;     // concurrent HTTP requests (each stream holds one)
   int default_max_tokens = 0;  // when a request gives none; 0 = until the context limit
+  // Sampling for the fields a request leaves out: the checkpoint's generation_config_defaults().
+  engine::SamplingParams sampling;
   // Images in chat messages: the vision tower (encode one image's block rows; null: images are refused),
   // the placeholder token, the model's vocabulary size (image tokens are vocab + type) and preprocessing.
   std::function<void(const vision::Patches&, const vision::ImageBlock&, std::vector<uint16_t>&)> encode_image;
@@ -39,6 +41,12 @@ struct ServerConfig {
   // Extra plain-text endpoints (path -> handler), e.g. the routing histogram.
   std::vector<std::pair<std::string, std::function<std::string()>>> extra_get, extra_post;
 };
+
+// The sampling defaults vLLM's --generation-config auto (its default) takes from DIR/generation_config.json:
+// temperature, top_p, top_k, min_p and repetition_penalty where the file sets them, SamplingParams' neutral values
+// (temperature 1, top_p 1, the rest off) otherwise; max_new_tokens is not read. No file: the neutral values.
+// `taken` lists what the file set ("" when nothing). Throws on a value that is not a number or out of range.
+engine::SamplingParams generation_config_defaults(const std::string& model_dir, std::string& taken);
 
 class OpenAIServer {
  public:
