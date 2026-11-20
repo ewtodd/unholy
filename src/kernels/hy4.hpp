@@ -47,14 +47,24 @@ struct Hy4Keys {
   const bf16* ring = nullptr;      // window: [512][576] of the slot
   const bf16* chunk = nullptr;     // window: the chunk's rows [n][576] (positions s0 ..)
   int s0 = 0;
+  const bf16* block = nullptr;     // DFly2 draft block: rows [6][576] of positions anchor .. (before the pages)
+  int anchor = 0;
 };
 // Absorbed MLA with learned sinks (HYV4FlashAttention, eager: softmax over the scores and the head's sink logit,
 // the sink's probability dropped), H heads (32 or 64), one block per query: q bf16 [n][H][576] (W_uk-absorbed nope
 // query, then the roped query), o bf16 [n][H][512] (the latent-space output, before W_uv). Keys: idx[t][0 .. w) when
 // idx is given (-1 skipped), else positions [lo, pos[t]] with lo = max(0, pos[t] - window + 1) (window 0: from 0).
 // sinks f32 [H]. gfx12 only.
+// counts (optional, with idx): the number of valid leading entries of each query's list (default: the indexer's).
+// ws (optional, ws_bytes): fp32 workspace for few queries: their keys split over several workgroups (flash-decoding),
+// each split's partial output and softmax state there, then combined; hy4_attn_split_bytes(n, H) is enough for all.
 void hy4_mla_attn(const bf16* q, int H, const Hy4Keys& keys, const int32_t* idx, int w, int window,
-                  const int32_t* pos, const float* sinks, bf16* o, int n, float scale, hipStream_t st);
+                  const int32_t* pos, const float* sinks, bf16* o, int n, float scale, hipStream_t st,
+                  const int32_t* counts = nullptr, float* ws = nullptr, size_t ws_bytes = 0);
+constexpr int kHy4AttnSplitRows = 64, kHy4AttnMaxSplit = 16, kHy4AttnSplitBlocks = 128;
+inline size_t hy4_attn_split_bytes(int H) {
+  return size_t(kHy4AttnSplitBlocks) * 2 * H * (kHy4Lat + 2) * 4;  // n * S <= 2 * kHy4AttnSplitBlocks
+}
 // q [T][H][256] (nope 192, roped 64) -> qn [T][H][192] (the absorbed product's input).
 void hy4_split_q(const bf16* q, bf16* qn, int T, int H, hipStream_t st);
 // out [T][H][576] = [qa [T][H][512], q's roped 64 (q [T][H][256], dims 192..255)].
@@ -65,6 +75,24 @@ void hy4_gate_mul(bf16* o, const bf16* g, size_t n, hipStream_t st);
 void hy4_ring_store(const bf16* rows, bf16* ring, int s0, int n, hipStream_t st);
 // A sparse layer's rows [n][576] of positions s0 .. into the slot's pages.
 void hy4_page_store(const bf16* rows, bf16* pages, const int32_t* table, int s0, int n, hipStream_t st);
+
+// ---- Speculative decoding: per-slot state of verify chunks -------------------------------------------------------
+// Window ring rows of positions s0 .. s0 + n - 1 (ring row p % 512) into bak [n][576] before a verify chunk overwrites
+// them; ring_restore puts back the rows of positions [from, to) (rejected drafts).
+void hy4_ring_backup(const bf16* ring, bf16* bak, int s0, int n, hipStream_t st);
+void hy4_ring_restore(bf16* ring, const bf16* bak, int s0, int from, int to, hipStream_t st);
+// An indexer tail after a partly rejected verify chunk at s0: the tail as it was before the chunk (bak [4][128]) with the
+// accepted positions s0 .. from - 1 (their token keys vk [*][128], row q - s0) applied.
+void hy4_tail_restore(bf16* tail, const bf16* bak, const bf16* vk, int s0, int from, hipStream_t st);
+// DFly2's history lists: for rows [t0, t0 + n) of a chunk (positions pos[t]), the token positions the indexer recalled
+// (sel [*][w], the valid ones first; null: the chunk attended densely, i.e. every position <= pos[t]) into the slot's
+// ring of the last 6 positions: dst [6][2048] at row pos % 6, counts [6].
+void hy4_dfly_save_sel(const int32_t* sel, int w, const int32_t* pos, int t0, int n, int32_t* dst, int32_t* counts,
+                       int groups, hipStream_t st);
+// The draft block's key lists: for request r (anchor a_r, history hist_r [2048] with hcount_r entries), row j: the
+// history then positions a_r .. a_r + j. lists [R][6][w], counts [R][6]. hist / hcount per request (device pointers).
+void hy4_dfly_lists(const int32_t* const* hist, const int32_t* const* hcount, const int32_t* anchor, int32_t* lists,
+                    int32_t* counts, int R, int w, hipStream_t st);
 
 // ---- Compressed indexer -------------------------------------------------------------------------------------------
 // Pooled keys: bf16 [pages][64][128] (one per 4-token group). A slot's last <= 4 token keys sit in a tail (index
@@ -119,6 +147,10 @@ void hy4_moe_sum(const bf16* pair_out, const int32_t* pidx, const int* remote0, 
 // (grid sized for max_rows).
 void hy4_gather_remote(const bf16* in, const int32_t* p2u, const MoePlan* plan, bf16* xa, int dim, int max_rows,
                        hipStream_t st);
+// x = bf16(x + bf16(g * f)) per row (DFly2's slot-0 fusion: x embed row, g the fusion gate [dim], f eh_proj's output).
+void hy4_gated_add(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim, hipStream_t st);
+// out [rows][2 dim] = [a, b] (two normalized rows side by side).
+void hy4_concat2(const bf16* a, const bf16* b, bf16* out, int rows, int dim, hipStream_t st);
 // out = bf16(a + b) elementwise.
 void hy4_add(const bf16* a, const bf16* b, bf16* out, size_t n, hipStream_t st);
 // out[r][c] = bf16(x[r][c] + bias[c]) from an fp32 GEMM result.

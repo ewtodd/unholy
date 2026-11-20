@@ -1765,3 +1765,30 @@ rather than the KV, leaning towards an AngelSlim quant.
   of 149 GB, 94% of routing on the cards in the test plan.
 - Specs from vLLM's merged Hy4 support (b067b6f) for DFly2 (a stateless block drafter: 5 MLA layers over the KV and
   indexer picks of target layers 25..41, 5 drafts per step) and the vision tower: scratchpad, to be turned into code.
+
+## 2026-11-20 — Hy4 flash: DFly2 speculative decoding, split-key attention for few queries
+
+- DFly2, the checkpoint's 5-layer block drafter, as vLLM's `dfly` (spec from vLLM b067b6f): per request a block of 6
+  rows at anchor .. anchor + 5 (the bonus token fused with the target's final hidden state of the last accepted row,
+  then 5 mask tokens), 5 dense MLA + SwiGLU layers attending to the KV rows target layer 25 + 4 i holds at the
+  positions its indexer picked for that row, plus the block's own rows (causal); then 5 sequential hidden-correction +
+  LM-head steps, argmax. Weights (0.85B, fp8 as released) and an extra copy of the embedding table on card 1, its own
+  stream; no state of its own. The target keeps per slot what the drafter reads (final hidden rows and indexer picks
+  of the last 6 positions) and what a verify chunk overwrites (window ring rows, indexer tails); draft() puts back the
+  rejected positions' state and the Engram history before drafting. The drafter's probability of each token is its
+  confidence (the checkpoint's confidence head is unused, as in vLLM and SGLang); Hy4 defaults to
+  `--spec-min-conf 0.7` (0.3 / 0.5 / 0.85 were slower).
+- Checks: greedy decoding with drafts gives the same 200 tokens as without (`unholy-hy4-resident-test --spec`, short
+  and 4096-token prompts); one draft call against an independent PyTorch drafter written from the spec
+  (`tools/ref/hy4_dfly_check.py` on an `UNHOLY_HY4_DFLY_DUMP`): the same 5 tokens and probabilities, block rows within
+  1.1-1.6% (bf16 vs fp32 roundings over 5 layers). Acceptance is low-ish on this model's terse reasoning text: about
+  25% of all 5 drafts greedy, first draft 57-75%.
+- The attention kernel ran one workgroup per query row: a decode row streamed its 2048 indexer picks (or 512 window
+  rows) through one workgroup, 0.9 ms per sparse layer, ~15 ms of a ~60 ms token. Steps of <= 64 query rows now split
+  the keys over up to 16 workgroups and merge the partial softmax states (flash-decoding); prefill-sized chunks are
+  unchanged (bit-identical logits), decode rows differ at bf16 noise and agree with the oracle as well (98.06% vs
+  97.97% top-1 on code, 1k). The drafter's attention uses it too.
+- Served (NVFP4 experts, 1M-token pool, 8 slots), one stream: without drafts 19.4-20.2 tok/s (17.1-17.6 before the
+  attention change); with drafts 22-28 tok/s on code and prose, ~34 on short reasoning, 26.6 at 131k tokens of context
+  (prefill 1268 tok/s); four streams ~12 tok/s each, ~48 aggregate. A 6-row verify step reads 3-4x the expert bytes
+  of a 1-row step (more distinct experts; the APU's cold experts 11 -> 32 ms), which is what holds the gain back.

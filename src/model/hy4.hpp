@@ -169,17 +169,27 @@ class Hy4Engram {
 // ---- state -------------------------------------------------------------------------------------------------------
 // Sparse layers: rows bf16 [pages][256][576], pooled keys bf16 [pages][64][128], tails bf16 [slots][4][128].
 // Window layers: rings bf16 [slots][512][576].
+// Speculative decoding (kHy4MaxVerify rows per verify chunk): window layers back up the ring rows a verify chunk
+// overwrites (ring_bak [slots][6][576]); sparse layers the indexer tail (tail_bak [slots][4][128]) and the chunk's token
+// keys (vkeys [slots][6][128]); DFly2's index layers (dfly) keep, per slot, the recalled positions of the last 6
+// positions (dsel [slots][6][2048], row pos % 6; dcount [slots][6]).
+constexpr int kHy4MaxVerify = 6;
 struct Hy4Cache {
   int layer = 0, slots = 0, num_pages = 0;
   bool sparse = false;
   rt::DeviceBuffer rows, pooled, tail, ring;
+  rt::DeviceBuffer ring_bak, tail_bak, vkeys, dsel, dcount;
 };
-Hy4Cache make_hy4_cache(const Hy4Config& c, int layer, int slots, int num_pages, int dev, hipStream_t st);
-size_t hy4_cache_bytes(const Hy4Config& c, bool sparse, int slots, int num_pages);
+Hy4Cache make_hy4_cache(const Hy4Config& c, int layer, int slots, int num_pages, int dev, hipStream_t st,
+                        bool dfly = false);
+size_t hy4_cache_bytes(const Hy4Config& c, bool sparse, int slots, int num_pages, bool dfly = false);
+// A slot's state back to how it was after position from - 1 of a verify chunk at s0 (positions [from, to) rejected).
+void hy4_restore_slot(Hy4Cache& cache, int slot, int s0, int from, int to, hipStream_t st);
 
 // Tokens [t0, t0 + n) of the batch are positions [s0, s0 + n) of the sequence in `slot` (one chunk per slot).
 struct Hy4Chunk {
   int slot = 0, s0 = 0, n = 0, t0 = 0;
+  bool verify = false;  // a verify chunk (its token and drafts): back up the state it overwrites
 };
 struct Hy4Batch {
   std::vector<Hy4Chunk> chunks;
@@ -204,6 +214,7 @@ enum Hy4Buf : int {
   kBufMlpG, kBufMlpU, kBufMlpH,                                                              // dense MLP
   kBufEngRows, kBufEngKv,                                                                    // Engram
   kBufDenseTiles,                                                                            // fp8 linears
+  kBufAttnSplit,                                                                             // few-query attention
   kHy4ScratchBufs
 };
 constexpr int kHy4IdxBlock = 64;  // queries per index-score pass
@@ -226,8 +237,9 @@ void hy4_embed(const Hy4Config& c, const Hy4HeadWeights& h, const int32_t* ids, 
 void hy4_layer_forward(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, const Hy4Scratch& s,
                        uint16_t* x, const Hy4Batch& b, hipStream_t st, RemoteExperts* remote = nullptr);
 // x [T][hc][dim] -> logits f32 [T][vocab] (hyper-head, norm, the fp32 LM head).
+// hn_out (optional): the normed rows the LM head reads [T][dim] (DFly2's target hidden states).
 void hy4_head_forward(const Hy4Config& c, const Hy4HeadWeights& h, const Hy4Scratch& s, const uint16_t* x, int T,
-                      float* logits, hipStream_t st);
+                      float* logits, hipStream_t st, uint16_t* hn_out = nullptr);
 // Routed experts of `w` on pair rows xa [P][latent] (tiles over rows this device holds): gate / up, clamped SwiGLU,
 // down, times the routing weight rw [P] -> out [P][latent]. eh / gu: [P][moe_inter] / [P][2 moe_inter] scratch.
 // Tiles of hy4_expert_tile_rows(w, tokens) rows.
@@ -241,6 +253,50 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
 constexpr int kHy4GemvTokens = 32;  // steps of up to this many tokens take the fp8 GEMVs
 int hy4_expert_tile_rows(bool mx, int tokens);
 int hy4_max_tiles(const Hy4Config& c, int max_tokens);
+
+// ---- DFly2 (the checkpoint's block drafter; vLLM's `dfly`) ---------------------------------------------------------
+// Per draft step and request: a block of 6 rows at positions anchor .. anchor + 5 (the sampled "bonus" token fused with
+// the target's final hidden state of the last accepted row, then 5 mask tokens) through 5 MLA + dense SwiGLU layers
+// (one residual stream, 32 heads, theta 1e7), each attending to the positions target layer 25 + 4 i recalled for that
+// row (its KV rows) and the block's own rows (causal); then the final norm and, row by row, a hidden-correction MLP
+// that also sees the previous token's embedding, the target's LM head and argmax: 5 draft tokens.
+constexpr int kHy4DraftTokens = 5, kHy4DraftRows = kHy4DraftTokens + 1;
+struct Hy4DflyLayer {
+  Hy4Linear q_a, q_b, kv_a, gate, o, mg, mu, md;
+  DevTensor in_norm, post_norm, q_a_norm, kv_a_norm, post_proj_norm, sinks, w_ukT, w_uv;
+};
+struct Hy4DflyWeights {
+  std::vector<Hy4DflyLayer> layers;
+  std::vector<int> target;  // target layer of each draft layer (its KV rows and its indexer's picks)
+  int mask_id = 0;
+  DevTensor embed, enorm, hnorm, fgate, c_hnorm, c_enorm, final_norm;
+  Hy4Linear eh, cg, cu, cd;
+};
+Hy4DflyWeights load_hy4_dfly(const Checkpoint& ck, const Hy4Config& c, int dev, hipStream_t st);
+size_t hy4_dfly_bytes(const Checkpoint& ck);  // its weights and the embedding table it reads
+bool hy4_has_dfly(const Checkpoint& ck);
+struct Hy4DflyScratch {
+  int max_reqs = 0;
+  std::vector<rt::DeviceBuffer> bufs;
+  int32_t* host = nullptr;  // pinned staging of the per-call inputs
+  ~Hy4DflyScratch();
+  Hy4DflyScratch() = default;
+  Hy4DflyScratch(Hy4DflyScratch&&) noexcept;
+  Hy4DflyScratch& operator=(Hy4DflyScratch&&) noexcept;
+};
+Hy4DflyScratch make_hy4_dfly_scratch(const Hy4Config& c, int dev, int max_reqs);
+size_t hy4_dfly_scratch_bytes(const Hy4Config& c, int max_reqs);
+struct Hy4DflyReq {
+  int slot = 0, anchor = 0;  // anchor: the bonus token's position (the last accepted row's + 1)
+  int32_t bonus = 0;
+};
+// Draft tokens (device int32 [5][R]) on `st`, and (conf, optional) the drafter's probability of each (fp32 [5][R]). target: the 5 target layers' caches (their pages, the saved picks);
+// tables: device block tables [slots][max_pages]; hidden: device [slots][6][dim], the final hidden state of each
+// slot's last 6 positions (row pos % 6).
+void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWeights& head,
+                    const std::vector<Hy4Cache*>& target, const int32_t* tables, int max_pages, const uint16_t* hidden,
+                    Hy4DflyScratch& s, const std::vector<Hy4DflyReq>& reqs, int32_t* tokens, hipStream_t st,
+                    float* conf = nullptr);
 
 // Optional per-layer routing histogram ([layer][expert] counts), filled when set.
 void set_hy4_expert_histogram(std::vector<std::vector<uint64_t>>* hist);

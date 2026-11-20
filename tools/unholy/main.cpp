@@ -30,6 +30,9 @@
 // verifies up to N drafted tokens (N <= 5) and keeps the ones the model would have produced.
 // --spec-min-conf C: verify only the leading drafts whose confidence-head score is >= C (default 0.5: on
 // short-context code and prose, 5 drafts at 0.5 gave 33.6 / 23.9 tok/s vs 30.0 / 19.1 verifying all).
+// Hy4 flash: its DFly2 drafter (5 tokens per step; card 1), the drafter's probability of each token as its
+// confidence, default 0.7 (code / prose / reasoning at 0.3, 0.5, 0.7, 0.85: 21.7 / 20.9 / 31.3, 22.0 / 23.0 / 33.7,
+// 24.0 / 22.1-28.2 / 33.7, 21.1 / 22.2 / 31.2 tok/s; 19.4-20.2 without drafts).
 //
 // Prefill scheduling: decodes always go first; prefill chunks fill the rest of the step's token budget
 // (--max-batch-tokens) in --prefill-order: `shortest` (default) packs the least remaining prompt first,
@@ -106,7 +109,8 @@ int usage() {
                "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
                "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
                "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n"
-               "                    [--reclaim-scratch 0|1] [--exact 0|1] [--engram DIR]\n");
+               "                    [--reclaim-scratch 0|1] [--exact 0|1] [--engram DIR]\n"
+               "                    [--experts-gguf FILE]\n");
   return 2;
 }
 
@@ -184,7 +188,7 @@ std::string engine_line(const engine::EngineStats& a, const engine::EngineStats&
 
 // Everything the command line sets.
 struct Options {
-  std::string model_dir, exl3_dir, engram_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
+  std::string model_dir, exl3_dir, engram_dir, experts_gguf, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
   bool profile_set = false;  // --profile given (otherwise each family has its default)
   server::ServerConfig scfg;
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
@@ -195,6 +199,7 @@ struct Options {
   int spec_drafts = 0;
   bool vision = true;
   float spec_min_conf = 0.5f;
+  bool spec_min_conf_set = false, model_name_set = false;
   double card_margin_gb = 2.0;
   double log_interval = 10;
   engine::PrefillOrder prefill_order = engine::PrefillOrder::Shortest;
@@ -449,7 +454,11 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
   const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
   const auto c = model::Hy4Config::from_hf(ck->config());
-  o.spec_drafts = 0;
+  // DFly2 drafts 5 tokens per step (--spec-drafts N verifies up to N of them).
+  const bool dfly = o.spec_drafts > 0 && model::hy4_has_dfly(*ck);
+  o.spec_drafts = dfly ? std::min(o.spec_drafts, model::kHy4DraftTokens) : 0;
+  if (!o.spec_min_conf_set) o.spec_min_conf = 0.7f;  // the drafter's own token probability (see the header)
+  if (!o.model_name_set) o.scfg.model_name = "hy4-flash";
   if (o.prefix_snapshots < 0) o.prefix_snapshots = 64;
   if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_hy4_code4k.txt";
   if (o.engram_dir.empty()) {
@@ -465,20 +474,25 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   if (kv_tokens <= 0) kv_tokens = o.num_pages > 0 ? (long long)(o.num_pages) * model::kPageTokens : 2LL * max_seq;
   geo.num_pages = int((kv_tokens + model::kPageTokens - 1) / model::kPageTokens);
 
+  std::unique_ptr<model::Checkpoint> gk;  // NVFP4 experts from a GGUF build (AngelSlim's SPARK-4Bit)
+  if (!o.experts_gguf.empty()) gk = model::Checkpoint::open_gguf({o.experts_gguf});
   engine::Hy4PlanInput pin;
   pin.cfg = &c;
   pin.ck = ck.get();
+  pin.nvfp4 = bool(gk);
   pin.usage = engine::load_usage_profile(o.profile, c.n_layers, c.n_experts);
   pin.geo = geo;
   pin.max_tokens = o.max_batch;
   pin.max_seq = max_seq;
-  pin.max_logit_rows = std::max(o.max_slots, 8);
+  pin.max_logit_rows = std::max(o.max_slots * (dfly ? model::kHy4DraftRows : 1), 8);
   pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
   pin.snapshots = o.prefix_snapshots;
+  pin.dfly = dfly;
   if (plan_only) {
     std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
-                "tokens; Hy4 flash FP8\n",
-                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch);
+                "tokens; Hy4 flash, %s experts\n",
+                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch,
+                gk ? "NVFP4 (GGUF)" : "FP8");
     try {
       std::printf("%s", engine::make_hy4_plan(pin).summary().c_str());
     } catch (const std::exception& e) {
@@ -494,8 +508,10 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   std::printf("engram pack: %s\n", o.engram_dir.c_str());
   std::fflush(stdout);
   const auto t0 = std::chrono::steady_clock::now();
+  if (gk) std::printf("routed experts: NVFP4 from %s\n", o.experts_gguf.c_str());
   engine::Hy4ResidentModel model(c, *ck, o.engram_dir, plan, geo, o.max_batch, max_seq, pin.max_logit_rows,
-                                 plan.snapshots);
+                                 plan.snapshots, false, gk.get(), dfly);
+  if (dfly) std::printf("DFly2 drafts: %d per step verified\n", o.spec_drafts);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
               (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);
@@ -527,10 +543,11 @@ int serve(int argc, char** argv, bool plan_only) {
     if (a == "--model") o.model_dir = v;
     else if (a == "--exl3") o.exl3_dir = v;
     else if (a == "--engram") o.engram_dir = v;
+    else if (a == "--experts-gguf") o.experts_gguf = v;
     else if (a == "--profile") o.profile = v, o.profile_set = true;
     else if (a == "--host") o.scfg.host = v;
     else if (a == "--port") o.scfg.port = std::stoi(v);
-    else if (a == "--served-model-name") o.scfg.model_name = v;
+    else if (a == "--served-model-name") o.scfg.model_name = v, o.model_name_set = true;
     else if (a == "--api-key") o.scfg.api_key = v;
     else if (a == "--http-threads") o.scfg.threads = std::stoi(v);
     else if (a == "--max-tokens-default") o.scfg.default_max_tokens = std::stoi(v);
@@ -542,7 +559,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--disk-snapshots") o.disk_snapshots = std::stoi(v);
     else if (a == "--spec-drafts") o.spec_drafts = std::stoi(v);
     else if (a == "--vision") o.vision = v != "0" && v != "off" && v != "false";
-    else if (a == "--spec-min-conf") o.spec_min_conf = std::stof(v);
+    else if (a == "--spec-min-conf") o.spec_min_conf = std::stof(v), o.spec_min_conf_set = true;
     else if (a == "--num-pages") o.num_pages = std::stoi(v);
     else if (a == "--max-batch-tokens") o.max_batch = std::stoi(v);
     else if (a == "--card-margin-gb") o.card_margin_gb = std::stod(v);

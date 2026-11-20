@@ -24,6 +24,10 @@
 #include "model/loader.hpp"
 
 namespace unholy::model {
+constexpr int kHy4Pool = kernels::kHy4Pool, kHy4IdxDim = kernels::kHy4IdxDim;
+}
+
+namespace unholy::model {
 
 namespace k = unholy::kernels;
 
@@ -571,6 +575,89 @@ Hy4HeadWeights load_hy4_head(const Checkpoint& ck, const Hy4Config& c, int dev, 
   return h;
 }
 
+bool hy4_has_dfly(const Checkpoint& ck) { return ck.find("model.dfly_layers.0.self_attn.q_a_proj.weight") != nullptr; }
+
+size_t hy4_dfly_bytes(const Checkpoint& ck) {
+  size_t b = ck.at("model.embed_tokens.weight").nbytes;
+  for (const auto& t : ck.tensors())
+    if (t.name.rfind("model.dfly_layers.", 0) == 0 && t.name.find("confidence_head") == std::string::npos)
+      b += t.nbytes;  // fp8 kept; kv_b split per head (the original dropped)
+  return b;
+}
+
+Hy4DflyWeights load_hy4_dfly(const Checkpoint& ck, const Hy4Config& c, int dev, hipStream_t st) {
+  const auto& cfg = ck.config();
+  const auto ints = [&](const char* key) {
+    std::vector<int> v;
+    const auto* a = cfg.find(key);
+    if (!a) throw std::runtime_error(std::string("config: missing ") + key);
+    for (const auto& e : a->items()) v.push_back(int(e.as_double()));
+    return v;
+  };
+  Hy4DflyWeights w;
+  w.target = ints("dfly_target_kv_layers");
+  if (ints("dfly_target_index_layer") != w.target) throw std::runtime_error("dfly: KV and index layers differ");
+  const int n = int(cfg.member_double("dfly_num_hidden_layers"));
+  w.mask_id = int(cfg.member_double("dfly_mask_token_id"));
+  if (n != int(w.target.size()) || n <= 0) throw std::runtime_error("dfly: layer count");
+  for (int t : w.target)
+    if (t < 0 || t >= c.n_layers || !c.is_sparse(t)) throw std::runtime_error("dfly: target layers must be sparse");
+  if (const auto* lw = cfg.find("dfly_context_local_window"); lw && !lw->is_null() && lw->as_double() != 0)
+    throw std::runtime_error("dfly: a local window is not supported");
+  LoadCtx lc{ck, dev};
+  lc.keep_fp8 = true;
+  std::vector<DevTensor> kvb(static_cast<size_t>(n)), sinks16(static_cast<size_t>(n));
+  w.layers.resize(size_t(n));
+  for (int i = 0; i < n; ++i) {
+    Hy4DflyLayer& L = w.layers[size_t(i)];
+    const std::string p = "model.dfly_layers." + std::to_string(i) + ".";
+    L.q_a = lc.linear(p + "self_attn.q_a_proj");
+    L.q_b = lc.linear(p + "self_attn.q_b_proj");
+    L.kv_a = lc.linear(p + "self_attn.kv_a_proj_with_mqa");
+    L.gate = lc.linear(p + "self_attn.linear_gate");
+    L.o = lc.linear(p + "self_attn.o_proj");
+    L.mg = lc.linear(p + "mlp.gate_proj");
+    L.mu = lc.linear(p + "mlp.up_proj");
+    L.md = lc.linear(p + "mlp.down_proj");
+    lc.bf16(p + "input_layernorm.weight", L.in_norm);
+    lc.bf16(p + "post_attention_layernorm.weight", L.post_norm);
+    lc.bf16(p + "self_attn.q_a_layernorm.weight", L.q_a_norm);
+    lc.bf16(p + "self_attn.kv_a_layernorm.weight", L.kv_a_norm);
+    lc.bf16(p + "self_attn.post_proj_norm.weight", L.post_proj_norm);
+    lc.bf16(p + "self_attn.learnable_sink_param", sinks16[size_t(i)]);
+    lc.bf16(p + "self_attn.kv_b_proj.weight", kvb[size_t(i)]);
+  }
+  const std::string f = "model.dfly_layers.";
+  lc.bf16(f + "mtp_fusion.enorm.weight", w.enorm);
+  lc.bf16(f + "mtp_fusion.hnorm.weight", w.hnorm);
+  lc.bf16(f + "mtp_fusion.gate", w.fgate);
+  w.eh = lc.linear(f + "mtp_fusion.eh_proj");
+  lc.bf16(f + "hidden_correction.hidden_norm.weight", w.c_hnorm);
+  lc.bf16(f + "hidden_correction.embed_norm.weight", w.c_enorm);
+  w.cg = lc.linear(f + "hidden_correction.gate_proj");
+  w.cu = lc.linear(f + "hidden_correction.up_proj");
+  w.cd = lc.linear(f + "hidden_correction.down_proj");
+  lc.bf16(f + "final_norm.weight", w.final_norm);
+  lc.bf16("model.embed_tokens.weight", w.embed);
+  lc.run(st, {});
+  rt::DeviceGuard g(dev);
+  const int H = c.heads_sparse, dn = c.nope, dv = c.v_dim, r = c.kv_lora;
+  for (int i = 0; i < n; ++i) {
+    Hy4DflyLayer& L = w.layers[size_t(i)];
+    if (L.q_b.out != H * (dn + c.rope) || kvb[size_t(i)].shape[0] != int64_t(H) * (dn + dv))
+      throw std::runtime_error("dfly: unexpected attention shapes");
+    L.sinks = lc.alloc(size_t(H) * 4, DType::F32, {H});
+    k::cast_bf16_f32(sinks16[size_t(i)].p<uint16_t>(), L.sinks.p<float>(), size_t(H), st);
+    L.w_ukT = lc.alloc(size_t(H) * r * dn * 2, DType::BF16, {H, r, dn});
+    L.w_uv = lc.alloc(size_t(H) * dv * r * 2, DType::BF16, {H, dv, r});
+    split_kv_b_kernel<<<4096, 256, 0, st>>>(kvb[size_t(i)].p<uint16_t>(), L.w_ukT.p<uint16_t>(), L.w_uv.p<uint16_t>(),
+                                            H, dn, dv, r);
+    UH_CHECK_LAUNCH();
+  }
+  UH_CHECK(hipStreamSynchronize(st));
+  return w;
+}
+
 size_t hy4_dense_layer_bytes(const Checkpoint& ck, const Hy4Config& c, int layer, bool dense_fp8) {
   const std::string p = kPrefix + "layers." + std::to_string(layer) + ".";
   size_t b = 0;
@@ -711,13 +798,28 @@ void Hy4Engram::lookup_all(const int32_t* ngram, const uint8_t* mask, int T, uin
 // ---------------------------------------------------------------------------------------------------
 // State and scratch
 
-size_t hy4_cache_bytes(const Hy4Config& c, bool sparse, int slots, int num_pages) {
-  if (!sparse) return size_t(slots) * k::kHy4Window * k::kHy4Row * 2;
+size_t hy4_cache_bytes(const Hy4Config& c, bool sparse, int slots, int num_pages, bool dfly) {
+  if (!sparse) return size_t(slots) * (k::kHy4Window + kHy4MaxVerify) * k::kHy4Row * 2;
   const size_t rows = size_t(num_pages) * k::kHy4PageRows;
-  return rows * k::kHy4Row * 2 + rows / c.idx_pool * c.idx_dim * 2 + size_t(slots) * c.idx_pool * c.idx_dim * 2;
+  return rows * k::kHy4Row * 2 + rows / c.idx_pool * c.idx_dim * 2 +
+         size_t(slots) * (2 * c.idx_pool + kHy4MaxVerify) * c.idx_dim * 2 +
+         (dfly ? size_t(slots) * kHy4MaxVerify * (2048 + 1) * 4 : 0);
 }
 
-Hy4Cache make_hy4_cache(const Hy4Config& c, int layer, int slots, int num_pages, int dev, hipStream_t st) {
+void hy4_restore_slot(Hy4Cache& k, int slot, int s0, int from, int to, hipStream_t st) {
+  if (to <= from) return;
+  if (k.sparse) {
+    const size_t T = size_t(kHy4Pool) * kHy4IdxDim, V = size_t(kHy4MaxVerify) * kHy4IdxDim;
+    k::hy4_tail_restore(k.tail.as<uint16_t>() + slot * T, k.tail_bak.as<uint16_t>() + slot * T,
+                        k.vkeys.as<uint16_t>() + slot * V, s0, from, st);
+  } else {
+    k::hy4_ring_restore(k.ring.as<uint16_t>() + size_t(slot) * k::kHy4Window * k::kHy4Row,
+                        k.ring_bak.as<uint16_t>() + size_t(slot) * kHy4MaxVerify * k::kHy4Row, s0, from, to, st);
+  }
+}
+
+Hy4Cache make_hy4_cache(const Hy4Config& c, int layer, int slots, int num_pages, int dev, hipStream_t st,
+                        bool dfly) {
   Hy4Cache k;
   k.layer = layer;
   k.slots = slots;
@@ -734,8 +836,15 @@ Hy4Cache make_hy4_cache(const Hy4Config& c, int layer, int slots, int num_pages,
     k.rows = zeroed(rows * k::kHy4Row * 2);
     k.pooled = zeroed(rows / c.idx_pool * c.idx_dim * 2);
     k.tail = zeroed(size_t(slots) * c.idx_pool * c.idx_dim * 2);
+    k.tail_bak = zeroed(size_t(slots) * c.idx_pool * c.idx_dim * 2);
+    k.vkeys = zeroed(size_t(slots) * kHy4MaxVerify * c.idx_dim * 2);
+    if (dfly) {
+      k.dsel = zeroed(size_t(slots) * kHy4MaxVerify * 2048 * 4);
+      k.dcount = zeroed(size_t(slots) * kHy4MaxVerify * 4);
+    }
   } else {
     k.ring = zeroed(size_t(slots) * k::kHy4Window * k::kHy4Row * 2);
+    k.ring_bak = zeroed(size_t(slots) * kHy4MaxVerify * k::kHy4Row * 2);
   }
   UH_CHECK(hipStreamSynchronize(st));
   return k;
@@ -791,6 +900,7 @@ std::vector<size_t> scratch_sizes(const Hy4Config& c, int max_tokens, int max_se
       T * 1536 * 2,                       // Engram rows
       T * 5 * D * 4,                      // Engram projections (fp32)
       (T / k::kHy4GemvRows + T / k::kHy4TileRows + 4) * sizeof(k::Exl3Tile),  // fp8 linears' tiles (8-row, 64-row)
+      k::hy4_attn_split_bytes(std::max(c.heads_sparse, c.heads_window)),       // split attention partials
   };
   if (sizes.size() != size_t(kHy4ScratchBufs)) throw std::logic_error("hy4 scratch: buffer list out of date");
   return sizes;

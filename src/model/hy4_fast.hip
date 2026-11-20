@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "kernels/elem_fast.hpp"
@@ -37,6 +39,13 @@ struct DenseTiles {
   int rows = 0;
 };
 DenseTiles g_tiles;
+
+void set_dense_tiles_at(k::Exl3Tile* t, int rows, hipStream_t st) {
+  const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
+  k::hy4_dense_tiles(t, rows, k::kHy4GemvRows, st);
+  k::hy4_dense_tiles(t + n8, rows, k::kHy4TileRows, st);
+  g_tiles = {t, t + n8, rows};
+}
 
 void set_dense_tiles(const Hy4Scratch& s, int rows, hipStream_t st) {
   auto* t = s.at<k::Exl3Tile>(kBufDenseTiles);
@@ -102,6 +111,8 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
   k::hy4_pack_q(qa, q, qp, T, H, st);
   bf16* ol = s.at<bf16>(kBufOl);
   const float scale = 1.0f / std::sqrt(float(c.nope + c.rope));
+  float* ws = s.at<float>(kBufAttnSplit);  // few-query attention: keys split over workgroups
+  const size_t ws_bytes = s.bufs[size_t(kBufAttnSplit)].size();
 
   if (w.sparse) {
     if (!b.tables) throw std::runtime_error("hy4: sparse layers need block tables");
@@ -125,14 +136,30 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
       bf16* rows = cache.rows.as<bf16>();
       k::hy4_page_store(kv + size_t(ch.t0) * R, rows, table, ch.s0, ch.n, st);
       const k::Hy4Pooled pg{cache.pooled.as<bf16>(), table};
+      if (ch.verify) {  // the tail and the chunk's token keys, for restoring the tail after rejected drafts
+        if (ch.n > kHy4MaxVerify) throw std::runtime_error("hy4: verify chunk longer than the backups");
+        const size_t T4 = size_t(c.idx_pool) * ID;
+        UH_CHECK(hipMemcpyAsync(cache.tail_bak.as<bf16>() + ch.slot * T4, cache.tail.as<bf16>() + ch.slot * T4, T4 * 2,
+                                hipMemcpyDeviceToDevice, st));
+        UH_CHECK(hipMemcpyAsync(cache.vkeys.as<bf16>() + size_t(ch.slot) * kHy4MaxVerify * ID, tk + size_t(ch.t0) * ID,
+                                size_t(ch.n) * ID * 2, hipMemcpyDeviceToDevice, st));
+      }
       k::hy4_idx_pool(tk + size_t(ch.t0) * ID, cache.tail.as<bf16>() + size_t(ch.slot) * c.idx_pool * ID,
                       w.idx_wv.p<float>(), w.idx_wg.p<float>(), w.idx_ape.p<float>(), w.idx_knorm.p<float>(), c.eps,
                       c.theta_sparse, pg, ch.s0, ch.n, st);
       const k::Hy4Keys keys{rows, table, nullptr, nullptr, 0};
       const int last = ch.s0 + ch.n - 1;
+      const int nsave = std::min(ch.n, kHy4MaxVerify);  // DFly2: the recalled positions of the chunk's last rows
+      const auto save = [&](const int32_t* sl) {
+        if (cache.dsel.data())
+          k::hy4_dfly_save_sel(sl, width, b.pos, ch.t0 + ch.n - nsave, nsave,
+                               cache.dsel.as<int32_t>() + size_t(ch.slot) * kHy4MaxVerify * 2048,
+                               cache.dcount.as<int32_t>() + size_t(ch.slot) * kHy4MaxVerify, kg, st);
+      };
       if (last / c.idx_pool <= kg) {  // every query recalls all of its groups: dense causal attention
         k::hy4_mla_attn(qp + size_t(ch.t0) * H * R, H, keys, nullptr, 0, 0, b.pos + ch.t0, w.sinks.p<float>(),
-                        ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st);
+                        ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st, nullptr, ws, ws_bytes);
+        save(nullptr);
         continue;
       }
       const int npool = (ch.s0 + ch.n) / c.idx_pool;
@@ -143,15 +170,20 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
         k::glm_topk(isc, npool, m, npool, kg, groups + size_t(t) * kg, s.get(kBufITopk), st);
       }
       k::hy4_idx_expand(groups + size_t(ch.t0) * kg, b.pos + ch.t0, sel + size_t(ch.t0) * width, ch.n, kg, st);
+      save(sel);
       k::hy4_mla_attn(qp + size_t(ch.t0) * H * R, H, keys, sel + size_t(ch.t0) * width, width, 0, b.pos + ch.t0,
-                      w.sinks.p<float>(), ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st);
+                      w.sinks.p<float>(), ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st, nullptr, ws, ws_bytes);
     }
   } else {
     for (const auto& ch : b.chunks) {
       bf16* ring = cache.ring.as<bf16>() + size_t(ch.slot) * k::kHy4Window * R;
       const k::Hy4Keys keys{nullptr, nullptr, ring, kv + size_t(ch.t0) * R, ch.s0};
       k::hy4_mla_attn(qp + size_t(ch.t0) * H * R, H, keys, nullptr, 0, c.window, b.pos + ch.t0, w.sinks.p<float>(),
-                      ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st);
+                      ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st, nullptr, ws, ws_bytes);
+      if (ch.verify) {  // the ring rows the chunk overwrites, for restoring them after rejected drafts
+        if (ch.n > kHy4MaxVerify) throw std::runtime_error("hy4: verify chunk longer than the backups");
+        k::hy4_ring_backup(ring, cache.ring_bak.as<bf16>() + size_t(ch.slot) * kHy4MaxVerify * R, ch.s0, ch.n, st);
+      }
       k::hy4_ring_store(kv + size_t(ch.t0) * R, ring, ch.s0, ch.n, st);
     }
   }
@@ -370,7 +402,7 @@ void hy4_layer_forward(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& c
 }
 
 void hy4_head_forward(const Hy4Config& c, const Hy4HeadWeights& hw, const Hy4Scratch& s, const uint16_t* x, int T,
-                      float* logits, hipStream_t st) {
+                      float* logits, hipStream_t st, uint16_t* hn_out) {
   const int D = c.dim, V = c.vocab, G = std::min(s.max_tokens, 64);
   bf16* h = s.at<bf16>(kBufH);
   for (int r0 = 0; r0 < T; r0 += G) {
@@ -378,8 +410,270 @@ void hy4_head_forward(const Hy4Config& c, const Hy4HeadWeights& hw, const Hy4Scr
     k::hy4_hc_head(x + size_t(r0) * c.hc * D, hw.hc_fn.p<float>(), hw.hc_scale.p<float>(), hw.hc_base.p<float>(), h, n,
                    c.hc, D, c.eps, c.hc_eps, st);
     norm(h, D, hw.norm, n, D, c.eps, st);
+    if (hn_out)
+      UH_CHECK(hipMemcpyAsync(hn_out + size_t(r0) * D, h, size_t(n) * D * 2, hipMemcpyDeviceToDevice, st));
     linear_f32(hw.head, h, D, logits + size_t(r0) * V, V, n, st);
   }
+}
+
+}  // namespace unholy::model
+
+// ---- DFly2 -------------------------------------------------------------------------------------------------------
+
+namespace unholy::model {
+
+namespace {
+
+enum DflyBuf : int {
+  dIds, dPos, dAnchor, dHistP, dCntP, dLists, dCounts, dX, dResid, dA, dAtt, dMlp, dQr, dQ, dQn, dQa, dQp, dKv, dG,
+  dOl, dO, dMg, dMu, dMh, dEin, dE, dHrow, dH, dCat, dF, dRowSel, dHIdx, dHid, dEmb, dHn, dEn, dCat2, dCg, dCu, dCh,
+  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dBufs
+};
+constexpr int kDflyW = 2048 + 8;  // a row's key list: the history (<= 2048), then the block's rows (<= 6)
+
+std::vector<size_t> dfly_sizes(const Hy4Config& c, int Rm) {
+  const size_t R = size_t(Rm), N = R * kHy4DraftRows, D = c.dim, H = c.heads_sparse, I = 9216;
+  std::vector<size_t> z = {
+      N * 4, N * 4, R * 4, 8 * R * 8, 8 * R * 8, N * kDflyW * 4, N * 4,      // ids .. counts
+      N * D * 2, N * D * 2, N * D * 2, N * D * 2, N * D * 2,                 // x, resid, a, att, mlp
+      N * c.q_lora * 2, N * H * 256 * 2, N * H * 192 * 2, N * H * 512 * 2, N * H * 576 * 2, N * 576 * 2,
+      N * H * 256 * 2, N * H * 512 * 2, N * H * 256 * 2,                    // g, ol, o
+      N * I * 2, N * I * 2, N * I * 2,                                       // MLP
+      R * D * 2, R * D * 2, R * D * 2, R * D * 2, R * 2 * D * 2, R * D * 2,  // fusion
+      kHy4DraftTokens * R * 4, R * 4,                                        // row selections, hidden rows
+      R * D * 2, R * D * 2, R * D * 2, R * D * 2, R * 2 * D * 2, R * D * 2, R * D * 2, R * D * 2, R * D * 2,
+      R * size_t(c.vocab) * 4, size_t(kHy4DraftTokens) * R * 4,              // logits, confidences [5][R]
+      2 * (N / k::kHy4GemvRows + N / k::kHy4TileRows + 2) * sizeof(k::Exl3Tile), R * 4,  // N rows, R rows
+      k::hy4_attn_split_bytes(c.heads_sparse)};
+  if (z.size() != size_t(dBufs)) throw std::logic_error("dfly scratch: buffer list out of date");
+  return z;
+}
+
+size_t host_words(int Rm) { return size_t(Rm) * (2 * kHy4DraftRows + 1 + kHy4DraftTokens + 2) + 4 + size_t(Rm) * 20; }
+
+}  // namespace
+
+Hy4DflyScratch::~Hy4DflyScratch() {
+  if (host) (void)hipHostFree(host);
+}
+Hy4DflyScratch::Hy4DflyScratch(Hy4DflyScratch&& o) noexcept : max_reqs(o.max_reqs), bufs(std::move(o.bufs)), host(o.host) {
+  o.host = nullptr;
+}
+Hy4DflyScratch& Hy4DflyScratch::operator=(Hy4DflyScratch&& o) noexcept {
+  if (this != &o) {
+    if (host) (void)hipHostFree(host);
+    max_reqs = o.max_reqs;
+    bufs = std::move(o.bufs);
+    host = o.host;
+    o.host = nullptr;
+  }
+  return *this;
+}
+
+size_t hy4_dfly_scratch_bytes(const Hy4Config& c, int max_reqs) {
+  size_t b = 0;
+  for (size_t z : dfly_sizes(c, max_reqs)) b += (std::max<size_t>(z, 16) + 255) / 256 * 256;
+  return b;
+}
+
+Hy4DflyScratch make_hy4_dfly_scratch(const Hy4Config& c, int dev, int max_reqs) {
+  Hy4DflyScratch s;
+  s.max_reqs = max_reqs;
+  rt::DeviceGuard g(dev);
+  for (size_t z : dfly_sizes(c, max_reqs)) s.bufs.emplace_back(dev, std::max<size_t>(z, 16));
+  UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&s.host), host_words(max_reqs) * 4, hipHostMallocPortable));
+  return s;
+}
+
+void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWeights& head,
+                    const std::vector<Hy4Cache*>& target, const int32_t* tables, int max_pages, const uint16_t* hidden,
+                    Hy4DflyScratch& s, const std::vector<Hy4DflyReq>& reqs, int32_t* tokens, hipStream_t st,
+                    float* conf) {
+  const int R = int(reqs.size()), nL = int(w.layers.size());
+  if (R == 0) return;
+  if (R > s.max_reqs) throw std::runtime_error("dfly: more requests than its scratch");
+  if (int(target.size()) != nL) throw std::runtime_error("dfly: target caches");
+  const int N = R * kHy4DraftRows, D = c.dim, H = c.heads_sparse, RW = k::kHy4Row, V = c.vocab, I = w.layers[0].mg.out;
+  const auto buf = [&](DflyBuf b) { return s.bufs[size_t(b)].data(); };
+  const auto bb = [&](DflyBuf b) { return static_cast<bf16*>(buf(b)); };
+  const auto ib = [&](DflyBuf b) { return static_cast<int32_t*>(buf(b)); };
+  // The call's inputs, staged in pinned memory: ids, positions, anchors, head-chain rows, hidden rows, bonus tokens; the
+  // history pointers of every draft layer.
+  int32_t* hp = s.host;
+  int32_t *ids = hp, *pos = ids + N, *anc = pos + N, *rsel = anc + R, *hidx = rsel + kHy4DraftTokens * R,
+          *bonus = hidx + R;
+  uint64_t* ptrs = reinterpret_cast<uint64_t*>(hp + ((bonus + R - hp + 1) & ~1));
+  uint64_t *histp = ptrs, *cntp = ptrs + size_t(nL) * R;
+  for (int r = 0; r < R; ++r) {
+    const auto& q = reqs[size_t(r)];
+    const int a = q.anchor, row = (a - 1) % kHy4MaxVerify;
+    for (int j = 0; j < kHy4DraftRows; ++j) {
+      ids[r * kHy4DraftRows + j] = j == 0 ? q.bonus : w.mask_id;
+      pos[r * kHy4DraftRows + j] = a + j;
+    }
+    anc[r] = a;
+    for (int t = 0; t < kHy4DraftTokens; ++t) rsel[t * R + r] = r * kHy4DraftRows + t + 1;
+    hidx[r] = q.slot * kHy4MaxVerify + row;
+    bonus[r] = q.bonus;
+    for (int L = 0; L < nL; ++L) {
+      histp[size_t(L) * R + r] = reinterpret_cast<uint64_t>(target[size_t(L)]->dsel.as<int32_t>() +
+                                                             (size_t(q.slot) * kHy4MaxVerify + row) * 2048);
+      cntp[size_t(L) * R + r] = reinterpret_cast<uint64_t>(target[size_t(L)]->dcount.as<int32_t>() +
+                                                            size_t(q.slot) * kHy4MaxVerify + row);
+    }
+  }
+  const auto up = [&](void* dst, const void* src, size_t bytes) {
+    UH_CHECK(hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, st));
+  };
+  up(buf(dIds), ids, size_t(N) * 4);
+  up(buf(dPos), pos, size_t(N) * 4);
+  up(buf(dAnchor), anc, size_t(R) * 4);
+  up(buf(dRowSel), rsel, size_t(kHy4DraftTokens) * R * 4);
+  up(buf(dHIdx), hidx, size_t(R) * 4);
+  up(buf(dBonus), bonus, size_t(R) * 4);
+  up(buf(dHistP), histp, size_t(nL) * R * 8);
+  up(buf(dCntP), cntp, size_t(nL) * R * 8);
+  const int32_t* dpos = ib(dPos);
+
+  // Embeddings; row 0 of each block fused with the target's hidden state.
+  bf16* x = bb(dX);
+  // fp8 linears run on tile lists of their row count: the block rows (N) and one row per request (R)
+  auto* tN = static_cast<k::Exl3Tile*>(buf(dTiles));
+  auto* tR = tN + (N + k::kHy4GemvRows - 1) / k::kHy4GemvRows + (N + k::kHy4TileRows - 1) / k::kHy4TileRows;
+  set_dense_tiles_at(tR, R, st);
+  k::gather_rows(w.embed.p<bf16>(), ib(dIds), x, N, D, st);
+  k::gather_rows(w.embed.p<bf16>(), ib(dBonus), bb(dEin), R, D, st);
+  k::rmsnorm_hf(bb(dEin), D, w.enorm.p<bf16>(), bb(dE), D, R, D, c.eps, st);
+  k::gather_rows(hidden, ib(dHIdx), bb(dHrow), R, D, st);
+  k::rmsnorm_hf(bb(dHrow), D, w.hnorm.p<bf16>(), bb(dH), D, R, D, c.eps, st);
+  k::hy4_concat2(bb(dE), bb(dH), bb(dCat), R, D, st);
+  linear(w.eh, bb(dCat), 2 * D, bb(dF), D, R, st);
+  k::hy4_gated_add(x, kHy4DraftRows * D, w.fgate.p<bf16>(), bb(dF), R, D, st);
+
+  set_dense_tiles_at(tN, N, st);
+  bf16 *resid = bb(dResid), *a = bb(dA), *att = bb(dAtt), *mlp = bb(dMlp);
+  const float scale = 1.0f / std::sqrt(float(c.nope + c.rope));
+  for (int L = 0; L < nL; ++L) {
+    const Hy4DflyLayer& W = w.layers[size_t(L)];
+    if (L > 0) k::hy4_add(mlp, resid, x, size_t(N) * D, st);
+    UH_CHECK(hipMemcpyAsync(resid, x, size_t(N) * D * 2, hipMemcpyDeviceToDevice, st));
+    k::rmsnorm_hf(x, D, W.in_norm.p<bf16>(), a, D, N, D, c.eps, st);
+    // attention
+    bf16* qr = bb(dQr);
+    linear(W.q_a, a, D, qr, c.q_lora, N, st);
+    k::rmsnorm_hf(qr, c.q_lora, W.q_a_norm.p<bf16>(), qr, c.q_lora, N, c.q_lora, c.eps, st);
+    bf16* q = bb(dQ);
+    linear(W.q_b, qr, c.q_lora, q, H * 256, N, st);
+    k::hy4_rope(q, H * 256, N, H, 256, c.nope, dpos, c.theta_sparse, st);
+    bf16* kv = bb(dKv);
+    linear(W.kv_a, a, D, kv, RW, N, st);
+    k::rmsnorm_hf(kv, RW, W.kv_a_norm.p<bf16>(), kv, RW, N, c.kv_lora, c.eps, st);
+    k::hy4_rope(kv, RW, N, 1, RW, c.kv_lora, dpos, c.theta_sparse, st);
+    bf16* g = bb(dG);
+    linear(W.gate, a, D, g, H * 256, N, st);
+    k::hy4_split_q(q, bb(dQn), N, H, st);
+    k::gemm_grouped_bf16_wmma(bb(dQn), W.w_ukT.p<bf16>(), bb(dQa), N, H, c.kv_lora, c.nope, st);
+    k::hy4_pack_q(bb(dQa), q, bb(dQp), N, H, st);
+    k::hy4_dfly_lists(reinterpret_cast<const int32_t* const*>(static_cast<uint64_t*>(buf(dHistP)) + size_t(L) * R),
+                      reinterpret_cast<const int32_t* const*>(static_cast<uint64_t*>(buf(dCntP)) + size_t(L) * R),
+                      ib(dAnchor), ib(dLists), ib(dCounts), R, kDflyW, st);
+    for (int r = 0; r < R; ++r) {
+      const auto& rq = reqs[size_t(r)];
+      k::Hy4Keys keys{target[size_t(L)]->rows.as<bf16>(), tables + size_t(rq.slot) * max_pages, nullptr, nullptr, 0,
+                      kv + size_t(r) * kHy4DraftRows * RW, rq.anchor};
+      k::hy4_mla_attn(bb(dQp) + size_t(r) * kHy4DraftRows * H * RW, H, keys,
+                      ib(dLists) + size_t(r) * kHy4DraftRows * kDflyW, kDflyW, 0, dpos + r * kHy4DraftRows,
+                      W.sinks.p<float>(), bb(dOl) + size_t(r) * kHy4DraftRows * H * c.kv_lora, kHy4DraftRows, scale,
+                      st, ib(dCounts) + r * kHy4DraftRows, static_cast<float*>(buf(dAttnWs)),
+                      s.bufs[size_t(dAttnWs)].size());
+    }
+    k::gemm_grouped_bf16_wmma(bb(dOl), W.w_uv.p<bf16>(), bb(dO), N, H, c.v_dim, c.kv_lora, st);
+    k::hy4_gate_mul(bb(dO), g, size_t(N) * H * c.v_dim, st);
+    linear(W.o, bb(dO), H * c.v_dim, att, D, N, st);
+    k::rmsnorm_hf(att, D, W.post_proj_norm.p<bf16>(), att, D, N, D, c.eps, st);
+    k::hy4_add(att, resid, x, size_t(N) * D, st);
+    UH_CHECK(hipMemcpyAsync(resid, x, size_t(N) * D * 2, hipMemcpyDeviceToDevice, st));
+    // MLP (dense SwiGLU, no clamp)
+    k::rmsnorm_hf(x, D, W.post_norm.p<bf16>(), a, D, N, D, c.eps, st);
+    linear(W.mg, a, D, bb(dMg), I, N, st);
+    linear(W.mu, a, D, bb(dMu), I, N, st);
+    k::hy4_swiglu(bb(dMg), bb(dMu), I, bb(dMh), N, I, st);
+    linear(W.md, bb(dMh), I, mlp, D, N, st);
+  }
+  k::hy4_add(mlp, resid, x, size_t(N) * D, st);
+  k::rmsnorm_hf(x, D, w.final_norm.p<bf16>(), x, D, N, D, c.eps, st);
+
+  // The head chain: row t + 1 of each block, corrected with the previous token's embedding, through the LM head.
+  set_dense_tiles_at(tR, R, st);
+  const int32_t* prev = ib(dBonus);
+  for (int t = 0; t < kHy4DraftTokens; ++t) {
+    k::gather_rows(x, ib(dRowSel) + t * R, bb(dHid), R, D, st);
+    k::gather_rows(w.embed.p<bf16>(), prev, bb(dEmb), R, D, st);
+    k::rmsnorm_hf(bb(dHid), D, w.c_hnorm.p<bf16>(), bb(dHn), D, R, D, c.eps, st);
+    k::rmsnorm_hf(bb(dEmb), D, w.c_enorm.p<bf16>(), bb(dEn), D, R, D, c.eps, st);
+    k::hy4_concat2(bb(dHn), bb(dEn), bb(dCat2), R, D, st);
+    linear(w.cg, bb(dCat2), 2 * D, bb(dCg), D, R, st);
+    linear(w.cu, bb(dCat2), 2 * D, bb(dCu), D, R, st);
+    k::hy4_swiglu(bb(dCg), bb(dCu), D, bb(dCh), R, D, st);
+    linear(w.cd, bb(dCh), D, bb(dHn), D, R, st);
+    k::hy4_add(bb(dHid), bb(dHn), bb(dCorr), size_t(R) * D, st);
+    linear_f32(head.head, bb(dCorr), D, static_cast<float*>(buf(dLogits)), V, R, st);
+    k::glm_argmax_conf(static_cast<float*>(buf(dLogits)), R, V, tokens + t * R,
+                       static_cast<float*>(buf(dConf)) + t * R, st);
+    prev = tokens + t * R;
+  }
+  if (conf)
+    UH_CHECK(hipMemcpyAsync(conf, buf(dConf), size_t(kHy4DraftTokens) * R * 4, hipMemcpyDeviceToDevice, st));
+
+  // Debug (tools/ref/hy4_dfly_check.py): UNHOLY_HY4_DFLY_DUMP=DIR writes request 0's inputs and outputs of the
+  // UNHOLY_HY4_DFLY_DUMP_AT-th call (default 20): the target hidden row, each layer's history positions and their KV
+  // rows, the final-normed block, the draft tokens and probabilities.
+  static const char* dump = std::getenv("UNHOLY_HY4_DFLY_DUMP");
+  static int calls = 0;
+  if (!dump || ++calls != (std::getenv("UNHOLY_HY4_DFLY_DUMP_AT") ? std::atoi(std::getenv("UNHOLY_HY4_DFLY_DUMP_AT")) : 20))
+    return;
+  UH_CHECK(hipStreamSynchronize(st));
+  const auto d2h = [](void* dst, const void* src, size_t bytes) { UH_CHECK(hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost)); };
+  const auto put = [&](const std::string& name, const void* p, size_t bytes) {
+    FILE* f = std::fopen((std::string(dump) + "/" + name).c_str(), "wb");
+    if (!f) throw std::runtime_error("dfly dump: cannot write " + name);
+    std::fwrite(p, 1, bytes, f);
+    std::fclose(f);
+  };
+  std::vector<uint16_t> hrow(static_cast<size_t>(D)), xb(static_cast<size_t>(kHy4DraftRows) * D);
+  d2h(hrow.data(), buf(dHrow), size_t(D) * 2);
+  d2h(xb.data(), buf(dX), xb.size() * 2);
+  put("hidden.bin", hrow.data(), hrow.size() * 2);
+  put("x.bin", xb.data(), xb.size() * 2);
+  std::vector<int32_t> toks(static_cast<size_t>(kHy4DraftTokens) * R), table(static_cast<size_t>(max_pages));
+  std::vector<float> cf(static_cast<size_t>(kHy4DraftTokens) * R);
+  d2h(toks.data(), tokens, toks.size() * 4);
+  d2h(cf.data(), buf(dConf), cf.size() * 4);
+  d2h(table.data(), tables + size_t(reqs[0].slot) * max_pages, table.size() * 4);
+  std::string meta = "{\"anchor\": " + std::to_string(reqs[0].anchor) + ", \"bonus\": " + std::to_string(reqs[0].bonus) +
+                     ", \"tokens\": [";
+  for (int t = 0; t < kHy4DraftTokens; ++t) meta += (t ? ", " : "") + std::to_string(toks[size_t(t) * R]);
+  meta += "], \"conf\": [";
+  for (int t = 0; t < kHy4DraftTokens; ++t) meta += (t ? ", " : "") + std::to_string(cf[size_t(t) * R]);
+  meta += "], \"layers\": [";
+  for (int L = 0; L < nL; ++L) {
+    int32_t cnt = 0;
+    d2h(&cnt, reinterpret_cast<const void*>(cntp[size_t(L) * R]), 4);
+    std::vector<int32_t> hist(static_cast<size_t>(cnt));
+    d2h(hist.data(), reinterpret_cast<const void*>(histp[size_t(L) * R]), size_t(cnt) * 4);
+    std::vector<uint16_t> rows(static_cast<size_t>(cnt) * RW);
+    for (int i = 0; i < cnt; ++i) {
+      const int p = hist[size_t(i)];
+      const size_t phys = size_t(table[size_t(p / k::kHy4PageRows)]) * k::kHy4PageRows + p % k::kHy4PageRows;
+      d2h(rows.data() + size_t(i) * RW, target[size_t(L)]->rows.as<uint16_t>() + phys * RW, size_t(RW) * 2);
+    }
+    put("hist_" + std::to_string(L) + ".bin", hist.data(), hist.size() * 4);
+    put("kv_" + std::to_string(L) + ".bin", rows.data(), rows.size() * 2);
+    meta += (L ? ", " : "") + std::to_string(w.target[size_t(L)]);
+  }
+  meta += "]}\n";
+  put("meta.json", meta.data(), meta.size());
+  std::fprintf(stderr, "dfly: dumped call %d to %s\n", calls, dump);
 }
 
 }  // namespace unholy::model

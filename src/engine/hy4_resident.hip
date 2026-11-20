@@ -127,7 +127,7 @@ Plan make_hy4_plan(const Hy4PlanInput& in) {
   size_t total = 0;
   for (int L = 0; L < c.n_layers; ++L) {
     dense[size_t(L)] = model::hy4_dense_layer_bytes(ck, c, L, true);
-    cache[size_t(L)] = model::hy4_cache_bytes(c, c.is_sparse(L), in.geo.max_slots, in.geo.num_pages);
+    cache[size_t(L)] = model::hy4_cache_bytes(c, c.is_sparse(L), in.geo.max_slots, in.geo.num_pages, in.dfly);
     total += dense[size_t(L)] + cache[size_t(L)];
   }
   pl.layer_card.assign(size_t(c.n_layers), 1);
@@ -145,6 +145,12 @@ Plan make_hy4_plan(const Hy4PlanInput& in) {
   }
   pl.dense[0] += ck.at("model.embed_tokens.weight").nbytes;
   pl.dense[1] += ck.at("lm_head.weight").nbytes + ck.at("model.norm.weight").nbytes;
+  if (in.dfly) {  // the drafter on card 1: weights + the embedding table, scratch, hidden-state rings, head rows
+    const int reqs = std::max(in.geo.max_slots, 1);
+    pl.dense[1] += model::hy4_dfly_bytes(ck) + model::hy4_dfly_scratch_bytes(c, reqs) +
+                   size_t(in.geo.max_slots) * model::kHy4MaxVerify * c.dim * 2 +
+                   size_t(in.max_logit_rows > 0 ? in.max_logit_rows : in.max_tokens) * c.dim * 2;
+  }
   const int logit_rows = in.max_logit_rows > 0 ? in.max_logit_rows : in.max_tokens;
   for (int kc = 0; kc < 2; ++kc) {
     pl.scratch[kc] = model::hy4_scratch_bytes(c, in.max_tokens, in.max_seq) +
@@ -222,13 +228,29 @@ size_t hy4_snapshot_bytes(const model::Hy4Config& c, const Plan& p, int kc) {
 Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Checkpoint& ck,
                                    const std::string& engram_dir, const Plan& plan, const model::CacheGeometry& geo,
                                    int max_tokens, int max_seq, int max_logit_rows, int snapshots, bool mxfp4,
-                                   const model::Checkpoint* experts_gguf)
+                                   const model::Checkpoint* experts_gguf, bool dfly)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
       max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens),
       snapshots_(snapshots) {
   if (geo.max_pages_per_seq * k::kHy4PageRows < max_seq) throw std::runtime_error("hy4: block table too narrow");
   engram_ = std::make_unique<model::Hy4Engram>(engram_dir, c);
   last2_.assign(size_t(geo.max_slots) * 2, -1);
+  dfly_ = dfly;
+  std::vector<uint8_t> dfly_layer(size_t(c.n_layers), 0);
+  if (dfly_) {
+    if (!model::hy4_has_dfly(ck)) throw std::runtime_error("hy4: the checkpoint has no DFly2 drafter");
+    const auto* tl = ck.config().find("dfly_target_kv_layers");
+    if (!tl) throw std::runtime_error("hy4: config has no dfly_target_kv_layers");
+    for (const auto& e : tl->items()) {
+      const int L = int(e.as_double());
+      if (L < 0 || L >= c.n_layers || plan.layer_card[size_t(L)] != 1)
+        throw std::runtime_error("hy4: DFly2's target layers must be on card 1");
+      dfly_layer[size_t(L)] = 1;
+    }
+    vs0_.assign(size_t(geo.max_slots), -1);
+    vids_.assign(size_t(geo.max_slots), {});
+    vprev_.assign(size_t(geo.max_slots) * 2, -1);
+  }
   model::Uploader up(ck);
   std::unique_ptr<model::Uploader> gup;
   if (experts_gguf) gup = std::make_unique<model::Uploader>(*experts_gguf);
@@ -259,7 +281,8 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
       lo.experts_up = gup.get();
       lo.up = &up;
       cd.w.push_back(model::load_hy4_layer(ck, c, L, cd.dev, cd.st, lo));
-      cd.cache.push_back(model::make_hy4_cache(c, L, geo.max_slots, geo.num_pages, cd.dev, cd.st));
+      cd.cache.push_back(model::make_hy4_cache(c, L, geo.max_slots, geo.num_pages, cd.dev, cd.st,
+                                               dfly_layer[size_t(L)] != 0));
     }
     if (c.is_dense(L)) continue;
     std::vector<uint8_t> cold(size_t(c.n_experts));
@@ -287,6 +310,25 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
     hrows_ = rt::DeviceBuffer(cd.dev, size_t(max_logit_rows_) * c.hc * c.dim * 2);
     logits_ = rt::DeviceBuffer(cd.dev, size_t(max_logit_rows_) * c.vocab * 4);
     rows_idx_ = rt::DeviceBuffer(cd.dev, size_t(max_logit_rows_) * 4);
+    if (dfly_) {
+      dw_ = model::load_hy4_dfly(ck, c, cd.dev, cd.st);
+      dscr_ = model::make_hy4_dfly_scratch(c, cd.dev, geo.max_slots);
+      UH_CHECK(hipStreamCreateWithFlags(&dst_, hipStreamNonBlocking));
+      UH_CHECK(hipEventCreateWithFlags(&drafted_, hipEventDisableTiming));
+      hidden_ = rt::DeviceBuffer(cd.dev, size_t(geo.max_slots) * model::kHy4MaxVerify * c.dim * 2);
+      UH_CHECK(hipMemset(hidden_.data(), 0, hidden_.size()));
+      hn_rows_ = rt::DeviceBuffer(cd.dev, size_t(max_logit_rows_) * c.dim * 2);
+      dtok_ = rt::DeviceBuffer(cd.dev, size_t(model::kHy4DraftTokens) * geo.max_slots * 8);  // tokens, then conf
+      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&dtok_host_),
+                             size_t(model::kHy4DraftTokens) * geo.max_slots * 8, hipHostMallocPortable));
+      for (auto& hc : cd.cache)
+        if (hc.dsel.data()) dtarget_.push_back(&hc);
+      if (dtarget_.size() != dw_.target.size()) throw std::runtime_error("hy4: DFly2 target caches");
+      // in the drafter's layer order
+      std::sort(dtarget_.begin(), dtarget_.end(), [](auto* a, auto* b) { return a->layer < b->layer; });
+      for (size_t i = 0; i < dtarget_.size(); ++i)
+        if (dtarget_[i]->layer != dw_.target[i]) throw std::runtime_error("hy4: DFly2 target layer order");
+    }
   }
   const auto pinned = [](auto** p, size_t bytes) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), std::max<size_t>(bytes, 64),
@@ -328,6 +370,12 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
 }
 
 Hy4ResidentModel::~Hy4ResidentModel() {
+  if (dst_) {
+    rt::DeviceGuard g(card_[1].dev);
+    (void)hipStreamDestroy(dst_);
+  }
+  if (drafted_) (void)hipEventDestroy(drafted_);
+  if (dtok_host_) (void)hipHostFree(dtok_host_);
   for (uint8_t* p : snap_host_)
     if (p) (void)hipHostFree(p);
   if (snap_tok_host_) (void)hipHostFree(snap_tok_host_);
@@ -420,7 +468,7 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
   if (R > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
   if (!in.image_rows.empty() || !in.image_spans.empty()) throw std::runtime_error("step: no vision tower loaded");
-  if (!in.backup.empty()) throw std::runtime_error("step: verify chunks without a drafter");
+  if (!in.backup.empty() && !dfly_) throw std::runtime_error("step: verify chunks without a drafter");
   for (const auto* ops : {&in.restore, &in.save})
     for (const StateOp& op : *ops)
       if (op.snapshot < 0 || op.snapshot >= snapshots_ || op.slot < 0 || op.slot >= geo_.max_slots)
@@ -434,8 +482,19 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   for (const StateOp& op : in.restore)
     std::memcpy(&last2_[size_t(op.slot) * 2], snap_tok_host_ + size_t(op.snapshot) * 4096, 8);
   std::vector<int32_t> ngram(size_t(T) * 3);
+  const auto is_verify = [&](const Chunk& ch) {
+    for (const RingBackup& bk : in.backup)
+      if (bk.slot == ch.slot && bk.s0 == ch.s0) return true;
+    return false;
+  };
   for (const Chunk& ch : in.chunks) {
     if (ch.s0 == 0) last2_[size_t(ch.slot) * 2] = last2_[size_t(ch.slot) * 2 + 1] = -1;
+    if (dfly_ && is_verify(ch)) {  // for rolling the Engram history back past rejected drafts
+      vs0_[size_t(ch.slot)] = ch.s0;
+      vids_[size_t(ch.slot)].assign(in.ids.begin() + ch.t0, in.ids.begin() + ch.t0 + ch.n);
+      vprev_[size_t(ch.slot) * 2] = last2_[size_t(ch.slot) * 2];
+      vprev_[size_t(ch.slot) * 2 + 1] = last2_[size_t(ch.slot) * 2 + 1];
+    }
     int32_t p1 = last2_[size_t(ch.slot) * 2], p2 = last2_[size_t(ch.slot) * 2 + 1];  // tokens at s0 - 1, s0 - 2
     for (int i = 0; i < ch.n; ++i) {
       const int t = ch.t0 + i;
@@ -461,7 +520,7 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   if (tables) std::memcpy(f.tables_host, tables_.data(), tables_.size() * 4);
   tables_dirty_ = false;
   model::Hy4Batch b;
-  for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0});
+  for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0, is_verify(ch)});
   b.T = T;
   b.max_pages = geo_.max_pages_per_seq;
   b.pos_host = in.pos.data();
@@ -481,6 +540,7 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
     if (kc == 0) {
       model::hy4_embed(c_, embed_, cd.ids.as<int32_t>(), cd.x.as<uint16_t>(), T, cd.st);
     } else {
+      if (dfly_) UH_CHECK(hipStreamWaitEvent(cd.st, drafted_, 0));  // the last draft()'s restores and reads
       UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));
       k::copy_kernel(cd.x.data(), f.x_host, size_t(T) * row * 2, cd.st);
       UH_CHECK(hipEventRecord(f.consumed, cd.st));
@@ -503,7 +563,21 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   if (R > 0) {
     k::copy_kernel(rows_idx_.data(), f.io_host + 2 * max_tokens_, size_t(R) * 4, cd.st);
     k::gather_rows(cd.x.as<uint16_t>(), rows_idx_.as<int32_t>(), hrows_.as<uint16_t>(), R, int(row), cd.st);
-    model::hy4_head_forward(c_, head_, cd.scratch, hrows_.as<uint16_t>(), R, logits_.as<float>(), cd.st);
+    model::hy4_head_forward(c_, head_, cd.scratch, hrows_.as<uint16_t>(), R, logits_.as<float>(), cd.st,
+                            dfly_ ? hn_rows_.as<uint16_t>() : nullptr);
+    if (dfly_)  // each logit row's final hidden state into its slot's ring (row pos % 6): DFly2's input
+      for (int i = 0; i < R; ++i) {
+        const int t = in.logit_rows[size_t(i)];
+        for (const Chunk& ch : in.chunks)
+          if (t >= ch.t0 && t < ch.t0 + ch.n) {
+            const int pos = ch.s0 + t - ch.t0;
+            UH_CHECK(hipMemcpyAsync(hidden_.as<uint16_t>() + (size_t(ch.slot) * model::kHy4MaxVerify +
+                                                              pos % model::kHy4MaxVerify) * D,
+                                    hn_rows_.as<uint16_t>() + size_t(i) * D, size_t(D) * 2, hipMemcpyDeviceToDevice,
+                                    cd.st));
+            break;
+          }
+      }
     k::copy_kernel(f.logits_host, logits_.data(), size_t(R) * c_.vocab * 4, cd.st);
   }
   UH_CHECK(hipEventRecord(f.done, cd.st));
@@ -511,6 +585,63 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   f.ticket = ticket;
   f.rows = R;
   return next_ticket_++;
+}
+
+// Restores first (card 0's caches on its stream, ahead of its next step; card 1's on the draft stream, which card 1's
+// next step waits for; the Engram history on the host), then the drafts on the draft stream.
+void Hy4ResidentModel::draft(const std::vector<RingRestore>& restore, const std::vector<DraftReq>& reqs,
+                             std::vector<int32_t>& tokens, std::vector<float>& conf) {
+  tokens.clear();
+  conf.clear();
+  if (!dfly_) throw std::runtime_error("draft: no DFly2 drafter loaded");
+  for (const RingRestore& r : restore) {
+    if (r.slot < 0 || r.slot >= geo_.max_slots || r.from <= r.s0 || r.to <= r.from ||
+        r.to - r.s0 > model::kHy4MaxVerify)
+      throw std::runtime_error("draft: bad restore");
+    {
+      Card& c0 = card_[0];
+      rt::DeviceGuard g(c0.dev);
+      for (auto& cache : c0.cache) model::hy4_restore_slot(cache, r.slot, r.s0, r.from, r.to, c0.st);
+    }
+    {
+      rt::DeviceGuard g(card_[1].dev);
+      for (auto& cache : card_[1].cache) model::hy4_restore_slot(cache, r.slot, r.s0, r.from, r.to, dst_);
+    }
+    const auto& ids = vids_[size_t(r.slot)];
+    if (vs0_[size_t(r.slot)] != r.s0 || int(ids.size()) < r.from - r.s0)
+      throw std::runtime_error("draft: restore without its verify chunk");
+    const auto tok_at = [&](int p) {
+      return p >= r.s0 ? ids[size_t(p - r.s0)] : vprev_[size_t(r.slot) * 2 + (r.s0 - 1 - p)];
+    };
+    last2_[size_t(r.slot) * 2] = tok_at(r.from - 1);
+    last2_[size_t(r.slot) * 2 + 1] = r.from - 2 >= 0 ? tok_at(r.from - 2) : -1;
+  }
+  Card& cd = card_[1];
+  rt::DeviceGuard g(cd.dev);
+  const int R = int(reqs.size());
+  if (R > 0) {
+    std::vector<model::Hy4DflyReq> dr;
+    for (const DraftReq& q : reqs) {
+      if (q.token < 0 || q.token >= c_.vocab) throw std::runtime_error("draft: token id outside the vocabulary");
+      dr.push_back({q.slot, q.start + 1, q.token});
+    }
+    model::hy4_dfly_draft(c_, dw_, head_, dtarget_, cd.tables.as<int32_t>(), geo_.max_pages_per_seq,
+                          hidden_.as<uint16_t>(), dscr_, dr, dtok_.as<int32_t>(), dst_,
+                          reinterpret_cast<float*>(dtok_.as<int32_t>() + size_t(model::kHy4DraftTokens) * R));
+    UH_CHECK(hipMemcpyAsync(dtok_host_, dtok_.data(), size_t(model::kHy4DraftTokens) * R * 8, hipMemcpyDeviceToHost,
+                            dst_));
+  }
+  UH_CHECK(hipEventRecord(drafted_, dst_));
+  UH_CHECK(hipStreamSynchronize(dst_));
+  // The drafter's probability of its token as the confidence (its confidence head is unused, as in vLLM and SGLang).
+  tokens.resize(size_t(R) * model::kHy4DraftTokens);
+  conf.resize(tokens.size());
+  const float* cf = reinterpret_cast<const float*>(dtok_host_ + size_t(model::kHy4DraftTokens) * R);
+  for (int r = 0; r < R; ++r)
+    for (int t = 0; t < model::kHy4DraftTokens; ++t) {
+      tokens[size_t(r) * model::kHy4DraftTokens + t] = dtok_host_[size_t(t) * R + r];
+      conf[size_t(r) * model::kHy4DraftTokens + t] = cf[size_t(t) * R + r];
+    }
 }
 
 void Hy4ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {

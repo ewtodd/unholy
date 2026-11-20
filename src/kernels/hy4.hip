@@ -9,6 +9,7 @@
 #include "kernels/hy4.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -148,6 +149,7 @@ __global__ void rope_kernel(bf16* x, int ld, int rows, int heads, int hstride, i
 constexpr int R = kHy4Row, L = kHy4Lat, KB = 16;
 
 __device__ __forceinline__ const bf16* key_row(const Hy4Keys& k, int p) {
+  if (k.block && p >= k.anchor) return k.block + size_t(p - k.anchor) * R;
   if (k.table)
     return k.pages + (size_t(k.table[p / kHy4PageRows]) * kHy4PageRows + p % kHy4PageRows) * R;
   return p >= k.s0 ? k.chunk + size_t(p - k.s0) * R : k.ring + size_t(p % kHy4Window) * R;
@@ -157,7 +159,9 @@ template <int H>
 __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict__ q, Hy4Keys keys,
                                                          const int32_t* __restrict__ idx, int w, int window,
                                                          const int32_t* __restrict__ pos, const float* __restrict__ sinks,
-                                                         bf16* __restrict__ o, float scale) {
+                                                         bf16* __restrict__ o, float scale,
+                                                         const int32_t* __restrict__ counts, int S,
+                                                         float* __restrict__ po, float* __restrict__ pml) {
 #if defined(UH_GFX12)
   constexpr int NT = H * 4, HG = H / 16;
   __shared__ alignas(16) uint16_t sK[KB][R + 8];   // [key][dim]
@@ -171,7 +175,9 @@ __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict_
   const int hg = wave >> 1, dh = wave & 1;
   const int pt = pos[t];
   int cnt, lo = 0;
-  if (idx) {  // the compact selection: min(groups before the query's, k) groups, then the query's own group
+  if (idx && counts) {
+    cnt = counts[t];
+  } else if (idx) {  // the compact selection: min(groups before the query's, k) groups, then the query's own group
     const int k = (w - kHy4Pool) / kHy4Pool;
     cnt = min(pt / kHy4Pool, k) * kHy4Pool + pt % kHy4Pool + 1;
   } else {
@@ -179,6 +185,14 @@ __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict_
     cnt = pt - lo + 1;
   }
   const int32_t* tidx = idx ? idx + size_t(t) * w : nullptr;
+  // Split si of S takes a contiguous run of whole key tiles; split 0 carries the sink.
+  const int si = blockIdx.y;
+  int e_lo = 0, e_hi = cnt;
+  if (S > 1) {
+    const int per = ((cnt + KB - 1) / KB + S - 1) / S * KB;
+    e_lo = min(cnt, si * per);
+    e_hi = min(cnt, e_lo + per);
+  }
 
   // Query fragments: dh 0 holds dims 0-255 (16 steps), dh 1 dims 256-511 and 512-575 (20 steps).
   constexpr int QS = 20;
@@ -198,15 +212,15 @@ __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict_
 #pragma unroll
     for (int e = 0; e < 8; ++e) acc[n][e] = 0.0f;
   if (tid < H) {
-    sM[tid] = sinks[tid];
-    sL[tid] = 1.0f;
+    sM[tid] = si == 0 ? sinks[tid] : -INFINITY;
+    sL[tid] = si == 0 ? 1.0f : 0.0f;
   }
-  for (int e0 = 0; e0 < cnt; e0 += KB) {
+  for (int e0 = e_lo; e0 < e_hi; e0 += KB) {
     __syncthreads();
     if (tid < KB) {
       const int e = e0 + tid;
       int p = -1;
-      if (e < cnt) p = tidx ? tidx[e] : lo + e;
+      if (e < e_hi) p = tidx ? tidx[e] : lo + e;
       sOk[tid] = p;
     }
     __syncthreads();
@@ -263,7 +277,7 @@ __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict_
       sum += __shfl_xor(sum, 2, 32);
       __syncthreads();
       if ((tid & 3) == 0) {
-        const float f = expf(m_old - m_new);
+        const float f = m_new == -INFINITY ? 1.0f : expf(m_old - m_new);  // (a split's first tiles may be all empty)
         sF[h] = f;
         sL[h] = sL[h] * f + sum;
         sM[h] = m_new;
@@ -285,6 +299,20 @@ __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict_
     }
   }
   __syncthreads();
+  if (S > 1) {  // the split's unnormalized output and its softmax state, for mla_combine_kernel
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int h = hg * 16 + (lane >> 4) * 8 + e;
+      float* prow = po + ((size_t(t) * S + si) * H + h) * L + dh * 256 + (lane & 15);
+#pragma unroll
+      for (int n = 0; n < 16; ++n) prow[n * 16] = acc[n][e];
+    }
+    if (tid < H) {
+      pml[((size_t(t) * S + si) * H + tid) * 2] = sM[tid];
+      pml[((size_t(t) * S + si) * H + tid) * 2 + 1] = sL[tid];
+    }
+    return;
+  }
 #pragma unroll
   for (int e = 0; e < 8; ++e) {
     const int h = hg * 16 + (lane >> 4) * 8 + e;
@@ -294,6 +322,32 @@ __global__ __launch_bounds__(H * 4) void mla_attn_kernel(const bf16* __restrict_
     for (int n = 0; n < 16; ++n) orow[n * 16] = f32_to_bf16(acc[n][e] / denom);
   }
 #endif
+}
+
+// One block per (query, head): the S splits' partial outputs merged by their softmax states.
+__global__ void mla_combine_kernel(const float* __restrict__ po, const float* __restrict__ pml, bf16* __restrict__ o,
+                                   int H, int S) {
+  const int t = blockIdx.x / H, h = blockIdx.x % H;
+  __shared__ float sw[kHy4AttnMaxSplit];
+  __shared__ float sinv;
+  if (threadIdx.x == 0) {
+    float M = -INFINITY;
+    for (int s = 0; s < S; ++s) M = fmaxf(M, pml[((size_t(t) * S + s) * H + h) * 2]);
+    float sum = 0.0f;
+    for (int s = 0; s < S; ++s) {
+      const float m = pml[((size_t(t) * S + s) * H + h) * 2], l = pml[((size_t(t) * S + s) * H + h) * 2 + 1];
+      const float wgt = m == -INFINITY ? 0.0f : expf(m - M);
+      sw[s] = wgt;
+      sum += l * wgt;
+    }
+    sinv = 1.0f / sum;
+  }
+  __syncthreads();
+  for (int d = threadIdx.x; d < L; d += blockDim.x) {
+    float a = 0.0f;
+    for (int s = 0; s < S; ++s) a += po[((size_t(t) * S + s) * H + h) * L + d] * sw[s];
+    o[(size_t(t) * H + h) * L + d] = f32_to_bf16(a * sinv);
+  }
 }
 
 __global__ void split_q_kernel(const bf16* q, bf16* qn, int T, int H) {
@@ -597,6 +651,79 @@ __global__ void gather_remote_kernel(const bf16* in, const int32_t* p2u, const M
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
     const size_t p = r0 + i / v, c = i % v;
     reinterpret_cast<uint4*>(xa + p * dim)[c] = reinterpret_cast<const uint4*>(in + size_t(p2u[p]) * dim)[c];
+  }
+}
+
+__global__ void ring_backup_kernel(const bf16* ring, bf16* bak, int s0, int n) {
+  const size_t total = size_t(n) * (R / 8);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
+    const int r = int(i / (R / 8)), d0 = int(i % (R / 8)) * 8;
+    *reinterpret_cast<uint4*>(bak + size_t(r) * R + d0) =
+        *reinterpret_cast<const uint4*>(ring + size_t((s0 + r) % kHy4Window) * R + d0);
+  }
+}
+
+__global__ void ring_restore_kernel(bf16* ring, const bf16* bak, int s0, int from, int to) {
+  const size_t total = size_t(to - from) * (R / 8);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
+    const int p = from + int(i / (R / 8)), d0 = int(i % (R / 8)) * 8;
+    *reinterpret_cast<uint4*>(ring + size_t(p % kHy4Window) * R + d0) =
+        *reinterpret_cast<const uint4*>(bak + size_t(p - s0) * R + d0);
+  }
+}
+
+__global__ void tail_restore_kernel(bf16* tail, const bf16* bak, const bf16* vk, int s0, int from) {
+  const int d = threadIdx.x;  // 128 threads
+  for (int j = 0; j < kHy4Pool; ++j) tail[j * kHy4IdxDim + d] = bak[j * kHy4IdxDim + d];
+  for (int q = max(s0, from - kHy4Pool); q < from; ++q)
+    tail[(q % kHy4Pool) * kHy4IdxDim + d] = vk[size_t(q - s0) * kHy4IdxDim + d];
+}
+
+// One block per saved row.
+__global__ void dfly_save_sel_kernel(const int32_t* sel, int w, const int32_t* pos, int t0, int n, int32_t* dst,
+                                     int32_t* counts, int groups) {
+  const int t = t0 + blockIdx.x;
+  const int p = pos[t], r = p % 6;
+  int32_t* out = dst + size_t(r) * 2048;
+  int cnt;
+  if (sel) {
+    cnt = min(p / kHy4Pool, groups) * kHy4Pool + p % kHy4Pool + 1;
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) out[i] = i < cnt ? sel[size_t(t) * w + i] : -1;
+  } else {
+    cnt = p + 1;  // dense: every position <= p (p < 2048 here)
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) out[i] = i < cnt ? i : -1;
+  }
+  if (threadIdx.x == 0) counts[r] = cnt;
+}
+
+__global__ void dfly_lists_kernel(const int32_t* const* hist, const int32_t* const* hcount, const int32_t* anchor,
+                                  int32_t* lists, int32_t* counts, int w) {
+  const int r = blockIdx.x / 6, j = blockIdx.x % 6;
+  const int hc = *hcount[r], a = anchor[r];
+  int32_t* out = lists + (size_t(r) * 6 + j) * w;
+  for (int i = threadIdx.x; i < w; i += blockDim.x) {
+    int v = -1;
+    if (i < hc) v = hist[r][i];
+    else if (i - hc <= j) v = a + (i - hc);
+    out[i] = v;
+  }
+  if (threadIdx.x == 0) counts[r * 6 + j] = hc + j + 1;
+}
+
+__global__ void gated_add_kernel(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim) {
+  const size_t n = size_t(rows) * dim;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    const size_t r = i / dim, d = i % dim;
+    bf16* xp = x + r * ldx + d;
+    *xp = f32_to_bf16(bf16_to_f32(*xp) + round_bf16(bf16_to_f32(g[d]) * bf16_to_f32(f[i])));
+  }
+}
+
+__global__ void concat2_kernel(const bf16* a, const bf16* b, bf16* out, int rows, int dim) {
+  const size_t n = size_t(rows) * 2 * dim;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    const size_t r = i / (2 * dim), d = i % (2 * dim);
+    out[i] = d < size_t(dim) ? a[r * dim + d] : b[r * dim + d - dim];
   }
 }
 
@@ -934,12 +1061,28 @@ void hy4_rope(bf16* x, int ld, int rows, int heads, int hstride, int off, const 
 }
 
 void hy4_mla_attn(const bf16* q, int H, const Hy4Keys& keys, const int32_t* idx, int w, int window,
-                  const int32_t* pos, const float* sinks, bf16* o, int n, float scale, hipStream_t st) {
+                  const int32_t* pos, const float* sinks, bf16* o, int n, float scale, hipStream_t st,
+                  const int32_t* counts, float* ws, size_t ws_bytes) {
   if (n <= 0) return;
-  if (H == 32) mla_attn_kernel<32><<<n, 128, 0, st>>>(q, keys, idx, w, window, pos, sinks, o, scale);
-  else if (H == 64) mla_attn_kernel<64><<<n, 256, 0, st>>>(q, keys, idx, w, window, pos, sinks, o, scale);
+  int S = 1;
+  static const bool no_split = std::getenv("UNHOLY_HY4_NO_ATTN_SPLIT") != nullptr;  // A/B checks
+  if (ws && n <= kHy4AttnSplitRows && !no_split) {
+    S = std::min(kHy4AttnMaxSplit, std::max(1, kHy4AttnSplitBlocks / n));
+    while (S > 1 && size_t(n) * S * H * (L + 2) * 4 > ws_bytes) --S;
+  }
+  float* po = ws;
+  float* pml = S > 1 ? ws + size_t(n) * S * H * L : nullptr;
+  const dim3 grid(static_cast<unsigned>(n), static_cast<unsigned>(S));
+  if (H == 32)
+    mla_attn_kernel<32><<<grid, 128, 0, st>>>(q, keys, idx, w, window, pos, sinks, o, scale, counts, S, po, pml);
+  else if (H == 64)
+    mla_attn_kernel<64><<<grid, 256, 0, st>>>(q, keys, idx, w, window, pos, sinks, o, scale, counts, S, po, pml);
   else throw std::runtime_error("hy4_mla_attn: 32 or 64 heads");
   UH_CHECK_LAUNCH();
+  if (S > 1) {
+    mla_combine_kernel<<<n * H, 128, 0, st>>>(po, pml, o, H, S);
+    UH_CHECK_LAUNCH();
+  }
 }
 
 void hy4_split_q(const bf16* q, bf16* qn, int T, int H, hipStream_t st) {
@@ -1041,6 +1184,49 @@ void hy4_gather_remote(const bf16* in, const int32_t* p2u, const MoePlan* plan, 
   if (max_rows <= 0) return;
   if (dim % 8) throw std::runtime_error("hy4_gather_remote: dim % 8");
   gather_remote_kernel<<<grid1d(size_t(max_rows) * (dim / 8)), 256, 0, st>>>(in, p2u, plan, xa, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_ring_backup(const bf16* ring, bf16* bak, int s0, int n, hipStream_t st) {
+  if (n <= 0) return;
+  ring_backup_kernel<<<grid1d(size_t(n) * (R / 8)), 256, 0, st>>>(ring, bak, s0, n);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_ring_restore(bf16* ring, const bf16* bak, int s0, int from, int to, hipStream_t st) {
+  if (to <= from) return;
+  ring_restore_kernel<<<grid1d(size_t(to - from) * (R / 8)), 256, 0, st>>>(ring, bak, s0, from, to);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_tail_restore(bf16* tail, const bf16* bak, const bf16* vk, int s0, int from, hipStream_t st) {
+  tail_restore_kernel<<<1, kHy4IdxDim, 0, st>>>(tail, bak, vk, s0, from);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_dfly_save_sel(const int32_t* sel, int w, const int32_t* pos, int t0, int n, int32_t* dst, int32_t* counts,
+                       int groups, hipStream_t st) {
+  if (n <= 0) return;
+  dfly_save_sel_kernel<<<n, 256, 0, st>>>(sel, w, pos, t0, n, dst, counts, groups);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_dfly_lists(const int32_t* const* hist, const int32_t* const* hcount, const int32_t* anchor, int32_t* lists,
+                    int32_t* counts, int R, int w, hipStream_t st) {
+  if (R <= 0) return;
+  dfly_lists_kernel<<<R * 6, 256, 0, st>>>(hist, hcount, anchor, lists, counts, w);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_gated_add(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim, hipStream_t st) {
+  if (rows <= 0) return;
+  gated_add_kernel<<<grid1d(size_t(rows) * dim), 256, 0, st>>>(x, ldx, g, f, rows, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_concat2(const bf16* a, const bf16* b, bf16* out, int rows, int dim, hipStream_t st) {
+  if (rows <= 0) return;
+  concat2_kernel<<<grid1d(size_t(rows) * 2 * dim), 256, 0, st>>>(a, b, out, rows, dim);
   UH_CHECK_LAUNCH();
 }
 
