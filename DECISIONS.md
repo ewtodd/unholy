@@ -1709,3 +1709,38 @@ A value that is not a number or is out of range stops the server at start instea
 Checked on son-of-anton (CPU only, service untouched): `unholy_server` and serve's main compile; a throwaway test of
 the loader on both real model directories, a missing file, nulls / top_k / min_p / repetition_penalty, and four bad
 files (string, top_p 1.5, temperature -1, not JSON): all as above. No served A/B yet (needs the GPUs).
+
+## 2026-11-20 — Hy4 flash: the forward at the oracle's noise floor (FP8 release, one card, layer-streamed)
+
+The owner wants Tencent's Hy4 flash in unholy (quality about DSV4-VE / GLM-5.3-Flash, several users at 1M context,
+faster), a working version first, evaluated by the owner. Weights: the FP8 release, tencent/Hy4-flash-FP8 @
+bd0e136 (`/scratch/models/hy4-flash-fp8`, 287 GB, of which 127 GB are the Engram tables in bf16), so the owner judges
+the model and not a quant of it. Routed experts are e4m3 with bf16 128x128 scales (148.6 GB, about DSV4's native
+147 GB); the dense weights (fp8 ones dequantized to bf16(w * s) at load, the oracle's arithmetic) about 9-13 GB.
+
+- Oracle: transformers' hy_v4_flash (PR #50903, ManaEstras/transformers@b865850, venv `/work/env/hy4`),
+  layer-streamed on one R9700 (`tools/ref/hy4_oracle/run.py`; masks, positions, n-grams built as
+  HYV4FlashTextModel does). On the code corpus (BOS 120000): next-token top-1 83.3%, mean NLL 0.677 (GLM 86.0% /
+  0.585, DSV4 85.2% / 0.583). Its own floor (bf16 eager attention vs the same math in fp32): mean KL 5.83e-3, top-1
+  98.06% at 1024 tokens; 6.11e-2 / 94.59% at 4096, growing with position (5.7e-3 for 0-1k, 3.7e-2 for 1-2k, 1.1e-1
+  for 2-3k): transformers' eager path rounds the scores to bf16 before the softmax.
+- Engram tables packed as e4m3 codes + one bf16 scale per row (`tools/ref/hy4_engram_pack.py`,
+  `/scratch/models/hy4-flash-engram`, 61 GB): exactly the values transformers reads (`_fp8_round_trip` per 96-value
+  row). The hash multipliers come from numpy's default_rng and are precomputed into the pack. Rows are read with
+  pread (page cache) per step.
+- `nn.RMSNorm(eps=None)` on bf16 inputs uses fp32's epsilon (1.19e-7, ATen's opmath type), not bf16's 2^-7 that its
+  docstring promises: with 2^-7 the Engram gates came out 2-3x too large (layer 1 rel err 1.09).
+- unholy (`model/hy4*`, `kernels/hy4.hip`, `tools/hy4_ref`): iHC, RoPE with bf16-rounded cos / sin, absorbed MLA
+  (576-wide key rows: latent + roped key; sinks; bf16 rows, paged for the 12 indexed layers, a 512-row ring per slot for
+  the 30 window layers), the compressed indexer (fp32 pooling, 16 heads, 511 groups + the query's own), latent MoE with
+  a new grouped e4m3 expert GEMM (gfx11 + gfx12), Engram. Layers in isolation: 5.7e-3 / 3.4e-3 / 2.7e-3 relative error
+  (dense + indexed / Engram + MoE / window + MoE). Full model at 1024 tokens (chunks of 512, then 8 decode steps):
+  mean KL 5.82e-3, top-1 97.29% vs the oracle (its floor: 5.83e-3, 98.06%); against the fp32 twin 7.0e-3 / 97.97%.
+  At 4096 tokens (indexer selecting past 2048): 6.07e-2 / 94.40% against the fp32 twin, the same per-position
+  profile as the oracle's own floor; one chunk or four, the same.
+- `moe_scatter` sorted each token's picks in 8-entry arrays; Hy4 routes to 16 (K <= 16 now, DSV4 / GLM arithmetic
+  unchanged).
+
+Single-card numbers (all 512 experts of a layer on one R9700, no multi-device plan yet, not tuned): ~1000 tok/s
+prefill summed over layers, 58-64 ms per decode token. Next: the resident plan over both cards and the APU, then
+serving.

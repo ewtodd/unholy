@@ -17,6 +17,12 @@
 : "${GLM_ORACLE:=$BOX_DATA/glm/oracle/code1024}"
 : "${GLM_PY:=/work/env/glm/bin/python}"
 : "${TRANSFORMERS_REV:=50e35cc0ca18ec19b80653690de553e6decf74f5}"   # transformers main with glm5_next
+# Hy4 flash (docs/PLAN-hy4-flash.md): FP8 release (tencent/Hy4-flash-FP8 @ bd0e136), its token ids, the oracle's venv
+: "${HY4_MODEL:=/scratch/models/hy4-flash-fp8}"
+: "${HY4_IDS:=$BOX_DATA/hy4/ids_code32768.bin}"
+: "${HY4_ORACLE:=$BOX_DATA/hy4/oracle/code1024}"
+: "${HY4_PY:=/work/env/hy4/bin/python}"
+: "${HY4_TRANSFORMERS:=ManaEstras/transformers/tar.gz/b865850d05326cf20e306b31f14b0027de802da3}"  # PR #50903 head
 : "${BUILD:=$BOX_TREE/build}"  # another tree's build: BUILD=/work/<tree>/build
 
 # The production server's flags (the NixOS module's, without host / port / name).

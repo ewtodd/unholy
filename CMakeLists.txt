@@ -56,6 +56,7 @@ add_library(unholy_text STATIC
   src/text/tokenizer.cpp
   src/text/chat.cpp
   src/text/glm_chat.cpp
+  src/text/hy4_chat.cpp
 )
 target_include_directories(unholy_text PUBLIC src)
 target_link_libraries(unholy_text PUBLIC PkgConfig::PCRE2)
@@ -64,6 +65,8 @@ add_executable(unholy-text-test tools/text_test/main.cpp)
 target_link_libraries(unholy-text-test PRIVATE unholy_text)
 add_executable(unholy-glm-parse-test tools/text_test/glm_parse_test.cpp)
 target_link_libraries(unholy-glm-parse-test PRIVATE unholy_text)
+add_executable(unholy-hy4-parse-test tools/text_test/hy4_parse_test.cpp)
+target_link_libraries(unholy-hy4-parse-test PRIVATE unholy_text)
 
 # Image preprocessing for the vision encoder (decode, PIL-exact resize, patches, token layout). No device code.
 add_library(unholy_vision STATIC src/vision/image.cpp)
@@ -137,6 +140,19 @@ target_link_libraries(unholy_glm PUBLIC unholy_ref)
 add_executable(unholy-glm-ref tools/glm_ref/main.hip)
 target_link_libraries(unholy-glm-ref PRIVATE unholy_glm)
 install(TARGETS unholy-glm-ref RUNTIME DESTINATION bin)
+
+# Hy4 flash (docs/PLAN-hy4-flash.md).
+add_library(unholy_hy4 STATIC
+  src/kernels/hy4.hip
+  src/model/hy4.hip
+  src/model/hy4_fast.hip
+)
+target_include_directories(unholy_hy4 PUBLIC src third_party)
+target_link_libraries(unholy_hy4 PUBLIC unholy_glm)
+
+add_executable(unholy-hy4-ref tools/hy4_ref/main.hip)
+target_link_libraries(unholy-hy4-ref PRIVATE unholy_hy4)
+install(TARGETS unholy-hy4-ref RUNTIME DESTINATION bin)
 
 # Engine: placement, resident multi-device model.
 add_library(unholy_engine STATIC

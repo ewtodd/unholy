@@ -83,8 +83,8 @@ __global__ void moe_scatter_kernel(const int32_t* sel, const float* wt, int T, i
                                    int32_t* eidx, float* ewt, int32_t* row_expert, int32_t* pidx) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T) return;
-  int es[8];
-  float ws[8];
+  int es[16];  // K <= 16 (Hy4 flash routes to 16 experts)
+  float ws[16];
   for (int j = 0; j < K; ++j) {
     es[j] = sel[size_t(t) * K + j];
     ws[j] = wt[size_t(t) * K + j];
@@ -647,6 +647,7 @@ void moe_plan(int32_t* count, const uint8_t* resident, int E, int P, MoePlan* pl
 
 void moe_scatter(const int32_t* sel, const float* wt, int T, int K, const int32_t* off, int32_t* fill, int32_t* eidx,
                  float* ewt, int32_t* row_expert, int32_t* pidx, hipStream_t st) {
+  if (K > 16) throw std::runtime_error("moe_scatter: K > 16");
   moe_scatter_kernel<<<(T + 63) / 64, 64, 0, st>>>(sel, wt, T, K, off, fill, eidx, ewt, row_expert, pidx);
   UH_CHECK_LAUNCH();
 }

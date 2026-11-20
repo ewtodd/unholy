@@ -8,6 +8,8 @@
 //   unholy-text-test parse <cases.json>                         array of {text, thinking, chunk} -> parsed
 //   unholy-text-test glm-request <requests.json>                GLM-5.3-Flash: OpenAI requests -> prompts
 //   unholy-text-test glm-parse <cases.json>                     GLM-5.3-Flash: {text, chunk, tools} -> parsed
+//   unholy-text-test hy4-request <requests.json>                Hy4-flash: OpenAI requests -> {prompt, thinking, images}
+//   unholy-text-test hy4-parse <cases.json>                     Hy4-flash: {text, chunk, tools, thinking} -> parsed
 //   unholy-text-test bench <tokenizer.json> <file>              tokenization throughput on a text file
 #include <chrono>
 #include <cstdio>
@@ -18,6 +20,7 @@
 
 #include "text/chat.hpp"
 #include "text/glm_chat.hpp"
+#include "text/hy4_chat.hpp"
 #include "text/json.hpp"
 #include "text/tokenizer.hpp"
 
@@ -109,7 +112,7 @@ int main(int argc, char** argv) {
           out.push_back(error_value(e));
         }
       }
-    } else if ((cmd == "parse" || cmd == "glm-parse") && argc == 3) {
+    } else if ((cmd == "parse" || cmd == "glm-parse" || cmd == "hy4-parse") && argc == 3) {
       const Value in = json::parse(slurp(argv[2]));
       for (const Value& c : in.items()) {
         const std::string& t = c.at("text").str();
@@ -117,6 +120,7 @@ int main(int argc, char** argv) {
         const Value* tools = c.find("tools");
         std::unique_ptr<text::ChatParser> p;
         if (cmd == "parse") p = std::make_unique<text::OutputParser>(c.at("thinking").truthy(), tools);
+        else if (cmd == "hy4-parse") p = std::make_unique<text::Hy4OutputParser>(!c.contains("thinking") || c.at("thinking").truthy(), tools);
         else p = std::make_unique<text::Glm5OutputParser>(tools);
         text::ParsedDelta d;
         for (size_t i = 0; i < t.size(); i += chunk) p->feed(std::string_view(t).substr(i, chunk), d);
@@ -139,6 +143,22 @@ int main(int argc, char** argv) {
       for (const Value& r : in.items()) {
         try {
           out.push_back(Value(text::glm5_render_request(r).prompt));
+        } catch (const std::exception& e) {
+          out.push_back(error_value(e));
+        }
+      }
+    } else if (cmd == "hy4-request" && argc == 3) {
+      const Value in = json::parse(slurp(argv[2]));
+      for (const Value& r : in.items()) {
+        try {
+          const text::RenderedChat rc = text::hy4_render_request(r);
+          Value o = Value::object();
+          o.set("prompt", Value(rc.prompt));
+          o.set("thinking", Value(rc.thinking));
+          Value urls = Value::array();
+          for (const auto& u : rc.images) urls.push_back(Value(u));
+          o.set("images", std::move(urls));
+          out.push_back(std::move(o));
         } catch (const std::exception& e) {
           out.push_back(error_value(e));
         }

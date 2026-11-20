@@ -26,7 +26,7 @@ WORDS = ["hello", "Hello", "HELLO", "don't", "it's", "I'm", "we'll", "x", "a1b2"
          "日本語", "中文字符", "ひらがな", "カタカナ", "ｶﾀｶﾅ", "漢字かな交じり", "é", "ạ̈",
          "👍", "👨‍👩‍👧‍👦", "🇺🇸", "🏳️‍🌈", "1", "12", "123", "1234", "12345", "١٢٣٤", "Ⅻ", "½", "²³", "𝟙𝟚𝟛",
          "0x1F", "3.14159", "1e-5", "-42", "v1.2.3", "http://example.com/a?b=c&d=e", "foo@bar.com",
-         "<think>", "</think>", "<｜User｜>", "<｜Assistant｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
+         "<think>", "</think>", "<think:opensource>", "</think:opensource>", "<tool_calls:opensource>", "</tool_calls:opensource>", "<tool_call:opensource>", "<arg_key:opensource>", "</arg_value:opensource>", "<｜hy_start:opensource｜>", "<｜hy_end:opensource｜>", "<｜hy_image▁pad:opensource｜>", "<｜hy_place▁holder▁no▁120006｜>", "<｜User｜>", "<｜Assistant｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
          "｜DSML｜", "<｜DSML｜tool_calls>", "<dsml:", "</dsml:", "<｜User", "｜>", "<think", "<<think>>",
          "<｜place▁holder▁no▁7｜>", "<｜deepseek_image｜>", "<|EOT|>", "<|place_holder_mm_span_0437|>",
          "<tool_result>", "\\n", "\\\\", "```python", "def f(x):", "    return x", "\t\tindent", "//", "/*", "*/",

@@ -32,4 +32,15 @@ if [ ! -f "$GLM_IDS" ] && [ -f "$GLM_MODEL/tokenizer.json" ]; then
   "$REF_PY" "$BOX_TREE/tools/box/mkids.py" --tokenizer "$GLM_MODEL/tokenizer.json" --src "$BOX_TREE" \
     --corpus "$BOX_DATA/code-corpus.txt" --out "$GLM_IDS" --bos -1 --prefix '[gMASK]<sop>'
 fi
+# Hy4 flash: transformers' hy_v4_flash PR in a venv over the pinned env's torch, and the corpus through Hy4's
+# tokenizer after its BOS.
+if [ ! -x "$HY4_PY" ]; then
+  /work/env/pyenv/bin/python3 -m venv --system-site-packages "$(dirname "$(dirname "$HY4_PY")")"
+  "$HY4_PY" -m pip install -q "transformers @ https://codeload.github.com/$HY4_TRANSFORMERS"
+fi
+if [ ! -f "$HY4_IDS" ] && [ -f "$HY4_MODEL/tokenizer.json" ]; then
+  mkdir -p "$(dirname "$HY4_IDS")"
+  "$REF_PY" "$BOX_TREE/tools/box/mkids.py" --tokenizer "$HY4_MODEL/tokenizer.json" --src "$BOX_TREE" \
+    --corpus "$BOX_DATA/code-corpus.txt" --out "$HY4_IDS" --bos 120000
+fi
 ls -la "$BOX_DATA"
