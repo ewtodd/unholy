@@ -76,6 +76,7 @@
 
 #include "engine/engine.hpp"
 #include "engine/glm5_resident.hpp"
+#include "engine/hy4_resident.hpp"
 #include "engine/plan.hpp"
 #include "engine/resident.hpp"
 #include "model/dsv4.hpp"
@@ -84,6 +85,7 @@
 #include "server/openai.hpp"
 #include "text/chat.hpp"
 #include "text/glm_chat.hpp"
+#include "text/hy4_chat.hpp"
 #include "text/tokenizer.hpp"
 
 #ifndef UNHOLY_DATA_DIR
@@ -104,7 +106,7 @@ int usage() {
                "                    [--spec-drafts N] [--spec-min-conf C] [--log-interval S]\n"
                "                    [--prefill-order shortest|fcfs] [--long-prefill-token-threshold N]\n"
                "                    [--long-prefill-token-threshold-adaptive 0|1] [--decode-split 0|1]\n"
-               "                    [--reclaim-scratch 0|1] [--exact 0|1]\n");
+               "                    [--reclaim-scratch 0|1] [--exact 0|1] [--engram DIR]\n");
   return 2;
 }
 
@@ -182,7 +184,7 @@ std::string engine_line(const engine::EngineStats& a, const engine::EngineStats&
 
 // Everything the command line sets.
 struct Options {
-  std::string model_dir, exl3_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
+  std::string model_dir, exl3_dir, engram_dir, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
   bool profile_set = false;  // --profile given (otherwise each family has its default)
   server::ServerConfig scfg;
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
@@ -440,6 +442,82 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
       eos);
 }
 
+// Hy4 flash, the FP8 release (docs/PLAN-hy4-flash.md): make_hy4_plan places the layers and experts, Hy4ResidentModel
+// runs them, text::hy4_chat_format(). The Engram pack (tools/ref/hy4_engram_pack.py) from --engram (default: the
+// model directory's sibling hy4-flash-engram). Prefix snapshots hold a slot's window rings (~18 MB). No drafter, no
+// vision yet.
+int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
+  const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
+  const auto c = model::Hy4Config::from_hf(ck->config());
+  o.spec_drafts = 0;
+  if (o.prefix_snapshots < 0) o.prefix_snapshots = 64;
+  if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_hy4_code4k.txt";
+  if (o.engram_dir.empty()) {
+    std::string m = o.model_dir;
+    while (m.size() > 1 && m.back() == '/') m.pop_back();
+    o.engram_dir = m.substr(0, m.find_last_of('/') + 1) + "hy4-flash-engram";
+  }
+  const int max_seq = (o.max_seq + model::kPageTokens - 1) / model::kPageTokens * model::kPageTokens;
+  model::CacheGeometry geo;
+  geo.max_slots = o.max_slots;
+  geo.max_pages_per_seq = max_seq / model::kPageTokens;
+  long long kv_tokens = o.kv_tokens;
+  if (kv_tokens <= 0) kv_tokens = o.num_pages > 0 ? (long long)(o.num_pages) * model::kPageTokens : 2LL * max_seq;
+  geo.num_pages = int((kv_tokens + model::kPageTokens - 1) / model::kPageTokens);
+
+  engine::Hy4PlanInput pin;
+  pin.cfg = &c;
+  pin.ck = ck.get();
+  pin.usage = engine::load_usage_profile(o.profile, c.n_layers, c.n_experts);
+  pin.geo = geo;
+  pin.max_tokens = o.max_batch;
+  pin.max_seq = max_seq;
+  pin.max_logit_rows = std::max(o.max_slots, 8);
+  pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
+  pin.snapshots = o.prefix_snapshots;
+  if (plan_only) {
+    std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
+                "tokens; Hy4 flash FP8\n",
+                (long long)(geo.num_pages) * model::kPageTokens, geo.num_pages, max_seq, o.max_slots, o.max_batch);
+    try {
+      std::printf("%s", engine::make_hy4_plan(pin).summary().c_str());
+    } catch (const std::exception& e) {
+      std::printf("does not fit: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
+  const auto plan = engine::make_hy4_plan(pin);
+  std::printf("%s", plan.summary().c_str());
+  if (plan.snapshots < o.prefix_snapshots)
+    std::printf("prefix snapshots: %d of %d fit beside the APU's experts\n", plan.snapshots, o.prefix_snapshots);
+  std::printf("engram pack: %s\n", o.engram_dir.c_str());
+  std::fflush(stdout);
+  const auto t0 = std::chrono::steady_clock::now();
+  engine::Hy4ResidentModel model(c, *ck, o.engram_dir, plan, geo, o.max_batch, max_seq, pin.max_logit_rows,
+                                 plan.snapshots);
+  std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+              (long long)(geo.num_pages) * model::kPageTokens, max_seq, o.max_slots);
+  std::vector<int32_t> eos;
+  const int32_t end = tok.token_id("<｜hy_end:opensource｜>");
+  if (end < 0) throw std::runtime_error("Hy4 tokenizer: no <｜hy_end:opensource｜>");
+  eos.push_back(end);
+  if (c.eos != end) eos.push_back(c.eos);
+  return run_server(
+      model, tok, text::hy4_chat_format(), o, max_seq, sigs,
+      [&](server::ServerConfig& scfg) {
+        scfg.extra_get.emplace_back("/unholy/routing_profile",
+                                    [&model] { return engine::format_usage_profile(model.routing_histogram()); });
+        scfg.extra_get.emplace_back("/unholy/routing_share", [&model] { return model.routing_share(); });
+        scfg.extra_post.emplace_back("/unholy/routing_profile/reset", [&model] {
+          model.reset_routing_histogram();
+          return std::string("ok\n");
+        });
+      },
+      eos);
+}
+
 int serve(int argc, char** argv, bool plan_only) {
   Options o;
   for (int i = 2; i < argc; ++i) {
@@ -448,6 +526,7 @@ int serve(int argc, char** argv, bool plan_only) {
     const std::string v = argv[++i];
     if (a == "--model") o.model_dir = v;
     else if (a == "--exl3") o.exl3_dir = v;
+    else if (a == "--engram") o.engram_dir = v;
     else if (a == "--profile") o.profile = v, o.profile_set = true;
     else if (a == "--host") o.scfg.host = v;
     else if (a == "--port") o.scfg.port = std::stoi(v);
@@ -511,6 +590,8 @@ int serve(int argc, char** argv, bool plan_only) {
       return serve_dsv4(o, std::move(ck), plan_only, sigs);
     case model::Family::Glm5Next:
       return serve_glm5(o, std::move(ck), plan_only, sigs);
+    case model::Family::Hy4Flash:
+      return serve_hy4(o, std::move(ck), plan_only, sigs);
   }
   return 1;
 }

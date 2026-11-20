@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "kernels/exl3_moe.hpp"
+#include "kernels/moe_dispatch.hpp"
 
 namespace unholy::kernels {
 
@@ -114,6 +115,10 @@ void hy4_scale_rows(bf16* y, const float* w, int rows, int dim, hipStream_t st, 
 // accumulation. remote null: every pair is local.
 void hy4_moe_sum(const bf16* pair_out, const int32_t* pidx, const int* remote0, const int32_t* tok2u,
                  const float* remote, bf16* out, int T, int K, int dim, hipStream_t st);
+// The remote side's pair rows from its compact token rows: xa[p] = in[p2u[p]] for p in [plan->remote0, plan->P)
+// (grid sized for max_rows).
+void hy4_gather_remote(const bf16* in, const int32_t* p2u, const MoePlan* plan, bf16* xa, int dim, int max_rows,
+                       hipStream_t st);
 // out = bf16(a + b) elementwise.
 void hy4_add(const bf16* a, const bf16* b, bf16* out, size_t n, hipStream_t st);
 // out[r][c] = bf16(x[r][c] + bias[c]) from an fp32 GEMM result.

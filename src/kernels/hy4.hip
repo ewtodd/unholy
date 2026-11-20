@@ -591,6 +591,15 @@ __global__ void moe_sum_kernel(const bf16* pair_out, const int32_t* pidx, const 
   }
 }
 
+__global__ void gather_remote_kernel(const bf16* in, const int32_t* p2u, const MoePlan* plan, bf16* xa, int dim) {
+  const int r0 = plan->remote0, P = plan->P, v = dim / 8;
+  const size_t n = size_t(max(0, P - r0)) * v;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    const size_t p = r0 + i / v, c = i % v;
+    reinterpret_cast<uint4*>(xa + p * dim)[c] = reinterpret_cast<const uint4*>(in + size_t(p2u[p]) * dim)[c];
+  }
+}
+
 __global__ void add_kernel(const bf16* a, const bf16* b, bf16* out, size_t n) {
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
     out[i] = f32_to_bf16(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
@@ -845,6 +854,14 @@ void hy4_moe_sum(const bf16* pair_out, const int32_t* pidx, const int* remote0, 
                  const float* remote, bf16* out, int T, int K, int dim, hipStream_t st) {
   if (T <= 0) return;
   moe_sum_kernel<<<grid1d(size_t(T) * dim), 256, 0, st>>>(pair_out, pidx, remote0, tok2u, remote, out, T, K, dim);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_gather_remote(const bf16* in, const int32_t* p2u, const MoePlan* plan, bf16* xa, int dim, int max_rows,
+                       hipStream_t st) {
+  if (max_rows <= 0) return;
+  if (dim % 8) throw std::runtime_error("hy4_gather_remote: dim % 8");
+  gather_remote_kernel<<<grid1d(size_t(max_rows) * (dim / 8)), 256, 0, st>>>(in, p2u, plan, xa, dim);
   UH_CHECK_LAUNCH();
 }
 

@@ -8,6 +8,7 @@ namespace unholy::model {
 enum class Family {
   Dsv4,      // DeepSeek-V4-Flash (and -Vision-Exp): model_type deepseek_v4
   Glm5Next,  // GLM-5.3-Flash: model_type glm5_next
+  Hy4Flash,  // Hy4 flash: model_type hy_v4_flash
 };
 
 // Throws for a model_type no family covers.

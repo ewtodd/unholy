@@ -13,6 +13,8 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <exception>
+#include <mutex>
 #include <thread>
 
 #include "kernels/glm_fast.hpp"
@@ -476,44 +478,65 @@ Hy4Engram::~Hy4Engram() {
   }
 }
 
-void Hy4Engram::lookup(int mi, const int32_t* ngram, const uint8_t* mask, int T, uint8_t* q, uint16_t* s) const {
-  const Mem& m = mem_.at(size_t(mi));
+void Hy4Engram::fill(int mi, const int32_t* ngram, const uint8_t* mask, int t, uint8_t* q, uint16_t* s) const {
+  const Mem& m = mem_[size_t(mi)];
   const int64_t size = int64_t(m.lookup.size());
-  const auto comp = [&](int32_t t) -> int64_t {
-    if (t < 0 || t >= size) return m.lookup[size_t(pad_)];
-    return m.lookup[size_t(t)];
+  const auto comp = [&](int32_t tok) -> int64_t {
+    if (tok < 0 || tok >= size) return m.lookup[size_t(pad_)];
+    return m.lookup[size_t(tok)];
   };
-  const auto work = [&](int t0, int t1) {
-    for (int t = t0; t < t1; ++t) {
-      uint8_t* qt = q + size_t(t) * 16 * 96;
-      uint16_t* stt = s + size_t(t) * 16;
-      if (!mask[t]) {
-        std::memset(qt, 0, 16 * 96);
-        std::memset(stt, 0, 16 * 2);
-        continue;
-      }
-      int64_t mixed[3];
-      for (int j = 0; j < 3; ++j) mixed[j] = comp(ngram[size_t(t) * 3 + j]) * m.mult[size_t(j)];
-      for (int h = 0; h < 16; ++h) {
-        const int64_t mix = h < 8 ? (mixed[0] ^ mixed[1]) : (mixed[0] ^ mixed[1] ^ mixed[2]);
-        int64_t r = mix % m.moduli[size_t(h)];
-        if (r < 0) r += m.moduli[size_t(h)];  // torch's % (remainder): the divisor's sign
-        const int64_t row = r + m.offsets[size_t(h)];
-        if (::pread(m.qfd, qt + h * 96, 96, off_t(row) * 96) != 96 ||
-            ::pread(m.sfd, stt + h, 2, off_t(row) * 2) != 2)
-          throw std::runtime_error("engram: short read");
-      }
-    }
-  };
-  const int nth = T >= 256 ? 16 : 1;
-  if (nth == 1) {
-    work(0, T);
+  uint8_t* qt = q + size_t(t) * 16 * 96;
+  uint16_t* stt = s + size_t(t) * 16;
+  if (!mask[t]) {
+    std::memset(qt, 0, 16 * 96);
+    std::memset(stt, 0, 16 * 2);
     return;
   }
-  std::vector<std::thread> th;
-  const int per = (T + nth - 1) / nth;
-  for (int i = 0; i < nth; ++i) th.emplace_back(work, std::min(T, i * per), std::min(T, (i + 1) * per));
-  for (auto& x : th) x.join();
+  int64_t mixed[3];
+  for (int j = 0; j < 3; ++j) mixed[j] = comp(ngram[size_t(t) * 3 + j]) * m.mult[size_t(j)];
+  for (int h = 0; h < 16; ++h) {
+    const int64_t mix = h < 8 ? (mixed[0] ^ mixed[1]) : (mixed[0] ^ mixed[1] ^ mixed[2]);
+    int64_t r = mix % m.moduli[size_t(h)];
+    if (r < 0) r += m.moduli[size_t(h)];  // torch's % (remainder): the divisor's sign
+    const int64_t row = r + m.offsets[size_t(h)];
+    if (::pread(m.qfd, qt + h * 96, 96, off_t(row) * 96) != 96 || ::pread(m.sfd, stt + h, 2, off_t(row) * 2) != 2)
+      throw std::runtime_error("engram: short read");
+  }
+}
+
+void Hy4Engram::lookup(int mi, const int32_t* ngram, const uint8_t* mask, int T, uint8_t* q, uint16_t* s) const {
+  uint8_t* const qs[1] = {q};
+  uint16_t* const ss[1] = {s};
+  (void)qs, (void)ss;
+  if (mi < 0 || mi >= memories()) throw std::runtime_error("engram: no such memory");
+  for (int t = 0; t < T; ++t) fill(mi, ngram, mask, t, q, s);
+}
+
+// (memory, row) jobs over up to 32 threads: a decode step's 64 random reads do not queue behind each other.
+void Hy4Engram::lookup_all(const int32_t* ngram, const uint8_t* mask, int T, uint8_t* const* q,
+                           uint16_t* const* s) const {
+  const int M = memories(), jobs = M * T;
+  if (jobs <= 0) return;
+  const int nth = std::clamp(jobs / 2, 1, 32);
+  std::exception_ptr err;
+  std::mutex mu;
+  const auto work = [&](int i0) {
+    try {
+      for (int i = i0; i < jobs; i += nth) fill(i % M, ngram, mask, i / M, q[i % M], s[i % M]);
+    } catch (...) {
+      std::lock_guard lk(mu);
+      if (!err) err = std::current_exception();
+    }
+  };
+  if (nth == 1) {
+    work(0);
+  } else {
+    std::vector<std::thread> th;
+    th.reserve(size_t(nth));
+    for (int i = 0; i < nth; ++i) th.emplace_back(work, i);
+    for (auto& x : th) x.join();
+  }
+  if (err) std::rethrow_exception(err);
 }
 
 // ---------------------------------------------------------------------------------------------------

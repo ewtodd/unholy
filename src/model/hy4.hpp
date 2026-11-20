@@ -139,9 +139,12 @@ class Hy4Engram {
   // Rows of memory m for T positions whose n-gram tokens are ngram [T][3] (the token, the one before, the one before
   // that; the pad id before a sequence's start): q [T][16][96], s [T][16]. Positions with mask 0 get zeros.
   void lookup(int m, const int32_t* ngram, const uint8_t* mask, int T, uint8_t* q, uint16_t* s) const;
+  // Every memory's rows at once (q[m], s[m] as lookup's), the reads spread over threads.
+  void lookup_all(const int32_t* ngram, const uint8_t* mask, int T, uint8_t* const* q, uint16_t* const* s) const;
   int memories() const { return int(mem_.size()); }
 
  private:
+  void fill(int m, const int32_t* ngram, const uint8_t* mask, int t, uint8_t* q, uint16_t* s) const;
   struct Mem {
     int layer = 0, qfd = -1, sfd = -1;
     std::vector<int32_t> lookup;
@@ -180,14 +183,14 @@ struct Hy4Batch {
 };
 
 enum Hy4Buf : int {
-  kH, kHn, kPost, kOut,                                                   // layer
-  kQr, kQ, kQn, kQa, kQp, kKv, kOl, kO, kG,                               // attention
-  kTk, kIq, kIw, kIScores, kIGroups, kISel, kITopk,                       // indexer
-  kLogits, kSel, kRw, kLat, kEIdx, kEWt, kRowExpert, kPidx, kTok2u,       // MoE
-  kExpIn, kGu, kEh, kPout, kMsum, kRouted, kShared, kShG, kShU, kShH,
-  kMoeCount, kMoeOff, kMoeFill, kMoePlan, kMoeLTiles, kMoeRTiles, kRouteHist,
-  kMlpG, kMlpU, kMlpH,                                                    // dense MLP
-  kEngRows, kEngKv,                                                       // Engram
+  kBufH, kBufHn, kBufPost, kBufOut,                                                          // layer
+  kBufQr, kBufQ, kBufQn, kBufQa, kBufQp, kBufKv, kBufOl, kBufO, kBufG,                       // attention
+  kBufTk, kBufIq, kBufIw, kBufIScores, kBufIGroups, kBufISel, kBufITopk,                     // indexer
+  kBufLogits, kBufSel, kBufRw, kBufLat, kBufEIdx, kBufEWt, kBufRowExpert, kBufPidx, kBufTok2u,  // MoE
+  kBufExpIn, kBufGu, kBufEh, kBufPout, kBufMsum, kBufRouted, kBufShared, kBufShG, kBufShU, kBufShH,
+  kBufMoeCount, kBufMoeOff, kBufMoeFill, kBufMoePlan, kBufMoeLTiles, kBufMoeRTiles, kBufRouteHist,
+  kBufMlpG, kBufMlpU, kBufMlpH,                                                              // dense MLP
+  kBufEngRows, kBufEngKv,                                                                    // Engram
   kHy4ScratchBufs
 };
 constexpr int kHy4IdxBlock = 64;  // queries per index-score pass
