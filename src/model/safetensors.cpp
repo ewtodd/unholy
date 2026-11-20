@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -128,6 +129,119 @@ void Checkpoint::add_shard(const std::string& path) {
     if (t.offset + t.nbytes > size) throw std::runtime_error(path + ": " + name + " out of bounds");
     if (t.dtype != DType::Unknown && uint64_t(t.numel()) * dtype_size(t.dtype) != t.nbytes)
       throw std::runtime_error(path + ": " + name + " size mismatch");
+    tensors_.push_back(std::move(t));
+  }
+}
+
+std::unique_ptr<Checkpoint> Checkpoint::open_gguf(const std::vector<std::string>& paths) {
+  std::unique_ptr<Checkpoint> ck(new Checkpoint());
+  ck->dir_ = paths.empty() ? std::string() : fs::path(paths[0]).parent_path().string();
+  for (const auto& p : paths) ck->add_gguf(p);
+  ck->by_name_.reserve(ck->tensors_.size());
+  for (size_t i = 0; i < ck->tensors_.size(); ++i) ck->by_name_.emplace(ck->tensors_[i].name, i);
+  return ck;
+}
+
+void Checkpoint::add_gguf(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) throw std::runtime_error("open " + path + ": " + std::strerror(errno));
+  struct stat st{};
+  if (fstat(fd, &st) != 0) throw std::runtime_error("stat " + path);
+  const size_t size = size_t(st.st_size);
+  void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+  if (base == MAP_FAILED) throw std::runtime_error("mmap " + path + ": " + std::strerror(errno));
+  const int file_idx = int(maps_.size());
+  maps_.push_back({fd, base, size});
+  shard_paths_.push_back(path);
+  const auto* b = static_cast<const uint8_t*>(base);
+  size_t pos = 0;
+  const auto need = [&](size_t n) {
+    if (pos + n > size) throw std::runtime_error(path + ": truncated GGUF header");
+  };
+  const auto u32 = [&] {
+    need(4);
+    uint32_t v;
+    std::memcpy(&v, b + pos, 4);
+    pos += 4;
+    return v;
+  };
+  const auto u64 = [&] {
+    need(8);
+    uint64_t v;
+    std::memcpy(&v, b + pos, 8);
+    pos += 8;
+    return v;
+  };
+  const auto str = [&] {
+    const uint64_t n = u64();
+    need(n);
+    std::string s(reinterpret_cast<const char*>(b + pos), size_t(n));
+    pos += n;
+    return s;
+  };
+  if (u32() != 0x46554747u) throw std::runtime_error(path + ": not a GGUF file");
+  (void)u32();  // version
+  const uint64_t nt = u64(), nkv = u64();
+  uint64_t align = 32;
+  // Skips a value of GGUF type t (keeps general.alignment).
+  const std::function<void(uint32_t, bool)> skip = [&](uint32_t t, bool is_align) {
+    static const size_t sz[13] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    if (t == 8) {
+      (void)str();
+    } else if (t == 9) {
+      const uint32_t et = u32();
+      const uint64_t n = u64();
+      for (uint64_t i = 0; i < n; ++i) skip(et, false);
+    } else if (t < 13) {
+      need(sz[t]);
+      if (is_align && t == 4) {
+        uint32_t v;
+        std::memcpy(&v, b + pos, 4);
+        align = v;
+      }
+      pos += sz[t];
+    } else {
+      throw std::runtime_error(path + ": unknown GGUF value type");
+    }
+  };
+  for (uint64_t i = 0; i < nkv; ++i) {
+    const std::string k = str();
+    skip(u32(), k == "general.alignment");
+  }
+  struct Raw {
+    std::string name;
+    std::vector<int64_t> shape;
+    uint32_t type;
+    uint64_t off;
+  };
+  std::vector<Raw> raw;
+  for (uint64_t i = 0; i < nt; ++i) {
+    Raw r;
+    r.name = str();
+    const uint32_t nd = u32();
+    std::vector<int64_t> dims(nd);
+    for (auto& d : dims) d = int64_t(u64());
+    r.shape.assign(dims.rbegin(), dims.rend());
+    r.type = u32();
+    r.off = u64();
+    raw.push_back(std::move(r));
+  }
+  const uint64_t data = (pos + align - 1) / align * align;
+  std::vector<uint64_t> offs;
+  for (const auto& r : raw) offs.push_back(r.off);
+  std::sort(offs.begin(), offs.end());
+  for (auto& r : raw) {
+    const auto it = std::upper_bound(offs.begin(), offs.end(), r.off);
+    const uint64_t end = it == offs.end() ? size - data : *it;
+    TensorInfo t;
+    t.name = std::move(r.name);
+    t.dtype = DType::U8;
+    t.shape = std::move(r.shape);
+    t.gguf_type = int(r.type);
+    t.file = file_idx;
+    t.offset = data + r.off;
+    t.nbytes = end - r.off;
+    if (t.offset + t.nbytes > size) throw std::runtime_error(path + ": " + t.name + " out of bounds");
     tensors_.push_back(std::move(t));
   }
 }

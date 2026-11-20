@@ -4,7 +4,10 @@
 // compared with the oracle's logits by KL divergence and top-1 agreement.
 //
 //   unholy-hy4-ref --oracle DIR [--ckpt FP8_DIR] [--engram DIR] [--chunk C] [--device D] [--isolate] [--layers N]
-//                  [--dump DIR] [--out logits.bin]
+//                  [--dump DIR] [--out logits.bin] [--mxfp4]
+//
+// --mxfp4 converts the routed experts to MXFP4 at load (model::Hy4LoadOptions::mxfp4); --experts-gguf FILE takes them
+// in NVFP4 from a GGUF build (AngelSlim's SPARK-4Bit).
 //
 // --isolate starts every layer from the oracle's input to it, so each layer's own error shows.
 #include <hip/hip_runtime.h>
@@ -84,10 +87,10 @@ T* host_mapped(size_t n) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string ckpt = "/scratch/models/hy4-flash-fp8", engram_dir = "/scratch/models/hy4-flash-engram", oracle,
+  std::string ckpt = "/scratch/models/hy4-flash-fp8", engram_dir = "/scratch/models/hy4-flash-engram", oracle, experts_gguf,
               out_path, dump_dir;
   int chunk = 0, dev = 0, n_layers = -1;
-  bool isolate = false;
+  bool isolate = false, mxfp4 = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() { return std::string(argv[++i]); };
@@ -98,6 +101,8 @@ int main(int argc, char** argv) {
     else if (a == "--device") dev = std::stoi(next());
     else if (a == "--layers") n_layers = std::stoi(next());
     else if (a == "--isolate") isolate = true;
+    else if (a == "--mxfp4") mxfp4 = true;
+    else if (a == "--experts-gguf") experts_gguf = next();
     else if (a == "--dump") dump_dir = next();
     else if (a == "--out") out_path = next();
     else {
@@ -110,6 +115,8 @@ int main(int argc, char** argv) {
   }
   try {
     auto ck = model::Checkpoint::open(ckpt);
+    std::unique_ptr<model::Checkpoint> gk;
+    if (!experts_gguf.empty()) gk = model::Checkpoint::open_gguf({experts_gguf});
     const auto c = model::Hy4Config::from_hf(ck->config());
     model::Hy4Engram eng(engram_dir, c);
     const auto meta = gufo::json::parse(read_text(oracle + "/meta.json"));
@@ -176,7 +183,10 @@ int main(int argc, char** argv) {
         UH_CHECK(hipMemcpy(x.data(), ref.data(), ref.size() * 2, hipMemcpyHostToDevice));
       }
       const auto tl = std::chrono::steady_clock::now();
-      auto w = model::load_hy4_layer(*ck, c, L, dev, st);
+      model::Hy4LoadOptions lo;
+      lo.mxfp4 = mxfp4;
+      lo.experts_gguf = gk.get();
+      auto w = model::load_hy4_layer(*ck, c, L, dev, st, lo);
       auto cache = model::make_hy4_cache(c, L, 1, pps, dev, st);
       auto run = [&](int s0, int n) {
         model::Hy4Batch b;

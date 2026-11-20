@@ -11,6 +11,7 @@
 #include "kernels/glm_fast.hpp"
 #include "kernels/hy4.hpp"
 #include "kernels/moe_dispatch.hpp"
+#include "kernels/mx_moe.hpp"
 #include "kernels/ref.hpp"
 #include "kernels/ref_glm.hpp"
 #include "model/hy4.hpp"
@@ -28,8 +29,39 @@ bool gemv_ok(const Hy4Linear& l, int rows) {
   return rows <= k::kGemvRowsCap && (l.in % 512 == 0 || (l.in < 512 && l.in % 64 == 0)) && l.out % 16 == 0;
 }
 
+// The current forward's dense tile lists (one matrix, the batch's rows): 8-row tiles for the GEMV, 64-row ones for the
+// GEMM; set by set_dense_tiles once per layer forward (every linear of a layer has the batch's rows).
+struct DenseTiles {
+  const k::Exl3Tile* t8 = nullptr;
+  const k::Exl3Tile* t64 = nullptr;
+  int rows = 0;
+};
+DenseTiles g_tiles;
+
+void set_dense_tiles(const Hy4Scratch& s, int rows, hipStream_t st) {
+  auto* t = s.at<k::Exl3Tile>(kBufDenseTiles);
+  const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
+  k::hy4_dense_tiles(t, rows, k::kHy4GemvRows, st);
+  k::hy4_dense_tiles(t + n8, rows, k::kHy4TileRows, st);
+  g_tiles = {t, t + n8, rows};
+}
+
 void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int rows, hipStream_t st) {
   if (rows <= 0) return;
+  if (l.fp8()) {
+    if (rows != g_tiles.rows) throw std::runtime_error("hy4: fp8 linear outside its forward's rows");
+    const auto* tw = l.tab.as<const uint8_t* const>();
+    const auto* ts = reinterpret_cast<const uint16_t* const*>(tw + 1);
+    if (rows <= kHy4GemvTokens) {
+      k::hy4_fp8_grouped_gemv(x, ldx, l.in, g_tiles.t8, (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows, tw, ts, out,
+                              ldo, l.out, st);
+    } else {
+      if (ldx != l.in) throw std::runtime_error("hy4: fp8 GEMM rows must be packed");
+      k::hy4_fp8_grouped_gemm(x, l.in, g_tiles.t64, (rows + k::kHy4TileRows - 1) / k::kHy4TileRows, tw, ts, out, ldo,
+                              l.out, st);
+    }
+    return;
+  }
   if (gemv_ok(l, rows)) k::gemv_bf16(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
   else k::gemm_bf16_wmma(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
 }
@@ -145,7 +177,7 @@ void dense_mlp(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s
   norm(out, D, w.post_mlp_norm, T, D, c.eps, st);
 }
 
-int cap_tiles(const Hy4Config& c, int T) { return T * c.n_active / k::kHy4TileRows + c.n_experts + 1; }
+int cap_tiles(const Hy4Config& c, int T, int tile_rows) { return T * c.n_active / tile_rows + c.n_experts + 1; }
 
 void moe(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, const bf16* hn, bf16* out, int T,
          hipStream_t st, RemoteExperts* remote) {
@@ -156,9 +188,10 @@ void moe(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, cons
   int32_t* sel = s.at<int32_t>(kBufSel);
   float* rw = s.at<float>(kBufRw);
   linear_f32(w.router, hn, D, logits, E, T, st);
-  k::glm_route(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
   bf16* lat = s.at<bf16>(kBufLat);
   linear(w.pre_expert, hn, D, lat, Lt, T, st);
+  const bool small = T <= k::kMoeSmallMaxTokens;  // the routing and the bookkeeping in one block (moe_dispatch_small)
+  if (!small) k::glm_route(logits, w.router_bias.p<float>(), sel, rw, T, E, K, c.route_scale, st);
 
   auto* plan = s.at<k::MoePlan>(kBufMoePlan);
   auto* lt = s.at<k::Exl3Tile>(kBufMoeLTiles);
@@ -170,19 +203,39 @@ void moe(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, cons
   int32_t* tok2u = s.at<int32_t>(kBufTok2u);
   int32_t* u2t = tok2u + T;
   uint32_t* hist = s.at<uint32_t>(kBufRouteHist) + size_t(w.layer) * E;  // the running routing histogram
-  const int ct = cap_tiles(c, T);
+  const int tile_rows = hy4_expert_tile_rows(w.mx, T);
+  const int ct = cap_tiles(c, T, tile_rows);
   if (any_remote && (size_t(P) > remote->capacity_rows || ct > remote->max_tiles))
     throw std::runtime_error("hy4: remote staging too small");
-  k::moe_count(sel, T, K, s.at<int32_t>(kBufMoeCount), E, st, hist);
-  k::moe_plan(s.at<int32_t>(kBufMoeCount), w.resident.as<uint8_t>(), E, P, plan, lt, rtl, s.at<int32_t>(kBufMoeOff),
-              s.at<int32_t>(kBufMoeFill), ct, st, k::kHy4TileRows);
-  k::moe_scatter(sel, rw, T, K, s.at<int32_t>(kBufMoeOff), s.at<int32_t>(kBufMoeFill), eidx, ewt, row_expert, pidx, st);
-  if (any_remote) {  // the remote tokens' latent rows to the APU, which starts once the card stream gets here
-    k::remote_tokens(pidx, eidx, T, K, plan, tok2u, u2t, remote->p2u_host, remote->u2p_host, st);
-    k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host, remote->e_host,
-                    P, st);
-    k::copy_remote_tokens(lat, Lt, u2t, plan, remote->in_host, T, st);
-    remote->enqueue(w.layer, st, P);
+  if (small) {
+    k::MoeSmallArgs ma{sel, rw, T, K, hist, w.resident.as<uint8_t>(), E, P, ct, tile_rows, plan, lt, rtl, eidx, ewt,
+                       row_expert, pidx, any_remote, any_remote, tok2u, u2t,
+                       any_remote ? remote->p2u_host : nullptr, any_remote ? remote->u2p_host : nullptr,
+                       any_remote ? remote->plan_host : nullptr, any_remote ? remote->tiles_host : nullptr,
+                       any_remote ? remote->w_host : nullptr, any_remote ? remote->e_host : nullptr};
+    ma.route_logits = logits;
+    ma.route_bias = w.router_bias.p<float>();
+    ma.route_scale = c.route_scale;
+    if (any_remote) {
+      ma.x = lat;
+      ma.dim = Lt;
+      ma.x_dst = remote->in_host;
+    }
+    k::moe_dispatch_small(ma, st);
+    if (any_remote) remote->enqueue(w.layer, st, P);
+  } else {
+    k::moe_count(sel, T, K, s.at<int32_t>(kBufMoeCount), E, st, hist);
+    k::moe_plan(s.at<int32_t>(kBufMoeCount), w.resident.as<uint8_t>(), E, P, plan, lt, rtl, s.at<int32_t>(kBufMoeOff),
+                s.at<int32_t>(kBufMoeFill), ct, st, tile_rows);
+    k::moe_scatter(sel, rw, T, K, s.at<int32_t>(kBufMoeOff), s.at<int32_t>(kBufMoeFill), eidx, ewt, row_expert, pidx,
+                   st);
+    if (any_remote) {  // the remote tokens' latent rows to the APU, which starts once the card stream gets here
+      k::remote_tokens(pidx, eidx, T, K, plan, tok2u, u2t, remote->p2u_host, remote->u2p_host, st);
+      k::stage_remote(plan, rtl, ewt, row_expert, remote->plan_host, remote->tiles_host, remote->w_host,
+                      remote->e_host, P, st);
+      k::copy_remote_tokens(lat, Lt, u2t, plan, remote->in_host, T, st);
+      remote->enqueue(w.layer, st, P);
+    }
   }
   bf16* pin = s.at<bf16>(kBufExpIn);
   bf16* pout = s.at<bf16>(kBufPout);
@@ -238,6 +291,53 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
                      uint16_t* eh, uint16_t* out, hipStream_t st, const int* row0_dev, const int* row1_dev) {
   const int E = c.n_experts, I = c.moe_inter, Lt = c.latent;
   max_tiles = std::min(max_tiles, P);
+  if (w.nv) {  // NVFP4: gate, up, the clamped SwiGLU, down (8-row tiles and the GEMVs for decode-sized steps)
+    const bool gemv = P / c.n_active <= kHy4GemvTokens;
+    uint16_t* g = gu;
+    uint16_t* u = gu + size_t(P) * I;
+    const auto lin = [&](const uint16_t* x, int K, int m3, uint16_t* y, int N) {
+      if (gemv)
+        k::hy4_nvfp4_grouped_gemv(x, K, K, tiles, max_tiles, w.mx_tab(m3, 0, E), w.mx_tab(m3, 1, E), y, N, N, st,
+                                  ntiles_dev);
+      else
+        k::hy4_nvfp4_grouped_gemm(x, K, tiles, max_tiles, w.mx_tab(m3, 0, E), w.mx_tab(m3, 1, E), y, N, N, st,
+                                  ntiles_dev);
+    };
+    lin(xa, Lt, 0, g, I);
+    lin(xa, Lt, 1, u, I);
+    k::hy4_swiglu_clamp2(g, u, eh, P, I, c.swiglu_limit, st);
+    lin(eh, I, 2, out, Lt);
+    k::hy4_scale_rows(out, rw, P, Lt, st, row0_dev, row1_dev);
+    return;
+  }
+  if (!w.mx && P / c.n_active <= kHy4GemvTokens) {  // decode-sized: the fp8 GEMVs on 8-row tiles
+    k::hy4_fp8_grouped_gemv(xa, Lt, Lt, tiles, max_tiles, w.gu_w(), w.gu_s(E), gu, 2 * I, 2 * I, st, ntiles_dev);
+    k::hy4_swiglu_clamp(gu, eh, P, I, c.swiglu_limit, st);
+    k::hy4_fp8_grouped_gemv(eh, I, I, tiles, max_tiles, w.dn_w(E), w.dn_s(E), out, Lt, Lt, st, ntiles_dev);
+    k::hy4_scale_rows(out, rw, P, Lt, st, row0_dev, row1_dev);
+    return;
+  }
+  if (w.mx) {  // the mx_moe kernels on bf16 rows (no activation quantization), gate and up in one launch
+    const bool gemv = k::mx_use_gemv(P / c.n_active);
+    const int rows = std::min(P / c.n_active, k::kExl3TileRows);
+    uint16_t* g = gu;
+    uint16_t* u = gu + size_t(P) * I;
+    if (gemv) {
+      k::mx_grouped_gemv(xa, Lt, tiles, max_tiles, w.mx_tab(0, 0, E), w.mx_tab(0, 1, E), g, I, I, st, ntiles_dev,
+                         w.mx_tab(1, 0, E), w.mx_tab(1, 1, E), u, rows);
+      k::hy4_swiglu_clamp2(g, u, eh, P, I, c.swiglu_limit, st);
+      k::mx_grouped_gemv(eh, I, tiles, max_tiles, w.mx_tab(2, 0, E), w.mx_tab(2, 1, E), out, Lt, Lt, st, ntiles_dev,
+                         nullptr, nullptr, nullptr, rows);
+    } else {
+      k::mx_grouped_gemm(xa, Lt, tiles, max_tiles, w.mx_tab(0, 0, E), w.mx_tab(0, 1, E), g, I, I, st, ntiles_dev,
+                         w.mx_tab(1, 0, E), w.mx_tab(1, 1, E), u, rows);
+      k::hy4_swiglu_clamp2(g, u, eh, P, I, c.swiglu_limit, st);
+      k::mx_grouped_gemm(eh, I, tiles, max_tiles, w.mx_tab(2, 0, E), w.mx_tab(2, 1, E), out, Lt, Lt, st, ntiles_dev,
+                         nullptr, nullptr, nullptr, rows);
+    }
+    k::hy4_scale_rows(out, rw, P, Lt, st, row0_dev, row1_dev);
+    return;
+  }
   k::hy4_fp8_grouped_gemm(xa, Lt, tiles, max_tiles, w.gu_w(), w.gu_s(E), gu, 2 * I, 2 * I, st, ntiles_dev);
   k::hy4_swiglu_clamp(gu, eh, P, I, c.swiglu_limit, st);
   k::hy4_fp8_grouped_gemm(eh, I, tiles, max_tiles, w.dn_w(E), w.dn_s(E), out, Lt, Lt, st, ntiles_dev);
@@ -253,6 +353,7 @@ void hy4_layer_forward(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& c
   bf16* hn = s.at<bf16>(kBufHn);
   bf16* out = s.at<bf16>(kBufOut);
   float* post = s.at<float>(kBufPost);
+  set_dense_tiles(s, T, st);
   if (w.engram >= 0) engram(c, w, s, x, b, st);
   // UNHOLY_HY4_ENGRAM_ONLY (debugging, tools/ref/hy4_oracle/engram_check.py): the layer stops after the Engram add.
   static const bool engram_only = std::getenv("UNHOLY_HY4_ENGRAM_ONLY") != nullptr;

@@ -132,6 +132,35 @@ void hy4_fp8_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntil
                           const bf16* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                           const int* ntiles_dev = nullptr);
 
+// MXFP4 experts from the release's e4m3: rows [row0, row0 + N) of w ([*][K] e4m3, bf16 128x128 scales with kb = K / 128
+// columns) as their bf16(w * s) values, quantized per 32 inputs: the e8m0 scale 2^e with e = ceil(log2(amax / 6)) or
+// one below (the lower squared error), values rounded to nearest-even on the e2m1 grid (clamped to +-6). codes
+// [N][K / 2] (low nibble first), scales [N][K / 32]: the checkpoint layout mx_repack expects.
+void hy4_fp8_to_mxfp4(const uint8_t* w, const bf16* s, int kb, int row0, int N, int K, uint8_t* codes, uint8_t* scales,
+                      hipStream_t st);
+// h = bf16(bf16(silu(min(g, lim))) * clamp(u, +-lim)) from separate gate / up rows [rows][I].
+void hy4_swiglu_clamp2(const bf16* g, const bf16* u, bf16* h, int rows, int I, float limit, hipStream_t st);
+
+// The same products for tiles of <= kHy4GemvRows rows (decode): a wave per 4 output columns, K split over its lanes in
+// 16-input chunks (K % 512 == 0); each weight dequantized to bf16(w * s) as above, fp32 sums. ldi: the rows' stride.
+constexpr int kHy4GemvRows = 8;
+void hy4_fp8_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
+                          const uint8_t* const* w_tab, const bf16* const* s_tab, bf16* out, int ldo, int N,
+                          hipStream_t st, const int* ntiles_dev = nullptr);
+// The same GEMM / GEMV for NVFP4 experts (ggml's NVFP4 as AngelSlim's SPARK-4Bit GGUF has them: e2m1 values with an
+// unsigned-e4m3 scale per 16 inputs, value = e2m1 * scale, exact in bf16): codes [N][K / 2] (in each group of 16, byte j
+// holds values j and j + 8), scales [N][K / 16] (hy4_nvfp4_split from the GGUF blocks).
+void hy4_nvfp4_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
+                            const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
+                            const int* ntiles_dev = nullptr);
+void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
+                            const uint8_t* const* w_tab, const uint8_t* const* s_tab, bf16* out, int ldo, int N,
+                            hipStream_t st, const int* ntiles_dev = nullptr);
+// GGUF NVFP4 blocks of an [N][K] matrix -> codes [N][K / 2], scales [N][K / 16].
+void hy4_nvfp4_split(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales, hipStream_t st);
+// Tiles of one matrix (expert 0) over `rows` rows: ceil(rows / tile_rows) tiles of <= tile_rows rows, on the stream.
+void hy4_dense_tiles(Exl3Tile* tiles, int rows, int tile_rows, hipStream_t st);
+
 // fp8 e4m3 [N][K] x bf16 128x128 scales -> bf16(w * s) [N][K] (the oracle's dequantization of the dense weights).
 void hy4_dequant_fp8(const uint8_t* w, const bf16* s, bf16* out, int N, int K, hipStream_t st);
 // bf16 [n] -> f32 [n].

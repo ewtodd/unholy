@@ -19,6 +19,7 @@
 
 #include "kernels/glm_fast.hpp"
 #include "kernels/hy4.hpp"
+#include "kernels/mx_moe.hpp"
 #include "kernels/ref.hpp"
 #include "model/loader.hpp"
 
@@ -161,7 +162,8 @@ struct LoadCtx {
     items.push_back({&t, d.ptr});
     return d;
   }
-  // A linear: bf16 as stored, fp8 (+ weight_scale_inv, bf16 128x128) dequantized to bf16 after the pass.
+  bool keep_fp8 = false;  // fp8 linears stay fp8 (Hy4LoadOptions::dense_fp8)
+  // A linear: bf16 as stored; fp8 (+ weight_scale_inv, bf16 128x128) kept, or dequantized to bf16 after the pass.
   Hy4Linear linear(const std::string& prefix) {
     Hy4Linear l;
     const TensorInfo& t = ck.at(prefix + ".weight");
@@ -170,6 +172,14 @@ struct LoadCtx {
     l.in = int(t.shape[1]);
     if (t.dtype == DType::BF16) {
       l.w = upload(prefix + ".weight");
+    } else if (t.dtype == DType::F8_E4M3 && keep_fp8) {
+      l.w8 = upload(prefix + ".weight");
+      l.s8 = upload(prefix + ".weight_scale_inv");
+      if (l.s8.dtype != DType::BF16) throw std::runtime_error(prefix + ": fp8 without bf16 block scales");
+      const void* p[2] = {l.w8.ptr, l.s8.ptr};
+      l.tab = rt::DeviceBuffer(dev, sizeof p);
+      rt::DeviceGuard g(dev);
+      UH_CHECK(hipMemcpy(l.tab.data(), p, sizeof p, hipMemcpyHostToDevice));
     } else if (t.dtype == DType::F8_E4M3) {
       deq.push_back({upload(prefix + ".weight"), upload(prefix + ".weight_scale_inv"), nullptr});
       if (deq.back().s.dtype != DType::BF16) throw std::runtime_error(prefix + ": fp8 without bf16 block scales");
@@ -234,9 +244,22 @@ size_t align256(size_t b) { return (b + 255) / 256 * 256; }
 
 }  // namespace
 
-size_t hy4_expert_bytes(const Hy4Config& c) {
+size_t hy4_expert_bytes(const Hy4Config& c, Hy4ExpertFormat f) {
   const size_t I = c.moe_inter, Lt = c.latent;
+  if (f == Hy4ExpertFormat::Mxfp4) return 3 * (I * Lt / 2 + I * Lt / 32);
+  if (f == Hy4ExpertFormat::Nvfp4) return 3 * (I * Lt / 2 + I * Lt / 16);
   return 2 * I * Lt + (2 * I / 128) * (Lt / 128) * 2 + Lt * I + (Lt / 128) * (I / 128) * 2;
+}
+
+int hy4_expert_tile_rows(bool mx, int tokens) {
+  if (!mx) return tokens <= kHy4GemvTokens ? k::kHy4GemvRows : k::kHy4TileRows;
+  return k::mx_use_gemv(tokens) ? k::kMxGemvTileRows : k::kExl3TileRows;
+}
+
+int hy4_max_tiles(const Hy4Config& c, int max_tokens) {
+  const size_t P = size_t(max_tokens) * c.n_active;
+  const size_t gemv = size_t(std::min(max_tokens, 64)) * c.n_active / k::kMxGemvTileRows;
+  return int(std::max(P / k::kHy4TileRows, gemv) + c.n_experts + 1);
 }
 
 Hy4LayerWeights load_hy4_layer(const Checkpoint& ck, const Hy4Config& c, int layer, int dev, hipStream_t st,
@@ -251,8 +274,9 @@ Hy4LayerWeights load_hy4_layer(const Checkpoint& ck, const Hy4Config& c, int lay
   const std::string m = p + "mlp.";
   std::vector<Hy4Linear*> deq;
   DevTensor kv_b;
+  lc.keep_fp8 = opt.dense_fp8;
   auto lin = [&](Hy4Linear& l, const std::string& name) {
-    const bool fp8 = ck.at(name + ".weight").dtype == DType::F8_E4M3;
+    const bool fp8 = ck.at(name + ".weight").dtype == DType::F8_E4M3 && !opt.dense_fp8;
     l = lc.linear(name);
     if (fp8) deq.push_back(&l);
   };
@@ -333,7 +357,149 @@ Hy4LayerWeights load_hy4_layer(const Checkpoint& ck, const Hy4Config& c, int lay
       lc.bf16(e + "unified_pre_gamma", w.eng_pre_gamma);
     }
   }
-  if (!w.dense && opt.load_experts) {
+  if (!w.dense && opt.load_experts && opt.mxfp4 && !opt.experts_gguf) {
+    // MXFP4: each batch of experts lands in e4m3 in a staging buffer, then is converted into the final layout and
+    // repacked tile-major (mx_repack) one matrix at a time.
+    const size_t E = size_t(c.n_experts), I = c.moe_inter, Lt = c.latent;
+    const size_t gu_b = 2 * I * Lt, gus_b = (2 * I / 128) * (Lt / 128) * 2, dn_b = Lt * I,
+                 dns_b = (Lt / 128) * (I / 128) * 2;
+    const size_t mw = I * Lt / 2, ms = I * Lt / 32;  // one matrix's codes / scales (all three are 1536 x 1536)
+    std::vector<int> here;
+    for (size_t e = 0; e < E; ++e)
+      if (!opt.expert_mask || (*opt.expert_mask)[e]) here.push_back(int(e));
+    const size_t n = here.size();
+    std::vector<const void*> tab(6 * E, nullptr);
+    std::vector<uint8_t> res(E, 0);
+    if (n) {
+      size_t off[6], at = 0;
+      for (int f = 0; f < 6; ++f) {
+        off[f] = at;
+        at += align256(n * (f % 2 == 0 ? mw : ms));
+      }
+      w.experts = rt::DeviceBuffer(dev, at);
+      uint8_t* base = w.experts.as<uint8_t>();
+      constexpr size_t kBatch = 32;
+      rt::DeviceBuffer stage(dev, kBatch * (gu_b + gus_b + dn_b + dns_b)), tmp(dev, mw + ms);
+      rt::DeviceGuard g(dev);
+      for (size_t b0 = 0; b0 < n; b0 += kBatch) {
+        const size_t nb = std::min(kBatch, n - b0);
+        LoadCtx sl{ck, dev, opt.up};
+        uint8_t* sb = stage.as<uint8_t>();
+        const auto at_of = [&](size_t i, int part) {
+          const size_t sizes[4] = {gu_b, gus_b, dn_b, dns_b};
+          size_t o = 0;
+          for (int q = 0; q < part; ++q) o += kBatch * sizes[q];
+          return sb + o + i * sizes[part];
+        };
+        for (size_t i = 0; i < nb; ++i) {
+          const size_t e = size_t(here[b0 + i]);
+          sl.slice(m + "experts.gate_up_proj", gu_b, e, 1, at_of(i, 0));
+          sl.slice(m + "experts.gate_up_proj_scale_inv", gus_b, e, 1, at_of(i, 1));
+          sl.slice(m + "experts.down_proj", dn_b, e, 1, at_of(i, 2));
+          sl.slice(m + "experts.down_proj_scale_inv", dns_b, e, 1, at_of(i, 3));
+        }
+        sl.run(st, {});
+        for (size_t i = 0; i < nb; ++i) {
+          const size_t idx = b0 + i, e = size_t(here[idx]);
+          uint8_t* dst[6];
+          for (int f = 0; f < 6; ++f) dst[f] = base + off[f] + idx * (f % 2 == 0 ? mw : ms);
+          const auto* gs = reinterpret_cast<const uint16_t*>(at_of(i, 1));
+          const auto* ds = reinterpret_cast<const uint16_t*>(at_of(i, 3));
+          k::hy4_fp8_to_mxfp4(at_of(i, 0), gs, int(Lt / 128), 0, int(I), int(Lt), dst[0], dst[1], st);   // gate
+          k::hy4_fp8_to_mxfp4(at_of(i, 0), gs, int(Lt / 128), int(I), int(I), int(Lt), dst[2], dst[3], st);  // up
+          k::hy4_fp8_to_mxfp4(at_of(i, 2), ds, int(I / 128), 0, int(Lt), int(I), dst[4], dst[5], st);  // down
+          k::mx_repack(dst[0], dst[1], int(I), int(Lt), tmp.as<uint8_t>(), st);
+          k::mx_repack(dst[2], dst[3], int(I), int(Lt), tmp.as<uint8_t>(), st);
+          k::mx_repack(dst[4], dst[5], int(Lt), int(I), tmp.as<uint8_t>(), st);
+          for (int f = 0; f < 6; ++f) tab[size_t(f) * E + e] = dst[f];
+          res[e] = 1;
+        }
+        UH_CHECK(hipStreamSynchronize(st));
+      }
+    }
+    w.mx = true;
+    w.n_resident = int(n);
+    w.tab = rt::DeviceBuffer(dev, tab.size() * sizeof(void*));
+    w.resident = rt::DeviceBuffer(dev, E);
+    rt::DeviceGuard g(dev);
+    UH_CHECK(hipMemcpy(w.tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
+    UH_CHECK(hipMemcpy(w.resident.data(), res.data(), E, hipMemcpyHostToDevice));
+  }
+  if (!w.dense && opt.load_experts && opt.experts_gguf) {
+    // NVFP4 from the GGUF: each batch of experts' blocks into a staging buffer, then split into codes and scales.
+    const Checkpoint& gk = *opt.experts_gguf;
+    const size_t E = size_t(c.n_experts), I = c.moe_inter, Lt = c.latent;
+    const char* names[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+    const int rows_of[3] = {int(I), int(I), int(Lt)}, k_of[3] = {int(Lt), int(Lt), int(I)};
+    size_t blk_bytes[3];
+    for (int m3 = 0; m3 < 3; ++m3) {
+      const TensorInfo& t = gk.at("blk." + std::to_string(layer) + "." + names[m3] + ".weight");
+      if (t.gguf_type != 40 || t.shape.size() != 3 || t.shape[0] != int64_t(E) || t.shape[1] != rows_of[m3] ||
+          t.shape[2] != k_of[m3])
+        throw std::runtime_error(t.name + ": expected NVFP4 [" + std::to_string(E) + ", N, K]");
+      blk_bytes[m3] = size_t(rows_of[m3]) * (k_of[m3] / 64) * 36;
+    }
+    std::vector<int> here;
+    for (size_t e = 0; e < E; ++e)
+      if (!opt.expert_mask || (*opt.expert_mask)[e]) here.push_back(int(e));
+    const size_t n = here.size();
+    std::vector<const void*> tab(6 * E, nullptr);
+    std::vector<uint8_t> res(E, 0);
+    if (n) {
+      const size_t cw = I * Lt / 2, cs = I * Lt / 16;  // one matrix's codes / scales (all three are 1536 x 1536)
+      size_t off[6], at = 0;
+      for (int f = 0; f < 6; ++f) {
+        off[f] = at;
+        at += align256(n * (f % 2 == 0 ? cw : cs));
+      }
+      w.experts = rt::DeviceBuffer(dev, at);
+      uint8_t* base = w.experts.as<uint8_t>();
+      constexpr size_t kBatch = 32;
+      rt::DeviceBuffer stage(dev, kBatch * (blk_bytes[0] + blk_bytes[1] + blk_bytes[2]));
+      std::unique_ptr<Uploader> own;
+      Uploader* gup = opt.experts_up;
+      if (!gup) {
+        own = std::make_unique<Uploader>(gk);
+        gup = own.get();
+      }
+      rt::DeviceGuard g(dev);
+      for (size_t b0 = 0; b0 < n; b0 += kBatch) {
+        const size_t nb = std::min(kBatch, n - b0);
+        LoadCtx sl{gk, dev, gup};
+        uint8_t* sb = stage.as<uint8_t>();
+        const auto at_of = [&](size_t i, int m3) {
+          size_t o = 0;
+          for (int q = 0; q < m3; ++q) o += kBatch * blk_bytes[q];
+          return sb + o + i * blk_bytes[m3];
+        };
+        for (size_t i = 0; i < nb; ++i)
+          for (int m3 = 0; m3 < 3; ++m3)
+            sl.slice("blk." + std::to_string(layer) + "." + names[m3] + ".weight", blk_bytes[m3],
+                     size_t(here[b0 + i]), 1, at_of(i, m3));
+        sl.run(st, {});
+        for (size_t i = 0; i < nb; ++i) {
+          const size_t idx = b0 + i, e = size_t(here[idx]);
+          for (int m3 = 0; m3 < 3; ++m3) {
+            uint8_t* codes = base + off[2 * m3] + idx * cw;
+            uint8_t* scales = base + off[2 * m3 + 1] + idx * cs;
+            k::hy4_nvfp4_split(at_of(i, m3), rows_of[m3], k_of[m3], codes, scales, st);
+            tab[size_t(2 * m3) * E + e] = codes;
+            tab[size_t(2 * m3 + 1) * E + e] = scales;
+          }
+          res[e] = 1;
+        }
+        UH_CHECK(hipStreamSynchronize(st));
+      }
+    }
+    w.nv = true;
+    w.n_resident = int(n);
+    w.tab = rt::DeviceBuffer(dev, tab.size() * sizeof(void*));
+    w.resident = rt::DeviceBuffer(dev, E);
+    rt::DeviceGuard g(dev);
+    UH_CHECK(hipMemcpy(w.tab.data(), tab.data(), tab.size() * sizeof(void*), hipMemcpyHostToDevice));
+    UH_CHECK(hipMemcpy(w.resident.data(), res.data(), E, hipMemcpyHostToDevice));
+  }
+  if (!w.dense && opt.load_experts && !opt.mxfp4 && !opt.experts_gguf) {
     const size_t E = size_t(c.n_experts), I = c.moe_inter, Lt = c.latent;
     const size_t gu_b = 2 * I * Lt, gus_b = (2 * I / 128) * (Lt / 128) * 2, dn_b = Lt * I,
                  dns_b = (Lt / 128) * (I / 128) * 2;
@@ -405,7 +571,7 @@ Hy4HeadWeights load_hy4_head(const Checkpoint& ck, const Hy4Config& c, int dev, 
   return h;
 }
 
-size_t hy4_dense_layer_bytes(const Checkpoint& ck, const Hy4Config& c, int layer) {
+size_t hy4_dense_layer_bytes(const Checkpoint& ck, const Hy4Config& c, int layer, bool dense_fp8) {
   const std::string p = kPrefix + "layers." + std::to_string(layer) + ".";
   size_t b = 0;
   for (const auto& t : ck.tensors()) {
@@ -413,8 +579,11 @@ size_t hy4_dense_layer_bytes(const Checkpoint& ck, const Hy4Config& c, int layer
     if (t.name.find(".mlp.experts.") != std::string::npos) continue;
     if (t.name.find("multi_head_embedding") != std::string::npos || t.name.find("lookup_table") != std::string::npos)
       continue;
-    if (t.name.find("_scale_inv") != std::string::npos) continue;
-    b += t.dtype == DType::F8_E4M3 ? t.nbytes * 2 : t.nbytes;  // dequantized to bf16 (kv_b: split, original dropped)
+    if (t.name.find("_scale_inv") != std::string::npos) {
+      if (dense_fp8) b += t.nbytes;  // kept with their fp8 linears
+      continue;
+    }
+    b += t.dtype == DType::F8_E4M3 && !dense_fp8 ? t.nbytes * 2 : t.nbytes;  // (kv_b: split, original dropped)
   }
   (void)c;
   return b;
@@ -577,7 +746,7 @@ namespace {
 std::vector<size_t> scratch_sizes(const Hy4Config& c, int max_tokens, int max_seq) {
   const size_t T = size_t(max_tokens), D = c.dim, H = std::max(c.heads_sparse, c.heads_window);
   const size_t P = T * c.n_active, E = c.n_experts, Lt = c.latent, I = c.moe_inter;
-  const size_t max_tiles = P / k::kHy4TileRows + E + 1;
+  const size_t max_tiles = size_t(hy4_max_tiles(c, max_tokens));
   const size_t npool = size_t(max_seq) / c.idx_pool + 1, kg = c.idx_groups();
   std::vector<size_t> sizes = {
       T * D * 2,                          // h
@@ -621,6 +790,7 @@ std::vector<size_t> scratch_sizes(const Hy4Config& c, int max_tokens, int max_se
       T * c.inter * 2, T * c.inter * 2, T * c.inter * 2,  // dense MLP
       T * 1536 * 2,                       // Engram rows
       T * 5 * D * 4,                      // Engram projections (fp32)
+      (T / k::kHy4GemvRows + T / k::kHy4TileRows + 4) * sizeof(k::Exl3Tile),  // fp8 linears' tiles (8-row, 64-row)
   };
   if (sizes.size() != size_t(kHy4ScratchBufs)) throw std::logic_error("hy4 scratch: buffer list out of date");
   return sizes;

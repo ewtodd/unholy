@@ -3,7 +3,7 @@
 ggml types per tensor group (routed experts, dense, shared experts, embedding / head, Engram projections, draft
 layers past the backbone, vision). A tensor's bytes are the distance to the next tensor's offset.
 
-    python3 tools/ref/gguf_inventory.py REPO PREFIX NSHARDS [--skip-last]
+    python3 tools/ref/gguf_inventory.py REPO PREFIX NSHARDS [--skip-last]     (NSHARDS 1: the single file PREFIX.gguf)
 
     e.g. unsloth/DeepSeek-V4.1-Flash-1017-GGUF UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL 7 --skip-last
 
@@ -67,8 +67,8 @@ tree = json.load(urllib.request.urlopen("https://huggingface.co/api/models/%s/tr
 sizes = {i["path"]: i.get("lfs", {}).get("size", i.get("size", 0)) for i in tree if i.get("type") == "file"}
 by_cat = collections.Counter(); types_by_cat = collections.defaultdict(collections.Counter); meta = {}
 n_layers = 1 << 30  # from the first shard's <arch>.block_count
-for s in range(1, nshards + 1 - (1 if skip_last else 0)):
-    path = "%s-%05d-of-%05d.gguf" % (prefix, s, nshards)
+for s in range(1, max(nshards, 1) + 1 - (1 if skip_last else 0)):
+    path = "%s-%05d-of-%05d.gguf" % (prefix, s, nshards) if nshards > 1 else prefix + ".gguf"
     url = "https://huggingface.co/%s/resolve/main/%s" % (repo, path)
     b = Buf(url)
     assert b.rd("I") == 0x46554747, path

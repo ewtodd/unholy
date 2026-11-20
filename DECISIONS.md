@@ -1744,3 +1744,24 @@ the model and not a quant of it. Routed experts are e4m3 with bf16 128x128 scale
 Single-card numbers (all 512 experts of a layer on one R9700, no multi-device plan yet, not tuned): ~1000 tok/s
 prefill summed over layers, 58-64 ms per decode token. Next: the resident plan over both cards and the APU, then
 serving.
+
+## 2026-11-20 — Hy4 flash: decode speed, expert formats (AngelSlim's NVFP4), the owner's gate for a hy4 mode
+
+Owner: no `hy4` llm-mode until speculative decoding and vision work and decode reaches >= 20 tok/s; quantize the experts
+rather than the KV, leaning towards an AngelSlim quant.
+
+- Speed (one stream, short context): the dense fp8 linears stay fp8 (the kernels dequantize bf16(w * s), the oracle's
+  values) and a few-row e4m3 GEMV replaces the 64-row tile kernel for decode-sized steps (cards ~600 GB/s); MoE
+  bookkeeping of steps <= 32 tokens in one launch (moe_dispatch_small now takes 16 picks; DSV4 / GLM unchanged). Served,
+  FP8 experts, 1M-token pool: decode 11.3 -> 15.2 tok/s. Resident test: 67 -> 50 ms/token (FP8), 47 ms (NVFP4).
+- Expert formats against the oracle (code, 1024 tokens; mean KL / top-1): FP8 release 5.7e-3 / 97.3% (the floor);
+  AngelSlim Q4_K_M (in the oracle, `run.py --experts-gguf`) 2.31e-2 / 95.7%; AngelSlim SPARK-4Bit NVFP4 (in unholy,
+  `--experts-gguf`) 2.72e-2 / 95.9%; MXFP4 by rounding to nearest (best of two scales, `--mxfp4`) 3.59e-2 / 94.7%.
+  AngelSlim's own agentic benchmarks put both within 1-2 points of the full model. Both AngelSlim builds hold the
+  release's weights (their Q8_0 dense tensors differ from the FP8 release by 0.54%, Q8_0's noise; both carry an extra
+  MTP layer, blk.42, instead of DFly2).
+- NVFP4 experts load straight from the GGUF (`Checkpoint::open_gguf`; ggml's NVFP4: e2m1 x unsigned-e4m3 scale per
+  16, exact in bf16; split into codes and scales on the device) and run on the e4m3 kernels' structure: 84 GB instead
+  of 149 GB, 94% of routing on the cards in the test plan.
+- Specs from vLLM's merged Hy4 support (b067b6f) for DFly2 (a stateless block drafter: 5 MLA layers over the KV and
+  indexer picks of target layers 25..41, 5 drafts per step) and the vision tower: scratchpad, to be turned into code.

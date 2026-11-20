@@ -36,8 +36,9 @@ std::string read_text(const std::string& p) {
 
 int main(int argc, char** argv) {
   std::string model_dir = "/scratch/models/hy4-flash-fp8", engram = "/scratch/models/hy4-flash-engram", oracle,
-              profile = "data/expert_profile_hy4_code4k.txt", out_path;
+              profile = "data/expert_profile_hy4_code4k.txt", out_path, experts_gguf;
   int chunk = 512, slots = 1;
+  bool mxfp4 = false;
   double margin = 2.0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -50,6 +51,8 @@ int main(int argc, char** argv) {
     else if (a == "--slots") slots = std::stoi(next());
     else if (a == "--card-margin-gb") margin = std::stod(next());
     else if (a == "--out") out_path = next();
+    else if (a == "--mxfp4") mxfp4 = true;
+    else if (a == "--experts-gguf") experts_gguf = next();
     else {
       std::fprintf(stderr, "usage: %s --model DIR --oracle DIR [--engram DIR] [--profile F] [--chunk C] [--slots N] "
                    "[--card-margin-gb G] [--out F]\n", argv[0]);
@@ -58,6 +61,8 @@ int main(int argc, char** argv) {
   }
   try {
     auto ck = model::Checkpoint::open(model_dir);
+    std::unique_ptr<model::Checkpoint> gk;
+    if (!experts_gguf.empty()) gk = model::Checkpoint::open_gguf({experts_gguf});
     const auto c = model::Hy4Config::from_hf(ck->config());
     const auto meta = gufo::json::parse(read_text(oracle + "/meta.json"));
     const int S = int(meta.member_size("S")), P = int(meta.member_size("prompt"));
@@ -77,9 +82,11 @@ int main(int argc, char** argv) {
     pin.max_seq = max_seq;
     pin.max_logit_rows = chunk;
     pin.card_margin = size_t(margin * double(1ull << 30));
+    pin.mxfp4 = mxfp4;
+    pin.nvfp4 = bool(gk);
     const auto plan = engine::make_hy4_plan(pin);
     std::printf("%s", plan.summary().c_str());
-    engine::Hy4ResidentModel m(c, *ck, engram, plan, geo, chunk, max_seq, chunk, 0);
+    engine::Hy4ResidentModel m(c, *ck, engram, plan, geo, chunk, max_seq, chunk, 0, mxfp4, gk.get());
     const int slot = slots - 1;
     std::vector<int32_t> tables(size_t(slots) * pps);
     for (size_t i = 0; i < tables.size(); ++i) tables[i] = int32_t(i);

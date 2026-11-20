@@ -66,11 +66,14 @@ struct Hy4Config {
   int n_engram() const;
 };
 
-// A bf16 linear [out, in] (fp8 ones dequantized at load).
+// A linear [out, in]: bf16, or the release's e4m3 with bf16 128x128 scales kept as they are (w8 / s8; the kernels use
+// bf16(w * s), the oracle's dequantization). tab: {w8, s8} as a one-matrix table for the grouped fp8 kernels.
 struct Hy4Linear {
-  DevTensor w;
+  DevTensor w, w8, s8;
+  rt::DeviceBuffer tab;
   int out = 0, in = 0;
-  explicit operator bool() const { return bool(w); }
+  bool fp8() const { return bool(w8); }
+  explicit operator bool() const { return bool(w) || bool(w8); }
 };
 
 struct Hy4LayerWeights {
@@ -92,14 +95,18 @@ struct Hy4LayerWeights {
   // MoE
   Hy4Linear router, pre_expert, post_expert, sh_gate, sh_up, sh_down;
   DevTensor router_bias, combine_norm;
-  rt::DeviceBuffer experts;   // this device's routed experts: [gate_up codes, scales, down codes, scales] each
-  rt::DeviceBuffer tab;       // [gu_w E][gu_s E][dn_w E][dn_s E] pointers (null: not here)
+  rt::DeviceBuffer experts;   // this device's routed experts: fp8 [gate_up codes, scales, down codes, scales], or
+                              // MXFP4 (mx) [w1 codes, scales, w3 codes, scales, w2 codes, scales], tile-major repacked
+  rt::DeviceBuffer tab;       // fp8: [gu_w E][gu_s E][dn_w E][dn_s E]; mx: [w1 w, w1 s, w3 w, w3 s, w2 w, w2 s] x E
+  bool mx = false;            // routed experts in MXFP4 (converted from the release's e4m3 at load)
+  bool nv = false;            // routed experts in NVFP4 from a GGUF build (tables as mx: [w1, w3, w2] x [codes, scales])
   rt::DeviceBuffer resident;  // uint8 [E]
   int n_resident = 0;
   const uint8_t* const* gu_w() const { return tab.as<const uint8_t* const>(); }
   const uint16_t* const* gu_s(int E) const { return tab.as<const uint16_t* const>() + E; }
   const uint8_t* const* dn_w(int E) const { return tab.as<const uint8_t* const>() + 2 * E; }
   const uint16_t* const* dn_s(int E) const { return tab.as<const uint16_t* const>() + 3 * E; }
+  const uint8_t* const* mx_tab(int m, int f, int E) const { return tab.as<const uint8_t* const>() + size_t(m * 2 + f) * E; }
   // Engram
   Hy4Linear eng_kv;  // [5 dim][1536]: key projections 0-3, value projection
   DevTensor eng_bias, eng_lookup_norm, eng_nk, eng_nq, eng_pre_gamma, eng_hcs;  // bf16
@@ -109,7 +116,11 @@ struct Hy4LoadOptions {
   bool load_dense = true;
   bool load_experts = true;
   const std::vector<uint8_t>* expert_mask = nullptr;  // [E] 1 = load (null: all)
+  bool mxfp4 = false;  // routed experts converted to MXFP4 (kernels::hy4_fp8_to_mxfp4) for the mx_moe kernels
+  bool dense_fp8 = true;  // keep the release's fp8 dense linears fp8 (false: dequantized to bf16 at load)
+  const Checkpoint* experts_gguf = nullptr;  // NVFP4 routed experts from a GGUF build (AngelSlim's SPARK-4Bit)
   Uploader* up = nullptr;
+  Uploader* experts_up = nullptr;  // for experts_gguf (null: one per call)
 };
 Hy4LayerWeights load_hy4_layer(const Checkpoint& ck, const Hy4Config& c, int layer, int dev, hipStream_t st,
                                const Hy4LoadOptions& opt = {});
@@ -124,8 +135,9 @@ Hy4HeadWeights load_hy4_head(const Checkpoint& ck, const Hy4Config& c, int dev, 
                              bool head = true);
 
 // Device bytes of a layer's dense part as loaded (fp8 dequantized; kv_b also split per head), and of one expert.
-size_t hy4_dense_layer_bytes(const Checkpoint& ck, const Hy4Config& c, int layer);
-size_t hy4_expert_bytes(const Hy4Config& c);
+size_t hy4_dense_layer_bytes(const Checkpoint& ck, const Hy4Config& c, int layer, bool dense_fp8 = true);
+enum class Hy4ExpertFormat : uint8_t { Fp8, Mxfp4, Nvfp4 };
+size_t hy4_expert_bytes(const Hy4Config& c, Hy4ExpertFormat f = Hy4ExpertFormat::Fp8);
 
 // ---- Engram store -----------------------------------------------------------------------------------------------
 // The pack (tools/ref/hy4_engram_pack.py: per memory, e4m3 rows [rows][96] and bf16 scales [rows]) read with pread;
@@ -191,6 +203,7 @@ enum Hy4Buf : int {
   kBufMoeCount, kBufMoeOff, kBufMoeFill, kBufMoePlan, kBufMoeLTiles, kBufMoeRTiles, kBufRouteHist,
   kBufMlpG, kBufMlpU, kBufMlpH,                                                              // dense MLP
   kBufEngRows, kBufEngKv,                                                                    // Engram
+  kBufDenseTiles,                                                                            // fp8 linears
   kHy4ScratchBufs
 };
 constexpr int kHy4IdxBlock = 64;  // queries per index-score pass
@@ -217,10 +230,17 @@ void hy4_head_forward(const Hy4Config& c, const Hy4HeadWeights& h, const Hy4Scra
                       float* logits, hipStream_t st);
 // Routed experts of `w` on pair rows xa [P][latent] (tiles over rows this device holds): gate / up, clamped SwiGLU,
 // down, times the routing weight rw [P] -> out [P][latent]. eh / gu: [P][moe_inter] / [P][2 moe_inter] scratch.
+// Tiles of hy4_expert_tile_rows(w, tokens) rows.
 void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_t* xa, const float* rw,
                      const kernels::Exl3Tile* tiles, int max_tiles, const int* ntiles_dev, int P, uint16_t* gu,
                      uint16_t* eh, uint16_t* out, hipStream_t st, const int* row0_dev = nullptr,
                      const int* row1_dev = nullptr);
+
+// Rows per expert tile for a step of `tokens` tokens: fp8 kHy4GemvRows up to kHy4GemvTokens tokens, else kHy4TileRows; MXFP4 the mx GEMV's when mx_use_gemv(tokens),
+// else kExl3TileRows. hy4_max_tiles: the tile list's room for a step of up to max_tokens tokens.
+constexpr int kHy4GemvTokens = 32;  // steps of up to this many tokens take the fp8 GEMVs
+int hy4_expert_tile_rows(bool mx, int tokens);
+int hy4_max_tiles(const Hy4Config& c, int max_tokens);
 
 // Optional per-layer routing histogram ([layer][expert] counts), filled when set.
 void set_hy4_expert_histogram(std::vector<std::vector<uint64_t>>* hist);

@@ -21,6 +21,10 @@ Outputs in --out: meta.json, logits.bin (f32 [S, vocab]), h_LLL.bin (bf16 [S, hc
 
 --attn-fp32 swaps the eager attention for the same math in fp32 (transformers' eager path runs the softmax in bf16):
 the oracle against itself with that change is the noise floor.
+
+--experts-gguf SHARD[,SHARD..] takes the routed experts from a GGUF build of the same weights (blk.L.ffn_{gate,up,down}_exps,
+dequantized by gguf-py, e.g. AngelSlim's Q4_K_M or SPARK-4Bit NVFP4): the oracle with a quantization's experts, for KL
+against the release.
 """
 import argparse
 import json
@@ -121,7 +125,25 @@ def checkpoint_name(L, key):
     return full
 
 
-def layer_state(layer, L, ck, dev, block):
+class GgufExperts:
+    """Routed experts of a GGUF build, dequantized to bf16 in the release's layout."""
+
+    def __init__(self, paths):
+        import gguf
+        from gguf.quants import dequantize
+        self.dequantize = dequantize
+        self.t = {}
+        for p in paths:
+            for t in gguf.GGUFReader(p).tensors:
+                self.t[t.name] = t
+
+    def get(self, name, dev):
+        t = self.t[name]
+        a = self.dequantize(t.data, t.tensor_type)  # [experts, out, in] (gguf dims reversed)
+        return torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)).to(dev).to(torch.bfloat16)
+
+
+def layer_state(layer, L, ck, dev, block, gx=None):
     sd = {}
     for key, p in list(layer.named_parameters()) + list(layer.named_buffers()):
         if key not in layer.state_dict():
@@ -129,6 +151,11 @@ def layer_state(layer, L, ck, dev, block):
         name = checkpoint_name(L, key)
         if key == "engram_layer.multi_head_embedding.embedding.weight":
             sd[key] = ck.host(name)  # stays in host memory
+        elif gx is not None and key == "mlp.experts.gate_up_proj":
+            sd[key] = torch.cat([gx.get(f"blk.{L}.ffn_gate_exps.weight", dev), gx.get(f"blk.{L}.ffn_up_exps.weight", dev)],
+                                dim=1)
+        elif gx is not None and key == "mlp.experts.down_proj":
+            sd[key] = gx.get(f"blk.{L}.ffn_down_exps.weight", dev)
         else:
             # As stored (assign=True keeps the checkpoint's dtype: bf16, or fp32 where the release keeps fp32,
             # which are the modules transformers keeps in fp32), fp8 dequantized to bf16.
@@ -208,6 +235,7 @@ def main():
     ap.add_argument("--layers", type=int, default=None, help="run only the first N layers (no logits)")
     ap.add_argument("--dump-layers", default="all", help="'all', 'none' or a comma list")
     ap.add_argument("--attn-fp32", action="store_true", help="fp32 scores / softmax (the noise-floor twin)")
+    ap.add_argument("--experts-gguf", default=None, help="comma-separated GGUF shards to take the routed experts from")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -222,6 +250,7 @@ def main():
     with open(os.path.join(args.ckpt, "config.json")) as f:
         block = json.load(f)["text_config"]["quantization_config"]["weight_block_size"]
     ck = Ckpt(args.ckpt)
+    gx = GgufExperts(args.experts_gguf.split(",")) if args.experts_gguf else None
     dt = torch.bfloat16
 
     ids_all = np.fromfile(args.ids, dtype=np.uint32).astype(np.int64)
@@ -247,7 +276,7 @@ def main():
             t0 = time.time()
             with torch.device("meta"):
                 layer = hym.HYV4FlashDecoderLayer(cfg, L)
-            layer.load_state_dict(layer_state(layer, L, ck, dev, block), strict=True, assign=True)
+            layer.load_state_dict(layer_state(layer, L, ck, dev, block, gx), strict=True, assign=True)
             fix_buffers(layer, cfg, dev)
             layer.eval()
             lt = layer.attention_type
@@ -286,7 +315,8 @@ def main():
                 h[0].contiguous().view(torch.uint16).cpu().numpy().tofile(os.path.join(args.out, f"h_{L:03d}.bin"))
 
         meta = {"S": S, "prompt": P, "decode": args.decode, "ids": ids_all[:S].tolist(), "ckpt": args.ckpt,
-                "layers": n_layers, "attn_fp32": args.attn_fp32, "transformers": transformers.__version__,
+                "layers": n_layers, "attn_fp32": args.attn_fp32, "experts_gguf": args.experts_gguf,
+                "transformers": transformers.__version__,
                 "torch": torch.__version__}
         if n_layers == cfg.num_hidden_layers:
             with torch.device("meta"):

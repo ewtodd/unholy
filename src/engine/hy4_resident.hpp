@@ -68,6 +68,8 @@ struct Hy4PlanInput {
   int max_tokens = 0, max_seq = 0, max_logit_rows = 0;
   size_t card_margin = size_t(2) << 30, apu_margin = size_t(4) << 30;
   int snapshots = 0;
+  bool mxfp4 = false;  // routed experts converted to MXFP4 at load
+  bool nvfp4 = false;  // routed experts in NVFP4 from a GGUF build
 };
 Plan make_hy4_plan(const Hy4PlanInput& in);
 // Pinned host bytes of one prefix snapshot on card k (its window rings and indexer tails of one slot), and the
@@ -78,7 +80,8 @@ class Hy4ResidentModel final : public StepModel {
  public:
   Hy4ResidentModel(const model::Hy4Config& c, const model::Checkpoint& ck, const std::string& engram_dir,
                    const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq,
-                   int max_logit_rows = 0, int snapshots = 0);
+                   int max_logit_rows = 0, int snapshots = 0, bool mxfp4 = false,
+                   const model::Checkpoint* experts_gguf = nullptr);
   ~Hy4ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }

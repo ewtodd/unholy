@@ -319,7 +319,7 @@ __device__ void route_token_wave(const MoeSmallArgs& a, int t, int lane) {
     const int e = lane + 32 * i;
     sv[i] = e < E ? route_sigmoid(lr[e]) + a.route_bias[e] : -INFINITY;
   }
-  int chosen[8];
+  int chosen[16];  // K <= 16 (Hy4 flash)
   for (int k = 0; k < K; ++k) {
     float bv = -INFINITY;
     int bi = 0x7fffffff;
@@ -343,7 +343,7 @@ __device__ void route_token_wave(const MoeSmallArgs& a, int t, int lane) {
         chosen[y] = chosen[y - 1];
         chosen[y - 1] = c;
       }
-    float s[8], sum = 0.0f;
+    float s[16], sum = 0.0f;
     for (int k = 0; k < K; ++k) {
       s[k] = route_sigmoid(lr[chosen[k]]);
       sum += s[k];
@@ -475,8 +475,8 @@ __global__ __launch_bounds__(NE) void moe_dispatch_small_kernel(MoeSmallArgs a) 
   // moe_scatter_kernel
   if (tid < T) {
     const int t = tid;
-    int es[8];
-    float ws[8];
+    int es[16];
+    float ws[16];
     for (int j = 0; j < K; ++j) {
       es[j] = a.sel[size_t(t) * K + j];
       ws[j] = a.wt[size_t(t) * K + j];
@@ -615,7 +615,8 @@ void stage_remote(const MoePlan* plan, const Exl3Tile* rtiles, const float* ewt,
 }
 
 void moe_dispatch_small(const MoeSmallArgs& a, hipStream_t st) {
-  if (a.T > kMoeSmallMaxTokens || a.K > 8 || a.E > 512) throw std::runtime_error("moe_dispatch_small: shape");
+  if (a.T > kMoeSmallMaxTokens || a.K > 16 || (a.ds_logits && a.K > 8) || a.E > 512)
+    throw std::runtime_error("moe_dispatch_small: shape");
   if (a.E <= 256) moe_dispatch_small_kernel<256><<<1, 256, 0, st>>>(a);
   else moe_dispatch_small_kernel<512><<<1, 512, 0, st>>>(a);
   UH_CHECK_LAUNCH();

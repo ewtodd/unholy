@@ -625,16 +625,34 @@ constexpr int BM = kHy4TileRows, BN = 128, GNT = 256;
 
 // gemm_wmma.hip's bf16_kernel with the weights e4m3 x bf16 block scales (dequantized to bf16 as the oracle does) and
 // the rows of one expert tile per blockIdx.y.
+// The NVFP4 scale byte (unsigned e4m3; 0 and 0x7f mean zero, as ggml_ue4m3_to_fp32).
+__device__ __forceinline__ float ue4m3_to_f32(uint8_t x) { return x == 0 || x == 0x7f ? 0.0f : e4m3_to_f32(x & 0x7f); }
+
+// Eight consecutive weights k .. k + 7 (k % 8 == 0) of NVFP4 row `row` (codes [N][K / 2], scales [N][K / 16]; within
+// each 16-value group byte j holds values j (low nibble) and j + 8): their bf16 values, exact, packed in pairs.
+__device__ __forceinline__ uint4 nvfp4_eight(const uint8_t* W, const uint8_t* S, size_t row, int K, int k) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(W + row * (K / 2) + (k / 16) * 8);
+  const float s = ue4m3_to_f32(S[row * (K / 16) + k / 16]);
+  const int sh = (k & 8) ? 4 : 0;
+  float f[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) f[j] = e2m1_to_f32(((j < 4 ? raw.x >> (8 * j) : raw.y >> (8 * (j - 4))) >> sh) & 15u) * s;
+  const auto pair = [&](int j) { return uint32_t(f32_to_bf16(f[j])) | (uint32_t(f32_to_bf16(f[j + 1])) << 16); };
+  return uint4{pair(0), pair(2), pair(4), pair(6)};
+}
+
+// kFmt 0: e4m3 [N][K] with bf16 128x128 scales (s_tab -> bf16); 1: NVFP4 (s_tab -> uint8 [N][K / 16]).
+template <int kFmt>
 __global__ __launch_bounds__(GNT) void fp8_grouped_kernel(const bf16* __restrict__ A, int K, const Exl3Tile* tiles,
                                                           int ntiles, const int* ntiles_dev,
-                                                          const uint8_t* const* w_tab, const bf16* const* s_tab,
+                                                          const uint8_t* const* w_tab, const void* const* s_tab,
                                                           bf16* __restrict__ C, int ldc, int N) {
 #if defined(UH_GFX12) || defined(UH_GFX11)
   const int nt = ntiles_dev ? *ntiles_dev : ntiles;
   if (int(blockIdx.y) >= nt) return;
   const Exl3Tile tile = tiles[blockIdx.y];
   const uint8_t* W = w_tab[tile.expert];
-  const bf16* S = s_tab[tile.expert];
+  const void* Sv = s_tab[tile.expert];
   if (!W || tile.rows <= 0) return;
   constexpr int KS = 32, STR = KS + 8;
   __shared__ alignas(16) uint16_t sA[BM * STR];
@@ -658,15 +676,20 @@ __global__ __launch_bounds__(GNT) void fp8_grouped_kernel(const bf16* __restrict
       uint4 vals = {0, 0, 0, 0};
       if (n0 + r < N) {
         const size_t row = n0 + r;
-        const uint2 raw = *reinterpret_cast<const uint2*>(W + row * K + k0 + c);
-        const float s = bf16_to_f32(S[(row / 128) * kb + (k0 + c) / 128]);
-        float f[8];
-        e4m3x4_to_f32(raw.x, f);
-        e4m3x4_to_f32(raw.y, f + 4);
-        const auto pair = [&](int j) {
-          return uint32_t(f32_to_bf16(f[j] * s)) | (uint32_t(f32_to_bf16(f[j + 1] * s)) << 16);
-        };
-        vals = uint4{pair(0), pair(2), pair(4), pair(6)};
+        if constexpr (kFmt == 1) {
+          vals = nvfp4_eight(W, static_cast<const uint8_t*>(Sv), row, K, k0 + c);
+        } else {
+          const bf16* S = static_cast<const bf16*>(Sv);
+          const uint2 raw = *reinterpret_cast<const uint2*>(W + row * K + k0 + c);
+          const float s = bf16_to_f32(S[(row / 128) * kb + (k0 + c) / 128]);
+          float f[8];
+          e4m3x4_to_f32(raw.x, f);
+          e4m3x4_to_f32(raw.y, f + 4);
+          const auto pair = [&](int j) {
+            return uint32_t(f32_to_bf16(f[j] * s)) | (uint32_t(f32_to_bf16(f[j + 1] * s)) << 16);
+          };
+          vals = uint4{pair(0), pair(2), pair(4), pair(6)};
+        }
       }
       *reinterpret_cast<uint4*>(&sW[r * STR + c]) = vals;
     }
@@ -704,6 +727,162 @@ __global__ __launch_bounds__(GNT) void fp8_grouped_kernel(const bf16* __restrict
         if (m < M) C[size_t(tile.row0 + m) * ldc + n] = f32_to_bf16(acc[i][e]);
       }
 #endif
+}
+
+__global__ void fp8_to_mx_kernel(const uint8_t* w, const bf16* s, int kb, int row0, int N, int K, uint8_t* codes,
+                                 uint8_t* scales) {
+  const int groups = K / 32;
+  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i >= size_t(N) * groups) return;
+  const int r = int(i / groups), g = int(i % groups), sr = row0 + r;
+  const float sc = bf16_to_f32(s[size_t(sr / 128) * kb + (g * 32) / 128]);
+  float v[32], amax = 0.0f;
+  for (int j = 0; j < 32; ++j) {
+    v[j] = round_bf16(e4m3_to_f32(w[size_t(sr) * K + g * 32 + j]) * sc);
+    amax = fmaxf(amax, fabsf(v[j]));
+  }
+  int best = -127;
+  if (amax > 0.0f) {
+    const int e_hi = int(ceilf(log2f(amax / 6.0f)));
+    float best_err = INFINITY;
+    for (int e = e_hi; e >= e_hi - 1; --e) {
+      const float inv = exp2f(float(-e)), sv = exp2f(float(e));
+      float err = 0.0f;
+      for (int j = 0; j < 32; ++j) {
+        const float q = round_e2m1(fminf(fmaxf(v[j] * inv, -6.0f), 6.0f)) * sv;
+        err += (q - v[j]) * (q - v[j]);
+      }
+      if (err < best_err) best_err = err, best = e;
+    }
+  }
+  best = max(-127, min(127, best));
+  scales[size_t(r) * groups + g] = uint8_t(best + 127);
+  const float inv = exp2f(float(-best));
+  uint8_t* out = codes + size_t(r) * (K / 2) + g * 16;
+  for (int j = 0; j < 32; j += 2) {
+    uint32_t nib[2];
+    for (int k2 = 0; k2 < 2; ++k2) {
+      const float q = round_e2m1(fminf(fmaxf(v[j + k2] * inv, -6.0f), 6.0f));
+      const float a = fabsf(q);
+      const uint32_t m = a < 2.0f ? uint32_t(a * 2.0f) : (a == 6.0f ? 7u : uint32_t(a) + 2u);
+      nib[k2] = m | (q < 0.0f ? 8u : 0u);
+    }
+    out[j / 2] = uint8_t(nib[0] | (nib[1] << 4));
+  }
+}
+
+__global__ void swiglu_clamp2_kernel(const bf16* g, const bf16* u, bf16* h, int rows, int I, float lim) {
+  const size_t n = size_t(rows) * I;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    const float gv = fminf(bf16_to_f32(g[i]), lim);
+    const float uv = fminf(fmaxf(bf16_to_f32(u[i]), -lim), lim);
+    h[i] = f32_to_bf16(round_bf16(siluf(gv)) * uv);
+  }
+}
+
+constexpr int kGemvCols = 4;  // output columns per wave
+
+template <int kFmt>
+__global__ __launch_bounds__(256) void fp8_gemv_kernel(const bf16* __restrict__ A, int ldi, int K, const Exl3Tile* tiles,
+                                                       int ntiles, const int* ntiles_dev, const uint8_t* const* w_tab,
+                                                       const void* const* s_tab, bf16* __restrict__ C, int ldc, int N) {
+  const int nt = ntiles_dev ? *ntiles_dev : ntiles;
+  if (int(blockIdx.y) >= nt) return;
+  const Exl3Tile tile = tiles[blockIdx.y];
+  const uint8_t* W = w_tab[tile.expert];
+  const void* Sv = s_tab[tile.expert];
+  if (!W || tile.rows <= 0) return;
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  const int c0 = (blockIdx.x * 8 + wave) * kGemvCols;
+  if (c0 >= N) return;
+  const int rows = min(tile.rows, kHy4GemvRows), kb = K / 128;
+  const bf16* Ar = A + size_t(tile.row0) * ldi;
+  float acc[kGemvCols][kHy4GemvRows];
+#pragma unroll
+  for (int j = 0; j < kGemvCols; ++j)
+#pragma unroll
+    for (int r = 0; r < kHy4GemvRows; ++r) acc[j][r] = 0.0f;
+  for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
+    float x[kHy4GemvRows][16];
+#pragma unroll
+    for (int r = 0; r < kHy4GemvRows; ++r) {
+      if (r < rows) {
+        const uint4 a0 = *reinterpret_cast<const uint4*>(Ar + size_t(r) * ldi + k0);
+        const uint4 a1 = *reinterpret_cast<const uint4*>(Ar + size_t(r) * ldi + k0 + 8);
+        const uint32_t aw[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          x[r][2 * q] = bf16_to_f32(uint16_t(aw[q]));
+          x[r][2 * q + 1] = bf16_to_f32(uint16_t(aw[q] >> 16));
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < kGemvCols; ++j) {
+      const int col = c0 + j;
+      if (col >= N) break;
+      float wf[16];
+      if constexpr (kFmt == 1) {
+        const uint2 raw = *reinterpret_cast<const uint2*>(W + size_t(col) * (K / 2) + k0 / 2);
+        const float sc = ue4m3_to_f32(static_cast<const uint8_t*>(Sv)[size_t(col) * (K / 16) + k0 / 16]);
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+          const uint32_t byte = (q < 4 ? raw.x >> (8 * q) : raw.y >> (8 * (q - 4))) & 0xffu;
+          wf[q] = e2m1_to_f32(byte & 15u) * sc;
+          wf[q + 8] = e2m1_to_f32(byte >> 4) * sc;
+        }
+      } else {
+        const bf16* S = static_cast<const bf16*>(Sv);
+        const uint4 wv = *reinterpret_cast<const uint4*>(W + size_t(col) * K + k0);
+        const float sc = bf16_to_f32(S[size_t(col / 128) * kb + k0 / 128]);
+        const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          e4m3x4_to_f32(ww[q], wf + 4 * q);
+#pragma unroll
+          for (int i = 0; i < 4; ++i) wf[4 * q + i] = round_bf16(wf[4 * q + i] * sc);
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < kHy4GemvRows; ++r) {
+        if (r < rows) {
+          float a = acc[j][r];
+#pragma unroll
+          for (int i = 0; i < 16; ++i) a = fmaf(wf[i], x[r][i], a);
+          acc[j][r] = a;
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < kGemvCols; ++j) {
+    const int col = c0 + j;
+#pragma unroll
+    for (int r = 0; r < kHy4GemvRows; ++r) {
+      if (r >= rows) continue;
+      const float v = warp_sum(acc[j][r]);
+      if (lane == 0 && col < N) C[size_t(tile.row0 + r) * ldc + col] = f32_to_bf16(v);
+    }
+  }
+}
+
+// GGUF NVFP4 blocks (64 values: 4 scale bytes, then 32 code bytes) of an [N][K] matrix -> codes [N][K / 2] and scales
+// [N][K / 16] (a block's codes are already in group order: group g's 8 bytes at 8 g).
+__global__ void nvfp4_split_kernel(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales) {
+  const size_t nb = size_t(N) * (K / 64);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < nb; i += size_t(gridDim.x) * blockDim.x) {
+    const uint8_t* b = blocks + i * 36;
+    const size_t row = i / (K / 64), blk = i % (K / 64);
+    for (int s = 0; s < 4; ++s) scales[row * (K / 16) + blk * 4 + s] = b[s];
+    uint8_t* dst = codes + row * (K / 2) + blk * 32;
+    for (int j = 0; j < 32; ++j) dst[j] = b[4 + j];
+  }
+}
+
+__global__ void dense_tiles_kernel(Exl3Tile* t, int rows, int tile_rows) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r0 = i * tile_rows;
+  if (r0 < rows) t[i] = Exl3Tile{0, r0, min(tile_rows, rows - r0)};
 }
 
 __global__ void dequant_fp8_kernel(const uint8_t* w, const bf16* s, bf16* out, int N, int K) {
@@ -881,8 +1060,66 @@ void hy4_fp8_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntil
                           const bf16* const* s_tab, bf16* out, int ldo, int N, hipStream_t st, const int* ntiles_dev) {
   if (ntiles <= 0) return;
   if (K % 128 || N % 128) throw std::runtime_error("hy4_fp8_grouped_gemm: K, N % 128");
-  fp8_grouped_kernel<<<dim3(N / BN, ntiles), GNT, 0, st>>>(xa, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, out, ldo,
-                                                           N);
+  fp8_grouped_kernel<0><<<dim3(N / BN, ntiles), GNT, 0, st>>>(xa, K, tiles, ntiles, ntiles_dev, w_tab,
+                                                              reinterpret_cast<const void* const*>(s_tab), out, ldo, N);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_fp8_to_mxfp4(const uint8_t* w, const bf16* s, int kb, int row0, int N, int K, uint8_t* codes, uint8_t* scales,
+                      hipStream_t st) {
+  if (K % 32) throw std::runtime_error("hy4_fp8_to_mxfp4: K % 32");
+  fp8_to_mx_kernel<<<cdiv(size_t(N) * (K / 32), 128), 128, 0, st>>>(w, s, kb, row0, N, K, codes, scales);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_swiglu_clamp2(const bf16* g, const bf16* u, bf16* h, int rows, int I, float limit, hipStream_t st) {
+  if (rows <= 0) return;
+  swiglu_clamp2_kernel<<<grid1d(size_t(rows) * I), 256, 0, st>>>(g, u, h, rows, I, limit);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_fp8_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
+                          const uint8_t* const* w_tab, const bf16* const* s_tab, bf16* out, int ldo, int N,
+                          hipStream_t st, const int* ntiles_dev) {
+  if (ntiles <= 0) return;
+  if (K % 512 || ldi % 8) throw std::runtime_error("hy4_fp8_grouped_gemv: K % 512, ldi % 8");
+  const int cols_per_block = 8 * kGemvCols;
+  fp8_gemv_kernel<0><<<dim3((N + cols_per_block - 1) / cols_per_block, ntiles), 256, 0, st>>>(
+      xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, reinterpret_cast<const void* const*>(s_tab), out, ldo, N);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_nvfp4_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int ntiles, const uint8_t* const* w_tab,
+                            const uint8_t* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
+                            const int* ntiles_dev) {
+  if (ntiles <= 0) return;
+  if (K % 128 || N % 128) throw std::runtime_error("hy4_nvfp4_grouped_gemm: K, N % 128");
+  fp8_grouped_kernel<1><<<dim3(N / BN, ntiles), GNT, 0, st>>>(xa, K, tiles, ntiles, ntiles_dev, w_tab,
+                                                              reinterpret_cast<const void* const*>(s_tab), out, ldo, N);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
+                            const uint8_t* const* w_tab, const uint8_t* const* s_tab, bf16* out, int ldo, int N,
+                            hipStream_t st, const int* ntiles_dev) {
+  if (ntiles <= 0) return;
+  if (K % 512 || ldi % 8) throw std::runtime_error("hy4_nvfp4_grouped_gemv: K % 512, ldi % 8");
+  const int cols_per_block = 8 * kGemvCols;
+  fp8_gemv_kernel<1><<<dim3((N + cols_per_block - 1) / cols_per_block, ntiles), 256, 0, st>>>(
+      xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, reinterpret_cast<const void* const*>(s_tab), out, ldo, N);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_nvfp4_split(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales, hipStream_t st) {
+  if (K % 64) throw std::runtime_error("hy4_nvfp4_split: K % 64");
+  nvfp4_split_kernel<<<grid1d(size_t(N) * (K / 64)), 256, 0, st>>>(blocks, N, K, codes, scales);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_dense_tiles(Exl3Tile* tiles, int rows, int tile_rows, hipStream_t st) {
+  if (rows <= 0) return;
+  const int n = (rows + tile_rows - 1) / tile_rows;
+  dense_tiles_kernel<<<(n + 63) / 64, 64, 0, st>>>(tiles, rows, tile_rows);
   UH_CHECK_LAUNCH();
 }
 

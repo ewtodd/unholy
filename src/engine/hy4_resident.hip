@@ -28,7 +28,7 @@ size_t Hy4ApuExperts::work_bytes(const model::Hy4Config& c, size_t cap) {
 size_t Hy4ApuExperts::staging_bytes(const model::Hy4Config& c, size_t cap) {
   const size_t tokens = cap / size_t(c.n_active), Lt = c.latent;
   return tokens * Lt * (2 + 4) + cap * 4 * 4 + sizeof(k::MoePlan) +
-         (cap / k::kHy4TileRows + c.n_experts + 1) * sizeof(k::Exl3Tile);
+         size_t(model::hy4_max_tiles(c, int(tokens))) * sizeof(k::Exl3Tile);
 }
 
 Hy4ApuExperts::Hy4ApuExperts(const model::Hy4Config& c, int dev, size_t capacity_rows, std::shared_ptr<Layers> layers)
@@ -36,7 +36,7 @@ Hy4ApuExperts::Hy4ApuExperts(const model::Hy4Config& c, int dev, size_t capacity
   rt::DeviceGuard g(dev);
   this->capacity_rows = capacity_rows;
   const size_t Lt = c.latent, I = c.moe_inter, cap = capacity_rows, tokens = cap / size_t(c.n_active);
-  max_tiles = int(cap / k::kHy4TileRows + c.n_experts + 1);
+  max_tiles = model::hy4_max_tiles(c, int(tokens));
   const unsigned flags = hipHostMallocPortable | hipHostMallocMapped;
   const auto pinned = [&](auto** host, auto** dev_ptr, size_t bytes) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(host), bytes, flags));
@@ -126,7 +126,7 @@ Plan make_hy4_plan(const Hy4PlanInput& in) {
   std::vector<size_t> dense(size_t(c.n_layers)), cache(size_t(c.n_layers));
   size_t total = 0;
   for (int L = 0; L < c.n_layers; ++L) {
-    dense[size_t(L)] = model::hy4_dense_layer_bytes(ck, c, L);
+    dense[size_t(L)] = model::hy4_dense_layer_bytes(ck, c, L, true);
     cache[size_t(L)] = model::hy4_cache_bytes(c, c.is_sparse(L), in.geo.max_slots, in.geo.num_pages);
     total += dense[size_t(L)] + cache[size_t(L)];
   }
@@ -161,7 +161,9 @@ Plan make_hy4_plan(const Hy4PlanInput& in) {
     double share;
     int layer, expert;
   };
-  const size_t eb = model::hy4_expert_bytes(c);
+  const size_t eb = model::hy4_expert_bytes(c, in.nvfp4   ? model::Hy4ExpertFormat::Nvfp4
+                                              : in.mxfp4 ? model::Hy4ExpertFormat::Mxfp4
+                                                         : model::Hy4ExpertFormat::Fp8);
   std::vector<Cand> cands[2];
   double layers_moe = 0;
   for (int L = 0; L < c.n_layers; ++L) {
@@ -219,7 +221,8 @@ size_t hy4_snapshot_bytes(const model::Hy4Config& c, const Plan& p, int kc) {
 
 Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Checkpoint& ck,
                                    const std::string& engram_dir, const Plan& plan, const model::CacheGeometry& geo,
-                                   int max_tokens, int max_seq, int max_logit_rows, int snapshots)
+                                   int max_tokens, int max_seq, int max_logit_rows, int snapshots, bool mxfp4,
+                                   const model::Checkpoint* experts_gguf)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
       max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens),
       snapshots_(snapshots) {
@@ -227,6 +230,8 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
   engram_ = std::make_unique<model::Hy4Engram>(engram_dir, c);
   last2_.assign(size_t(geo.max_slots) * 2, -1);
   model::Uploader up(ck);
+  std::unique_ptr<model::Uploader> gup;
+  if (experts_gguf) gup = std::make_unique<model::Uploader>(*experts_gguf);
   {
     auto layers = std::make_shared<Hy4ApuExperts::Layers>();
     for (auto& ch : chan_) ch = std::make_unique<Hy4ApuExperts>(c, plan.apu, size_t(max_tokens) * c.n_active, layers);
@@ -249,6 +254,9 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
       rt::DeviceGuard g(cd.dev);
       model::Hy4LoadOptions lo;
       lo.expert_mask = &plan.on_card[size_t(L)];
+      lo.mxfp4 = mxfp4;
+      lo.experts_gguf = experts_gguf;
+      lo.experts_up = gup.get();
       lo.up = &up;
       cd.w.push_back(model::load_hy4_layer(ck, c, L, cd.dev, cd.st, lo));
       cd.cache.push_back(model::make_hy4_cache(c, L, geo.max_slots, geo.num_pages, cd.dev, cd.st));
@@ -262,6 +270,9 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
     model::Hy4LoadOptions la;
     la.load_dense = false;
     la.expert_mask = &cold;
+    la.mxfp4 = mxfp4;
+    la.experts_gguf = experts_gguf;
+    la.experts_up = gup.get();
     la.up = &up;
     chan_[0]->add_layer(model::load_hy4_layer(ck, c, L, plan.apu, chan_[0]->stream(), la));
   }

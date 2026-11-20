@@ -32,6 +32,7 @@ struct TensorInfo {
   int file = -1;        // index into Checkpoint's shard list
   uint64_t offset = 0;  // absolute byte offset of the payload in the shard file
   uint64_t nbytes = 0;
+  int gguf_type = -1;   // GGUF tensors: the ggml type (dtype U8: raw blocks); -1 for safetensors
 
   int64_t numel() const {
     int64_t n = 1;
@@ -45,6 +46,9 @@ class Checkpoint {
   // `dir` holds model.safetensors.index.json (or a single model.safetensors) and config.json; `extra` names side
   // files in it whose tensors join the index when they exist (exllamav3 keeps the MTP layer in mtp.safetensors).
   static std::unique_ptr<Checkpoint> open(const std::string& dir, const std::vector<std::string>& extra = {});
+  // GGUF files (one or more shards of one build): every tensor as raw blocks (dtype U8, gguf_type set, shape in
+  // row-major order, i.e. the GGUF dims reversed), payload bytes up to the next tensor or the end of the file.
+  static std::unique_ptr<Checkpoint> open_gguf(const std::vector<std::string>& paths);
   ~Checkpoint();
   Checkpoint(const Checkpoint&) = delete;
   Checkpoint& operator=(const Checkpoint&) = delete;
@@ -72,6 +76,7 @@ class Checkpoint {
  private:
   Checkpoint() = default;
   void add_shard(const std::string& path);
+  void add_gguf(const std::string& path);
 
   struct Map {
     int fd = -1;
