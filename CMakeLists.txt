@@ -74,6 +74,8 @@ target_include_directories(unholy_vision PUBLIC src)
 target_link_libraries(unholy_vision PUBLIC PkgConfig::TURBOJPEG PkgConfig::LIBPNG PkgConfig::LIBWEBP)
 add_executable(unholy-vision-test tools/vision_test/main.cpp)
 target_link_libraries(unholy-vision-test PRIVATE unholy_vision unholy_text)
+add_executable(unholy-hy4-preprocess tools/hy4_preprocess/main.cpp)
+target_link_libraries(unholy-hy4-preprocess PRIVATE unholy_vision)
 
 # Scheduler / sampler: host-only, tested against a fake model.
 add_library(unholy_sched STATIC

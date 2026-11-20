@@ -584,3 +584,185 @@ std::vector<GlmImageInput> glm_expand_images(std::vector<int32_t>& ids, int32_t 
 }
 
 }  // namespace unholy::vision
+
+namespace unholy::vision {
+
+namespace {
+
+// One axis of torch's aa kernel (UpSampleKernel.cpp, _compute_index_ranges_int16_weights with bicubic aa_filter, a = -0.5).
+struct AxisWeights {
+  std::vector<int> start, size;
+  std::vector<int16_t> weight;  // [out][max_size]
+  int max_size = 0, precision = 0;
+};
+
+double cubic_filter(double x) {
+  constexpr double a = -0.5;
+  x = std::abs(x);
+  if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+  if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+  return 0.0;
+}
+
+AxisWeights torch_axis_weights(int in_size, int out_size) {
+  const double scale = double(in_size) / double(out_size);
+  const double support = scale >= 1.0 ? 2.0 * scale : 2.0;
+  const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
+  AxisWeights a;
+  a.max_size = int(std::ceil(support)) * 2 + 1;
+  std::vector<double> w(size_t(out_size) * a.max_size, 0.0);
+  a.start.resize(size_t(out_size));
+  a.size.resize(size_t(out_size));
+  double wt_max = 0.0;
+  for (int i = 0; i < out_size; ++i) {
+    const double center = scale * (i + 0.5);
+    const int xmin = std::max(int(center - support + 0.5), 0);
+    const int xsize = std::min(std::min(int(center + support + 0.5), in_size) - xmin, a.max_size);
+    double total = 0.0;
+    for (int j = 0; j < xsize; ++j) {
+      const double v = cubic_filter((j + xmin - center + 0.5) * invscale);
+      w[size_t(i) * a.max_size + j] = v;
+      total += v;
+    }
+    if (total != 0.0)
+      for (int j = 0; j < xsize; ++j) w[size_t(i) * a.max_size + j] /= total;
+    for (int j = 0; j < xsize; ++j) wt_max = std::max(wt_max, w[size_t(i) * a.max_size + j]);
+    a.start[size_t(i)] = xmin;
+    a.size[size_t(i)] = xsize;
+  }
+  int p = 0;
+  while (p < 22 && int(0.5 + wt_max * double(1 << (p + 1))) < (1 << 15)) ++p;
+  a.precision = p;
+  a.weight.assign(w.size(), 0);
+  const double mult = double(1 << p);
+  for (size_t k = 0; k < w.size(); ++k) {
+    const double v = w[k] * mult;
+    a.weight[k] = int16_t(v < 0 ? int(-0.5 + v) : int(0.5 + v));
+  }
+  return a;
+}
+
+}  // namespace
+
+RgbImage resize_bicubic_torch_aa(const RgbImage& in, int w, int h) {
+  if (w == in.w && h == in.h) return in;
+  const AxisWeights ax = torch_axis_weights(in.w, w), ay = torch_axis_weights(in.h, h);
+  auto clamp8 = [](int v) { return uint8_t(std::min(std::max(v, 0), 255)); };
+  RgbImage mid;  // horizontal pass: in.h rows of w pixels
+  mid.w = w;
+  mid.h = in.h;
+  mid.px.resize(size_t(w) * in.h * 3);
+  for (int y = 0; y < in.h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const int16_t* wt = &ax.weight[size_t(x) * ax.max_size];
+      const uint8_t* src = &in.px[(size_t(y) * in.w + size_t(ax.start[size_t(x)])) * 3];
+      for (int c = 0; c < 3; ++c) {
+        int acc = 1 << (ax.precision - 1);
+        for (int j = 0; j < ax.size[size_t(x)]; ++j) acc += int(src[j * 3 + c]) * int(wt[j]);
+        mid.px[(size_t(y) * w + x) * 3 + size_t(c)] = clamp8(acc >> ax.precision);
+      }
+    }
+  RgbImage out;
+  out.w = w;
+  out.h = h;
+  out.px.resize(size_t(w) * h * 3);
+  for (int y = 0; y < h; ++y) {
+    const int16_t* wt = &ay.weight[size_t(y) * ay.max_size];
+    for (int x = 0; x < w; ++x)
+      for (int c = 0; c < 3; ++c) {
+        int acc = 1 << (ay.precision - 1);
+        for (int j = 0; j < ay.size[size_t(y)]; ++j)
+          acc += int(mid.px[(size_t(ay.start[size_t(y)] + j) * w + x) * 3 + size_t(c)]) * int(wt[j]);
+        out.px[(size_t(y) * w + x) * 3 + size_t(c)] = clamp8(acc >> ay.precision);
+      }
+  }
+  return out;
+}
+
+std::pair<int, int> hy4_smart_resize(int height, int width, const Hy4VisionConfig& cfg) {
+  const int factor = cfg.patch * cfg.merge;
+  if (height <= 0 || width <= 0) throw ImageError("image: empty");
+  if (double(std::max(height, width)) / double(std::min(height, width)) > 200.0)
+    throw ImageError("image: aspect ratio above 200");
+  // Python round() is half-to-even; nearbyint under the default rounding mode is the same.
+  long h_bar = long(std::nearbyint(double(height) / factor)) * factor;
+  long w_bar = long(std::nearbyint(double(width) / factor)) * factor;
+  if (h_bar * w_bar > cfg.max_pixels) {
+    const double beta = std::sqrt(double(height) * double(width) / double(cfg.max_pixels));
+    h_bar = std::max<long>(factor, long(std::floor(double(height) / beta / factor)) * factor);
+    w_bar = std::max<long>(factor, long(std::floor(double(width) / beta / factor)) * factor);
+  } else if (h_bar * w_bar < cfg.min_pixels) {
+    const double beta = std::sqrt(double(cfg.min_pixels) / (double(height) * double(width)));
+    h_bar = long(std::ceil(double(height) * beta / factor)) * factor;
+    w_bar = long(std::ceil(double(width) * beta / factor)) * factor;
+  }
+  // vLLM's guards after the same branches.
+  h_bar = std::max<long>(h_bar, factor);
+  w_bar = std::max<long>(w_bar, factor);
+  if (h_bar * w_bar > cfg.max_pixels) throw ImageError("image: resized size above max_pixels");
+  return {int(h_bar), int(w_bar)};
+}
+
+RgbImage hy4_resize(const RgbImage& img, const Hy4VisionConfig& cfg) {
+  const auto [h, w] = hy4_smart_resize(img.h, img.w, cfg);
+  return resize_bicubic_torch_aa(img, w, h);
+}
+
+Hy4Patches hy4_preprocess(const RgbImage& img, const Hy4VisionConfig& cfg) {
+  const RgbImage r = hy4_resize(img, cfg);
+  const int p = cfg.patch;
+  Hy4Patches out;
+  out.grid_h = r.h / p;
+  out.grid_w = r.w / p;
+  // tvF.normalize(x.float(), mean * 255, std * 255): (x - 127.5f) / 127.5f in fp32, to bf16 (nearest even).
+  const float mean = cfg.mean * 255.0f, stddev = cfg.stddev * 255.0f;
+  uint16_t lut[256];
+  for (int v = 0; v < 256; ++v) {
+    const float x = (float(v) - mean) / stddev;
+    uint32_t u;
+    std::memcpy(&u, &x, 4);
+    lut[v] = uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  }
+  out.data.resize(size_t(out.grid_h) * out.grid_w * 3 * p * p);
+  size_t o = 0;
+  for (int gy = 0; gy < out.grid_h; ++gy)
+    for (int gx = 0; gx < out.grid_w; ++gx)
+      for (int c = 0; c < 3; ++c)
+        for (int py = 0; py < p; ++py)
+          for (int px = 0; px < p; ++px)
+            out.data[o++] = lut[r.px[(size_t(gy * p + py) * r.w + size_t(gx * p + px)) * 3 + size_t(c)]];
+  return out;
+}
+
+std::vector<Hy4ImageInput> hy4_expand_images(std::vector<int32_t>& ids, int32_t pad_token,
+                                             const std::vector<std::string>& urls, const Hy4VisionConfig& cfg) {
+  const size_t n = size_t(std::count(ids.begin(), ids.end(), pad_token));
+  if (n != urls.size())
+    throw ImageError("found " + std::to_string(n) + " image pads but got " + std::to_string(urls.size()) + " images");
+  std::vector<Hy4ImageInput> out;
+  if (n == 0) return out;
+  std::vector<int32_t> expanded;
+  size_t next = 0;
+  for (const int32_t t : ids) {
+    if (t != pad_token) {
+      expanded.push_back(t);
+      continue;
+    }
+    const std::vector<uint8_t> bytes = image_bytes_from_url(urls[next++]);
+    Hy4ImageInput in;
+    uint64_t h = 1469598103934665603ull;
+    for (const uint8_t b : bytes) h = (h ^ b) * 1099511628211ull;
+    in.hash = h;
+    in.patches = hy4_preprocess(decode_image(bytes), cfg);
+    in.start = int(expanded.size());
+    in.rows = in.patches.grid_h / cfg.merge;
+    in.cols = in.patches.grid_w / cfg.merge + 1;  // one newline slot per merged row
+    in.tokens = in.rows * in.cols;
+    expanded.insert(expanded.end(), size_t(in.tokens), pad_token);
+    out.push_back(std::move(in));
+  }
+  ids = std::move(expanded);
+  return out;
+}
+
+}  // namespace unholy::vision

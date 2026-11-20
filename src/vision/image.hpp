@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace unholy::vision {
@@ -92,6 +93,45 @@ struct GlmImageInput {
 // image's token count of copies, the images decoded and preprocessed. Throws ImageError when the counts differ.
 std::vector<GlmImageInput> glm_expand_images(std::vector<int32_t>& ids, int32_t image_token,
                                              const std::vector<std::string>& urls, const GlmVisionConfig& cfg);
+
+// Hunyuan Hy4-flash's image processor (transformers HYV4VLImageProcessor, torchvision backend, as configured by the
+// checkpoint's processor_config.json): a size aligned to patch * merge pixels within [min_pixels, max_pixels]
+// (smart_resize, factor 32); the uint8 image resized with torch's antialiased bicubic kernel; (x - 127.5) / 127.5 in
+// float32 (mean = std = 0.5, rescale 1/255 fused) rounded to bf16; patches in plain raster order, each [3][patch][patch].
+struct Hy4VisionConfig {
+  int patch = 16, merge = 2;
+  long min_pixels = 4096, max_pixels = 4194304;
+  float mean = 0.5f, stddev = 0.5f;
+};
+
+// torchvision resize(uint8 CHW, BICUBIC, antialias=True): per-axis int16 fixed-point weights, horizontal pass then
+// vertical with a uint8 intermediate; the input unchanged when the size is equal.
+RgbImage resize_bicubic_torch_aa(const RgbImage& in, int w, int h);
+
+// smart_resize (Python round, double math) with vLLM's guards: the aligned (height, width). Throws ImageError for an
+// aspect ratio over 200 or a result outside the pixel budget.
+std::pair<int, int> hy4_smart_resize(int height, int width, const Hy4VisionConfig& cfg);
+
+// The image as the processor resizes it (hy4_smart_resize + resize_bicubic_torch_aa).
+RgbImage hy4_resize(const RgbImage& img, const Hy4VisionConfig& cfg);
+
+struct Hy4Patches {
+  int grid_h = 0, grid_w = 0;  // 16-pixel patches
+  std::vector<uint16_t> data;  // [grid_h * grid_w][3 * patch * patch] bf16, raster patch order
+};
+Hy4Patches hy4_preprocess(const RgbImage& img, const Hy4VisionConfig& cfg);
+
+// One image of an Hy4 request: `tokens` image pads from position `start` (rows of cols = grid_w / merge + 1 slots, the
+// last of each row being the newline slot), the encoder input, a hash of the image bytes.
+struct Hy4ImageInput {
+  int start = 0, tokens = 0, rows = 0, cols = 0;
+  Hy4Patches patches;
+  uint64_t hash = 0;
+};
+// The chat template writes <image_start><image_pad><image_end> per image; each single `pad_token` of ids becomes its
+// image's `tokens` pads (start = index of the first). Throws ImageError when the counts differ.
+std::vector<Hy4ImageInput> hy4_expand_images(std::vector<int32_t>& ids, int32_t pad_token,
+                                             const std::vector<std::string>& urls, const Hy4VisionConfig& cfg);
 
 // Image bytes from an OpenAI-style URL: "data:<mime>;base64,<payload>" only (http(s) and paths are
 // refused). Throws ImageError.
