@@ -148,6 +148,7 @@ add_library(unholy_hy4 STATIC
   src/kernels/hy4.hip
   src/model/hy4.hip
   src/model/hy4_fast.hip
+  src/model/hy4_vision.hip
 )
 target_include_directories(unholy_hy4 PUBLIC src third_party)
 target_link_libraries(unholy_hy4 PUBLIC unholy_glm)

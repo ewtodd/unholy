@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -197,7 +198,12 @@ Plan make_hy4_plan(const Hy4PlanInput& in) {
   pl.routed_on_cards = mass_cards / std::max(layers_moe, 1.0);
   pl.apu_free = info(pl.apu).free_bytes;
   const size_t cap = size_t(in.max_tokens) * c.n_active;
-  const size_t apu_work = 2 * (Hy4ApuExperts::work_bytes(c, cap) + Hy4ApuExperts::staging_bytes(c, cap));
+  size_t apu_work = 2 * (Hy4ApuExperts::work_bytes(c, cap) + Hy4ApuExperts::staging_bytes(c, cap));
+  if (in.vision) {  // the vision tower: weights, a scratch for the largest image, its rows
+    const auto vc = model::Hy4VisionConfig::from_hf(ck.config());
+    apu_work += model::hy4_vision_weight_bytes(ck) + model::hy4_vision_scratch_bytes(vc, vc.max_patches) +
+                size_t(vc.max_patches) * vc.out_dim * 2;
+  }
   const size_t apu_need = pl.apu_experts + apu_work + in.apu_margin;
   if (apu_need > pl.apu_free) {
     char msg[256];
@@ -225,10 +231,24 @@ size_t hy4_snapshot_bytes(const model::Hy4Config& c, const Plan& p, int kc) {
 // ---------------------------------------------------------------------------------------------------
 // Hy4ResidentModel
 
+struct Hy4ResidentModel::Vision {
+  int dev = 0;
+  hipStream_t st = nullptr;
+  std::mutex mu;
+  model::Hy4VisionConfig c;
+  model::Hy4VisionWeights w;
+  model::Hy4VisionScratch s;
+  rt::DeviceBuffer out;
+  ~Vision() {
+    rt::DeviceGuard g(dev);
+    if (st) (void)hipStreamDestroy(st);
+  }
+};
+
 Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Checkpoint& ck,
                                    const std::string& engram_dir, const Plan& plan, const model::CacheGeometry& geo,
                                    int max_tokens, int max_seq, int max_logit_rows, int snapshots, bool mxfp4,
-                                   const model::Checkpoint* experts_gguf, bool dfly)
+                                   const model::Checkpoint* experts_gguf, bool dfly, bool vision)
     : c_(c), plan_(plan), geo_(geo), max_tokens_(max_tokens),
       max_logit_rows_(max_logit_rows > 0 ? std::min(max_logit_rows, max_tokens) : max_tokens),
       snapshots_(snapshots) {
@@ -267,6 +287,7 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
     cd.x = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * c.hc * c.dim * 2);
     cd.ids = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
     cd.pos = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 4);
+    cd.pos3 = rt::DeviceBuffer(cd.dev, size_t(max_tokens) * 3 * 4);
     cd.tables = rt::DeviceBuffer(cd.dev, size_t(geo.max_slots) * geo.max_pages_per_seq * 4);
   }
   for (int L = 0; L < c.n_layers; ++L) {
@@ -330,6 +351,19 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
         if (dtarget_[i]->layer != dw_.target[i]) throw std::runtime_error("hy4: DFly2 target layer order");
     }
   }
+  if (vision) {
+    vision_ = std::make_unique<Vision>();
+    Vision& v = *vision_;
+    v.dev = plan.apu;
+    v.c = model::Hy4VisionConfig::from_hf(ck.config());
+    if (v.c.depth <= 0) throw std::runtime_error("hy4: the config has no vision tower");
+    if (v.c.out_dim != c.dim) throw std::runtime_error("hy4: the vision tower's output width is not the model's");
+    rt::DeviceGuard g(v.dev);
+    UH_CHECK(hipStreamCreateWithFlags(&v.st, hipStreamNonBlocking));
+    v.w = model::load_hy4_vision(ck, v.c, v.dev, v.st);
+    v.s = model::make_hy4_vision_scratch(v.c, v.c.max_patches, v.dev);
+    v.out = rt::DeviceBuffer(v.dev, size_t(v.c.max_patches) * v.c.out_dim * 2);
+  }
   const auto pinned = [](auto** p, size_t bytes) {
     UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(p), std::max<size_t>(bytes, 64),
                            hipHostMallocPortable | hipHostMallocMapped));
@@ -338,6 +372,8 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
     pinned(&f.x_host, size_t(max_tokens) * c.hc * c.dim * 2);
     pinned(&f.logits_host, size_t(max_logit_rows_) * c.vocab * 4);
     pinned(&f.io_host, size_t(max_tokens) * 3 * 4);
+    pinned(&f.pos3_host, size_t(max_tokens) * 3 * 4);
+    if (vision) pinned(&f.img_host, size_t(max_tokens) * c.dim * 2);
     pinned(&f.tables_host, size_t(geo.max_slots) * geo.max_pages_per_seq * 4);
     for (int m = 0; m < engram_->memories(); ++m) {
       pinned(&f.eng_q[m], size_t(max_tokens) * 16 * 96);
@@ -386,7 +422,8 @@ Hy4ResidentModel::~Hy4ResidentModel() {
     }
   for (Flight& f : flight_) {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.io_host),
-                    static_cast<void*>(f.tables_host), static_cast<void*>(f.eng_mask)})
+                    static_cast<void*>(f.tables_host), static_cast<void*>(f.eng_mask), static_cast<void*>(f.pos3_host),
+                    static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
     for (int m = 0; m < 4; ++m) {
       if (f.eng_q[m]) (void)hipHostFree(f.eng_q[m]);
@@ -467,7 +504,8 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   const int T = int(in.ids.size()), R = int(in.logit_rows.size()), D = c_.dim;
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
   if (R > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
-  if (!in.image_rows.empty() || !in.image_spans.empty()) throw std::runtime_error("step: no vision tower loaded");
+  if (!in.image_spans.empty()) throw std::runtime_error("step: Hy4 image tokens are causal (no spans)");
+  if (!in.image_rows.empty() && !vision_) throw std::runtime_error("step: image rows without a vision tower");
   if (!in.backup.empty() && !dfly_) throw std::runtime_error("step: verify chunks without a drafter");
   for (const auto* ops : {&in.restore, &in.save})
     for (const StateOp& op : *ops)
@@ -513,6 +551,22 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
     std::memcpy(snap_tok_host_ + size_t(op.snapshot) * 4096, &last2_[size_t(op.slot) * 2], 8);
   engram_->lookup_all(ngram.data(), f.eng_mask, T, f.eng_q, f.eng_s);
 
+  // Image rows into this flight's pinned buffer, in order.
+  {
+    size_t off = 0;
+    for (const ImageRows& im : in.image_rows) {
+      if (im.t0 < 0 || im.n <= 0 || im.t0 + im.n > T || off + size_t(im.n) > size_t(T))
+        throw std::runtime_error("step: image rows outside the batch");
+      std::memcpy(f.img_host + off * D, im.rows, size_t(im.n) * D * 2);
+      off += size_t(im.n);
+    }
+  }
+  // M-RoPE: when a chunk's sequence has images, every row's three planes (text rows: their slot, shifted past images)
+  bool mrope = false;
+  for (const Chunk& ch : in.chunks) mrope |= ch.mrope != nullptr;
+  if (mrope)
+    for (const Chunk& ch : in.chunks)
+      for (int i = 0; i < ch.n; ++i) mrope_position(ch.mrope, ch.s0 + i, f.pos3_host + size_t(ch.t0 + i) * 3);
   std::memcpy(f.io_host, in.ids.data(), size_t(T) * 4);
   std::memcpy(f.io_host + max_tokens_, in.pos.data(), size_t(T) * 4);
   std::memcpy(f.io_host + 2 * max_tokens_, in.logit_rows.data(), size_t(R) * 4);
@@ -520,7 +574,10 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   if (tables) std::memcpy(f.tables_host, tables_.data(), tables_.size() * 4);
   tables_dirty_ = false;
   model::Hy4Batch b;
-  for (const Chunk& ch : in.chunks) b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0, is_verify(ch)});
+  for (const Chunk& ch : in.chunks) {
+    b.chunks.push_back({ch.slot, ch.s0, ch.n, ch.t0, is_verify(ch)});
+    if (mrope) mrope_position(ch.mrope, ch.s0 / c_.idx_pool * c_.idx_pool, b.chunks.back().g0);
+  }
   b.T = T;
   b.max_pages = geo_.max_pages_per_seq;
   b.pos_host = in.pos.data();
@@ -534,11 +591,18 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
     rt::DeviceGuard g(cd.dev);
     if (kc == 0) k::copy_kernel(cd.ids.data(), f.io_host, size_t(T) * 4, cd.st);
     k::copy_kernel(cd.pos.data(), f.io_host + max_tokens_, size_t(T) * 4, cd.st);
+    if (mrope) k::copy_kernel(cd.pos3.data(), f.pos3_host, size_t(T) * 3 * 4, cd.st);
     if (tables) k::copy_kernel(cd.tables.data(), f.tables_host, tables_.size() * 4, cd.st);
     b.pos = cd.pos.as<int32_t>();
+    b.pos3 = mrope ? cd.pos3.as<int32_t>() : nullptr;
     b.tables = cd.tables.as<int32_t>();
     if (kc == 0) {
       model::hy4_embed(c_, embed_, cd.ids.as<int32_t>(), cd.x.as<uint16_t>(), T, cd.st);
+      size_t off = 0;  // image rows over their pad tokens' embeddings (every iHC stream), from the pinned buffer
+      for (const ImageRows& im : in.image_rows) {
+        k::put_rows_hc(f.img_host + off * D, im.n, cd.x.as<uint16_t>(), im.t0, D, c_.hc, cd.st);
+        off += size_t(im.n);
+      }
     } else {
       if (dfly_) UH_CHECK(hipStreamWaitEvent(cd.st, drafted_, 0));  // the last draft()'s restores and reads
       UH_CHECK(hipStreamWaitEvent(cd.st, f.handoff, 0));
@@ -623,7 +687,9 @@ void Hy4ResidentModel::draft(const std::vector<RingRestore>& restore, const std:
     std::vector<model::Hy4DflyReq> dr;
     for (const DraftReq& q : reqs) {
       if (q.token < 0 || q.token >= c_.vocab) throw std::runtime_error("draft: token id outside the vocabulary");
-      dr.push_back({q.slot, q.start + 1, q.token});
+      int32_t rp[3];
+      mrope_position(q.mrope, q.start + 1, rp);  // text after any images: the three planes are equal
+      dr.push_back({q.slot, q.start + 1, q.token, rp[0]});
     }
     model::hy4_dfly_draft(c_, dw_, head_, dtarget_, cd.tables.as<int32_t>(), geo_.max_pages_per_seq,
                           hidden_.as<uint16_t>(), dscr_, dr, dtok_.as<int32_t>(), dst_,
@@ -642,6 +708,19 @@ void Hy4ResidentModel::draft(const std::vector<RingRestore>& restore, const std:
       tokens[size_t(r) * model::kHy4DraftTokens + t] = dtok_host_[size_t(t) * R + r];
       conf[size_t(r) * model::kHy4DraftTokens + t] = cf[size_t(t) * R + r];
     }
+}
+
+void Hy4ResidentModel::encode_image(const vision::Hy4Patches& p, std::vector<uint16_t>& rows) {
+  if (!vision_) throw std::runtime_error("no vision tower loaded");
+  Vision& v = *vision_;
+  const int n = (p.grid_h / v.c.merge) * (p.grid_w / v.c.merge + 1);
+  if (p.grid_h * p.grid_w > v.c.max_patches) throw std::runtime_error("image of more patches than the vision tower takes");
+  std::lock_guard lk(v.mu);
+  rt::DeviceGuard g(v.dev);
+  model::hy4_vision_encode(v.c, v.w, v.s, p.grid_h, p.grid_w, p.data, v.out.as<uint16_t>(), v.st);
+  rows.resize(size_t(n) * v.c.out_dim);
+  UH_CHECK(hipMemcpyAsync(rows.data(), v.out.data(), rows.size() * 2, hipMemcpyDeviceToHost, v.st));
+  UH_CHECK(hipStreamSynchronize(v.st));
 }
 
 void Hy4ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {

@@ -22,6 +22,13 @@ Outputs in --out: meta.json, logits.bin (f32 [S, vocab]), h_LLL.bin (bf16 [S, hc
 --attn-fp32 swaps the eager attention for the same math in fp32 (transformers' eager path runs the softmax in bf16):
 the oracle against itself with that change is the noise floor.
 
+--image FILE --question TEXT (instead of --ids / --prompt): one user turn with an image, rendered and preprocessed by
+transformers' own HYV4Flash processor (chat template, smart_resize, pad expansion); the vision tower
+(HYV4VLVisionModel, sdpa attention, its checkpoint names renamed as transformers' conversion mapping does) gives the
+image rows, which replace the pad tokens' embeddings; positions are HYV4FlashModel.get_rope_index's three planes (for
+RoPE and the indexer's group phases). Extra outputs: rows.bin (bf16 [pads][3072]), positions.bin (int32 [3][S]);
+meta.json gets the grid. No decode steps (the logits of every prompt position are compared).
+
 --experts-gguf SHARD[,SHARD..] takes the routed experts from a GGUF build of the same weights (blk.L.ffn_{gate,up,down}_exps,
 dequantized by gguf-py, e.g. AngelSlim's Q4_K_M or SPARK-4Bit NVFP4): the oracle with a quantization's experts, for KL
 against the release.
@@ -224,11 +231,74 @@ def ngram_tokens(ids, n, pad):
     return torch.stack(cols, -1)
 
 
+_VIT_RENAMES = [  # HYV4VLVisionModel key -> checkpoint name (transformers' hy_v4_vl conversion mapping, reversed)
+    (r"^layers\.(\d+)\.layer_norm1\.", r"vit.layers.\1.input_layernorm."),
+    (r"^layers\.(\d+)\.layer_norm2\.", r"vit.layers.\1.post_attention_layernorm."),
+    (r"\.mlp\.fc1\.", ".mlp.dense_h_to_4h."),
+    (r"\.mlp\.fc2\.", ".mlp.dense_4h_to_h."),
+    (r"^patch_merger\.before_rms\.", "vit.perceive.norm."),
+    (r"^patch_merger\.proj_conv\.", "vit.perceive.proj.0."),
+    (r"^patch_merger\.proj_out\.", "vit.perceive.proj.2."),
+    (r"^patch_merger\.", "vit.perceive."),
+    (r"^(?!vit\.)", "vit."),
+]
+
+
+def vit_name(key):
+    import re
+    for a, b in _VIT_RENAMES:
+        key = re.sub(a, b, key)
+    return key
+
+
+def vision_inputs(args, full, ck, dev, block):
+    """The processor's ids / pixel_values / grid for one image turn, the tower's rows, get_rope_index's positions."""
+    import types
+    from PIL import Image
+    from transformers import AutoProcessor
+    from transformers.models.hy_v4_vl import modeling_hy_v4_vl as hvl
+    proc = AutoProcessor.from_pretrained(args.ckpt)
+    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": args.question}]}]
+    text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    enc = proc(text=[text], images=[Image.open(args.image)], return_tensors="pt")
+    ids = enc["input_ids"][0]
+    grid = enc["image_grid_thw"]
+    vcfg = full.vision_config
+    vcfg._attn_implementation = "sdpa"
+    with torch.device("meta"):
+        tower = hvl.HYV4VLVisionModel(vcfg)
+    sd = {k: ck.get(vit_name(k), dev, block) for k in tower.state_dict()}
+    tower.load_state_dict(sd, strict=True, assign=True)
+    left = [n for n, b in list(tower.named_parameters()) + list(tower.named_buffers()) if b.is_meta]
+    if left:
+        raise SystemExit(f"vision tower tensors left on meta: {left}")
+    tower.eval()
+    dt = torch.float32 if args.vision_fp32 else torch.bfloat16
+    tower = tower.to(dt)
+    with torch.no_grad():
+        rows = tower(enc["pixel_values"].to(dev).to(dt), grid_thw=grid.to(dev)).pooler_output.squeeze(0)
+        rows = rows.to(torch.bfloat16)
+    rows.contiguous().view(torch.uint16).cpu().numpy().tofile(os.path.join(args.out, "rows.bin"))
+    del tower, sd
+    torch.cuda.empty_cache()
+    mm = (ids == full.image_token_id).int().unsqueeze(0)
+    fake = types.SimpleNamespace(config=full)
+    fake.get_vision_position_ids = types.MethodType(hym.HYV4FlashModel.get_vision_position_ids, fake)
+    positions, delta = hym.HYV4FlashModel.get_rope_index(fake, ids.unsqueeze(0), mm, image_grid_thw=grid)
+    positions.to(torch.int32).numpy().tofile(os.path.join(args.out, "positions.bin"))
+    print(f"image: grid {grid.tolist()}, {int(mm.sum())} pads, {len(ids)} tokens, rope delta {int(delta)}", flush=True)
+    return {"ids": ids.numpy().astype(np.int64), "grid": grid[0].tolist(), "rows": rows, "positions": positions}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="/scratch/models/hy4-flash-fp8")
-    ap.add_argument("--ids", required=True, help="uint32 token ids")
-    ap.add_argument("--prompt", type=int, required=True, help="prompt length within --ids")
+    ap.add_argument("--ids", help="uint32 token ids")
+    ap.add_argument("--prompt", type=int, help="prompt length within --ids")
+    ap.add_argument("--image", help="an image for one user turn (with --question), instead of --ids")
+    ap.add_argument("--question", default="Describe this image.")
+    ap.add_argument("--vision-fp32", action="store_true", help="the vision tower in fp32 (rows rounded to bf16 for the "
+                    "LM): with --attn-fp32, the image path's noise-floor twin")
     ap.add_argument("--decode", type=int, default=0, help="teacher-forced decode steps after the prompt")
     ap.add_argument("--prefill-chunk", type=int, default=0, help="push the prompt through in calls of this many "
                     "tokens (0: one call); eager attention takes heads x S x S bf16 scores per call")
@@ -253,9 +323,20 @@ def main():
     gx = GgufExperts(args.experts_gguf.split(",")) if args.experts_gguf else None
     dt = torch.bfloat16
 
-    ids_all = np.fromfile(args.ids, dtype=np.uint32).astype(np.int64)
+    image = None
+    if args.image:
+        image = vision_inputs(args, full, ck, dev, block)
+        ids_all = image["ids"]
+        args.prompt, args.decode = len(ids_all), 0
+    elif args.ids is None or args.prompt is None:
+        raise SystemExit("--ids and --prompt, or --image")
+    else:
+        ids_all = np.fromfile(args.ids, dtype=np.uint32).astype(np.int64)
     P, S = args.prompt, args.prompt + args.decode
     ids = torch.tensor(ids_all[:S], device=dev)
+    # RoPE / indexer positions [3, 1, S]: the three planes equal for text, get_rope_index's with an image
+    positions = (image["positions"].to(dev) if image is not None
+                 else torch.arange(S, device=dev).view(1, 1, -1).expand(3, 1, -1))
     n_layers = args.layers if args.layers is not None else cfg.num_hidden_layers
     dump = (set(range(n_layers)) if args.dump_layers == "all" else set()
             if args.dump_layers == "none" else {int(x) for x in args.dump_layers.split(",")})
@@ -263,8 +344,14 @@ def main():
     with torch.no_grad():
         rope = hym.HYV4FlashRotaryEmbedding(cfg, device=dev)
         embed = ck.get("model.embed_tokens.weight", dev, block)
-        h = embed[ids].unsqueeze(0).unsqueeze(2).expand(-1, -1, cfg.hc_mult, -1).contiguous()  # [1, S, hc, hidden]
-        del embed
+        e = embed[ids]
+        if image is not None:  # masked_scatter of the image rows over the pad tokens
+            pads = ids == full.image_token_id
+            if int(pads.sum()) != image["rows"].shape[0]:
+                raise SystemExit("image rows and pad tokens differ")
+            e[pads] = image["rows"].to(e.dtype)
+        h = e.unsqueeze(0).unsqueeze(2).expand(-1, -1, cfg.hc_mult, -1).contiguous()  # [1, S, hc, hidden]
+        del embed, e
         ngrams = ngram_tokens(ids, cfg.engram_max_ngram_size, cfg.engram_pad_id).unsqueeze(0)  # [1, S, n]
         emask = ((ids != full.image_token_id) & (ids != full.video_token_id) & (ids != cfg.engram_pad_id)).unsqueeze(0)
         cache = DynamicCache(config=cfg)
@@ -289,7 +376,7 @@ def main():
 
             outs = []
             for s0, s1 in calls:
-                pos = torch.arange(s0, s1, device=dev).view(1, 1, -1).expand(3, 1, -1)
+                pos = positions[:, :, s0:s1]
                 cos, sin = rope(h, position_ids=pos, layer_type=lt)
                 o = layer(
                     h[:, s0:s1],
@@ -298,7 +385,7 @@ def main():
                     cache=cache,
                     use_cache=True,
                     position_embeddings=(cos, sin),
-                    indexer_position_ids=torch.arange(0, s1, device=dev).view(1, 1, -1).expand(3, 1, -1),
+                    indexer_position_ids=positions[:, :, :s1],
                     ngram_tokens=ngrams[:, s0:s1],
                     engram_mask=emask[:, s0:s1],
                 )
@@ -318,6 +405,8 @@ def main():
                 "layers": n_layers, "attn_fp32": args.attn_fp32, "experts_gguf": args.experts_gguf,
                 "transformers": transformers.__version__,
                 "torch": torch.__version__}
+        if image is not None:
+            meta.update({"image": args.image, "question": args.question, "grid": image["grid"]})
         if n_layers == cfg.num_hidden_layers:
             with torch.device("meta"):
                 head = hym.HYV4FlashHyperHead(cfg)

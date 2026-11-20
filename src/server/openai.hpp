@@ -38,6 +38,10 @@ struct ServerConfig {
   // the prompt becomes the image's token count of copies.
   std::function<void(const vision::GlmPatches&, std::vector<uint16_t>&)> encode_glm_image;
   vision::GlmVisionConfig glm_vision;
+  // Hy4 flash: its processor's layout (<image_start>, one pad per row of the image, <image_end>; image_token is the
+  // pad), the tower's rows, M-RoPE positions from the block's rows x cols.
+  std::function<void(const vision::Hy4Patches&, std::vector<uint16_t>&)> encode_hy4_image;
+  vision::Hy4VisionConfig hy4_vision;
   // Extra plain-text endpoints (path -> handler), e.g. the routing histogram.
   std::vector<std::pair<std::string, std::function<std::string()>>> extra_get, extra_post;
 };

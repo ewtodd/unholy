@@ -17,12 +17,39 @@
 
 namespace unholy::engine {
 
+// Hy4's M-RoPE (three rotary planes t, h, w; transformers HYV4FlashModel.get_rope_index): an image block of
+// rows x cols pad slots from slot `start` (cols counts each merged row's newline slot). Block slot (r, c) is at
+// (S, S + r, S + c), S the block's first position; the positions after it continue from S + max(rows, cols); text
+// has the three planes equal.
+struct MropeBlock {
+  int start = 0, rows = 0, cols = 0;
+};
+// The (t, h, w) rotary positions of a sequence's `slot` (blocks in slot order; null: plain text).
+inline void mrope_position(const std::vector<MropeBlock>* blocks, int slot, int32_t out[3]) {
+  int delta = 0;
+  if (blocks)
+    for (const MropeBlock& b : *blocks) {
+      const int len = b.rows * b.cols;
+      if (slot < b.start) break;
+      if (slot < b.start + len) {
+        const int k = slot - b.start, S = b.start + delta;
+        out[0] = S;
+        out[1] = S + k / b.cols;
+        out[2] = S + k % b.cols;
+        return;
+      }
+      delta += (b.rows > b.cols ? b.rows : b.cols) - len;
+    }
+  out[0] = out[1] = out[2] = slot + delta;
+}
+
 struct Chunk {
   int slot = 0, s0 = 0, n = 0, t0 = 0;
   // Only for the routing trace (UNHOLY_ROUTING_TRACE): the request's id and what the chunk is.
   enum Kind : uint8_t { Prefill = 0, Decode = 1, Verify = 2 };
   uint64_t seq = 0;
   uint8_t kind = Prefill;
+  const std::vector<MropeBlock>* mrope = nullptr;  // the sequence's image blocks (models with M-RoPE)
 };
 
 // Prefix reuse: a snapshot holds a slot's unpaged state (window ring, compressor rings) as it was at a
@@ -48,6 +75,7 @@ struct RingRestore {
 struct DraftReq {
   int slot = 0, start = 0;
   int32_t token = 0;
+  const std::vector<MropeBlock>* mrope = nullptr;  // as Chunk::mrope
 };
 
 // Images: an image block's embedding rows replace its tokens' embeddings (rows [n][dim] bf16 in host memory

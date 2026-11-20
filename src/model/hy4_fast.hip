@@ -96,11 +96,11 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
   norm(qr, c.q_lora, w.q_a_norm, T, c.q_lora, c.eps, st);
   bf16* q = s.at<bf16>(kBufQ);
   linear(w.q_b, qr, c.q_lora, q, H * 256, T, st);
-  k::hy4_rope(q, H * 256, T, H, 256, c.nope, b.pos, theta, st);
+  k::hy4_rope(q, H * 256, T, H, 256, c.nope, b.pos, theta, st, b.pos3);
   bf16* kv = s.at<bf16>(kBufKv);
   linear(w.kv_a, hn, D, kv, R, T, st);
   norm(kv, R, w.kv_a_norm, T, c.kv_lora, c.eps, st);
-  k::hy4_rope(kv, R, T, 1, R, c.kv_lora, b.pos, theta, st);
+  k::hy4_rope(kv, R, T, 1, R, c.kv_lora, b.pos, theta, st, b.pos3);
   bf16* g = s.at<bf16>(kBufG);
   linear(w.gate, hn, D, g, H * 256, T, st);
   bf16* qn = s.at<bf16>(kBufQn);
@@ -122,7 +122,7 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
     norm(tk, ID, w.idx_tok_norm, T, ID, c.eps, st);
     bf16* iq = s.at<bf16>(kBufIq);
     linear(w.idx_q, qr, c.q_lora, iq, IH * ID, T, st);
-    k::hy4_rope(iq, IH * ID, T, IH, ID, ID - c.rope, b.pos, c.theta_sparse, st);
+    k::hy4_rope(iq, IH * ID, T, IH, ID, ID - c.rope, b.pos, c.theta_sparse, st, b.pos3);
     bf16* iw = s.at<bf16>(kBufIw);
     linear(w.idx_w, hn, D, iw, IH, T, st);
     const float wscale = 1.0f / std::sqrt(float(IH)) / std::sqrt(float(ID));
@@ -144,9 +144,14 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
         UH_CHECK(hipMemcpyAsync(cache.vkeys.as<bf16>() + size_t(ch.slot) * kHy4MaxVerify * ID, tk + size_t(ch.t0) * ID,
                                 size_t(ch.n) * ID * 2, hipMemcpyDeviceToDevice, st));
       }
+      k::Hy4GroupRope gr;
+      if (b.pos3) {
+        gr.rows = b.pos3 + size_t(ch.t0) * 3;
+        std::copy_n(ch.g0, 3, gr.g0);
+      }
       k::hy4_idx_pool(tk + size_t(ch.t0) * ID, cache.tail.as<bf16>() + size_t(ch.slot) * c.idx_pool * ID,
                       w.idx_wv.p<float>(), w.idx_wg.p<float>(), w.idx_ape.p<float>(), w.idx_knorm.p<float>(), c.eps,
-                      c.theta_sparse, pg, ch.s0, ch.n, st);
+                      c.theta_sparse, pg, ch.s0, ch.n, st, gr);
       const k::Hy4Keys keys{rows, table, nullptr, nullptr, 0};
       const int last = ch.s0 + ch.n - 1;
       const int nsave = std::min(ch.n, kHy4MaxVerify);  // DFly2: the recalled positions of the chunk's last rows
@@ -509,7 +514,7 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
     const int a = q.anchor, row = (a - 1) % kHy4MaxVerify;
     for (int j = 0; j < kHy4DraftRows; ++j) {
       ids[r * kHy4DraftRows + j] = j == 0 ? q.bonus : w.mask_id;
-      pos[r * kHy4DraftRows + j] = a + j;
+      pos[r * kHy4DraftRows + j] = q.rope + j;  // rotary positions (the block's slots are the anchor's + j)
     }
     anc[r] = a;
     for (int t = 0; t < kHy4DraftTokens; ++t) rsel[t * R + r] = r * kHy4DraftRows + t + 1;

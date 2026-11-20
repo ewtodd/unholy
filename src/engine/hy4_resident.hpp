@@ -15,7 +15,12 @@
 // history on the host), then drafts 5 tokens per request from each slot's saved final hidden state and the indexer
 // picks of target layers 25 + 4 i, with the drafter's probabilities as confidences.
 //
-// Not yet: the vision tower, steps split into overlapping parts.
+// Images (vision): the vision tower (model/hy4_vision.hpp) on the APU encodes a request's images when the server
+// parses it; a step's image rows replace their pad tokens' embeddings on card 0; chunks of sequences with images carry
+// their M-RoPE layout (Chunk::mrope), from which the three rotary planes of the rows, of the indexer groups' first
+// slots and of the drafter's block are computed per step.
+//
+// Not yet: steps split into overlapping parts.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -29,6 +34,8 @@
 #include "kernels/hy4.hpp"
 #include "kernels/moe_dispatch.hpp"
 #include "model/hy4.hpp"
+#include "model/hy4_vision.hpp"
+#include "vision/image.hpp"
 
 namespace unholy::engine {
 
@@ -76,6 +83,7 @@ struct Hy4PlanInput {
   bool mxfp4 = false;  // routed experts converted to MXFP4 at load
   bool nvfp4 = false;  // routed experts in NVFP4 from a GGUF build
   bool dfly = false;   // the DFly2 drafter (card 1: its weights, the embedding table, its scratch)
+  bool vision = false;  // the vision tower (the APU: its weights and a scratch for the largest image)
 };
 Plan make_hy4_plan(const Hy4PlanInput& in);
 // Pinned host bytes of one prefix snapshot on card k (its window rings and indexer tails of one slot), and the
@@ -87,7 +95,7 @@ class Hy4ResidentModel final : public StepModel {
   Hy4ResidentModel(const model::Hy4Config& c, const model::Checkpoint& ck, const std::string& engram_dir,
                    const Plan& plan, const model::CacheGeometry& geo, int max_tokens, int max_seq,
                    int max_logit_rows = 0, int snapshots = 0, bool mxfp4 = false,
-                   const model::Checkpoint* experts_gguf = nullptr, bool dfly = false);
+                   const model::Checkpoint* experts_gguf = nullptr, bool dfly = false, bool vision = false);
   ~Hy4ResidentModel() override;
 
   int vocab() const override { return c_.vocab; }
@@ -109,6 +117,10 @@ class Hy4ResidentModel final : public StepModel {
   uint64_t submit(const StepInput& in) override;
   void wait(uint64_t ticket, std::vector<float>& logits) override;
 
+  bool has_vision() const { return bool(vision_); }
+  // One image's rows [(gh / 2) * (gw / 2 + 1)][dim] bf16 (thread-safe; the APU's vision stream).
+  void encode_image(const vision::Hy4Patches& p, std::vector<uint16_t>& rows);
+
   const Plan& plan() const { return plan_; }
   std::vector<std::vector<uint64_t>> routing_histogram() const;
   void reset_routing_histogram();
@@ -121,7 +133,7 @@ class Hy4ResidentModel final : public StepModel {
     std::vector<model::Hy4LayerWeights> w;
     std::vector<model::Hy4Cache> cache;
     model::Hy4Scratch scratch;
-    rt::DeviceBuffer x, ids, pos, tables;
+    rt::DeviceBuffer x, ids, pos, pos3, tables;
   };
   const model::Hy4Config& c_;
   Plan plan_;
@@ -152,6 +164,8 @@ class Hy4ResidentModel final : public StepModel {
     uint16_t* x_host = nullptr;
     float* logits_host = nullptr;
     int32_t* io_host = nullptr;
+    int32_t* pos3_host = nullptr;  // [max_tokens][3] M-RoPE planes
+    uint16_t* img_host = nullptr;  // [max_tokens][dim] the step's image rows
     int32_t* tables_host = nullptr;
     uint8_t* eng_q[4] = {};
     uint16_t* eng_s[4] = {};
@@ -172,6 +186,8 @@ class Hy4ResidentModel final : public StepModel {
   uint8_t* snap_host_[2] = {nullptr, nullptr};
   uint8_t* snap_tok_host_ = nullptr;  // [snapshots][4096]: the slot's last two tokens
   void state_copies(int k, const std::vector<StateOp>& ops, bool save);
+  struct Vision;
+  std::unique_ptr<Vision> vision_;
   uint64_t next_ticket_ = 1;
   std::vector<int32_t> tables_;
   bool tables_dirty_ = false;

@@ -190,11 +190,13 @@ void hy4_restore_slot(Hy4Cache& cache, int slot, int s0, int from, int to, hipSt
 struct Hy4Chunk {
   int slot = 0, s0 = 0, n = 0, t0 = 0;
   bool verify = false;  // a verify chunk (its token and drafts): back up the state it overwrites
+  int g0[3] = {0, 0, 0};  // with pos3: the M-RoPE planes of the first slot of the indexer group the chunk starts in
 };
 struct Hy4Batch {
   std::vector<Hy4Chunk> chunks;
   int T = 0;
-  const int32_t* pos = nullptr;     // device [T]
+  const int32_t* pos = nullptr;     // device [T]: the rows' slots (cache positions; RoPE too unless pos3)
+  const int32_t* pos3 = nullptr;    // device [T][3] or null: M-RoPE's planes (t, h, w) for RoPE (images)
   const int32_t* tables = nullptr;  // device block tables [slots][max_pages]
   int max_pages = 0;
   const int32_t* pos_host = nullptr;  // host copy of pos (the indexer's launch sizes)
@@ -287,8 +289,9 @@ struct Hy4DflyScratch {
 Hy4DflyScratch make_hy4_dfly_scratch(const Hy4Config& c, int dev, int max_reqs);
 size_t hy4_dfly_scratch_bytes(const Hy4Config& c, int max_reqs);
 struct Hy4DflyReq {
-  int slot = 0, anchor = 0;  // anchor: the bonus token's position (the last accepted row's + 1)
+  int slot = 0, anchor = 0;  // anchor: the bonus token's slot (the last accepted row's + 1)
   int32_t bonus = 0;
+  int rope = 0;              // the anchor's rotary position (its slot, or past images M-RoPE's shifted one)
 };
 // Draft tokens (device int32 [5][R]) on `st`, and (conf, optional) the drafter's probability of each (fp32 [5][R]). target: the 5 target layers' caches (their pages, the saved picks);
 // tables: device block tables [slots][max_pages]; hidden: device [slots][6][dim], the final hidden state of each

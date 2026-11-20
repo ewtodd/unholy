@@ -33,8 +33,16 @@ void hy4_hc_head(const bf16* x, const float* fn, const float* scale, const float
 // In place on bf16 rows: for row r, head h, the 64 values at x + r * ld + h * hstride + off, interleaved pairs
 // (2i, 2i + 1) rotated by angle pos[r] * theta^(-2i / 64) with cos / sin rounded to bf16 (transformers' rotary
 // tables are bf16), the products in fp32, one rounding. Text positions (all M-RoPE planes equal).
+// pos3 (optional, [rows][3]): M-RoPE's three planes (t, h, w) instead of pos: pair i rotates by the h plane when
+// i % 3 == 1 and i < 30, the w plane when i % 3 == 2 and i < 30, else t (interleaved sections [12, 10, 10]).
 void hy4_rope(bf16* x, int ld, int rows, int heads, int hstride, int off, const int32_t* pos, float theta,
-              hipStream_t st);
+              hipStream_t st, const int32_t* pos3 = nullptr);
+// M-RoPE positions of the pooled indexer groups: the chunk's rows [n][3] (row q - s0 for slot q), and the planes of
+// the first slot of the group the chunk starts in (when that slot is before the chunk).
+struct Hy4GroupRope {
+  const int32_t* rows = nullptr;  // null: plain positions (slot = position)
+  int g0[3] = {0, 0, 0};
+};
 
 // ---- Attention ----------------------------------------------------------------------------------------------------
 // Key rows are 576 bf16: the normed latent (512) then the roped key (64). Sparse layers keep every position's row in
@@ -107,7 +115,7 @@ struct Hy4Pooled {
 // pooled = sum v * p, key_norm (fp32 RMSNorm, weight f32 [128]) -> bf16, RoPE on dims 64.. at the group's first
 // position (theta), stored. Then the tail takes the chunk's last <= 4 keys.
 void hy4_idx_pool(const bf16* tk, bf16* tail, const float* wv, const float* wg, const float* ape, const float* knorm,
-                  float eps, float theta, Hy4Pooled pg, int s0, int n, hipStream_t st);
+                  float eps, float theta, Hy4Pooled pg, int s0, int n, hipStream_t st, Hy4GroupRope gr = {});
 // Scores of the chunk's n queries against groups [0, npool): s[t][p] = sum_h w[t][h] * relu(q[t][h] . pk[p]) with
 // w = float(hw[t][h]) * wscale, -inf for p >= pos[t] / 4 (the query's own group and later). q bf16 [n][16][128]
 // (roped), hw bf16 [n][16]; out f32 [n][ld]. gfx12 (WMMA).

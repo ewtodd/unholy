@@ -127,13 +127,17 @@ InvFreq inv_freq(float theta) {
   return r;
 }
 
+// M-RoPE's plane of rotary pair i (interleaved sections [12, 10, 10]: t, h, w).
+__device__ __forceinline__ int mrope_plane(int i) { return i < 30 && i % 3 != 0 ? i % 3 : 0; }
+
 __global__ void rope_kernel(bf16* x, int ld, int rows, int heads, int hstride, int off, const int32_t* pos,
-                            InvFreq fr) {
+                            InvFreq fr, const int32_t* pos3) {
   const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i >= size_t(rows) * heads * 32) return;
   const int pr = int(i % 32), h = int((i / 32) % heads), r = int(i / (32 * size_t(heads)));
   bf16* p = x + size_t(r) * ld + size_t(h) * hstride + off + 2 * pr;
-  const float a = __fmul_rn(float(pos[r]), fr.f[pr]);
+  const int ps = pos3 ? pos3[r * 3 + mrope_plane(pr)] : pos[r];
+  const float a = __fmul_rn(float(ps), fr.f[pr]);
   const float c = round_bf16(cosf(a)), s = round_bf16(sinf(a));
   const float x0 = bf16_to_f32(p[0]), x1 = bf16_to_f32(p[1]);
   p[0] = f32_to_bf16(__fadd_rn(__fmul_rn(x0, c), __fmul_rn(-x1, s)));
@@ -399,7 +403,7 @@ __device__ __forceinline__ bf16* pool_row(const Hy4Pooled& pg, int p) {
 // One block of 128 threads (thread = output dim) per completed group.
 __global__ __launch_bounds__(ID) void idx_pool_kernel(const bf16* tk, const bf16* tail, const float* wv,
                                                       const float* wg, const float* ape, const float* knorm, float eps,
-                                                      InvFreq fr, Hy4Pooled pg, int s0, int p0) {
+                                                      InvFreq fr, Hy4Pooled pg, int s0, int p0, Hy4GroupRope gr) {
   __shared__ float sk[POOL][ID];
   __shared__ float red[32];
   __shared__ float sp[ID];
@@ -435,8 +439,9 @@ __global__ __launch_bounds__(ID) void idx_pool_kernel(const bf16* tk, const bf16
   __syncthreads();
   float out = sp[d];
   if (d >= ID - 64) {  // RoPE on the last 64 dims at the group's first position
-    const int k = d - (ID - 64), pr = k / 2;
-    const float a = __fmul_rn(float(p * POOL), fr.f[pr]);
+    const int k = d - (ID - 64), pr = k / 2, q0 = p * POOL;
+    const int ps = !gr.rows ? q0 : q0 >= s0 ? gr.rows[(q0 - s0) * 3 + mrope_plane(pr)] : gr.g0[mrope_plane(pr)];
+    const float a = __fmul_rn(float(ps), fr.f[pr]);
     const float c = round_bf16(cosf(a)), s = round_bf16(sinf(a));
     const float x0 = sp[d & ~1], x1 = sp[d | 1];
     out = (k & 1) == 0 ? __fadd_rn(__fmul_rn(x0, c), __fmul_rn(-x1, s)) : __fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s));
@@ -1053,10 +1058,10 @@ void hy4_hc_head(const bf16* x, const float* fn, const float* scale, const float
 }
 
 void hy4_rope(bf16* x, int ld, int rows, int heads, int hstride, int off, const int32_t* pos, float theta,
-              hipStream_t st) {
+              hipStream_t st, const int32_t* pos3) {
   if (rows <= 0) return;
   const size_t n = size_t(rows) * heads * 32;
-  rope_kernel<<<cdiv(n, 256), 256, 0, st>>>(x, ld, rows, heads, hstride, off, pos, inv_freq(theta));
+  rope_kernel<<<cdiv(n, 256), 256, 0, st>>>(x, ld, rows, heads, hstride, off, pos, inv_freq(theta), pos3);
   UH_CHECK_LAUNCH();
 }
 
@@ -1116,11 +1121,11 @@ void hy4_page_store(const bf16* rows, bf16* pages, const int32_t* table, int s0,
 }
 
 void hy4_idx_pool(const bf16* tk, bf16* tail, const float* wv, const float* wg, const float* ape, const float* knorm,
-                  float eps, float theta, Hy4Pooled pg, int s0, int n, hipStream_t st) {
+                  float eps, float theta, Hy4Pooled pg, int s0, int n, hipStream_t st, Hy4GroupRope gr) {
   if (n <= 0) return;
   const int end = s0 + n, p0 = s0 / POOL, p1 = end / POOL;  // groups whose last member is in [s0, end)
   if (p1 > p0)
-    idx_pool_kernel<<<p1 - p0, ID, 0, st>>>(tk, tail, wv, wg, ape, knorm, eps, inv_freq(theta), pg, s0, p0);
+    idx_pool_kernel<<<p1 - p0, ID, 0, st>>>(tk, tail, wv, wg, ape, knorm, eps, inv_freq(theta), pg, s0, p0, gr);
   const int first = std::max(s0, end - POOL);
   idx_tail_kernel<<<cdiv(size_t(end - first) * ID, 256), 256, 0, st>>>(tk, tail, s0, end);
   UH_CHECK_LAUNCH();

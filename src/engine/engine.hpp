@@ -56,6 +56,7 @@ const char* finish_reason_name(FinishReason r);
 // keys on it) and the block's embedding rows [len][dim] bf16 from the vision tower.
 struct GenImage {
   int start = 0, len = 0, span_start = 0, span_end = 0;
+  int mrope_rows = 0, mrope_cols = 0;  // Hy4: the block's layout for M-RoPE positions (rows x cols == len; 0: none)
   uint64_t hash = 0;
   std::shared_ptr<const std::vector<uint16_t>> rows;
 };

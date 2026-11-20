@@ -44,6 +44,15 @@ void vit_swiglu_clamp(const float* acc, int M, int I, const bf16* bias, float li
 // GLM merger: out = bf16(gelu_erf(bf16((x - mean) * rstd * w + b))), nn.LayerNorm in fp32 then nn.GELU.
 void vit_layernorm_gelu(const bf16* x, int M, int D, const bf16* w, const bf16* b, float eps, bf16* out,
                         hipStream_t st);
+// Hy4: out = bf16((x - mean) * rstd * w + b), nn.LayerNorm in fp32.
+void vit_layernorm(const bf16* x, int M, int D, const bf16* w, const bf16* b, float eps, bf16* out, hipStream_t st);
+// Hy4: bidirectional attention for heads of D <= 80 dims padded to 80: qkv [N][3][H][80] (pad dims zero) ->
+// out [N][H * D]; softmax(q k^T * scale) in fp32 with an online softmax, P rounded to bf16 for P V (WMMA).
+void vit_attention_wmma80(const bf16* qkv, int N, int H, int D, float scale, bf16* out, hipStream_t st);
+// Hy4: x [gh * gw][C] += bf16(the learned grid table [edge * edge][C] resampled to gh x gw), F.interpolate's
+// bilinear (align_corners false) with scale factors (g + 0.1) / edge as the PR passes them (sampling step
+// float(1 / scale)); the sum rounded to bf16.
+void vit_add_pos_bilinear(bf16* x, const bf16* table, int edge, int gh, int gw, int C, hipStream_t st);
 // Image block rows: src[i] >= 0 -> aligned[src[i]], else params[-1 - src[i]] (the token type's learned
 // row); out [n, D].
 void vit_assemble(const bf16* aligned, const bf16* params, const int32_t* src, int n, int D, bf16* out,

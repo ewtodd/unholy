@@ -31,6 +31,7 @@ struct Engine::Seq {
   Sink sink;
   Sampler sampler;
   std::vector<int32_t> tokens;  // prompt + generated
+  std::vector<MropeBlock> mrope;  // the images' M-RoPE layouts (Hy4), in slot order
   int n_prompt = 0;
   int computed = 0;             // positions submitted to the model (cache valid once their steps complete)
   int slot = -1;
@@ -69,7 +70,10 @@ struct Engine::Seq {
   std::vector<float> draft_conf;
 
   Seq(uint64_t id_, GenRequest r, Sink s, uint64_t seed)
-      : id(id_), req(std::move(r)), sink(std::move(s)), sampler(req.sampling, seed) {}
+      : id(id_), req(std::move(r)), sink(std::move(s)), sampler(req.sampling, seed) {
+    for (const GenImage& im : req.images)
+      if (im.mrope_rows > 0) mrope.push_back({im.start, im.mrope_rows, im.mrope_cols});
+  }
   int generated() const { return int(tokens.size()) - n_prompt; }
 };
 
@@ -723,7 +727,8 @@ bool Engine::submit_step(int budget0) {
     }
     if (it.end == s.cut) s.cut = 0;
     in.chunks.push_back({s.slot, s.computed, it.n, t0, s.id,
-                         uint8_t(it.ndraft > 0 ? Chunk::Verify : it.n == 1 && it.logits ? Chunk::Decode : Chunk::Prefill)});
+                         uint8_t(it.ndraft > 0 ? Chunk::Verify : it.n == 1 && it.logits ? Chunk::Decode : Chunk::Prefill),
+                         s.mrope.empty() ? nullptr : &s.mrope});
     for (const GenImage& im : s.req.images) {  // whole blocks lie wholly inside chunks (planning above)
       const int a = std::max(im.start, s.computed), e = std::min(im.start + im.len, s.computed + it.n - it.ndraft);
       if (a >= e) continue;
@@ -860,7 +865,7 @@ void Engine::complete_step() {
     std::vector<DraftReq> reqs;
     for (Seq* s : sampled)
       if (int(s->tokens.size()) - s->computed == 1 && s->computed + 1 < max_context_)
-        reqs.push_back({s->slot, s->computed - 1, s->tokens.back()});
+        reqs.push_back({s->slot, s->computed - 1, s->tokens.back(), s->mrope.empty() ? nullptr : &s->mrope});
     std::vector<int32_t> toks;
     std::vector<float> conf;
     try {

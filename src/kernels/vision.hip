@@ -1,6 +1,8 @@
 // Vision tower kernels (kernels/vision.hpp).
 #include "kernels/dev.hip.hpp"
 #include "kernels/vision.hpp"
+
+#include <stdexcept>
 #include "rt/hip.hpp"
 
 namespace unholy::kernels {
@@ -107,6 +109,42 @@ __global__ void vit_layernorm_gelu_kernel(const bf16* x, int D, const bf16* w, c
   for (int i = threadIdx.x; i < D; i += blockDim.x) {
     const float y = round_bf16((bf16_to_f32(xr[i]) - mean) * rstd * bf16_to_f32(w[i]) + bf16_to_f32(b[i]));
     out[size_t(blockIdx.x) * D + i] = f32_to_bf16(0.5f * y * (1.0f + erff(y * 0.70710678118654752f)));
+  }
+}
+
+__global__ void vit_layernorm_kernel(const bf16* x, int D, const bf16* w, const bf16* b, float eps, bf16* out) {
+  __shared__ float red[32];
+  const bf16* xr = x + size_t(blockIdx.x) * D;
+  float s = 0.0f;
+  for (int i = threadIdx.x; i < D; i += blockDim.x) s += bf16_to_f32(xr[i]);
+  const float mean = block_sum(s, red) / float(D);
+  float v = 0.0f;
+  for (int i = threadIdx.x; i < D; i += blockDim.x) {
+    const float d = bf16_to_f32(xr[i]) - mean;
+    v += d * d;
+  }
+  const float rstd = rsqrtf(block_sum(v, red) / float(D) + eps);
+  for (int i = threadIdx.x; i < D; i += blockDim.x)
+    out[size_t(blockIdx.x) * D + i] =
+        f32_to_bf16((bf16_to_f32(xr[i]) - mean) * rstd * bf16_to_f32(w[i]) + bf16_to_f32(b[i]));
+}
+
+// One block per output row (grid cell); upsample_bilinear2d's index and weight arithmetic in fp32.
+__global__ void vit_add_pos_bilinear_kernel(bf16* x, const bf16* table, int edge, int gw, int C, float sh, float sw) {
+  const int cell = blockIdx.x, i = cell / gw, j = cell % gw;
+  const float hr = fmaxf(sh * (float(i) + 0.5f) - 0.5f, 0.0f), wr = fmaxf(sw * (float(j) + 0.5f) - 0.5f, 0.0f);
+  const int h0 = min(int(hr), edge - 1), w0 = min(int(wr), edge - 1);
+  const int hp = h0 < edge - 1 ? 1 : 0, wp = w0 < edge - 1 ? 1 : 0;
+  const float h1l = hr - float(h0), h0l = 1.0f - h1l, w1l = wr - float(w0), w0l = 1.0f - w1l;
+  const bf16* p00 = table + (size_t(h0) * edge + w0) * C;
+  const bf16* p01 = p00 + size_t(wp) * C;
+  const bf16* p10 = p00 + size_t(hp) * edge * C;
+  const bf16* p11 = p10 + size_t(wp) * C;
+  bf16* xr = x + size_t(cell) * C;
+  for (int d = threadIdx.x; d < C; d += blockDim.x) {
+    const float v = h0l * (w0l * bf16_to_f32(p00[d]) + w1l * bf16_to_f32(p01[d])) +
+                    h1l * (w0l * bf16_to_f32(p10[d]) + w1l * bf16_to_f32(p11[d]));
+    xr[d] = f32_to_bf16(bf16_to_f32(xr[d]) + round_bf16(v));
   }
 }
 
@@ -325,6 +363,108 @@ __global__ __launch_bounds__(256) void vit_attention_wmma_kernel(const bf16* qkv
 #endif
 }
 
+// Heads of up to 80 dims (Hy4's 72, zero-padded): vit_attention_wmma_kernel's scheme with 5 K steps.
+constexpr int kW80 = 80, kW80KS = kW80 + 8, kW80VS = 64 + 8;  // (keys per tile: 64, as kWK)
+__global__ __launch_bounds__(256) void vit_attention_wmma80_kernel(const bf16* qkv, int N, int H, int D, float scale,
+                                                                   bf16* out) {
+#if defined(UH_GFX12) || defined(UH_GFX11)
+  constexpr int DF = kW80 / 16;
+  __shared__ alignas(16) uint16_t sK[kWK * kW80KS];   // [key][dim]
+  __shared__ alignas(16) uint16_t sVt[kW80 * kW80VS];  // [dim][key]
+  __shared__ alignas(16) uint16_t sP[8][16 * kW80VS];  // per wave [query][key]
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, h = blockIdx.y;
+  const int q0 = blockIdx.x * kWQ + wave * 16;
+  const size_t ld = size_t(3) * H * kW80;
+  frag_t qf[DF];
+  {
+    const bf16* row = qkv + size_t(min(q0 + (lane & 15), N - 1)) * ld + size_t(h) * kW80;
+#pragma unroll
+    for (int d = 0; d < DF; ++d) qf[d] = frag_at(row, d * 16, lane);
+  }
+  float8_t o[DF];
+  float m[8], l[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    m[e] = -INFINITY;
+    l[e] = 0.0f;
+#pragma unroll
+    for (int f = 0; f < DF; ++f) o[f][e] = 0.0f;
+  }
+  const float sc = scale * 1.4426950408889634f;  // log2 units
+  uint16_t* P = sP[wave];
+  for (int k0 = 0; k0 < N; k0 += kWK) {
+    __syncthreads();
+    for (int i = tid; i < kWK * (kW80 / 8); i += 256) {
+      const int r = i / (kW80 / 8), c = (i % (kW80 / 8)) * 8;
+      uint4 kv = {0, 0, 0, 0}, vv = {0, 0, 0, 0};
+      if (k0 + r < N) {
+        const bf16* row = qkv + size_t(k0 + r) * ld + size_t(h) * kW80 + c;
+        kv = *reinterpret_cast<const uint4*>(row + size_t(H) * kW80);
+        vv = *reinterpret_cast<const uint4*>(row + size_t(2) * H * kW80);
+      }
+      *reinterpret_cast<uint4*>(&sK[r * kW80KS + c]) = kv;
+      const uint32_t w[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sVt[(c + j) * kW80VS + r] = uint16_t(w[j >> 1] >> ((j & 1) * 16));
+    }
+    __syncthreads();
+    float8_t s[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) s[j][e] = 0.0f;
+#pragma unroll
+      for (int d = 0; d < DF; ++d)
+        s[j] = wmma_bf16(qf[d], frag_at(&sK[(j * 16 + (lane & 15)) * kW80KS], d * 16, lane), s[j]);
+    }
+    const int key = k0 + (lane & 15);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float mx = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        s[j][e] = key + j * 16 < N ? s[j][e] * sc : -INFINITY;
+        mx = fmaxf(mx, s[j][e]);
+      }
+#pragma unroll
+      for (int x = 1; x < 16; x <<= 1) mx = fmaxf(mx, __shfl_xor(mx, x, 32));
+      const float mn = fmaxf(m[e], mx), alpha = exp2f(m[e] - mn);
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        s[j][e] = exp2f(s[j][e] - mn);
+        sum += s[j][e];
+        P[acc_row(e, lane) * kW80VS + j * 16 + (lane & 15)] = f32_to_bf16(s[j][e]);
+      }
+#pragma unroll
+      for (int x = 1; x < 16; x <<= 1) sum += __shfl_xor(sum, x, 32);
+      l[e] = l[e] * alpha + sum;
+      m[e] = mn;
+#pragma unroll
+      for (int f = 0; f < DF; ++f) o[f][e] *= alpha;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      const frag_t pf = frag_at(&P[(lane & 15) * kW80VS], kk * 16, lane);
+#pragma unroll
+      for (int f = 0; f < DF; ++f)
+        o[f] = wmma_bf16(pf, frag_at(&sVt[(f * 16 + (lane & 15)) * kW80VS], kk * 16, lane), o[f]);
+    }
+  }
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const int q = q0 + acc_row(e, lane);
+    if (q < N)
+#pragma unroll
+      for (int f = 0; f < DF; ++f) {
+        const int d = f * 16 + (lane & 15);
+        if (d < D) out[size_t(q) * H * D + size_t(h) * D + d] = f32_to_bf16(o[f][e] / l[e]);
+      }
+  }
+#endif
+}
+
 __global__ void vit_unfold_kernel(const bf16* x, int n_h, int n_w, int C, int r, int lw, bf16* out) {
   const int l = blockIdx.x;
   const int R = l / lw, S = l % lw, K = C * r * r;
@@ -405,6 +545,25 @@ void vit_attention(const bf16* qkv, int N, int H, bf16* out, hipStream_t st) {
 void vit_attention_wmma(const bf16* qkv, int N, int H, bf16* out, hipStream_t st) {
   if (N <= 0) return;
   vit_attention_wmma_kernel<<<dim3(unsigned((N + kWQ - 1) / kWQ), unsigned(H)), 256, 0, st>>>(qkv, N, H, out);
+  UH_CHECK_LAUNCH();
+}
+void vit_layernorm(const bf16* x, int M, int D, const bf16* w, const bf16* b, float eps, bf16* out, hipStream_t st) {
+  if (M <= 0) return;
+  vit_layernorm_kernel<<<M, 256, 0, st>>>(x, D, w, b, eps, out);
+  UH_CHECK_LAUNCH();
+}
+void vit_attention_wmma80(const bf16* qkv, int N, int H, int D, float scale, bf16* out, hipStream_t st) {
+  if (N <= 0) return;
+  if (D > kW80) throw std::runtime_error("vit_attention_wmma80: head dim over 80");
+  vit_attention_wmma80_kernel<<<dim3(unsigned((N + kWQ - 1) / kWQ), unsigned(H)), 256, 0, st>>>(qkv, N, H, D, scale,
+                                                                                                 out);
+  UH_CHECK_LAUNCH();
+}
+void vit_add_pos_bilinear(bf16* x, const bf16* table, int edge, int gh, int gw, int C, hipStream_t st) {
+  if (gh <= 0 || gw <= 0) return;
+  // F.interpolate(scale_factor=(g + 0.1) / edge): upsample_bilinear2d steps by float(1 / scale) (double math)
+  const float sh = float(1.0 / ((double(gh) + 0.1) / double(edge))), sw = float(1.0 / ((double(gw) + 0.1) / double(edge)));
+  vit_add_pos_bilinear_kernel<<<gh * gw, 256, 0, st>>>(x, table, edge, gw, C, sh, sw);
   UH_CHECK_LAUNCH();
 }
 void vit_unfold(const bf16* x, int n_h, int n_w, int C, int r, bf16* out, hipStream_t st) {

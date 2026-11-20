@@ -1792,3 +1792,25 @@ rather than the KV, leaning towards an AngelSlim quant.
   attention change); with drafts 22-28 tok/s on code and prose, ~34 on short reasoning, 26.6 at 131k tokens of context
   (prefill 1268 tok/s); four streams ~12 tok/s each, ~48 aggregate. A 6-row verify step reads 3-4x the expert bytes
   of a 1-row step (more distinct experts; the APU's cold experts 11 -> 32 ms), which is what holds the gain back.
+
+## 2026-11-20 — Hy4 flash: images (preprocessing, the vision tower, M-RoPE)
+
+- Preprocessing bit-exact with transformers' HYV4VL image processor as the checkpoint configures it (18 test images:
+  grid, resized pixels and pixel_values identical; `tools/ref/hy4_preprocess_check.py`): smart_resize to multiples of
+  32 within [4096, 4194304] pixels, torch's uint8 antialiased bicubic (not PIL's), (x - 127.5) / 127.5 (the
+  checkpoint's 0.5 / 0.5, which the reference applies; vLLM's CLIP comments do not), raster 16-pixel patches; each
+  image pad of the chat template becomes (gh / 2) * (gw / 2 + 1) pads.
+- The tower (`model/hy4_vision`) on the APU, encoding at request parse time as GLM's: patch embedding + the learned
+  128 x 128 position table resampled bilinearly as F.interpolate does with the PR's (g + 0.1) / 128 scale factors;
+  27 LayerNorm blocks with 72-dim heads (padded to 80 for a WMMA flash attention; the MLP's 4304 padded to 4320 with
+  zeros); RMSNorm, the 2 x 2 conv as a GEMM over unfolded cells, GELU, the 1 x 1 conv, a newline row per merged row.
+  ~85 ms for a 640 x 480 image.
+- LM side: image rows over the pad tokens' embeddings (every iHC stream); the Engram skips pads (as before); M-RoPE's
+  three planes from each chunk's image layout (`Chunk::mrope`, computed per step by `mrope_position`): RoPE of the
+  attention and the indexer queries, the pooled indexer groups at their first slot's planes, and the DFly2 block's
+  positions past the image (shifted by the block's max(rows, cols) - rows * cols).
+- Checks against the oracle (`run.py --image`, transformers' processor, tower and get_rope_index) and its fp32 twin
+  (`--attn-fp32 --vision-fp32`): positions identical; tower rows 2.20e-2 from the fp32 tower, the reference's bf16
+  tower 2.19e-2; text after the image KL 2.1e-2 / top-1 100% against the twin (the reference's bf16 run: 5.0e-2 /
+  91.7%). Served with drafts: a synthetic image (shapes and "UNHOLY 42") read correctly, decode 24-29 tok/s after it,
+  prefix reuse across requests with the same image.

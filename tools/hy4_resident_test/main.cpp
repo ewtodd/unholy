@@ -11,16 +11,24 @@
 // drafts (5 per step, verified in one chunk, the rejected ones rolled back); the two continuations should agree (up
 // to near-ties flipped by the different step shapes). Reports the accepted drafts per step and both speeds.
 // --spec-only plain|draft runs one of the two (for profiles); --spec-only draft-first runs both, drafted first.
+//
+// An oracle run with an image (run.py --image): the image preprocessed and encoded here (the tower's rows against
+// the oracle's rows.bin, the M-RoPE positions against its positions.bin), its rows over the pad tokens, every
+// position's logits compared.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "engine/hy4_resident.hpp"
+#include "vision/image.hpp"
 #include "gufo/json.hpp"
 #include "model/hy4.hpp"
 #include "model/safetensors.hpp"
@@ -74,6 +82,8 @@ int main(int argc, char** argv) {
     const auto c = model::Hy4Config::from_hf(ck->config());
     const auto meta = gufo::json::parse(read_text(oracle + "/meta.json"));
     const int S = int(meta.member_size("S")), P = int(meta.member_size("prompt"));
+    const auto* image_path = meta.find("image");
+    const bool image = image_path && image_path->is_string();
     std::vector<int32_t> ids;
     for (const auto& v : meta.find("ids")->items()) ids.push_back(int32_t(v.as_double()));
     const int max_seq = (std::max(S, P + spec + 16) + 255) / 256 * 256, pps = max_seq / 256;
@@ -93,9 +103,77 @@ int main(int argc, char** argv) {
     pin.mxfp4 = mxfp4;
     pin.nvfp4 = bool(gk);
     pin.dfly = spec > 0;
+    pin.vision = image;
     const auto plan = engine::make_hy4_plan(pin);
     std::printf("%s", plan.summary().c_str());
-    engine::Hy4ResidentModel m(c, *ck, engram, plan, geo, chunk, max_seq, chunk, 0, mxfp4, gk.get(), spec > 0);
+    engine::Hy4ResidentModel m(c, *ck, engram, plan, geo, chunk, max_seq, chunk, 0, mxfp4, gk.get(), spec > 0, image);
+    // The image: its block of pads, rows from our preprocessing and tower, the M-RoPE layout.
+    std::vector<engine::MropeBlock> blocks;
+    std::vector<uint16_t> img_rows;
+    int img_start = -1, img_len = 0;
+    if (image) {
+      const std::string path = image_path->str();
+      std::ifstream f(path, std::ios::binary);
+      const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      const auto patches = vision::hy4_preprocess(vision::decode_image(bytes), vision::Hy4VisionConfig{});
+      std::vector<int> grid;
+      for (const auto& v : meta.find("grid")->items()) grid.push_back(int(v.as_double()));
+      if (grid.size() != 3 || grid[1] != patches.grid_h || grid[2] != patches.grid_w)
+        throw std::runtime_error("image grid differs from the oracle's");
+      for (int i = 0; i < S; ++i)
+        if (ids[size_t(i)] == c.image_token) {
+          if (img_start < 0) img_start = i;
+          ++img_len;
+        }
+      const int rows = patches.grid_h / 2, cols = patches.grid_w / 2 + 1;
+      if (img_len != rows * cols) throw std::runtime_error("pad count differs from the grid");
+      blocks.push_back({img_start, rows, cols});
+      const auto te = std::chrono::steady_clock::now();
+      m.encode_image(patches, img_rows);
+      std::printf("image: grid %dx%d, %d pads from %d, encoded in %.0f ms\n", patches.grid_h, patches.grid_w, img_len,
+                  img_start, std::chrono::duration<double>(std::chrono::steady_clock::now() - te).count() * 1e3);
+      std::vector<uint16_t> ref(img_rows.size());
+      std::ifstream rf(oracle + "/rows.bin", std::ios::binary);
+      if (!rf.read(reinterpret_cast<char*>(ref.data()), std::streamsize(ref.size() * 2)))
+        throw std::runtime_error("no oracle rows.bin of that size");
+      const auto bf = [](uint16_t v) {
+        const uint32_t u = uint32_t(v) << 16;
+        float x;
+        std::memcpy(&x, &u, 4);
+        return double(x);
+      };
+      double num = 0, den = 0, worst = 0;
+      for (int r = 0; r < img_len; ++r) {
+        double rn = 0, rd = 0;
+        for (int d = 0; d < c.dim; ++d) {
+          const double a = bf(img_rows[size_t(r) * c.dim + d]), b = bf(ref[size_t(r) * c.dim + d]);
+          rn += (a - b) * (a - b);
+          rd += b * b;
+        }
+        num += rn;
+        den += rd;
+        worst = std::max(worst, std::sqrt(rn / std::max(rd, 1e-30)));
+      }
+      std::printf("image rows vs the oracle's: rel err %.3e (worst row %.3e)\n", std::sqrt(num / den), worst);
+      if (!out_path.empty())
+        std::ofstream(out_path + ".rows", std::ios::binary)
+            .write(reinterpret_cast<const char*>(img_rows.data()), std::streamsize(img_rows.size() * 2));
+      if (std::getenv("UNHOLY_TEST_ORACLE_ROWS")) {  // isolate the LM: the oracle's rows over the pads
+        img_rows = ref;
+        std::printf("using the oracle's image rows\n");
+      }
+      std::vector<int32_t> pos3(size_t(3) * S);
+      std::ifstream pf(oracle + "/positions.bin", std::ios::binary);
+      if (!pf.read(reinterpret_cast<char*>(pos3.data()), std::streamsize(pos3.size() * 4)))
+        throw std::runtime_error("no oracle positions.bin");
+      int bad = 0;
+      for (int t = 0; t < S; ++t) {
+        int32_t q[3];
+        engine::mrope_position(&blocks, t, q);
+        for (int a = 0; a < 3; ++a) bad += q[a] != pos3[size_t(a) * S + t];
+      }
+      std::printf("M-RoPE positions: %d of %d differ from the oracle's\n", bad, 3 * S);
+    }
     const int slot = slots - 1;
     std::vector<int32_t> tables(size_t(slots) * pps);
     for (size_t i = 0; i < tables.size(); ++i) tables[i] = int32_t(i);
@@ -197,6 +275,11 @@ int main(int argc, char** argv) {
     const auto run = [&](int s0, int n) {
       engine::StepInput in;
       in.chunks.push_back({slot, s0, n, 0});
+      if (!blocks.empty()) {
+        in.chunks.back().mrope = &blocks;
+        const int a = std::max(s0, img_start), e = std::min(s0 + n, img_start + img_len);
+        if (a < e) in.image_rows.push_back({a - s0, e - a, img_rows.data() + size_t(a - img_start) * c.dim});
+      }
       for (int i = 0; i < n; ++i) {
         in.ids.push_back(ids[size_t(s0 + i)]);
         in.pos.push_back(s0 + i);

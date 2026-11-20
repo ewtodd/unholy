@@ -449,8 +449,9 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 
 // Hy4 flash, the FP8 release (docs/PLAN-hy4-flash.md): make_hy4_plan places the layers and experts, Hy4ResidentModel
 // runs them, text::hy4_chat_format(). The Engram pack (tools/ref/hy4_engram_pack.py) from --engram (default: the
-// model directory's sibling hy4-flash-engram). Prefix snapshots hold a slot's window rings (~18 MB). No drafter, no
-// vision yet.
+// model directory's sibling hy4-flash-engram). Prefix snapshots hold a slot's window rings (~18 MB). --experts-gguf
+// FILE: the routed experts in NVFP4 from AngelSlim's SPARK-4Bit GGUF. --spec-drafts N: the DFly2 drafter. Images
+// (--vision, on by default): the vision tower on the APU, transformers' HYV4Flash processor layout.
 int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
   const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
   const auto c = model::Hy4Config::from_hf(ck->config());
@@ -488,6 +489,9 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   pin.card_margin = size_t(o.card_margin_gb * double(1ull << 30));
   pin.snapshots = o.prefix_snapshots;
   pin.dfly = dfly;
+  const bool vision = o.vision && model::Hy4VisionConfig::from_hf(ck->config()).depth > 0 &&
+                      ck->find("vit.embeddings.patch_embedding.weight") != nullptr;
+  pin.vision = vision;
   if (plan_only) {
     std::printf("geometry: kv pool %lld tokens (%d pages), up to %d tokens per request, %d requests at once; step %d "
                 "tokens; Hy4 flash, %s experts\n",
@@ -510,7 +514,8 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   const auto t0 = std::chrono::steady_clock::now();
   if (gk) std::printf("routed experts: NVFP4 from %s\n", o.experts_gguf.c_str());
   engine::Hy4ResidentModel model(c, *ck, o.engram_dir, plan, geo, o.max_batch, max_seq, pin.max_logit_rows,
-                                 plan.snapshots, false, gk.get(), dfly);
+                                 plan.snapshots, false, gk.get(), dfly, vision);
+  if (vision) std::printf("vision tower on the APU\n");
   if (dfly) std::printf("DFly2 drafts: %d per step verified\n", o.spec_drafts);
   std::printf("loaded in %.1f s; kv pool %lld tokens, up to %d per request, %d requests at once\n",
               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
@@ -530,6 +535,13 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
           model.reset_routing_histogram();
           return std::string("ok\n");
         });
+        if (model.has_vision()) {
+          scfg.encode_hy4_image = [&model](const vision::Hy4Patches& p, std::vector<uint16_t>& rows) {
+            model.encode_image(p, rows);
+          };
+          scfg.image_token = c.image_token;
+          if (scfg.image_token < 0) throw std::runtime_error("Hy4 config: no image_token_id");
+        }
       },
       eos);
 }
