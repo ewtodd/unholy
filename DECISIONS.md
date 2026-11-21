@@ -1844,3 +1844,45 @@ Resident test: decode 46-48 -> 38-40 ms/token (FP8 and NVFP4 experts), DFly2 on 
 (1M pool, 8 slots, drafts on; code / prose / short reasoning, two rounds): NVFP4 experts 29.5-34.0 / 34.0-34.6 /
 49.9-51.2 tok/s (22-28 / 22-28 / ~34 before); FP8 experts (the owner's preference; 54.7% predicted on the cards)
 20.8-26.4 / 26.3-29.3 / 32.8-35.4. A step now spends ~12 ms in DFly2's draft (5 LM-head passes on card 1).
+
+## 2026-11-20 — Hy4 flash: fewer, faster kernels per decode step; the draft rule; where the APU's time goes
+
+From served traces (rocprofv3 over tools/box/served-decode.sh): a step was ~60 ms, of which ~17 ms the cards idle
+between dependent kernels (~4.7 us each, the GPU's dispatch latency: kernel arguments already in device memory, so
+fewer kernels is the only fix), the rest weights, the APU's experts, the draft. Commits 17f513b .. 8799520:
+- Few-row WMMA GEMV for every decode-sized linear and expert (fp8, NVFP4, bf16; gfx12 and gfx11 variants, the
+  latter exchanging operand halves with permlanex16), used at any row count so a row's result never depends on the
+  step's size (drafted == plain greedy stays exact). Its epilogue (Hy4GemvEpilogue) also adds (the routed + shared
+  sum), scales rows (the routing weight) and, with two operands, computes the gate and up of the same columns and
+  their clamped SwiGLU: a decode-sized expert step is 2 launches instead of 5 (cards and APU).
+- One kernel per sublayer boundary (hy4_ihc_fused: the previous output's norm and stream add, the next mix and its
+  norm), the mix's 393 KB of fp32 weights read by 24 blocks per token instead of one; each layer's last add deferred
+  into the next layer's kernel (not across the cards or into an Engram layer). 31 -> 15 us a boundary.
+- The attention's per-head products as a few-row WMMA GEMV per head (hy4_heads_gemv: q read in place, the packed
+  query written directly with its rope pairs rotated on the way; the value-up gated in the epilogue): 48 -> 24 and
+  60 -> 35 us a layer. q_a + kv_a one linear (weights adjacent at load) and one kernel for both norms and the key
+  row's rope; the shared expert's gate + up one linear; the ring backup inside the ring store.
+- DFly2's head on a shortlist (one LM-head pass over the 5 uncorrected rows, their top 256, per-step corrections of
+  those only): draft 10.3 -> 7.2 ms; the pick over 32 blocks per row: -> 5.5 ms.
+- Drafts verified while their cumulative probability (the product of the drafter's) holds: default 0.2 with NVFP4
+  experts, 0.4 with fp8 (served means: NVFP4 45.7 vs 44 for each draft >= 0.7; fp8 34.9 at 0.4 vs 31.6 at 0.2).
+Tried and dropped: split-K for the few-column-block GEMVs (o_proj's 96 blocks; partials reduced by the last block):
+slower at every shape (q_a 14.1 -> 16.1 us, o_proj 119 -> 123); most of a small matrix's time is the launch gap.
+Moving the card split (card 1 from layer 22 or 24): the same step time, the APU's work only moves.
+
+Checks: code1024 prefilled in 16-row chunks (every position through the few-row kernels) against the oracle, FP8
+experts, KL 5.35e-3 / top-1 97.87% before, 6.84e-3 / 97.97% after (the parallel mix sums and the per-head GEMV round
+differently, 1 ulp; the per-head GEMV alone was 4.91e-3 / 98.55%); the fusions after that bit-identical; drafted ==
+plain greedy 200 of 200 (FP8, NVFP4). Served (1M pool, 8 slots, drafts on; code / prose / reasoning x 2): NVFP4
+experts 45.7 -> 50.2 tok/s mean (49.2 ms a step), FP8 experts 34.9 -> 38.7.
+
+Where a step's time goes now (NVFP4, ~49 ms, ~2.1 tokens): card 0's layers ~17 ms, card 1's ~19, the LM head and
+sampling ~2.5, the draft 5.5. Weights at bandwidth are ~25 ms of it; launch gaps ~7 ms. The rest is the APU:
+UNHOLY_HY4_REMOTE_STATS shows only 48% (card 1's layers) to 66% (card 0's) of the pairs on the cards for these
+prompts (the plan predicted 73%; Hy4 routes 16 of 512 experts per token), and the APU streams ~15 cold experts a layer
+at its bandwidth (~185 GB/s, 109 us per matrix call; the bench: 7 experts x 3 rows 49 us), so card 1 waits ~160 us
+a layer for it. A placement made from the same prompts' routing (--routing-log, in-sample): 77-82% on the cards, 45.3
+ms a step (49.9), 58.2 tok/s mean (53.5); the owner's production log does not fit these prompts (50.5 ms). So the
+hot set's fit to the workload is worth ~10%: the next lever is a per-conversation expert cache (swaps within a
+layer's slots, the APU holding every expert: 84 GB in NVFP4, fits; fp8's 168 GB does not, it would need two-way
+swaps).
