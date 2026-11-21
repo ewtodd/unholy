@@ -73,8 +73,35 @@ __device__ __forceinline__ void e4m3x4_to_f32(uint32_t w, float* v) {
   v[2] = hi[0];
   v[3] = hi[1];
 #else
+  // No fp8 conversion here (gfx11): an e4m3fn code moved into an fp16's sign, exponent and mantissa fields is an fp16
+  // of value code * 2^-8, subnormals included (and the NaN codes decode to 480 as e4m3_to_f32's bit decode does);
+  // two codes per integer op, then the hardware's fp16 -> fp32 and an exact * 256.
+  const uint32_t lo = (w & 0xffu) | ((w & 0xff00u) << 8), hi = ((w >> 16) & 0xffu) | ((w >> 8) & 0xff0000u);
+  const uint32_t hl = ((lo & 0x00800080u) << 8) | ((lo & 0x007f007fu) << 7);
+  const uint32_t hh = ((hi & 0x00800080u) << 8) | ((hi & 0x007f007fu) << 7);
+  v[0] = float(__builtin_bit_cast(_Float16, uint16_t(hl))) * 256.0f;
+  v[1] = float(__builtin_bit_cast(_Float16, uint16_t(hl >> 16))) * 256.0f;
+  v[2] = float(__builtin_bit_cast(_Float16, uint16_t(hh))) * 256.0f;
+  v[3] = float(__builtin_bit_cast(_Float16, uint16_t(hh >> 16))) * 256.0f;
+#endif
+}
+
+// e4m3x4_to_f32 times a scale, v[i] = code_i * s, exactly as e4m3_to_f32(code_i) * s (one rounding of the exact
+// product): s256 = s * 256 (exact) folds the fp16 decode's 2^8 into the scale on gfx11.
+__device__ __forceinline__ void e4m3x4_scaled(uint32_t w, float s, float* v) {
+#if defined(UH_GFX12) && __has_builtin(__builtin_amdgcn_cvt_pk_f32_fp8)
+  e4m3x4_to_f32(w, v);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) v[i] = e4m3_to_f32(uint8_t(w >> (8 * i)));
+  for (int i = 0; i < 4; ++i) v[i] *= s;
+#else
+  const float s256 = s * 256.0f;
+  const uint32_t lo = (w & 0xffu) | ((w & 0xff00u) << 8), hi = ((w >> 16) & 0xffu) | ((w >> 8) & 0xff0000u);
+  const uint32_t hl = ((lo & 0x00800080u) << 8) | ((lo & 0x007f007fu) << 7);
+  const uint32_t hh = ((hi & 0x00800080u) << 8) | ((hi & 0x007f007fu) << 7);
+  v[0] = float(__builtin_bit_cast(_Float16, uint16_t(hl))) * s256;
+  v[1] = float(__builtin_bit_cast(_Float16, uint16_t(hl >> 16))) * s256;
+  v[2] = float(__builtin_bit_cast(_Float16, uint16_t(hh))) * s256;
+  v[3] = float(__builtin_bit_cast(_Float16, uint16_t(hh >> 16))) * s256;
 #endif
 }
 
@@ -101,6 +128,23 @@ __device__ __forceinline__ float e2m1_to_f32(uint32_t nib) {
   // 0, 0.5, 1, 1.5, 2, 3, 4, 6
   const float mag = m < 4 ? 0.5f * float(m) : (m == 7 ? 6.0f : float(m - 2));
   return (nib & 8) ? -mag : mag;
+}
+
+// The low (lo) and high (hi) nibbles of w's four bytes as e2m1 codes, times s: lo[i] = e2m1(byte i & 15) * s,
+// hi[i] = e2m1(byte i >> 4) * s, exactly as e2m1_to_f32(code) * s (the product needs no rounding: 2 x 4 significant
+// bits). An e2m1 code moved into an fp16's sign / exponent / top mantissa bit is an fp16 of value code * 2^-14.
+__device__ __forceinline__ void e2m1x8_scaled(uint32_t w, float s, float* lo, float* hi) {
+  const float sk = s * 16384.0f;
+  const auto two = [&](uint32_t t, float* out) {  // nibbles in bits 0..3 and 16..19
+    const uint32_t h = ((t & 0x00080008u) << 12) | ((t & 0x00070007u) << 9);
+    out[0] = float(__builtin_bit_cast(_Float16, uint16_t(h))) * sk;
+    out[1] = float(__builtin_bit_cast(_Float16, uint16_t(h >> 16))) * sk;
+  };
+  two((w & 0xfu) | ((w & 0xf00u) << 8), lo);
+  two(((w >> 16) & 0xfu) | ((w >> 8) & 0xf0000u), lo + 2);
+  const uint32_t u = w >> 4;
+  two((u & 0xfu) | ((u & 0xf00u) << 8), hi);
+  two(((u >> 16) & 0xfu) | ((u >> 8) & 0xf0000u), hi + 2);
 }
 
 // Round-to-nearest-even onto the e2m1 grid (x already clamped to [-6, 6]).

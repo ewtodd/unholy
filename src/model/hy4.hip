@@ -7,6 +7,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -727,72 +730,189 @@ Hy4Engram::Hy4Engram(const std::string& dir, const Hy4Config& c) {
   }
 }
 
+// The reader pool: persistent threads, one batch at a time. A batch's jobs are (memory, position, head) in memory-major
+// order: each computes its row and reads its 96 + 2 bytes; the last job of a memory sets that memory's flag.
+struct Hy4Engram::Pool {
+  struct Batch {
+    std::vector<int32_t> ngram;
+    std::vector<uint8_t> mask;
+    int T = 0, M = 0, total = 0;
+    uint8_t* q[4] = {};
+    uint16_t* s[4] = {};
+    uint32_t* flags[4] = {};
+    uint32_t ticket = 0;
+    std::atomic<int> next{0}, all_left{0};
+    std::atomic<int> left[4];
+    std::mutex err_mu;
+    std::exception_ptr err;
+  };
+  std::vector<std::thread> threads;
+  std::mutex mu;
+  std::condition_variable cv, done;
+  uint64_t gen = 0;
+  bool stop = false;
+  std::shared_ptr<Batch> cur;
+  std::exception_ptr pending;  // the last finished batch's error, for finish()
+
+  static void set_flag(uint32_t* f, uint32_t v) {
+    if (f) std::atomic_ref<uint32_t>(*f).store(v, std::memory_order_release);
+  }
+};
+
 Hy4Engram::~Hy4Engram() {
+  if (pool_) {
+    {
+      std::lock_guard lk(pool_->mu);
+      pool_->stop = true;
+    }
+    pool_->cv.notify_all();
+    for (auto& t : pool_->threads) t.join();
+  }
   for (auto& m : mem_) {
     if (m.qfd >= 0) ::close(m.qfd);
     if (m.sfd >= 0) ::close(m.sfd);
   }
 }
 
-void Hy4Engram::fill(int mi, const int32_t* ngram, const uint8_t* mask, int t, uint8_t* q, uint16_t* s) const {
+void Hy4Engram::fill_head(int mi, const int32_t* ngram, const uint8_t* mask, int t, int h, uint8_t* q,
+                          uint16_t* s) const {
   const Mem& m = mem_[size_t(mi)];
+  uint8_t* qh = q + (size_t(t) * 16 + h) * 96;
+  uint16_t* sh = s + size_t(t) * 16 + h;
+  if (!mask[t]) {
+    std::memset(qh, 0, 96);
+    *sh = 0;
+    return;
+  }
   const int64_t size = int64_t(m.lookup.size());
   const auto comp = [&](int32_t tok) -> int64_t {
     if (tok < 0 || tok >= size) return m.lookup[size_t(pad_)];
     return m.lookup[size_t(tok)];
   };
-  uint8_t* qt = q + size_t(t) * 16 * 96;
-  uint16_t* stt = s + size_t(t) * 16;
-  if (!mask[t]) {
-    std::memset(qt, 0, 16 * 96);
-    std::memset(stt, 0, 16 * 2);
-    return;
-  }
-  int64_t mixed[3];
-  for (int j = 0; j < 3; ++j) mixed[j] = comp(ngram[size_t(t) * 3 + j]) * m.mult[size_t(j)];
-  for (int h = 0; h < 16; ++h) {
-    const int64_t mix = h < 8 ? (mixed[0] ^ mixed[1]) : (mixed[0] ^ mixed[1] ^ mixed[2]);
-    int64_t r = mix % m.moduli[size_t(h)];
-    if (r < 0) r += m.moduli[size_t(h)];  // torch's % (remainder): the divisor's sign
-    const int64_t row = r + m.offsets[size_t(h)];
-    if (::pread(m.qfd, qt + h * 96, 96, off_t(row) * 96) != 96 || ::pread(m.sfd, stt + h, 2, off_t(row) * 2) != 2)
-      throw std::runtime_error("engram: short read");
+  int64_t mix = (comp(ngram[size_t(t) * 3]) * m.mult[0]) ^ (comp(ngram[size_t(t) * 3 + 1]) * m.mult[1]);
+  if (h >= 8) mix ^= comp(ngram[size_t(t) * 3 + 2]) * m.mult[2];
+  int64_t r = mix % m.moduli[size_t(h)];
+  if (r < 0) r += m.moduli[size_t(h)];  // torch's % (remainder): the divisor's sign
+  const int64_t row = r + m.offsets[size_t(h)];
+  if (::pread(m.qfd, qh, 96, off_t(row) * 96) != 96 || ::pread(m.sfd, sh, 2, off_t(row) * 2) != 2) {
+    std::memset(qh, 0, 96);
+    *sh = 0;
+    throw std::runtime_error("engram: short read");
   }
 }
 
+void Hy4Engram::fill(int mi, const int32_t* ngram, const uint8_t* mask, int t, uint8_t* q, uint16_t* s) const {
+  for (int h = 0; h < 16; ++h) fill_head(mi, ngram, mask, t, h, q, s);
+}
+
 void Hy4Engram::lookup(int mi, const int32_t* ngram, const uint8_t* mask, int T, uint8_t* q, uint16_t* s) const {
-  uint8_t* const qs[1] = {q};
-  uint16_t* const ss[1] = {s};
-  (void)qs, (void)ss;
   if (mi < 0 || mi >= memories()) throw std::runtime_error("engram: no such memory");
   for (int t = 0; t < T; ++t) fill(mi, ngram, mask, t, q, s);
 }
 
-// (memory, row) jobs over up to 32 threads: a decode step's 64 random reads do not queue behind each other.
 void Hy4Engram::lookup_all(const int32_t* ngram, const uint8_t* mask, int T, uint8_t* const* q,
                            uint16_t* const* s) const {
-  const int M = memories(), jobs = M * T;
-  if (jobs <= 0) return;
-  const int nth = std::clamp(jobs / 2, 1, 32);
-  std::exception_ptr err;
-  std::mutex mu;
-  const auto work = [&](int i0) {
-    try {
-      for (int i = i0; i < jobs; i += nth) fill(i % M, ngram, mask, i / M, q[i % M], s[i % M]);
-    } catch (...) {
-      std::lock_guard lk(mu);
-      if (!err) err = std::current_exception();
-    }
-  };
-  if (nth == 1) {
-    work(0);
-  } else {
-    std::vector<std::thread> th;
-    th.reserve(size_t(nth));
-    for (int i = 0; i < nth; ++i) th.emplace_back(work, i);
-    for (auto& x : th) x.join();
+  lookup_async(ngram, mask, T, q, s, nullptr, 0);
+  finish();
+}
+
+void Hy4Engram::finish() const {
+  if (!pool_) return;
+  Pool& p = *pool_;
+  std::unique_lock lk(p.mu);
+  p.done.wait(lk, [&] { return !p.cur || p.cur->all_left.load(std::memory_order_acquire) == 0; });
+  if (p.cur) {
+    std::lock_guard el(p.cur->err_mu);
+    if (p.cur->err && !p.pending) p.pending = p.cur->err;
   }
-  if (err) std::rethrow_exception(err);
+  if (p.pending) {
+    const auto e = p.pending;
+    p.pending = nullptr;
+    std::rethrow_exception(e);
+  }
+}
+
+void Hy4Engram::rethrow_pending() const {
+  if (!pool_) return;
+  std::lock_guard lk(pool_->mu);
+  if (pool_->pending) {
+    const auto e = pool_->pending;
+    pool_->pending = nullptr;
+    std::rethrow_exception(e);
+  }
+}
+
+void Hy4Engram::lookup_async(const int32_t* ngram, const uint8_t* mask, int T, uint8_t* const* q,
+                             uint16_t* const* s, uint32_t* const* flags, uint32_t ticket) const {
+  auto* self = const_cast<Hy4Engram*>(this);
+  const int M = memories();
+  if (!pool_) {  // the readers: enough threads for a decode step's reads to be in flight together
+    const char* e = std::getenv("UNHOLY_HY4_ENGRAM_THREADS");
+    const int n = std::clamp(e ? std::atoi(e) : 64, 1, 512);
+    self->pool_ = std::make_unique<Pool>();
+    Pool* p = self->pool_.get();
+    for (int i = 0; i < n; ++i)
+      p->threads.emplace_back([this, p] {
+        uint64_t seen = 0;
+        for (;;) {
+          std::shared_ptr<Pool::Batch> b;
+          {
+            std::unique_lock lk(p->mu);
+            p->cv.wait(lk, [&] { return p->stop || p->gen != seen; });
+            if (p->stop) return;
+            seen = p->gen;
+            b = p->cur;
+          }
+          for (int i; (i = b->next.fetch_add(1, std::memory_order_relaxed)) < b->total;) {
+            const int per = b->T * 16, m = i / per, t = (i % per) / 16, h = i % 16;
+            try {
+              fill_head(m, b->ngram.data(), b->mask.data(), t, h, b->q[m], b->s[m]);
+            } catch (...) {
+              std::lock_guard el(b->err_mu);
+              if (!b->err) b->err = std::current_exception();
+            }
+            if (b->left[m].fetch_sub(1, std::memory_order_acq_rel) == 1) Pool::set_flag(b->flags[m], b->ticket);
+            if (b->all_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+              std::lock_guard lk(p->mu);
+              p->done.notify_all();
+            }
+          }
+        }
+      });
+  }
+  Pool& p = *pool_;
+  {  // the batch before must be done (its buffers and flags belong to the other flight)
+    std::unique_lock lk(p.mu);
+    p.done.wait(lk, [&] { return !p.cur || p.cur->all_left.load(std::memory_order_acquire) == 0; });
+    if (p.cur) {
+      std::lock_guard el(p.cur->err_mu);
+      if (p.cur->err && !p.pending) p.pending = p.cur->err;
+    }
+  }
+  auto b = std::make_shared<Pool::Batch>();
+  b->ngram.assign(ngram, ngram + size_t(T) * 3);
+  b->mask.assign(mask, mask + T);
+  b->T = T;
+  b->M = M;
+  b->total = M * T * 16;
+  b->ticket = ticket;
+  for (int m = 0; m < M; ++m) {
+    b->q[m] = q[m];
+    b->s[m] = s[m];
+    b->flags[m] = flags ? flags[m] : nullptr;
+    b->left[m].store(T * 16, std::memory_order_relaxed);
+  }
+  b->all_left.store(b->total, std::memory_order_relaxed);
+  if (b->total == 0) {
+    for (int m = 0; m < M; ++m) Pool::set_flag(b->flags[m], ticket);
+    return;
+  }
+  {
+    std::lock_guard lk(p.mu);
+    p.cur = std::move(b);
+    ++p.gen;
+  }
+  p.cv.notify_all();
 }
 
 // ---------------------------------------------------------------------------------------------------

@@ -295,15 +295,17 @@ int main(int argc, char** argv) {
     std::printf("steps: prefill %.2f s for %d tokens (%.0f tok/s), decode %.1f ms/token (%d tokens), %.1f s in all\n",
                 t_pre, P, P / std::max(t_pre, 1e-9), S > P ? t_dec * 1e3 / (S - P) : 0.0, S - P,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    std::vector<float> lr(size_t(S) * V);
-    {
-      std::ifstream f(oracle + "/logits.bin", std::ios::binary);
-      if (!f.read(reinterpret_cast<char*>(lr.data()), std::streamsize(lr.size() * 4)))
-        throw std::runtime_error("no oracle logits.bin");
-    }
     if (!out_path.empty())
       std::ofstream(out_path, std::ios::binary).write(reinterpret_cast<const char*>(logits.data()),
                                                        std::streamsize(logits.size() * 4));
+    std::vector<float> lr(size_t(S) * V);
+    {
+      std::ifstream f(oracle + "/logits.bin", std::ios::binary);
+      if (!f.read(reinterpret_cast<char*>(lr.data()), std::streamsize(lr.size() * 4))) {
+        std::printf("no oracle logits.bin: no comparison\n");  // (a timing probe: ids only)
+        return 0;
+      }
+    }
     double kl_sum = 0;
     int agree = 0;
     std::vector<double> kls;

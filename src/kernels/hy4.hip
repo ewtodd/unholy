@@ -715,6 +715,62 @@ __global__ void dfly_lists_kernel(const int32_t* const* hist, const int32_t* con
   if (threadIdx.x == 0) counts[r * 6 + j] = hc + j + 1;
 }
 
+// Slice s of row r: its max, the max's first index and sum(exp(x - max)) -> ws[(r * S + s) * 3 ..].
+__global__ __launch_bounds__(256) void argmax_slice_kernel(const float* logits, int V, float* ws) {
+  __shared__ float sv[8], ss[8];
+  __shared__ int si[8];
+  const int r = blockIdx.y, sl = blockIdx.x, S = gridDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int per = (V + S - 1) / S, v0 = sl * per, v1 = min(V, v0 + per);
+  const float* row = logits + size_t(r) * V;
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  for (int v = v0 + tid; v < v1; v += 256)
+    if (row[v] > bv) bv = row[v], bi = v;
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(bv, o, 32);
+    const int oi = __shfl_xor(bi, o, 32);
+    if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+  }
+  if (lane == 0) sv[warp] = bv, si[warp] = bi;
+  __syncthreads();
+  float mx = sv[0];
+  int mi = si[0];
+  for (int w = 1; w < 8; ++w)
+    if (sv[w] > mx || (sv[w] == mx && si[w] < mi)) mx = sv[w], mi = si[w];
+  float s = 0.0f;
+  if (mx > -INFINITY)
+    for (int v = v0 + tid; v < v1; v += 256) s += expf(row[v] - mx);
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);
+  if (lane == 0) ss[warp] = s;
+  __syncthreads();
+  if (tid == 0) {
+    float tot = 0.0f;
+    for (int w = 0; w < 8; ++w) tot += ss[w];
+    float* out = ws + (size_t(r) * S + sl) * 3;
+    out[0] = mx;
+    out[1] = __int_as_float(mi);
+    out[2] = tot;
+  }
+}
+
+__global__ void argmax_combine_kernel(const float* ws, int S, int32_t* tok, float* conf) {
+  const int r = blockIdx.x;
+  if (threadIdx.x != 0) return;
+  const float* p = ws + size_t(r) * S * 3;
+  float mx = -INFINITY;
+  int mi = 0x7fffffff;
+  for (int s = 0; s < S; ++s) {
+    const float v = p[s * 3];
+    const int i = __float_as_int(p[s * 3 + 1]);
+    if (v > mx || (v == mx && i < mi)) mx = v, mi = i;
+  }
+  float tot = 0.0f;
+  for (int s = 0; s < S; ++s)
+    if (p[s * 3] > -INFINITY) tot += p[s * 3 + 2] * expf(p[s * 3] - mx);
+  tok[r] = mi;
+  conf[r] = 1.0f / tot;
+}
+
 __global__ void gated_add_kernel(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim) {
   const size_t n = size_t(rows) * dim;
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
@@ -954,25 +1010,21 @@ __global__ __launch_bounds__(256) void fp8_gemv_kernel(const bf16* __restrict__ 
       const int col = c0 + j;
       if (col >= N) break;
       float wf[16];
-      if constexpr (kFmt == 1) {
+      if constexpr (kFmt == 1) {  // wf[q] / wf[q + 8]: byte q's low / high nibble
         const uint2 raw = *reinterpret_cast<const uint2*>(W + size_t(col) * (K / 2) + k0 / 2);
         const float sc = ue4m3_to_f32(static_cast<const uint8_t*>(Sv)[size_t(col) * (K / 16) + k0 / 16]);
-#pragma unroll
-        for (int q = 0; q < 8; ++q) {
-          const uint32_t byte = (q < 4 ? raw.x >> (8 * q) : raw.y >> (8 * (q - 4))) & 0xffu;
-          wf[q] = e2m1_to_f32(byte & 15u) * sc;
-          wf[q + 8] = e2m1_to_f32(byte >> 4) * sc;
-        }
-      } else {
+        e2m1x8_scaled(raw.x, sc, wf, wf + 8);
+        e2m1x8_scaled(raw.y, sc, wf + 4, wf + 12);
+      } else {  // bf16(w * s), the reference's dequantized weight
         const bf16* S = static_cast<const bf16*>(Sv);
         const uint4 wv = *reinterpret_cast<const uint4*>(W + size_t(col) * K + k0);
         const float sc = bf16_to_f32(S[size_t(col / 128) * kb + k0 / 128]);
         const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
-          e4m3x4_to_f32(ww[q], wf + 4 * q);
+          e4m3x4_scaled(ww[q], sc, wf + 4 * q);
 #pragma unroll
-          for (int i = 0; i < 4; ++i) wf[4 * q + i] = round_bf16(wf[4 * q + i] * sc);
+          for (int i = 0; i < 4; ++i) wf[4 * q + i] = round_bf16_finite(wf[4 * q + i]);
         }
       }
 #pragma unroll
@@ -1220,6 +1272,14 @@ void hy4_dfly_lists(const int32_t* const* hist, const int32_t* const* hcount, co
                     int32_t* counts, int R, int w, hipStream_t st) {
   if (R <= 0) return;
   dfly_lists_kernel<<<R * 6, 256, 0, st>>>(hist, hcount, anchor, lists, counts, w);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, float* ws, hipStream_t st) {
+  if (rows <= 0) return;
+  argmax_slice_kernel<<<dim3(kHy4ArgmaxSlices, unsigned(rows)), 256, 0, st>>>(logits, V, ws);
+  UH_CHECK_LAUNCH();
+  argmax_combine_kernel<<<rows, 32, 0, st>>>(ws, kHy4ArgmaxSlices, tok, conf);
   UH_CHECK_LAUNCH();
 }
 

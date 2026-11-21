@@ -155,6 +155,11 @@ void hy4_moe_sum(const bf16* pair_out, const int32_t* pidx, const int* remote0, 
 // (grid sized for max_rows).
 void hy4_gather_remote(const bf16* in, const int32_t* p2u, const MoePlan* plan, bf16* xa, int dim, int max_rows,
                        hipStream_t st);
+// Per row of logits [rows][V]: the first maximum's index and its softmax probability (glm_argmax_conf's results), the
+// row split over kHy4ArgmaxSlices blocks and combined (one block per row read the whole row). ws: rows *
+// kHy4ArgmaxSlices * 3 floats.
+constexpr int kHy4ArgmaxSlices = 64;
+void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, float* ws, hipStream_t st);
 // x = bf16(x + bf16(g * f)) per row (DFly2's slot-0 fusion: x embed row, g the fusion gate [dim], f eh_proj's output).
 void hy4_gated_add(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim, hipStream_t st);
 // out [rows][2 dim] = [a, b] (two normalized rows side by side).

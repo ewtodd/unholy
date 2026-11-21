@@ -40,19 +40,19 @@ struct DenseTiles {
 };
 DenseTiles g_tiles;
 
-void set_dense_tiles_at(k::Exl3Tile* t, int rows, hipStream_t st) {
+// A tile buffer's lists depend only on the row count: written when it changes (*cached: the rows the buffer holds,
+// kept with the buffer's owner; every buffer is written and read on one stream).
+void set_dense_tiles_at(k::Exl3Tile* t, int rows, hipStream_t st, int* cached = nullptr) {
   const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
+  g_tiles = {t, t + n8, rows};
+  if (cached && *cached == rows) return;
   k::hy4_dense_tiles(t, rows, k::kHy4GemvRows, st);
   k::hy4_dense_tiles(t + n8, rows, k::kHy4TileRows, st);
-  g_tiles = {t, t + n8, rows};
+  if (cached) *cached = rows;
 }
 
 void set_dense_tiles(const Hy4Scratch& s, int rows, hipStream_t st) {
-  auto* t = s.at<k::Exl3Tile>(kBufDenseTiles);
-  const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
-  k::hy4_dense_tiles(t, rows, k::kHy4GemvRows, st);
-  k::hy4_dense_tiles(t + n8, rows, k::kHy4TileRows, st);
-  g_tiles = {t, t + n8, rows};
+  set_dense_tiles_at(s.at<k::Exl3Tile>(kBufDenseTiles), rows, st, &s.dense_tile_rows);
 }
 
 void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int rows, hipStream_t st) {
@@ -307,6 +307,8 @@ void engram(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, u
             hipStream_t st) {
   const int T = b.T, D = c.dim, m = w.engram;
   if (!b.eng_q[m] || !b.eng_s[m] || !b.eng_mask) throw std::runtime_error("hy4: Engram rows missing from the batch");
+  if (b.eng_flag[m])  // the host's readers fill the rows while the layers before run
+    UH_CHECK(hipStreamWaitValue32(st, b.eng_flag[m], b.eng_ticket, hipStreamWaitValueGte, 0xffffffffu));
   bf16* rows = s.at<bf16>(kBufEngRows);
   float* kv = s.at<float>(kBufEngKv);
   k::hy4_engram_rows(b.eng_q[m], b.eng_s[m], w.eng_lookup_norm.p<bf16>(), rows, T, st);
@@ -432,7 +434,7 @@ namespace {
 enum DflyBuf : int {
   dIds, dPos, dAnchor, dHistP, dCntP, dLists, dCounts, dX, dResid, dA, dAtt, dMlp, dQr, dQ, dQn, dQa, dQp, dKv, dG,
   dOl, dO, dMg, dMu, dMh, dEin, dE, dHrow, dH, dCat, dF, dRowSel, dHIdx, dHid, dEmb, dHn, dEn, dCat2, dCg, dCu, dCh,
-  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dBufs
+  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dArgmaxWs, dBufs
 };
 constexpr int kDflyW = 2048 + 8;  // a row's key list: the history (<= 2048), then the block's rows (<= 6)
 
@@ -449,7 +451,7 @@ std::vector<size_t> dfly_sizes(const Hy4Config& c, int Rm) {
       R * D * 2, R * D * 2, R * D * 2, R * D * 2, R * 2 * D * 2, R * D * 2, R * D * 2, R * D * 2, R * D * 2,
       R * size_t(c.vocab) * 4, size_t(kHy4DraftTokens) * R * 4,              // logits, confidences [5][R]
       2 * (N / k::kHy4GemvRows + N / k::kHy4TileRows + 2) * sizeof(k::Exl3Tile), R * 4,  // N rows, R rows
-      k::hy4_attn_split_bytes(c.heads_sparse)};
+      k::hy4_attn_split_bytes(c.heads_sparse), R * size_t(k::kHy4ArgmaxSlices) * 3 * 4};
   if (z.size() != size_t(dBufs)) throw std::logic_error("dfly scratch: buffer list out of date");
   return z;
 }
@@ -461,7 +463,8 @@ size_t host_words(int Rm) { return size_t(Rm) * (2 * kHy4DraftRows + 1 + kHy4Dra
 Hy4DflyScratch::~Hy4DflyScratch() {
   if (host) (void)hipHostFree(host);
 }
-Hy4DflyScratch::Hy4DflyScratch(Hy4DflyScratch&& o) noexcept : max_reqs(o.max_reqs), bufs(std::move(o.bufs)), host(o.host) {
+Hy4DflyScratch::Hy4DflyScratch(Hy4DflyScratch&& o) noexcept
+    : max_reqs(o.max_reqs), bufs(std::move(o.bufs)), tile_rows{o.tile_rows[0], o.tile_rows[1]}, host(o.host) {
   o.host = nullptr;
 }
 Hy4DflyScratch& Hy4DflyScratch::operator=(Hy4DflyScratch&& o) noexcept {
@@ -469,6 +472,8 @@ Hy4DflyScratch& Hy4DflyScratch::operator=(Hy4DflyScratch&& o) noexcept {
     if (host) (void)hipHostFree(host);
     max_reqs = o.max_reqs;
     bufs = std::move(o.bufs);
+    tile_rows[0] = o.tile_rows[0];
+    tile_rows[1] = o.tile_rows[1];
     host = o.host;
     o.host = nullptr;
   }
@@ -545,7 +550,7 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
   // fp8 linears run on tile lists of their row count: the block rows (N) and one row per request (R)
   auto* tN = static_cast<k::Exl3Tile*>(buf(dTiles));
   auto* tR = tN + (N + k::kHy4GemvRows - 1) / k::kHy4GemvRows + (N + k::kHy4TileRows - 1) / k::kHy4TileRows;
-  set_dense_tiles_at(tR, R, st);
+  set_dense_tiles_at(tR, R, st, &s.tile_rows[1]);
   k::gather_rows(w.embed.p<bf16>(), ib(dIds), x, N, D, st);
   k::gather_rows(w.embed.p<bf16>(), ib(dBonus), bb(dEin), R, D, st);
   k::rmsnorm_hf(bb(dEin), D, w.enorm.p<bf16>(), bb(dE), D, R, D, c.eps, st);
@@ -555,7 +560,7 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
   linear(w.eh, bb(dCat), 2 * D, bb(dF), D, R, st);
   k::hy4_gated_add(x, kHy4DraftRows * D, w.fgate.p<bf16>(), bb(dF), R, D, st);
 
-  set_dense_tiles_at(tN, N, st);
+  set_dense_tiles_at(tN, N, st, &s.tile_rows[0]);
   bf16 *resid = bb(dResid), *a = bb(dA), *att = bb(dAtt), *mlp = bb(dMlp);
   const float scale = 1.0f / std::sqrt(float(c.nope + c.rope));
   for (int L = 0; L < nL; ++L) {
@@ -609,7 +614,7 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
   k::rmsnorm_hf(x, D, w.final_norm.p<bf16>(), x, D, N, D, c.eps, st);
 
   // The head chain: row t + 1 of each block, corrected with the previous token's embedding, through the LM head.
-  set_dense_tiles_at(tR, R, st);
+  set_dense_tiles_at(tR, R, st, &s.tile_rows[1]);
   const int32_t* prev = ib(dBonus);
   for (int t = 0; t < kHy4DraftTokens; ++t) {
     k::gather_rows(x, ib(dRowSel) + t * R, bb(dHid), R, D, st);
@@ -623,8 +628,8 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
     linear(w.cd, bb(dCh), D, bb(dHn), D, R, st);
     k::hy4_add(bb(dHid), bb(dHn), bb(dCorr), size_t(R) * D, st);
     linear_f32(head.head, bb(dCorr), D, static_cast<float*>(buf(dLogits)), V, R, st);
-    k::glm_argmax_conf(static_cast<float*>(buf(dLogits)), R, V, tokens + t * R,
-                       static_cast<float*>(buf(dConf)) + t * R, st);
+    k::hy4_argmax_conf(static_cast<float*>(buf(dLogits)), R, V, tokens + t * R,
+                       static_cast<float*>(buf(dConf)) + t * R, static_cast<float*>(buf(dArgmaxWs)), st);
     prev = tokens + t * R;
   }
   if (conf)

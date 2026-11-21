@@ -32,6 +32,10 @@ using UsageProfile = std::vector<std::vector<double>>;
 UsageProfile load_usage_profile(const std::string& path, int n_layers, int n_experts);
 // Counts [layer][expert] in that format.
 std::string format_usage_profile(const std::vector<std::vector<uint64_t>>& counts);
+// Routing counts saved in that format (a served model's histogram, --routing-log); empty when the file is missing.
+std::vector<std::vector<uint64_t>> load_routing_counts(const std::string& path, int n_layers, int n_experts);
+// (1 - w) * u + w * counts, each normalised per layer (layers without counts keep u).
+UsageProfile mix_usage(const UsageProfile& u, const std::vector<std::vector<uint64_t>>& counts, double w);
 
 struct PlanInput {
   const model::Dsv4Config* cfg = nullptr;

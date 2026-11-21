@@ -64,6 +64,7 @@
 // quant whose routed experts are used instead of the native MXFP4 ones. Placement comes from the
 // planner (src/engine/plan.hpp) for the requested cache geometry.
 #include <chrono>
+#include <fstream>
 #include <condition_variable>
 #include <stop_token>
 #include <csignal>
@@ -190,6 +191,7 @@ std::string engine_line(const engine::EngineStats& a, const engine::EngineStats&
 struct Options {
   std::string model_dir, exl3_dir, engram_dir, experts_gguf, profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_unholy_mixed.txt";
   bool profile_set = false;  // --profile given (otherwise each family has its default)
+  std::string routing_log;   // Hy4: --routing-log FILE (served routing counts, mixed into the placement)
   server::ServerConfig scfg;
   int max_slots = 8, max_seq = 65536, num_pages = 0, max_batch = 2048;
   long long kv_tokens = 0;
@@ -451,7 +453,9 @@ int serve_glm5(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only
 // runs them, text::hy4_chat_format(). The Engram pack (tools/ref/hy4_engram_pack.py) from --engram (default: the
 // model directory's sibling hy4-flash-engram). Prefix snapshots hold a slot's window rings (~18 MB). --experts-gguf
 // FILE: the routed experts in NVFP4 from AngelSlim's SPARK-4Bit GGUF. --spec-drafts N: the DFly2 drafter. Images
-// (--vision, on by default): the vision tower on the APU, transformers' HYV4Flash processor layout.
+// (--vision, on by default): the vision tower on the APU, transformers' HYV4Flash processor layout. --routing-log FILE:
+// the expert picks of the runs that used it are half of the placement (the other half --profile's), and this run
+// adds its own every 10 minutes and at exit, so the hot experts follow the traffic over restarts.
 int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only, sigset_t sigs) {
   const auto tok = text::Tokenizer::load(o.model_dir + "/tokenizer.json");
   const auto c = model::Hy4Config::from_hf(ck->config());
@@ -482,6 +486,13 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   pin.ck = ck.get();
   pin.nvfp4 = bool(gk);
   pin.usage = engine::load_usage_profile(o.profile, c.n_layers, c.n_experts);
+  // --routing-log: the counts earlier runs saved, half of the placement; this run adds its own to the file.
+  const auto logged = o.routing_log.empty() ? std::vector<std::vector<uint64_t>>{}
+                                            : engine::load_routing_counts(o.routing_log, c.n_layers, c.n_experts);
+  if (!logged.empty()) {
+    pin.usage = engine::mix_usage(pin.usage, logged, 0.5);
+    std::printf("routing log %s: half of the expert placement\n", o.routing_log.c_str());
+  }
   pin.geo = geo;
   pin.max_tokens = o.max_batch;
   pin.max_seq = max_seq;
@@ -525,7 +536,35 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   if (end < 0) throw std::runtime_error("Hy4 tokenizer: no <｜hy_end:opensource｜>");
   eos.push_back(end);
   if (c.eos != end) eos.push_back(c.eos);
-  return run_server(
+  // --routing-log: the counts loaded at start plus this run's, saved every 10 minutes and at exit (atomically).
+  std::mutex log_mu;
+  const auto write_log = [&] {
+    std::lock_guard lk(log_mu);
+    auto h = model.routing_histogram();
+    for (size_t L = 0; L < h.size() && L < logged.size(); ++L)
+      for (size_t e = 0; e < h[L].size() && e < logged[L].size(); ++e) h[L][e] += logged[L][e];
+    const std::string tmp = o.routing_log + ".tmp";
+    {
+      std::ofstream f(tmp, std::ios::trunc);
+      f << "# unholy serve --routing-log: Hy4 flash expert picks per layer, summed over the runs that used this file\n"
+        << engine::format_usage_profile(h);
+      if (!f) return;
+    }
+    if (std::rename(tmp.c_str(), o.routing_log.c_str()) != 0) std::remove(tmp.c_str());
+  };
+  std::jthread logger;
+  if (!o.routing_log.empty())
+    logger = std::jthread([&](std::stop_token stop) {
+      std::mutex m;
+      std::condition_variable_any cv;
+      std::unique_lock lk(m);
+      for (;;) {  // (wait_for returns the predicate's false on a stop request too: test the token itself)
+        cv.wait_for(lk, stop, std::chrono::minutes(10), [] { return false; });
+        if (stop.stop_requested()) break;
+        write_log();
+      }
+    });
+  const int rc = run_server(
       model, tok, text::hy4_chat_format(), o, max_seq, sigs,
       [&](server::ServerConfig& scfg) {
         scfg.extra_get.emplace_back("/unholy/routing_profile",
@@ -544,6 +583,12 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
         }
       },
       eos);
+  if (logger.joinable()) {
+    logger.request_stop();
+    logger.join();
+  }
+  if (!o.routing_log.empty()) write_log();
+  return rc;
 }
 
 int serve(int argc, char** argv, bool plan_only) {
@@ -557,6 +602,7 @@ int serve(int argc, char** argv, bool plan_only) {
     else if (a == "--engram") o.engram_dir = v;
     else if (a == "--experts-gguf") o.experts_gguf = v;
     else if (a == "--profile") o.profile = v, o.profile_set = true;
+    else if (a == "--routing-log") o.routing_log = v;
     else if (a == "--host") o.scfg.host = v;
     else if (a == "--port") o.scfg.port = std::stoi(v);
     else if (a == "--served-model-name") o.scfg.model_name = v, o.model_name_set = true;

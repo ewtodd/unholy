@@ -1814,3 +1814,33 @@ rather than the KV, leaning towards an AngelSlim quant.
   tower 2.19e-2; text after the image KL 2.1e-2 / top-1 100% against the twin (the reference's bf16 run: 5.0e-2 /
   91.7%). Served with drafts: a synthetic image (shapes and "UNHOLY 42") read correctly, decode 24-29 tok/s after it,
   prefix reuse across requests with the same image.
+
+## 2026-11-20 — Hy4 flash: speed without changing outputs (Engram reads, decoders, placement, sampler)
+
+Found from traces and the first served traffic, all logits bit-identical to before (tools/box/hy4-validate.sh: the
+resident test against a baseline build, FP8 and NVFP4 experts, prefill and 64 decode rows: max |diff| 0; DFly2's
+drafts and continuation identical):
+- Placement: on the owner's traffic only 56% of the expert picks were on the cards (the code profile predicted 82%).
+  data/expert_profile_hy4_mixed.txt (half that traffic's histogram, half code) is the default; `--routing-log FILE`
+  makes the logged picks of earlier runs half of the placement and adds this run's (every 10 min and at exit).
+- Engram: a decode step read 128 rows from the SSD pack on 2 freshly made threads before the cards could start.
+  Now a pool of 64 readers, one job per (memory, position, head), memories in layer order, each raising a flag the
+  stream waits for before its Engram layer (only layer 1's memory is waited for up front). Uncached reads
+  (unholy-hy4-engram-bench --random): decode 3.3 -> 0.53 ms, verify 20.7 -> 2.4 ms, a 2048-token prefill step
+  5.4 -> 0.54 s.
+- Expert GEMVs: the APU (gfx1151) has no fp8 conversion; its bit decode and a NaN-checking bf16 rounding made the
+  GEMV compute-bound. An e4m3 (e2m1) code shifted into an fp16 is the value times 2^-8 (2^-14), exact for every code
+  (checked for all of them), the factor folded into the scale; finite-only rounding. unholy-hy4-gemv-bench, 16
+  experts x 6 rows (larger than the APU's cache): APU FP8 358 -> 261 us, NVFP4 238 -> 179; card 0 FP8 133 -> 101,
+  NVFP4 146 -> 98 (decode-sized: APU FP8 96 -> 39 us, card 0 38 -> 22).
+- dense_tiles once per row count (~40 launches per card per step); DFly2's argmax split over 64 blocks (one block
+  read the 120k-entry row twice, ~170 us x 5 per draft).
+- Sampler (all models): the whole-vocabulary case (temperature only) in one fp32 pass with block sums, 462 ->
+  164 us per row; unholy-sampler-test checks it against the exact softmax.
+- UNHOLY_HY4_HOST_TIMING=1 (host time per step), UNHOLY_HY4_DFLY_CONF=product (cumulative draft confidence; not
+  measured yet).
+
+Resident test: decode 46-48 -> 38-40 ms/token (FP8 and NVFP4 experts), DFly2 on 4k code 35.5 -> 46.3 tok/s. Served
+(1M pool, 8 slots, drafts on; code / prose / short reasoning, two rounds): NVFP4 experts 29.5-34.0 / 34.0-34.6 /
+49.9-51.2 tok/s (22-28 / 22-28 / ~34 before); FP8 experts (the owner's preference; 54.7% predicted on the cards)
+20.8-26.4 / 26.3-29.3 / 32.8-35.4. A step now spends ~12 ms in DFly2's draft (5 LM-head passes on card 1).

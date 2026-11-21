@@ -151,12 +151,23 @@ class Hy4Engram {
   // Rows of memory m for T positions whose n-gram tokens are ngram [T][3] (the token, the one before, the one before
   // that; the pad id before a sequence's start): q [T][16][96], s [T][16]. Positions with mask 0 get zeros.
   void lookup(int m, const int32_t* ngram, const uint8_t* mask, int T, uint8_t* q, uint16_t* s) const;
-  // Every memory's rows at once (q[m], s[m] as lookup's), the reads spread over threads.
+  // Every memory's rows at once (q[m], s[m] as lookup's).
   void lookup_all(const int32_t* ngram, const uint8_t* mask, int T, uint8_t* const* q, uint16_t* const* s) const;
+  // lookup_all without waiting: the engram's pool of reader threads (one job per memory, position and head, so a
+  // step's reads are in flight together; the memories in order) fills q / s, and once memory m's rows are in place
+  // sets *flags[m] = ticket (flags: coherent host memory the cards wait on; null: none). ngram and mask are copied.
+  // Waits for the batch before it first. A failed read zeroes its rows and still sets the flags; finish() rethrows.
+  void lookup_async(const int32_t* ngram, const uint8_t* mask, int T, uint8_t* const* q, uint16_t* const* s,
+                    uint32_t* const* flags, uint32_t ticket) const;
+  void finish() const;  // waits for the batch in flight; rethrows its first error
+  void rethrow_pending() const;  // rethrows a finished batch's error (lookup_async collects it), without waiting
   int memories() const { return int(mem_.size()); }
 
  private:
   void fill(int m, const int32_t* ngram, const uint8_t* mask, int t, uint8_t* q, uint16_t* s) const;
+  void fill_head(int m, const int32_t* ngram, const uint8_t* mask, int t, int h, uint8_t* q, uint16_t* s) const;
+  struct Pool;
+  std::unique_ptr<Pool> pool_;
   struct Mem {
     int layer = 0, qfd = -1, sfd = -1;
     std::vector<int32_t> lookup;
@@ -204,6 +215,10 @@ struct Hy4Batch {
   const uint8_t* eng_q[4] = {};
   const uint16_t* eng_s[4] = {};
   const uint8_t* eng_mask = nullptr;
+  // With asynchronous lookups (Hy4Engram::lookup_async): memory m's rows are in place once *eng_flag[m] >= eng_ticket
+  // (the stream waits for it before the Engram layer). Null: already there.
+  uint32_t* eng_flag[4] = {};
+  uint32_t eng_ticket = 0;
 };
 
 enum Hy4Buf : int {
@@ -223,6 +238,7 @@ constexpr int kHy4IdxBlock = 64;  // queries per index-score pass
 struct Hy4Scratch {
   int max_tokens = 0, max_seq = 0;
   std::vector<rt::DeviceBuffer> bufs;
+  mutable int dense_tile_rows = -1;  // the row count kBufDenseTiles' lists were written for
   void* get(size_t i) const { return bufs.at(i).data(); }
   template <typename T>
   T* at(Hy4Buf b) const {
@@ -280,6 +296,7 @@ bool hy4_has_dfly(const Checkpoint& ck);
 struct Hy4DflyScratch {
   int max_reqs = 0;
   std::vector<rt::DeviceBuffer> bufs;
+  int tile_rows[2] = {-1, -1};  // the row counts its two tile lists (block rows, request rows) were written for
   int32_t* host = nullptr;  // pinned staging of the per-call inputs
   ~Hy4DflyScratch();
   Hy4DflyScratch() = default;

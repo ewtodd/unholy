@@ -1,6 +1,7 @@
 #include "engine/hy4_resident.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -380,6 +381,9 @@ Hy4ResidentModel::Hy4ResidentModel(const model::Hy4Config& c, const model::Check
       pinned(&f.eng_s[m], size_t(max_tokens) * 16 * 2);
     }
     pinned(&f.eng_mask, size_t(max_tokens));
+    UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&f.eng_flag), 64,
+                           hipHostMallocPortable | hipHostMallocMapped | hipHostMallocCoherent));
+    std::memset(f.eng_flag, 0, 64);
     {
       rt::DeviceGuard g(card_[0].dev);
       UH_CHECK(hipEventCreateWithFlags(&f.handoff, hipEventDisableTiming));
@@ -423,6 +427,7 @@ Hy4ResidentModel::~Hy4ResidentModel() {
   for (Flight& f : flight_) {
     for (void* p : {static_cast<void*>(f.x_host), static_cast<void*>(f.logits_host), static_cast<void*>(f.io_host),
                     static_cast<void*>(f.tables_host), static_cast<void*>(f.eng_mask), static_cast<void*>(f.pos3_host),
+                    static_cast<void*>(f.eng_flag),
                     static_cast<void*>(f.img_host)})
       if (p) (void)hipHostFree(p);
     for (int m = 0; m < 4; ++m) {
@@ -500,7 +505,31 @@ void Hy4ResidentModel::state_copies(int kc, const std::vector<StateOp>& ops, boo
   }
 }
 
+// UNHOLY_HY4_HOST_TIMING=1: the host's time per step on stderr every 100 steps (submit before the first kernel, the
+// enqueueing, the wait for the logits, their copy; and the gap from wait's return to the next submit).
+namespace {
+struct HostTiming {
+  bool on = std::getenv("UNHOLY_HY4_HOST_TIMING") != nullptr;
+  using clock = std::chrono::steady_clock;
+  clock::time_point last_wait_end;
+  double pre = 0, enq = 0, sync = 0, copy = 0, between = 0;
+  int n = 0;
+  static double ms(clock::time_point a, clock::time_point b) { return std::chrono::duration<double>(b - a).count() * 1e3; }
+  void report() {
+    if (++n < 100) return;
+    std::fprintf(stderr, "hy4 host per step (%d steps): submit before kernels %.3f ms, enqueue %.3f, wait %.3f, "
+                 "logits copy %.3f, wait -> next submit %.3f\n", n, pre / n, enq / n, sync / n, copy / n, between / n);
+    pre = enq = sync = copy = between = 0;
+    n = 0;
+  }
+};
+HostTiming g_host_timing;
+}  // namespace
+
 uint64_t Hy4ResidentModel::submit(const StepInput& in) {
+  HostTiming& ht = g_host_timing;
+  const auto t_submit = HostTiming::clock::now();
+  if (ht.on && ht.last_wait_end.time_since_epoch().count() != 0) ht.between += HostTiming::ms(ht.last_wait_end, t_submit);
   const int T = int(in.ids.size()), R = int(in.logit_rows.size()), D = c_.dim;
   if (T == 0 || T > max_tokens_) throw std::runtime_error("step: bad token count");
   if (R > max_logit_rows_) throw std::runtime_error("step: too many logit rows");
@@ -549,7 +578,10 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   }
   for (const StateOp& op : in.save)
     std::memcpy(snap_tok_host_ + size_t(op.snapshot) * 4096, &last2_[size_t(op.slot) * 2], 8);
-  engram_->lookup_all(ngram.data(), f.eng_mask, T, f.eng_q, f.eng_s);
+  // The Engram reads run while the cards start: each Engram layer waits for its memory's flag.
+  uint32_t* flags[4] = {f.eng_flag, f.eng_flag + 1, f.eng_flag + 2, f.eng_flag + 3};
+  engram_->lookup_async(ngram.data(), f.eng_mask, T, f.eng_q, f.eng_s, flags, uint32_t(ticket));
+  engram_->rethrow_pending();  // a failed read of the step before (its rows were zeros)
 
   // Image rows into this flight's pinned buffer, in order.
   {
@@ -586,6 +618,10 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
     b.eng_s[m] = f.eng_s[m];
   }
   b.eng_mask = f.eng_mask;
+  for (int m = 0; m < engram_->memories(); ++m) b.eng_flag[m] = f.eng_flag + m;
+  b.eng_ticket = uint32_t(ticket);
+  const auto t_enqueue = HostTiming::clock::now();
+  if (ht.on) ht.pre += HostTiming::ms(t_submit, t_enqueue);
   for (int kc = 0; kc < 2; ++kc) {
     Card& cd = card_[kc];
     rt::DeviceGuard g(cd.dev);
@@ -648,6 +684,7 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
   f.busy = true;
   f.ticket = ticket;
   f.rows = R;
+  if (ht.on) ht.enq += HostTiming::ms(t_enqueue, HostTiming::clock::now());
   return next_ticket_++;
 }
 
@@ -700,14 +737,23 @@ void Hy4ResidentModel::draft(const std::vector<RingRestore>& restore, const std:
   UH_CHECK(hipEventRecord(drafted_, dst_));
   UH_CHECK(hipStreamSynchronize(dst_));
   // The drafter's probability of its token as the confidence (its confidence head is unused, as in vLLM and SGLang).
+  // UNHOLY_HY4_DFLY_CONF=product: the running product instead (the chance the drafts up to it all hold), so the
+  // engine's per-draft threshold becomes a cumulative one.
+  static const bool product = [] {
+    const char* e = std::getenv("UNHOLY_HY4_DFLY_CONF");
+    return e && std::string(e) == "product";
+  }();
   tokens.resize(size_t(R) * model::kHy4DraftTokens);
   conf.resize(tokens.size());
   const float* cf = reinterpret_cast<const float*>(dtok_host_ + size_t(model::kHy4DraftTokens) * R);
-  for (int r = 0; r < R; ++r)
+  for (int r = 0; r < R; ++r) {
+    float run = 1.0f;
     for (int t = 0; t < model::kHy4DraftTokens; ++t) {
       tokens[size_t(r) * model::kHy4DraftTokens + t] = dtok_host_[size_t(t) * R + r];
-      conf[size_t(r) * model::kHy4DraftTokens + t] = cf[size_t(t) * R + r];
+      run = product ? run * cf[size_t(t) * R + r] : cf[size_t(t) * R + r];
+      conf[size_t(r) * model::kHy4DraftTokens + t] = run;
     }
+  }
 }
 
 void Hy4ResidentModel::encode_image(const vision::Hy4Patches& p, std::vector<uint16_t>& rows) {
@@ -726,6 +772,8 @@ void Hy4ResidentModel::encode_image(const vision::Hy4Patches& p, std::vector<uin
 void Hy4ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {
   Flight& f = flight_[ticket % 2];
   if (!f.busy || f.ticket != ticket) throw std::runtime_error("step: wait for an unknown ticket");
+  HostTiming& ht = g_host_timing;
+  const auto t0 = HostTiming::clock::now();
   {
     rt::DeviceGuard g(card_[1].dev);
     UH_CHECK(hipEventSynchronize(f.done));
@@ -735,9 +783,16 @@ void Hy4ResidentModel::wait(uint64_t ticket, std::vector<float>& out) {
     UH_CHECK(hipEventSynchronize(f.saved));
     f.saved_wait = false;
   }
+  const auto t1 = HostTiming::clock::now();
   out.resize(size_t(f.rows) * c_.vocab);
   std::memcpy(out.data(), f.logits_host, out.size() * 4);
   f.busy = false;
+  if (ht.on) {
+    ht.last_wait_end = HostTiming::clock::now();
+    ht.sync += HostTiming::ms(t0, t1);
+    ht.copy += HostTiming::ms(t1, ht.last_wait_end);
+    ht.report();
+  }
 }
 
 }  // namespace unholy::engine

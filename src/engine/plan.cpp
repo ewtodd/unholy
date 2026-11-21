@@ -51,6 +51,39 @@ UsageProfile load_usage_profile(const std::string& path, int n_layers, int n_exp
   return u;
 }
 
+std::vector<std::vector<uint64_t>> load_routing_counts(const std::string& path, int n_layers, int n_experts) {
+  std::ifstream f(path);
+  if (!f) return {};
+  std::vector<std::vector<uint64_t>> c(size_t(n_layers), std::vector<uint64_t>(size_t(n_experts), 0));
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.size() < 2 || line[0] != 'L') continue;
+    std::istringstream ss(line.substr(1));
+    int layer = -1;
+    ss >> layer;
+    if (layer < 0 || layer >= n_layers) continue;
+    for (int e = 0; e < n_experts; ++e) {
+      uint64_t v = 0;
+      if (!(ss >> v)) break;
+      c[size_t(layer)][size_t(e)] = v;
+    }
+  }
+  return c;
+}
+
+UsageProfile mix_usage(const UsageProfile& u, const std::vector<std::vector<uint64_t>>& counts, double w) {
+  UsageProfile out = u;
+  for (size_t L = 0; L < out.size() && L < counts.size(); ++L) {
+    double su = 0, sc = 0;
+    for (double v : u[L]) su += v;
+    for (uint64_t v : counts[L]) sc += double(v);
+    if (su <= 0 || sc <= 0) continue;
+    for (size_t e = 0; e < out[L].size() && e < counts[L].size(); ++e)
+      out[L][e] = 1e6 * ((1 - w) * u[L][e] / su + w * double(counts[L][e]) / sc);
+  }
+  return out;
+}
+
 std::string format_usage_profile(const std::vector<std::vector<uint64_t>>& counts) {
   std::string s;
   for (size_t L = 0; L < counts.size(); ++L) {

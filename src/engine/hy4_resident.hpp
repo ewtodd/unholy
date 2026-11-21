@@ -170,6 +170,7 @@ class Hy4ResidentModel final : public StepModel {
     uint8_t* eng_q[4] = {};
     uint16_t* eng_s[4] = {};
     uint8_t* eng_mask = nullptr;
+    uint32_t* eng_flag = nullptr;  // [4] coherent: memory m's rows of this flight's step are in place (= its ticket)
     hipEvent_t handoff = nullptr, consumed = nullptr, done = nullptr, saved = nullptr;
     uint64_t ticket = 0;
     int rows = 0;
