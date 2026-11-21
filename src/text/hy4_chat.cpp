@@ -970,6 +970,8 @@ RenderedChat hy4_render_request(const Value& req) {
     if (!e->is_string()) throw ChatError("reasoning_effort error : should be no_think/high");
     opt.reasoning_effort = e->str();
   }
+  // OpenAI's name for no reasoning (what maitred and its clients send); the template itself knows no_think / high.
+  if (opt.reasoning_effort == "none") opt.reasoning_effort = "no_think";
   if (const Value* v = kwargs.find("preserved_thinking")) {
     opt.preserved_thinking_set = true;
     opt.preserved_thinking = v->truthy();

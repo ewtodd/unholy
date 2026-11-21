@@ -49,7 +49,7 @@
 namespace unholy::text {
 
 struct Hy4Options {
-  std::string reasoning_effort = "high";  // "high" or "no_think"; anything else is ChatError
+  std::string reasoning_effort = "high";  // "high" or "no_think" (a request's "none" too); anything else is ChatError
   bool preserved_thinking_set = false;    // template default: on exactly when tools are given
   bool preserved_thinking = false;
   bool raw_last_assistant = false;        // the last assistant message stays open, without think tags
