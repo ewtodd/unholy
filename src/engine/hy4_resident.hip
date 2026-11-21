@@ -736,12 +736,13 @@ void Hy4ResidentModel::draft(const std::vector<RingRestore>& restore, const std:
   }
   UH_CHECK(hipEventRecord(drafted_, dst_));
   UH_CHECK(hipStreamSynchronize(dst_));
-  // The drafter's probability of its token as the confidence (its confidence head is unused, as in vLLM and SGLang).
-  // UNHOLY_HY4_DFLY_CONF=product: the running product instead (the chance the drafts up to it all hold), so the
-  // engine's per-draft threshold becomes a cumulative one.
+  // Confidence: the running product of the drafter's probabilities of its tokens (the chance the drafts up to this
+  // one all hold; the checkpoint's confidence head is unused, as in vLLM and SGLang), so the engine's threshold is a
+  // cumulative one (served, 2026-11-20: product >= 0.15-0.3 45.6-45.7 tok/s vs each draft >= 0.7 ~44, >= 0.5 to 0
+  // ~42.5). UNHOLY_HY4_DFLY_CONF=each: each draft's own probability.
   static const bool product = [] {
     const char* e = std::getenv("UNHOLY_HY4_DFLY_CONF");
-    return e && std::string(e) == "product";
+    return !(e && std::string(e) == "each");
   }();
   tokens.resize(size_t(R) * model::kHy4DraftTokens);
   conf.resize(tokens.size());

@@ -30,9 +30,10 @@
 // verifies up to N drafted tokens (N <= 5) and keeps the ones the model would have produced.
 // --spec-min-conf C: verify only the leading drafts whose confidence-head score is >= C (default 0.5: on
 // short-context code and prose, 5 drafts at 0.5 gave 33.6 / 23.9 tok/s vs 30.0 / 19.1 verifying all).
-// Hy4 flash: its DFly2 drafter (5 tokens per step; card 1), the drafter's probability of each token as its
-// confidence, default 0.7 (code / prose / reasoning at 0.3, 0.5, 0.7, 0.85: 21.7 / 20.9 / 31.3, 22.0 / 23.0 / 33.7,
-// 24.0 / 22.1-28.2 / 33.7, 21.1 / 22.2 / 31.2 tok/s; 19.4-20.2 without drafts).
+// Hy4 flash: its DFly2 drafter (5 tokens per step; card 1); a draft's confidence is the product of the drafter's
+// probabilities of it and the drafts before it, default 0.2 with NVFP4 experts and 0.4 with fp8 ones (2026-11-20,
+// averaged over code, prose and reasoning prompts; NVFP4: product >= 0.15 / 0.3 / 0.4 45.7 / 45.6 / 43.1 tok/s, each
+// draft's own probability >= 0.7 / 0.5 / 0.3 / 0 ~44 / 42.7 / 42.6 / 42.4; fp8: product >= 0.2 / 0.4 31.6 / 34.9).
 //
 // Prefill scheduling: decodes always go first; prefill chunks fill the rest of the step's token budget
 // (--max-batch-tokens) in --prefill-order: `shortest` (default) packs the least remaining prompt first,
@@ -462,7 +463,9 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   // DFly2 drafts 5 tokens per step (--spec-drafts N verifies up to N of them).
   const bool dfly = o.spec_drafts > 0 && model::hy4_has_dfly(*ck);
   o.spec_drafts = dfly ? std::min(o.spec_drafts, model::kHy4DraftTokens) : 0;
-  if (!o.spec_min_conf_set) o.spec_min_conf = 0.7f;  // the drafter's own token probability (see the header)
+  // The drafts' cumulative probability (see the header): verifying a row costs more with fp8 experts (more of them on
+  // the APU), so they verify fewer.
+  if (!o.spec_min_conf_set) o.spec_min_conf = o.experts_gguf.empty() ? 0.4f : 0.2f;
   if (!o.model_name_set) o.scfg.model_name = "hy4-flash";
   if (o.prefix_snapshots < 0) o.prefix_snapshots = 64;
   if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_hy4_mixed.txt";
