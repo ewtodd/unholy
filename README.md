@@ -1,9 +1,11 @@
 # unholy
 <!---->
-A from-scratch serving engine for **DeepSeek-V4-Flash** and **GLM-5.3-Flash** on a single desktop machine.
+A from-scratch serving engine for **DeepSeek-V4-Flash**, **GLM-5.3-Flash** and **Hy4 flash** on a single desktop
+machine.
 It runs them across two AMD Radeon AI PRO R9700 cards and the Radeon 8060S iGPU of a Ryzen AI Max+ 395
 ("Strix Halo"): DeepSeek-V4-Flash at native precision (MXFP4 routed experts, fp8 dense weights, bf16 KV),
-GLM-5.3-Flash as an EXL3 4.05-bit quant.
+GLM-5.3-Flash as an EXL3 4.05-bit quant, Hy4 flash from Tencent's FP8 release (fp8 dense weights, bf16 KV; routed
+experts in fp8, or in NVFP4 from AngelSlim's 4-bit build).
 It serves an
 OpenAI-compatible API with vLLM-style continuous batching, prefix caching, speculative decoding with
 each checkpoint's own drafter, image input, and contexts up to 1M tokens.
@@ -11,7 +13,7 @@ each checkpoint's own drafter, image input, and contexts up to 1M tokens.
 C++20 and HIP; no Python at runtime; every kernel is our own (no rocBLAS / hipBLASLt / CK). It builds
 with Nix against TheRock's ROCm 10 SDK.
 <!---->
-It is *vertical*: a couple of models, one machine.
+It is *vertical*: a few models, one machine.
 The first working version was built in one day by Claude Opus 5.5 (RIP software engineering), with an engineering log
 (`DECISIONS.md`) that records every measurement and dead end along the way.
 <!---->
@@ -43,26 +45,32 @@ about 168 GB on disk.
 GLM-5.3-Flash (45 layers: 34 of Kimi delta attention, a linear recurrence, and 11 of DSA, sparse MLA over the
 2048 positions its indexer selects; 288 routed experts with 8 active; hyper-connections; one MTP layer) is
 165 GB as the EXL3 4.05 quant (`docs/glm53-flash-quant.md` for why that build).
-Either is more than the 64 GB of VRAM, so the planner splits the layers between
-the two cards (the diagram shows DeepSeek-V4-Flash; GLM-5.3-Flash splits at layer 23).
+Hy4 flash (42 layers of gated MLA: 30 over a 512-token sliding window and 12 sparse, over the 2048 positions a
+compressed indexer picks; 512 routed experts with 16 active in a 1536-wide latent MoE; hyper-connections; n-gram
+"Engram" memories at 4 layers; a 5-layer DFly2 drafter; a SigLIP2 ViT) is 287 GB as the FP8 release, 127 GB of it
+the Engram tables in bf16. Those stay on the NVMe (61 GB as unholy packs them, fp8 with a scale per row): each step
+reads its rows there while the cards run. Its routed experts are 149 GB in fp8, or 84 GB in AngelSlim's NVFP4
+build.
+Each is more than the 64 GB of VRAM, so the planner splits the layers between
+the two cards (the diagram shows DeepSeek-V4-Flash; GLM-5.3-Flash splits at layer 23, Hy4 flash at 20).
 Each layer's dense weights, caches and its most-used ("hot") experts live on its card;
 the hot set is chosen from routing histograms measured on real traffic, and fills the VRAM left after
 the dense weights and KV. The rest of the experts live on the iGPU and are computed there, with
-device-side flags between the cards and the iGPU so the host never waits. Large prefill steps run as two
-overlapping halves, so the iGPU computes one half's experts while the cards compute the other half's
-attention.
+device-side flags between the cards and the iGPU so the host never waits. For DeepSeek-V4-Flash and
+GLM-5.3-Flash, large prefill steps run as two overlapping halves, so the iGPU computes one half's experts while
+the cards compute the other half's attention.
 <!---->
 ## Performance
 <!---->
-Measured on that machine, behind the PCIe switch. Both models through `unholy serve` with their production
-settings, measured the same way: DeepSeek-V4-Flash on 2026-11-03 (`docs/bench/perf-dsv4-2026-11-03.txt`),
-GLM-5.3-Flash on 2026-10-24 (`docs/bench/compare-perf-dsv4-glm-2026-10-24.txt`):
+Measured on that machine, behind the PCIe switch. All three through `unholy serve` with their production
+settings: DeepSeek-V4-Flash on 2026-11-03 (`docs/bench/perf-dsv4-2026-11-03.txt`), GLM-5.3-Flash on 2026-10-24
+(`docs/bench/compare-perf-dsv4-glm-2026-10-24.txt`), Hy4 flash on 2026-11-20 (`docs/bench/perf-hy4-2026-11-20.txt`):
 <!---->
-| | DeepSeek-V4-Flash | GLM-5.3-Flash |
-|---|---|---|
-| prefill, one request, unique text (time to first token) | 1837 tok/s at 8k, 2187 at 32k, 2194 at 128k, 1929 at 512k (266 s) | 1037 tok/s at 8k, 1249 at 32k, 1425 at 128k, 1476 at 512k (355 s) |
-| decode, one stream, production drafting | 37-41 tok/s to 128k, 35-37 at 256-512k (DSpark, 5 drafts, 55-86% accepted) | 24-25 tok/s from 8k to 512k (MTP, 1 draft, 75-94% accepted) |
-| GSM8K chat, engine-batch, 1 / 2 / 4 / 8 requests | 42.0 / 53.9 / 64.3 / 74.8 tok/s | 25.8 / 32.1 / 36.5 / 50.2 tok/s |
+| | DeepSeek-V4-Flash | GLM-5.3-Flash | Hy4 flash |
+|---|---|---|---|
+| prefill, one request, unique text (time to first token) | 1837 tok/s at 8k, 2187 at 32k, 2194 at 128k, 1929 at 512k (266 s) | 1037 tok/s at 8k, 1249 at 32k, 1425 at 128k, 1476 at 512k (355 s) | 982 tok/s at 4k, 1243 at 34k, 1201 at 144k, 1148 at 584k (509 s) |
+| decode, one stream, production drafting | 37-41 tok/s to 128k, 35-37 at 256-512k (DSpark, 5 drafts, 55-86% accepted) | 24-25 tok/s from 8k to 512k (MTP, 1 draft, 75-94% accepted) | 29-36 tok/s to 144k, 28 at 584k; on chat prompts 29-35, ~50 on short reasoning (DFly2, 5 drafts, 62-91% accepted) |
+| GSM8K chat, engine-batch, 1 / 2 / 4 / 8 requests | 42.0 / 53.9 / 64.3 / 74.8 tok/s | 25.8 / 32.1 / 36.5 / 50.2 tok/s | not measured yet |
 <!---->
 DeepSeek-V4-Flash's own curves (`unholy-curve`, one sequence in 4096-token chunks, 2026-11-03): prefill 2540 tok/s
 averaged over 0-64k, 2349 over 0-256k; decode without speculation 34.4 tok/s at 4k depth, 32.1 at 64k, 29.9 at
@@ -79,7 +87,11 @@ concurrency too when the requests reach the engine alike (`unholy-engine-batch`)
 <!---->
 Production settings: DeepSeek-V4-Flash with a 1.5M-token KV pool shared by up to 8 requests of up to 768k
 tokens each, DSpark with 5 drafts, 64 prefix-cache snapshots, the vision tower loaded; GLM-5.3-Flash with a
-1M-token pool, 3072-token steps, MTP drafts, the vision tower and the snapshots that fit (26; 40 without the tower). Depth curves are in
+1M-token pool, 3072-token steps, MTP drafts, the vision tower and the snapshots that fit (26; 40 without the tower);
+Hy4 flash with a 1M-token pool (requests up to 1M tokens), 2048-token steps, NVFP4 experts, DFly2 with 5 drafts,
+the vision tower, 64 snapshots and 256 more on disk, and a routing log that keeps its hot experts following the
+traffic. With the release's fp8 experts instead (fewer of them fit on the cards: a predicted 55% of the routing
+there instead of 73%), Hy4 flash decodes at 21-29 tok/s on chat prompts and 33-35 on short reasoning. Depth curves are in
 `docs/bench/`.
 <!---->
 ## Accuracy
@@ -106,6 +118,16 @@ outputs do not depend on chunking, the two-part steps or speculative drafts (a r
 rolls the recurrent state back exactly); the iGPU's experts come back as one fp32 sum per token, so like
 DeepSeek-V4-Flash's they depend on the expert placement at the noise level.
 <!---->
+Hy4 flash is checked against the transformers implementation (huggingface/transformers#50903) running Tencent's
+FP8 release (`tools/ref/hy4_oracle`, layer-streamed on one card). With the release's experts the served path is at
+the oracle's noise floor on code: KL 5.4e-3 and 98.1% top-1, where the oracle's bf16 run differs from its fp32
+twin by 5.8e-3; at 4096 tokens it is 7.4e-2 from the fp32 twin, the oracle's bf16 run 6.1e-2. AngelSlim's NVFP4
+experts are at 2.8e-2 / 95.5% (their Q4_K_M build, run in the oracle: 2.3e-2 / 95.7%). Image preprocessing is
+bit-exact with transformers' processor, and the image path (ViT, the rows in the embedding, M-RoPE) is as far from
+an fp32 run as the reference's own bf16 run. DFly2's drafts match an independent PyTorch version of the drafter,
+and greedy decoding gives the same tokens with drafts as without. Like the others, its outputs depend on the
+expert placement at the noise level.
+<!---->
 Every optimized kernel has a reference kernel next to it (`src/kernels/ref_*.hip`), and its test compares
 against that reference: bit-identical where the math allows, ulp-level where it doesn't (`tools/kernel_test`).
 <!---->
@@ -117,13 +139,13 @@ against that reference: bit-identical where the math allows, ulp-level where it 
     `unholy_kv_usage_ratio` and the per-stream `unholy_{prefill,decode}_sequence_seconds_total` and
     `unholy_first_token{_seconds,s}_total` that llmtop reads);
   - request features: SSE streaming with keepalives, tool calls, reasoning (`reasoning` and
-    `reasoning_content`; `reasoning_effort` none/low/high/max, and low/high/max for GLM-5.3-Flash, which
-    always thinks), stop strings, logprobs, usage with `cached_tokens`;
+    `reasoning_content`; `reasoning_effort` none/low/high/max, low/high/max for GLM-5.3-Flash, which
+    always thinks, and none/high for Hy4 flash), stop strings, logprobs, usage with `cached_tokens`;
   - optional API key (`--api-key` or `UNHOLY_API_KEY`).
 - **The chat formats and tokenizers, matching the references exactly**: a PCRE2 BPE tokenizer
   identical to Hugging Face's; the DSV4 template with its streaming tool-call / reasoning parser,
   checked against the reference on thousands of generated conversations; GLM-5.3-Flash's template and a
-  parser following vLLM's GLM-4.7 one.
+  parser following vLLM's GLM-4.7 one; Hy4 flash's template and parser, checked against the transformers template.
 - **Scheduling as in vLLM**, configured the same way: one KV pool of `--kv-tokens` positions in
   256-token pages, `--max-model-len`, `--max-num-seqs`.
   - Continuous batching with chunked prefill and recompute preemption.
@@ -132,9 +154,10 @@ against that reference: bit-identical where the math allows, ulp-level where it 
     `--long-prefill-token-threshold` is available.
   - Two steps in flight, so the cards and the iGPU overlap.
 - **Prefix caching**: pages named by chained token hashes and refcounted, with LRU eviction.
-  Both models
+  All three
   keep per-sequence state outside the paged cache (DSV4: the sliding window and compressor rings; GLM: the
-  delta-attention recurrent states, ~148 MB a sequence).
+  delta-attention recurrent states, ~148 MB a sequence; Hy4: the window rings and the indexer's partial
+  groups, ~18 MB).
   That
   state is snapshotted to pinned host memory at page boundaries, so a cached prefix is resumed exactly.
   With `--snapshot-dir DIR --disk-snapshots N` the least recently used snapshots spill to a preallocated file
@@ -142,21 +165,31 @@ against that reference: bit-identical where the math allows, ulp-level where it 
   RAM can stay small (`--prefix-snapshots 2`) and many more prefixes stay resumable.
 - **Speculative decoding** with each checkpoint's drafter: DeepSeek-V4-Flash's 3-stage DSpark block drafter,
   its drafts filtered by its confidence head; GLM-5.3-Flash's MTP layer, one draft per step, with the
-  recurrent state rolled back when the draft is rejected. Drafts are verified with exact speculative
+  recurrent state rolled back when the draft is rejected; Hy4 flash's DFly2, a 5-layer block drafter over the
+  target's own KV rows and indexer picks, 5 drafts per step, verified up to those the drafter is at least
+  70% sure of, with the window rings, indexer tails and n-gram history rolled back for rejected ones. Drafts are verified with exact speculative
   sampling, so outputs are distributed exactly as without them.
 - **Vision**: images in chat messages (data URLs; JPEG, PNG, WebP), preprocessed on the CPU bit-exactly
   as the reference does, and encoded by the model's ViT on the iGPU. DeepSeek-V4-Flash's blocks (up to 384
   tokens) encode in under a second. GLM-5.3-Flash's images run up to 8000 tokens, encoded with the release's
   bf16 tower (`tools/box/extract-glm-vision.py`) at its reference's accuracy: 0.55 s for 1000 tokens, 11 s at
-  8000. Its image tokens are causal, so an image may span prefill steps and prefix-cache pages.
+  8000. Its image tokens are causal, so an image may span prefill steps and prefix-cache pages. Hy4 flash's
+  images (up to 4160 tokens, 2048 x 2048) are preprocessed bit-exactly as transformers' processor does
+  (torch's antialiased bicubic), encoded on the iGPU (85 ms for 640 x 480) and positioned with the model's
+  three-plane M-RoPE.
 - **Contexts to 1M tokens**: DeepSeek-V4-Flash with bf16 KV only, by design; GLM-5.3-Flash keeps its DSA
-  latent in fp8 (e4m3, a power-of-two scale per 64 values).
+  latent in fp8 (e4m3, a power-of-two scale per 64 values); Hy4 flash with bf16 KV, its attention reading at
+  most 2048 picked positions or a 512-token window per layer.
+- **Engram** (Hy4 flash): the n-gram memory tables (61 GB) stay on the NVMe. A pool of reader threads fetches a
+  step's rows, one read per head, all in flight together, while the cards run the layers before each memory's;
+  that layer waits on a device-side flag. (A decode step's 128 reads take ~0.5 ms uncached.)
 - **Placement planner** (`unholy plan`): what goes where for a given KV geometry, from the checkpoint and
   real allocation sizes. Routing histograms of live traffic are exported at `GET /unholy/routing_profile`
-  for re-planning, and for GLM-5.3-Flash `GET /unholy/routing_share` gives the share served by the cards'
-  experts; `tools/box/mklong.py`, `routing-depth.sh` and `mixprofile.py` build profiles from broad traffic
+  for re-planning, and for GLM-5.3-Flash and Hy4 flash `GET /unholy/routing_share` gives the share served by
+  the cards' experts; Hy4 flash's `--routing-log FILE` keeps the runs' picks and makes them half of the next
+  start's placement; `tools/box/mklong.py`, `routing-depth.sh` and `mixprofile.py` build profiles from broad traffic
   (`data/expert_profile_glm53_broad.txt`).
-- **Two-part prefill steps**: steps of 2048 tokens or more run as two halves software-pipelined on each
+- **Two-part prefill steps** (DeepSeek-V4-Flash, GLM-5.3-Flash): steps of 2048 tokens or more run as two halves software-pipelined on each
   card, so the iGPU's experts for one half overlap the cards' attention for the other; outputs are
   bit-identical either way (`UNHOLY_DSV4_SPLIT=0` / `UNHOLY_GLM_SPLIT=0` turn it off).
 - **Logs**: one line per request (queue time, time to first token, prefill and decode tok/s, draft
@@ -203,6 +236,18 @@ unholy serve --model /path/to/glm53-flash-exl3-4.05bpw \
   --served-model-name glm53 --host 0.0.0.0 --port 8250
 ```
 <!---->
+Hy4 flash (the FP8 release; its Engram pack, made once by `tools/ref/hy4_engram_pack.py`, in the model
+directory's sibling `hy4-flash-engram` or at `--engram DIR`; without `--experts-gguf` it serves the release's fp8
+experts):
+<!---->
+```sh
+unholy serve --model /path/to/Hy4-flash-FP8 \
+  --experts-gguf /path/to/Hy4-flash-SPARK-4Bit.gguf \
+  --kv-tokens 1048576 --max-model-len 1048576 --max-num-seqs 8 --max-batch-tokens 2048 \
+  --prefix-snapshots 64 --spec-drafts 5 --routing-log /path/to/hy4-routing.txt \
+  --served-model-name hy4-flash --host 0.0.0.0 --port 8270
+```
+<!---->
 ```sh
 curl http://localhost:8200/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "dsv4-flash",
@@ -230,6 +275,8 @@ This is not a general-purpose engine:
   The planner sizes everything from what the devices report, but the split itself is
   fixed.
 - It needs roughly 100-120 GB of iGPU-visible memory (GTT) beyond the cards' 64 GB.
+- Hy4 flash reads its Engram tables from an SSD: ~128 random 4 KB reads per generated token, 128 per prompt
+  token, so an NVMe that keeps many reads in flight.
 - Transfers follow the rules measured on this platform (`DECISIONS.md`, 2026-10-11): the reading side
   pulls, and the iGPU only touches its own memory and pinned host memory. Some peer paths that the
   runtime reports as available are broken on this machine, and the engine avoids them.
@@ -242,8 +289,8 @@ This is not a general-purpose engine:
 | | |
 |---|---|
 | `src/engine` | scheduler and paged cache (`engine`), placement planner, the resident multi-device model, sampler |
-| `src/model` | checkpoint loading, the DSV4 forward pass, the vision tower, GLM-5.3-Flash (`glm5*`: reference and fast paths) |
-| `src/kernels` | HIP kernels: WMMA GEMMs (fp8, bf16, MXFP4, EXL3), sparse attention, the fp4 indexer, hyper-connections, MoE dispatch, DSpark, ViT, GLM's delta attention and DSA (`glm_fast`); `ref_*` are the reference kernels |
+| `src/model` | checkpoint loading, the DSV4 forward pass, the vision tower, GLM-5.3-Flash (`glm5*`: reference and fast paths), Hy4 flash (`hy4*`: the forward, DFly2, Engram, the vision tower) |
+| `src/kernels` | HIP kernels: WMMA GEMMs (fp8, bf16, MXFP4, EXL3), sparse attention, the fp4 indexer, hyper-connections, MoE dispatch, DSpark, ViT, GLM's delta attention and DSA (`glm_fast`), Hy4's MLA, indexer, Engram and expert GEMVs (`hy4`); `ref_*` are the reference kernels |
 | `src/server`, `src/text`, `src/vision` | HTTP/OpenAI layer, tokenizer and chat format, image preprocessing |
 | `tools/` | `unholy`, `unholy-probe`, benchmarks (`unholy-bench`, `unholy-curve`), tests, the reference/oracle scripts (`tools/ref`), and the scripts for the dev box (`tools/box`) and the model comparison (`tools/compare`) |
 | `data/` | expert routing profiles for the planner |
@@ -274,10 +321,15 @@ is copied here.
 DeepSeek-V4-Flash's weights and reference code are DeepSeek's, under their own license.
 GLM-5.3-Flash's math follows the transformers implementation and Z.AI's release; its weights are Z.AI's,
 under their own license.
+Hy4 flash's math follows the transformers implementation (huggingface/transformers#50903) and Tencent's release,
+with vLLM's Hy4 support for DFly2 and the image path; its weights are Tencent's, under the Tencent Hy license, and
+the NVFP4 experts are AngelSlim's build of them.
 <!---->
 The design also draws on these projects, without copying code: gufo (MIT), antirez ds4.c (MIT),
 exllamav3 (MIT), Strata (MIT), llama.cpp / ggml and the llama-halo-hybrid ds4-hybrid branch (MIT),
-vLLM and sglang (Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0).
+vLLM and sglang (Apache-2.0), radiance libr4d (Apache-2.0), dsv4-engine (Apache-2.0). Hy4 flash's image resize
+reimplements PyTorch's antialiased bicubic (BSD-3-Clause) from its algorithm, and the sampler's fp32 exp uses the
+polynomial of the Cephes library's `expf`.
 <!---->
 ## License
 <!---->

@@ -1,0 +1,34 @@
+Hy4 flash served by `unholy serve` (483f070), 2026-11-20, son-of-anton (two R9700 + Strix Halo iGPU, PCIe switch).
+
+Production settings (llm-mode hy4, /etc/nixos 864167d6): the FP8 release's dense weights, routed experts in NVFP4 from
+AngelSlim's Hy4-flash-SPARK-4Bit GGUF (--experts-gguf), placement data/expert_profile_hy4_mixed.txt plus
+--routing-log, --kv-tokens 1048576 --max-model-len 1048576 --max-num-seqs 8 --max-batch-tokens 2048
+--prefix-snapshots 64 --disk-snapshots 256 --spec-drafts 5 (DFly2, drafter-probability threshold 0.7), vision
+tower loaded.
+
+== Prefill curve: one request at a time, unique text (a random first line; unholy's sources), 64 tokens generated
+after each, temperature 0; the server's request lines.
+
+19:16:33 request chatcmpl-0731dd348b5cc582954b4719c7b56669: length | prompt 4431, completion 64 | queue 0.00 s, ttft 4.51 s, prefill 982.0 tok/s, decode 29.9 tok/s | drafts 29/32 accepted (90.6%), 2.53 tok/step
+19:17:02 request chatcmpl-e652db8120c737515ffc2365add7c7ae: length | prompt 33646, completion 64 | queue 0.00 s, ttft 27.06 s, prefill 1243.2 tok/s, decode 36.4 tok/s | drafts 37/43 accepted (86.0%), 2.68 tok/step
+19:19:04 request chatcmpl-2126cc89b5db6ce93e173ef80c28eb1d: length | prompt 144017, completion 64 | queue 0.00 s, ttft 119.97 s, prefill 1200.5 tok/s, decode 30.4 tok/s | drafts 32/52 accepted (61.5%), 2.45 tok/step
+19:27:35 request chatcmpl-a42dd79be94a6826d19d2db310fd7173: length | prompt 584308, completion 64 | queue 0.00 s, ttft 509.13 s, prefill 1147.7 tok/s, decode 27.9 tok/s | drafts 28/36 accepted (77.8%), 2.56 tok/step
+
+== Decode, one stream, production drafting: tools/box/served-decode.sh (code, prose, short reasoning prompts;
+600 tokens max), two rounds, a dev server on :8300 with the production flags.
+
+NVFP4 experts (production):
+prompt 45, completion 600 | decode 29.5 tok/s | drafts 251/361 accepted (69.5%), 2.32 tok/step
+prompt 44, completion 600 | decode 34.0 tok/s | drafts 292/412 accepted (70.9%), 2.69 tok/step
+prompt 66, completion 336 | decode 51.2 tok/s | drafts 238/300 accepted (79.3%), 3.90 tok/step
+prompt 45, completion 600 | decode 34.0 tok/s | drafts 294/388 accepted (75.8%), 2.72 tok/step
+prompt 44, completion 600 | decode 34.6 tok/s | drafts 302/451 accepted (67.0%), 2.64 tok/step
+prompt 66, completion 325 | decode 49.9 tok/s | drafts 224/271 accepted (82.7%), 3.67 tok/step
+
+FP8 experts (the release's, no --experts-gguf; 54.7% of routing predicted on the cards vs 72.7%):
+prompt 45, completion 600 | decode 20.8 tok/s | drafts 232/326 accepted (71.2%), 2.33 tok/step
+prompt 44, completion 600 | decode 29.3 tok/s | drafts 322/424 accepted (75.9%), 2.84 tok/step
+prompt 66, completion 347 | decode 32.8 tok/s | drafts 226/299 accepted (75.6%), 3.54 tok/step
+prompt 45, completion 600 | decode 26.4 tok/s | drafts 266/365 accepted (72.9%), 2.56 tok/step
+prompt 44, completion 600 | decode 26.3 tok/s | drafts 267/372 accepted (71.8%), 2.49 tok/step
+prompt 66, completion 394 | decode 35.4 tok/s | drafts 275/365 accepted (75.3%), 3.67 tok/step
