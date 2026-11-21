@@ -45,6 +45,13 @@ class Sampler {
   // request's sampling distribution (greedy: when it is the argmax), otherwise returns a token drawn
   // from that distribution with `draft` excluded — so the result is distributed exactly as sample().
   Sampled verify(const float* logits, int vocab, int32_t draft, bool& accepted);
+  // exp(x) for x <= 0 in fp32 (Cephes' expf polynomial after a Cody-Waite reduction by the nearest integer, ~1 ulp;
+  // x < -87 as -87), written to vectorize on baseline x86-64. Public for the tests.
+  static float exp_nonpos(float x);
+  // weights[i] = exp_nonpos((l[i] - m) * inv_t), 0 where l[i] is -inf or NaN; blocks[b] = the sum of weights
+  // [256 b, 256 b + 256) in double (blocks: n / 256 rounded up); returns the total.
+  static constexpr int kWeightBlock = 256;
+  static double weights_pass(const float* l, int n, float m, float inv_t, float* weights, double* blocks);
   // Forget generated tokens (recompute after preemption replays them through accept()).
   void reset_output();
 
@@ -55,6 +62,8 @@ class Sampler {
   std::vector<int32_t> prompt_unique_;
   std::vector<float> work_;
   std::vector<std::pair<float, int32_t>> cand_;
+  std::vector<float> weights_;   // the unfiltered case: exp((l_i - max) / T) per token
+  std::vector<double> blocks_;   // and their sums per kWeightBlock tokens
   Sampled sample_impl(const float* logits, int vocab, int32_t draft, bool* accepted);
   bool penalties_ = false;
 };

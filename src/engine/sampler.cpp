@@ -1,7 +1,9 @@
 #include "engine/sampler.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 
 namespace unholy::engine {
@@ -22,6 +24,41 @@ void Sampler::accept(int32_t token) {
 }
 
 void Sampler::reset_output() { out_counts_.clear(); }
+
+float Sampler::exp_nonpos(float x) {
+  x = x < -87.0f ? -87.0f : x;
+  const float t = x * 1.44269504088896341f;
+  const float n = (t + 12582912.0f) - 12582912.0f;  // nearest integer (|t| < 2^22): no floor, which baseline SSE lacks
+  float r = x - n * 0.693359375f;
+  r = r - n * -2.12194440e-4f;
+  float p = 1.9875691500e-4f;
+  p = p * r + 1.3981999507e-3f;
+  p = p * r + 8.3334519073e-3f;
+  p = p * r + 4.1665795894e-2f;
+  p = p * r + 1.6666665459e-1f;
+  p = p * r + 5.0000001201e-1f;
+  p = p * (r * r) + r + 1.0f;
+  return p * __builtin_bit_cast(float, uint32_t(int32_t(n) + 127) << 23);
+}
+
+double Sampler::weights_pass(const float* l, int n, float m, float inv_t, float* w, double* blocks) {
+  for (int i = 0; i < n; ++i) {
+    const float e = exp_nonpos((l[i] - m) * inv_t);
+    w[i] = l[i] > -INFINITY ? e : 0.0f;
+  }
+  double total = 0.0;
+  for (int b0 = 0, b = 0; b0 < n; b0 += kWeightBlock, ++b) {
+    const int b1 = std::min(n, b0 + kWeightBlock);
+    double acc[8] = {};
+    int i = b0;
+    for (; i + 8 <= b1; i += 8)
+      for (int j = 0; j < 8; ++j) acc[j] += double(w[i + j]);
+    for (; i < b1; ++i) acc[0] += double(w[i]);
+    blocks[b] = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    total += blocks[b];
+  }
+  return total;
+}
 
 Sampled Sampler::sample(const float* logits, int V) { return sample_impl(logits, V, -1, nullptr); }
 
@@ -54,6 +91,43 @@ Sampled Sampler::sample_impl(const float* logits, int V, int32_t draft, bool* ac
   if (p_.temperature < 1e-5f || p_.top_k == 1) {
     s.token = int32_t(std::max_element(l, l + V) - l);  // first maximum
     if (accepted) *accepted = s.token == draft;
+  } else if ((p_.top_k <= 0 || p_.top_k >= V) && p_.top_p >= 1.0f && p_.min_p <= 0.0f) {
+    // The whole vocabulary (the usual case, e.g. temperature only): one fp32 pass of weights, the draw walks them in
+    // token order (as the general path walks its candidates). A -inf logit weighs 0 (it is never drawn).
+    const size_t im = size_t(std::max_element(l, l + V) - l);
+    const float m = l[im];
+    const int nb = (V + kWeightBlock - 1) / kWeightBlock;
+    weights_.resize(size_t(V));
+    blocks_.resize(size_t(nb));
+    float* w = weights_.data();
+    const double total = weights_pass(l, V, m, float(1.0 / double(p_.temperature)), w, blocks_.data());
+    const bool has_draft = accepted && draft >= 0 && draft < V;
+    const double pd = has_draft ? double(w[draft]) : 0.0;
+    bool take_draft = false;
+    if (accepted && pd > 0.0) take_draft = std::uniform_real_distribution<double>(0.0, total)(rng_) < pd;
+    if (take_draft) {
+      s.token = draft;
+      *accepted = true;
+    } else {
+      // Rejected (or no draft): draw without the draft, by blocks, then within the block.
+      double u = std::uniform_real_distribution<double>(0.0, total - pd)(rng_);
+      s.token = -1;
+      for (int b = 0; b < nb && s.token < 0; ++b) {
+        const int b0 = b * kWeightBlock, b1 = std::min(V, b0 + kWeightBlock);
+        const double bs = blocks_[size_t(b)] - (has_draft && draft >= b0 && draft < b1 ? pd : 0.0);
+        if (u >= bs && b + 1 < nb) {
+          u -= bs;
+          continue;
+        }
+        for (int i = b0; i < b1; ++i) {
+          if (w[i] == 0.0f || (has_draft && i == draft)) continue;
+          s.token = int32_t(i);
+          u -= double(w[i]);
+          if (u < 0.0) break;
+        }
+      }
+      if (s.token < 0) s.token = int32_t(im);
+    }
   } else {
     const double T = p_.temperature;
     const float m = *std::max_element(l, l + V);

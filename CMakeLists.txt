@@ -86,6 +86,8 @@ target_include_directories(unholy_sched PUBLIC src)
 find_package(Threads REQUIRED)
 target_link_libraries(unholy_sched PUBLIC Threads::Threads)
 
+add_executable(unholy-sampler-test tools/sampler_test/main.cpp)
+target_link_libraries(unholy-sampler-test PRIVATE unholy_sched)
 add_executable(unholy-sched-test tools/sched_test/main.cpp)
 target_link_libraries(unholy-sched-test PRIVATE unholy_sched)
 
@@ -171,6 +173,8 @@ target_link_libraries(unholy_engine PUBLIC unholy_ref unholy_glm unholy_hy4)
 add_executable(unholy-resident-test tools/resident_test/main.hip)
 target_link_libraries(unholy-resident-test PRIVATE unholy_engine)
 
+add_executable(unholy-hy4-engram-bench tools/hy4_engram_bench/main.cpp)
+target_link_libraries(unholy-hy4-engram-bench PRIVATE unholy_hy4)
 add_executable(unholy-hy4-resident-test tools/hy4_resident_test/main.cpp)
 target_link_libraries(unholy-hy4-resident-test PRIVATE unholy_engine)
 
@@ -186,7 +190,8 @@ target_link_libraries(unholy PRIVATE unholy_server unholy_engine)
 install(TARGETS unholy unholy-text-test unholy-sched-test unholy-vision-test RUNTIME DESTINATION bin)
 install(FILES data/expert_profile_dsv4engine_code32k.txt data/expert_profile_unholy_mixed.txt
               data/expert_profile_unholy_code32k.txt data/expert_profile_glm53_mixed.txt
-              data/expert_profile_glm53_broad.txt data/expert_profile_hy4_code4k.txt DESTINATION share/unholy)
+              data/expert_profile_glm53_broad.txt data/expert_profile_hy4_code4k.txt data/expert_profile_hy4_mixed.txt
+              DESTINATION share/unholy)
 
 # Requests through the engine on one thread (no HTTP): token-for-token comparisons of builds under concurrency.
 add_executable(unholy-engine-batch tools/engine_batch/main.cpp)

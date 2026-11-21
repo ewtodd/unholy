@@ -461,7 +461,7 @@ int serve_hy4(Options& o, std::unique_ptr<model::Checkpoint> ck, bool plan_only,
   if (!o.spec_min_conf_set) o.spec_min_conf = 0.7f;  // the drafter's own token probability (see the header)
   if (!o.model_name_set) o.scfg.model_name = "hy4-flash";
   if (o.prefix_snapshots < 0) o.prefix_snapshots = 64;
-  if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_hy4_code4k.txt";
+  if (!o.profile_set) o.profile = std::string(UNHOLY_DATA_DIR) + "/expert_profile_hy4_mixed.txt";
   if (o.engram_dir.empty()) {
     std::string m = o.model_dir;
     while (m.size() > 1 && m.back() == '/') m.pop_back();
