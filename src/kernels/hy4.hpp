@@ -159,7 +159,14 @@ void hy4_gather_remote(const bf16* in, const int32_t* p2u, const MoePlan* plan, 
 // row split over kHy4ArgmaxSlices blocks and combined (one block per row read the whole row). ws: rows *
 // kHy4ArgmaxSlices * 3 floats.
 constexpr int kHy4ArgmaxSlices = 64;
-void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, float* ws, hipStream_t st);
+void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, float* ws, hipStream_t st,
+                     float* lse = nullptr);  // lse (optional): each row's log-sum-exp
+// DFly2's shortlisted head step, per request r (one block): the logits base[r] (the LM head of the uncorrected
+// hidden row, fp32 [R][V], log-sum-exp lse[r]) corrected by head . delta[r] for the K candidates cand[r] (the base's
+// top K): the best candidate (ties: lower id) into tok[r], and conf[r] its probability with the candidates' mass
+// moved to their corrected logits. head bf16 [V][D], delta bf16 [R][D].
+void hy4_draft_pick(const float* base, const float* lse, const int32_t* cand, int K, const bf16* head,
+                    const bf16* delta, int R, int V, int D, int32_t* tok, float* conf, hipStream_t st);
 // x = bf16(x + bf16(g * f)) per row (DFly2's slot-0 fusion: x embed row, g the fusion gate [dim], f eh_proj's output).
 void hy4_gated_add(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim, hipStream_t st);
 // out [rows][2 dim] = [a, b] (two normalized rows side by side).

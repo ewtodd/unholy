@@ -448,9 +448,11 @@ namespace {
 enum DflyBuf : int {
   dIds, dPos, dAnchor, dHistP, dCntP, dLists, dCounts, dX, dResid, dA, dAtt, dMlp, dQr, dQ, dQn, dQa, dQp, dKv, dG,
   dOl, dO, dMg, dMu, dMh, dEin, dE, dHrow, dH, dCat, dF, dRowSel, dHIdx, dHid, dEmb, dHn, dEn, dCat2, dCg, dCu, dCh,
-  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dArgmaxWs, dBufs
+  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dArgmaxWs, dHid5, dCand, dTopkWs, dLse, dTokTmp, dConfTmp, dBufs
 };
 constexpr int kDflyW = 2048 + 8;  // a row's key list: the history (<= 2048), then the block's rows (<= 6)
+// The head chain's shortlist: the uncorrected rows' top K tokens, among which the corrected logits pick.
+constexpr int kDraftShortlist = 256;
 
 std::vector<size_t> dfly_sizes(const Hy4Config& c, int Rm) {
   const size_t R = size_t(Rm), N = R * kHy4DraftRows, D = c.dim, H = c.heads_sparse, I = 9216;
@@ -463,9 +465,13 @@ std::vector<size_t> dfly_sizes(const Hy4Config& c, int Rm) {
       R * D * 2, R * D * 2, R * D * 2, R * D * 2, R * 2 * D * 2, R * D * 2,  // fusion
       kHy4DraftTokens * R * 4, R * 4,                                        // row selections, hidden rows
       R * D * 2, R * D * 2, R * D * 2, R * D * 2, R * 2 * D * 2, R * D * 2, R * D * 2, R * D * 2, R * D * 2,
-      R * size_t(c.vocab) * 4, size_t(kHy4DraftTokens) * R * 4,              // logits, confidences [5][R]
+      size_t(kHy4DraftTokens) * R * c.vocab * 4, size_t(kHy4DraftTokens) * R * 4,  // logits [5R][V], conf [5][R]
       2 * (N / k::kHy4GemvRows + N / k::kHy4TileRows + 2) * sizeof(k::Exl3Tile), R * 4,  // N rows, R rows
-      k::hy4_attn_split_bytes(c.heads_sparse), R * size_t(k::kHy4ArgmaxSlices) * 3 * 4};
+      k::hy4_attn_split_bytes(c.heads_sparse), kHy4DraftTokens * R * size_t(k::kHy4ArgmaxSlices) * 3 * 4,
+      // the shortlisted head: the uncorrected rows, their top-K, top-k work, log-sum-exp, argmax outputs
+      kHy4DraftTokens * R * D * 2, kHy4DraftTokens * R * size_t(kDraftShortlist) * 4,
+      k::glm_topk_cand_bytes(kHy4DraftTokens * Rm, c.vocab, kDraftShortlist), kHy4DraftTokens * R * 4,
+      kHy4DraftTokens * R * 4, kHy4DraftTokens * R * 4};
   if (z.size() != size_t(dBufs)) throw std::logic_error("dfly scratch: buffer list out of date");
   return z;
 }
@@ -628,9 +634,39 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
   k::rmsnorm_hf(x, D, w.final_norm.p<bf16>(), x, D, N, D, c.eps, st);
 
   // The head chain: row t + 1 of each block, corrected with the previous token's embedding, through the LM head.
+  // By default one pass of the LM head over all 5 uncorrected rows (logits are linear in the row: lm_head(hid +
+  // delta) = lm_head(hid) + lm_head(delta)), each row's top kDraftShortlist tokens, and per step only those tokens'
+  // corrections (hy4_draft_pick): 2 LM-head passes a step instead of 6. Drafts only (outputs are the verify step's);
+  // UNHOLY_HY4_DFLY_EXACT_HEAD=1: the full head per step, as the reference does.
   set_dense_tiles_at(tR, R, st, &s.tile_rows[1]);
   const int32_t* prev = ib(dBonus);
-  for (int t = 0; t < kHy4DraftTokens; ++t) {
+  static const bool exact_head = std::getenv("UNHOLY_HY4_DFLY_EXACT_HEAD") != nullptr;
+  if (!exact_head) {
+    const int R5 = kHy4DraftTokens * R;
+    float* base = static_cast<float*>(buf(dLogits));
+    bf16* hid5 = bb(dHid5);  // rows t * R + r
+    k::gather_rows(x, ib(dRowSel), hid5, R5, D, st);
+    linear_f32(head.head, hid5, D, base, V, R5, st);
+    k::hy4_argmax_conf(base, R5, V, ib(dTokTmp), static_cast<float*>(buf(dConfTmp)), static_cast<float*>(buf(dArgmaxWs)),
+                       st, static_cast<float*>(buf(dLse)));
+    k::glm_topk(base, V, R5, V, kDraftShortlist, ib(dCand), buf(dTopkWs), st);
+    for (int t = 0; t < kHy4DraftTokens; ++t) {
+      const bf16* hid = hid5 + size_t(t) * R * D;
+      k::gather_rows(w.embed.p<bf16>(), prev, bb(dEmb), R, D, st);
+      k::rmsnorm_hf(hid, D, w.c_hnorm.p<bf16>(), bb(dHn), D, R, D, c.eps, st);
+      k::rmsnorm_hf(bb(dEmb), D, w.c_enorm.p<bf16>(), bb(dEn), D, R, D, c.eps, st);
+      k::hy4_concat2(bb(dHn), bb(dEn), bb(dCat2), R, D, st);
+      linear(w.cg, bb(dCat2), 2 * D, bb(dCg), D, R, st);
+      linear(w.cu, bb(dCat2), 2 * D, bb(dCu), D, R, st);
+      k::hy4_swiglu(bb(dCg), bb(dCu), D, bb(dCh), R, D, st);
+      linear(w.cd, bb(dCh), D, bb(dHn), D, R, st);  // the correction (delta) of each request's row
+      k::hy4_draft_pick(base + size_t(t) * R * V, static_cast<float*>(buf(dLse)) + t * R,
+                        ib(dCand) + size_t(t) * R * kDraftShortlist, kDraftShortlist, head.head.w.p<bf16>(), bb(dHn),
+                        R, V, D, tokens + t * R, static_cast<float*>(buf(dConf)) + t * R, st);
+      prev = tokens + t * R;
+    }
+  }
+  for (int t = 0; exact_head && t < kHy4DraftTokens; ++t) {
     k::gather_rows(x, ib(dRowSel) + t * R, bb(dHid), R, D, st);
     k::gather_rows(w.embed.p<bf16>(), prev, bb(dEmb), R, D, st);
     k::rmsnorm_hf(bb(dHid), D, w.c_hnorm.p<bf16>(), bb(dHn), D, R, D, c.eps, st);

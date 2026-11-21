@@ -754,7 +754,7 @@ __global__ __launch_bounds__(256) void argmax_slice_kernel(const float* logits, 
   }
 }
 
-__global__ void argmax_combine_kernel(const float* ws, int S, int32_t* tok, float* conf) {
+__global__ void argmax_combine_kernel(const float* ws, int S, int32_t* tok, float* conf, float* lse) {
   const int r = blockIdx.x;
   if (threadIdx.x != 0) return;
   const float* p = ws + size_t(r) * S * 3;
@@ -770,6 +770,66 @@ __global__ void argmax_combine_kernel(const float* ws, int S, int32_t* tok, floa
     if (p[s * 3] > -INFINITY) tot += p[s * 3 + 2] * expf(p[s * 3] - mx);
   tok[r] = mi;
   conf[r] = 1.0f / tot;
+  if (lse) lse[r] = mx + logf(tot);
+}
+
+// One block of 256 threads per request: each warp scores K / 8 candidates (lanes stride the hidden dimension).
+__global__ __launch_bounds__(256) void draft_pick_kernel(const float* base, const float* lse, const int32_t* cand,
+                                                         int K, const bf16* head, const bf16* delta, int V, int D,
+                                                         int32_t* tok, float* conf) {
+  extern __shared__ float sm[];  // delta [D], then corrected logits [K]
+  float* sd = sm;
+  float* sl = sm + D;
+  __shared__ float rv[8], rs0[8], rs1[8];
+  __shared__ int ri[8];
+  const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  for (int d = tid; d < D; d += 256) sd[d] = bf16_to_f32(delta[size_t(r) * D + d]);
+  __syncthreads();
+  const int32_t* cr = cand + size_t(r) * K;
+  const float* br = base + size_t(r) * V;
+  for (int c = warp; c < K; c += 8) {
+    const int id = cr[c];
+    float s = 0.0f;
+    if (id >= 0) {
+      const bf16* hr = head + size_t(id) * D;
+      for (int d = lane; d < D; d += 32) s = fmaf(bf16_to_f32(hr[d]), sd[d], s);
+    }
+    s = warp_sum(s);
+    if (lane == 0) sl[c] = id >= 0 ? br[id] + s : -INFINITY;
+  }
+  __syncthreads();
+  // best candidate, and the mass: 1 - sum exp(base_c - lse) + sum exp(l_c - lse)
+  const float L = lse[r];
+  float bv = -INFINITY, s0 = 0.0f, s1 = 0.0f;
+  int bi = 0x7fffffff;
+  for (int c = tid; c < K; c += 256) {
+    const int id = cr[c];
+    if (id < 0) continue;
+    const float l = sl[c];
+    if (l > bv || (l == bv && id < bi)) bv = l, bi = id;
+    s0 += expf(br[id] - L);
+    s1 += expf(l - L);
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(bv, o, 32);
+    const int oi = __shfl_xor(bi, o, 32);
+    if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    s0 += __shfl_xor(s0, o, 32);
+    s1 += __shfl_xor(s1, o, 32);
+  }
+  if (lane == 0) rv[warp] = bv, ri[warp] = bi, rs0[warp] = s0, rs1[warp] = s1;
+  __syncthreads();
+  if (tid == 0) {
+    float v = rv[0], a = rs0[0], b = rs1[0];
+    int i = ri[0];
+    for (int w = 1; w < 8; ++w) {
+      if (rv[w] > v || (rv[w] == v && ri[w] < i)) v = rv[w], i = ri[w];
+      a += rs0[w];
+      b += rs1[w];
+    }
+    tok[r] = i;
+    conf[r] = expf(v - L) / fmaxf(1.0f - a + b, 1e-30f);
+  }
 }
 
 __global__ void gated_add_kernel(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim) {
@@ -1500,11 +1560,19 @@ void hy4_dfly_lists(const int32_t* const* hist, const int32_t* const* hcount, co
   UH_CHECK_LAUNCH();
 }
 
-void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, float* ws, hipStream_t st) {
+void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* conf, float* ws, hipStream_t st,
+                     float* lse) {
   if (rows <= 0) return;
   argmax_slice_kernel<<<dim3(kHy4ArgmaxSlices, unsigned(rows)), 256, 0, st>>>(logits, V, ws);
   UH_CHECK_LAUNCH();
-  argmax_combine_kernel<<<rows, 32, 0, st>>>(ws, kHy4ArgmaxSlices, tok, conf);
+  argmax_combine_kernel<<<rows, 32, 0, st>>>(ws, kHy4ArgmaxSlices, tok, conf, lse);
+  UH_CHECK_LAUNCH();
+}
+
+void hy4_draft_pick(const float* base, const float* lse, const int32_t* cand, int K, const bf16* head,
+                    const bf16* delta, int R, int V, int D, int32_t* tok, float* conf, hipStream_t st) {
+  if (R <= 0) return;
+  draft_pick_kernel<<<R, 256, size_t(D + K) * 4, st>>>(base, lse, cand, K, head, delta, V, D, tok, conf);
   UH_CHECK_LAUNCH();
 }
 
