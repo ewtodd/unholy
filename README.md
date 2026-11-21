@@ -64,13 +64,13 @@ the cards compute the other half's attention.
 <!---->
 Measured on that machine, behind the PCIe switch. All three through `unholy serve` with their production
 settings: DeepSeek-V4-Flash on 2026-11-03 (`docs/bench/perf-dsv4-2026-11-03.txt`), GLM-5.3-Flash on 2026-10-24
-(`docs/bench/compare-perf-dsv4-glm-2026-10-24.txt`), Hy4 flash on 2026-11-20 (`docs/bench/perf-hy4-2026-11-20.txt`):
+(`docs/bench/compare-perf-dsv4-glm-2026-10-24.txt`), Hy4 flash on 2026-11-21 (`docs/bench/perf-hy4-2026-11-21.txt`):
 <!---->
 | | DeepSeek-V4-Flash | GLM-5.3-Flash | Hy4 flash |
 |---|---|---|---|
-| prefill, one request, unique text (time to first token) | 1837 tok/s at 8k, 2187 at 32k, 2194 at 128k, 1929 at 512k (266 s) | 1037 tok/s at 8k, 1249 at 32k, 1425 at 128k, 1476 at 512k (355 s) | 982 tok/s at 4k, 1243 at 34k, 1201 at 144k, 1148 at 584k (509 s) |
-| decode, one stream, production drafting | 37-41 tok/s to 128k, 35-37 at 256-512k (DSpark, 5 drafts, 55-86% accepted) | 24-25 tok/s from 8k to 512k (MTP, 1 draft, 75-94% accepted) | 29-36 tok/s to 144k, 28 at 584k; on chat prompts 29-35, ~50 on short reasoning (DFly2, 5 drafts, 62-91% accepted) |
-| GSM8K chat, engine-batch, 1 / 2 / 4 / 8 requests | 42.0 / 53.9 / 64.3 / 74.8 tok/s | 25.8 / 32.1 / 36.5 / 50.2 tok/s | not measured yet |
+| prefill, one request, unique text (time to first token) | 1837 tok/s at 8k, 2187 at 32k, 2194 at 128k, 1929 at 512k (266 s) | 1037 tok/s at 8k, 1249 at 32k, 1425 at 128k, 1476 at 512k (355 s) | 983 tok/s at 4k, 1197 at 34k, 1200 at 144k, 1174 at 586k (499 s) |
+| decode, one stream, production drafting | 37-41 tok/s to 128k, 35-37 at 256-512k (DSpark, 5 drafts, 55-86% accepted) | 24-25 tok/s from 8k to 512k (MTP, 1 draft, 75-94% accepted) | 53-54 tok/s to 144k, 38 at 586k; on chat prompts 41-45, 62-64 on short reasoning (DFly2, 5 drafts, 36-59% of the verified accepted) |
+| GSM8K chat, engine-batch, 1 / 2 / 4 / 8 requests | 42.0 / 53.9 / 64.3 / 74.8 tok/s | 25.8 / 32.1 / 36.5 / 50.2 tok/s | 47.9 / 63.3 / 81.4 / 93.7 tok/s (served: the same 48 requests over HTTP) |
 <!---->
 DeepSeek-V4-Flash's own curves (`unholy-curve`, one sequence in 4096-token chunks, 2026-11-03): prefill 2540 tok/s
 averaged over 0-64k, 2349 over 0-256k; decode without speculation 34.4 tok/s at 4k depth, 32.1 at 64k, 29.9 at
@@ -88,11 +88,12 @@ concurrency too when the requests reach the engine alike (`unholy-engine-batch`)
 Production settings: DeepSeek-V4-Flash with a 1.5M-token KV pool shared by up to 8 requests of up to 768k
 tokens each, DSpark with 5 drafts, 64 prefix-cache snapshots, the vision tower loaded; GLM-5.3-Flash with a
 1M-token pool, 3072-token steps, MTP drafts, the vision tower and the snapshots that fit (26; 40 without the tower);
-Hy4 flash with a 1M-token pool (requests up to 1M tokens), 2048-token steps, NVFP4 experts, DFly2 with 5 drafts,
-the vision tower, 64 snapshots and 256 more on disk, and a routing log that keeps its hot experts following the
-traffic. With the release's fp8 experts instead (fewer of them fit on the cards: a predicted 55% of the routing
-there instead of 73%), Hy4 flash decodes at 21-29 tok/s on chat prompts and 33-35 on short reasoning. Depth curves are in
-`docs/bench/`.
+Hy4 flash with a 1M-token pool (requests up to 1M tokens), 2048-token steps, NVFP4 experts, DFly2 with 5 drafts
+(verified while their cumulative probability is at least 0.2), the vision tower, 64 snapshots and 256 more on disk,
+and a routing log that keeps its hot experts following the traffic. With the release's fp8 experts instead (fewer
+of them fit on the cards: a predicted 55% of the routing there instead of 73%; drafts verified to a cumulative 0.4),
+Hy4 flash decodes at 29-39 tok/s on chat prompts and 43-50 on short reasoning (the same build on a dev server with
+the production flags). Depth curves are in `docs/bench/`.
 <!---->
 ## Accuracy
 <!---->
@@ -120,9 +121,9 @@ DeepSeek-V4-Flash's they depend on the expert placement at the noise level.
 <!---->
 Hy4 flash is checked against the transformers implementation (huggingface/transformers#50903) running Tencent's
 FP8 release (`tools/ref/hy4_oracle`, layer-streamed on one card). With the release's experts the served path is at
-the oracle's noise floor on code: KL 5.4e-3 and 98.1% top-1, where the oracle's bf16 run differs from its fp32
-twin by 5.8e-3; at 4096 tokens it is 7.4e-2 from the fp32 twin, the oracle's bf16 run 6.1e-2. AngelSlim's NVFP4
-experts are at 2.8e-2 / 95.5% (their Q4_K_M build, run in the oracle: 2.3e-2 / 95.7%). Image preprocessing is
+the oracle's noise floor on code: KL 5.1e-3 and 97.8% top-1, where the oracle's bf16 run differs from its fp32
+twin by 5.8e-3; at 4096 tokens it is 5.7e-2 from the fp32 twin, the oracle's bf16 run 6.1e-2. AngelSlim's NVFP4
+experts are at 2.6e-2 / 95.9% (their Q4_K_M build, run in the oracle: 2.3e-2 / 95.7%). Image preprocessing is
 bit-exact with transformers' processor, and the image path (ViT, the rows in the embedding, M-RoPE) is as far from
 an fp32 run as the reference's own bf16 run. DFly2's drafts match an independent PyTorch version of the drafter,
 and greedy decoding gives the same tokens with drafts as without. Like the others, its outputs depend on the
@@ -166,8 +167,9 @@ against that reference: bit-identical where the math allows, ulp-level where it 
 - **Speculative decoding** with each checkpoint's drafter: DeepSeek-V4-Flash's 3-stage DSpark block drafter,
   its drafts filtered by its confidence head; GLM-5.3-Flash's MTP layer, one draft per step, with the
   recurrent state rolled back when the draft is rejected; Hy4 flash's DFly2, a 5-layer block drafter over the
-  target's own KV rows and indexer picks, 5 drafts per step, verified up to those the drafter is at least
-  70% sure of, with the window rings, indexer tails and n-gram history rolled back for rejected ones. Drafts are verified with exact speculative
+  target's own KV rows and indexer picks, 5 drafts per step, verified while the drafter's cumulative
+  probability for them holds (at least 0.2 with NVFP4 experts, 0.4 with fp8), with the window rings, indexer
+  tails and n-gram history rolled back for rejected ones. Drafts are verified with exact speculative
   sampling, so outputs are distributed exactly as without them.
 - **Vision**: images in chat messages (data URLs; JPEG, PNG, WebP), preprocessed on the CPU bit-exactly
   as the reference does, and encoded by the model's ViT on the iGPU. DeepSeek-V4-Flash's blocks (up to 384
