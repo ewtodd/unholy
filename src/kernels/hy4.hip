@@ -231,18 +231,48 @@ InvFreq inv_freq(float theta) {
 // M-RoPE's plane of rotary pair i (interleaved sections [12, 10, 10]: t, h, w).
 __device__ __forceinline__ int mrope_plane(int i) { return i < 30 && i % 3 != 0 ? i % 3 : 0; }
 
+// Rotary pair pr (of 32) of row r: src -> dst (may be the same).
+__device__ __forceinline__ void rope_pair(const bf16* src, bf16* dst, int r, int pr, const int32_t* pos,
+                                          const int32_t* pos3, const InvFreq& fr) {
+  const int ps = pos3 ? pos3[r * 3 + mrope_plane(pr)] : pos[r];
+  const float a = __fmul_rn(float(ps), fr.f[pr]);
+  const float c = round_bf16(cosf(a)), s = round_bf16(sinf(a));
+  const float x0 = bf16_to_f32(src[0]), x1 = bf16_to_f32(src[1]);
+  dst[0] = f32_to_bf16(__fadd_rn(__fmul_rn(x0, c), __fmul_rn(-x1, s)));
+  dst[1] = f32_to_bf16(__fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s)));
+}
+
 __global__ void rope_kernel(bf16* x, int ld, int rows, int heads, int hstride, int off, const int32_t* pos,
                             InvFreq fr, const int32_t* pos3) {
   const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i >= size_t(rows) * heads * 32) return;
   const int pr = int(i % 32), h = int((i / 32) % heads), r = int(i / (32 * size_t(heads)));
   bf16* p = x + size_t(r) * ld + size_t(h) * hstride + off + 2 * pr;
-  const int ps = pos3 ? pos3[r * 3 + mrope_plane(pr)] : pos[r];
-  const float a = __fmul_rn(float(ps), fr.f[pr]);
-  const float c = round_bf16(cosf(a)), s = round_bf16(sinf(a));
-  const float x0 = bf16_to_f32(p[0]), x1 = bf16_to_f32(p[1]);
-  p[0] = f32_to_bf16(__fadd_rn(__fmul_rn(x0, c), __fmul_rn(-x1, s)));
-  p[1] = f32_to_bf16(__fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s)));
+  rope_pair(p, p, r, pr, pos, pos3, fr);
+}
+
+// hy4_qkv_post: grid (T, 2), 256 threads: block y 0 the q_a part's rmsnorm (rmsnorm_hf's order) into qr, block y 1
+// the key row's latent rmsnorm and its rope pairs into kv.
+__global__ __launch_bounds__(256) void qkv_post_kernel(const bf16* qkv, int ld, int nq, const bf16* qn_w, bf16* qr,
+                                                       int nl, const bf16* kn_w, bf16* kv, int nkv, float eps,
+                                                       const int32_t* pos, const int32_t* pos3, InvFreq fr) {
+  __shared__ float red[32];
+  const int t = blockIdx.x;
+  const bf16* src = qkv + size_t(t) * ld + (blockIdx.y ? nq : 0);
+  const int n = blockIdx.y ? nl : nq;
+  const bf16* w = blockIdx.y ? kn_w : qn_w;
+  bf16* dst = blockIdx.y ? kv + size_t(t) * nkv : qr + size_t(t) * nq;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = bf16_to_f32(src[i]);
+    ss += v * v;
+  }
+  ss = block_sum(ss, red);
+  const float r = rsqrtf(ss / float(n) + eps);
+  for (int i = threadIdx.x; i < n; i += blockDim.x)
+    dst[i] = f32_to_bf16(bf16_to_f32(w[i]) * round_bf16(bf16_to_f32(src[i]) * r));
+  if (blockIdx.y && int(threadIdx.x) < (nkv - nl) / 2)
+    rope_pair(src + nl + 2 * threadIdx.x, dst + nl + 2 * threadIdx.x, t, threadIdx.x, pos, pos3, fr);
 }
 
 // ---- attention -------------------------------------------------------------------------------------------------
@@ -475,12 +505,14 @@ __global__ void gate_mul_kernel(bf16* o, const bf16* g, size_t n) {
     o[i] = f32_to_bf16(bf16_to_f32(o[i]) * round_bf16(sigmoidf(bf16_to_f32(g[i]))));
 }
 
-__global__ void ring_store_kernel(const bf16* rows, bf16* ring, int s0, int n) {
+__global__ void ring_store_kernel(const bf16* rows, bf16* ring, int s0, int n, bf16* bak) {
   const int first = max(0, n - kHy4Window);
   const size_t total = size_t(n - first) * R;
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) {
     const int r = first + int(i / R), d = int(i % R);
-    ring[size_t((s0 + r) % kHy4Window) * R + d] = rows[size_t(r) * R + d];
+    bf16* slot = ring + size_t((s0 + r) % kHy4Window) * R + d;
+    if (bak) bak[size_t(r) * R + d] = *slot;  // n <= kHy4Window with a backup: each slot once
+    *slot = rows[size_t(r) * R + d];
   }
 }
 
@@ -1233,7 +1265,8 @@ template <int kFmt>
 __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__ A, int ldi, int K,
                                                         const Exl3Tile* tiles, int ntiles, const int* ntiles_dev,
                                                         const uint8_t* const* w_tab, const void* const* s_tab,
-                                                        const uint8_t* w_direct, bf16* __restrict__ C, int ldc, int N) {
+                                                        const uint8_t* w_direct, bf16* __restrict__ C, int ldc, int N,
+                                                        const bf16* __restrict__ addend) {
 #if defined(UH_GFX12)
   __shared__ float red[8][2][256];
   const int nt = ntiles_dev ? *ntiles_dev : ntiles;
@@ -1326,7 +1359,10 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
       float sum = 0.0f;
 #pragma unroll
       for (int w = 0; w < 8; ++w) sum += red[w][g][t];
-      C[size_t(tile.row0 + r) * ldc + c0 + g * 16 + cc] = f32_to_bf16(sum);
+      const size_t at = size_t(tile.row0 + r) * ldc + c0 + g * 16 + cc;
+      bf16 v = f32_to_bf16(sum);
+      if (addend) v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(addend[at]));  // hy4_add's rounding
+      C[at] = v;
     }
 #elif defined(UH_GFX11)
   // gfx11 (the APU): a WMMA operand is all 16 inputs of a k step in both half-waves. Each lane decodes only its own
@@ -1432,7 +1468,10 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
       float sum = 0.0f;
 #pragma unroll
       for (int w = 0; w < 8; ++w) sum += red[w][g][t];
-      C[size_t(tile.row0 + r) * ldc + c0 + g * 16 + cc] = f32_to_bf16(sum);
+      const size_t at = size_t(tile.row0 + r) * ldc + c0 + g * 16 + cc;
+      bf16 v = f32_to_bf16(sum);
+      if (addend) v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(addend[at]));  // hy4_add's rounding
+      C[at] = v;
     }
 #endif
 }
@@ -1526,6 +1565,16 @@ void hy4_hc_head(const bf16* x, const float* fn, const float* scale, const float
   UH_CHECK_LAUNCH();
 }
 
+void hy4_qkv_post(const bf16* qkv, int ld, int nq, const bf16* q_norm, bf16* qr, int nl, const bf16* kv_norm,
+                  bf16* kv, int nkv, int T, float eps, const int32_t* pos, const int32_t* pos3, float theta,
+                  hipStream_t st) {
+  if (T <= 0) return;
+  if (nkv - nl != 64) throw std::runtime_error("hy4_qkv_post: 32 rope pairs");
+  qkv_post_kernel<<<dim3(unsigned(T), 2), 256, 0, st>>>(qkv, ld, nq, q_norm, qr, nl, kv_norm, kv, nkv, eps, pos, pos3,
+                                                        inv_freq(theta));
+  UH_CHECK_LAUNCH();
+}
+
 void hy4_rope(bf16* x, int ld, int rows, int heads, int hstride, int off, const int32_t* pos, float theta,
               hipStream_t st, const int32_t* pos3) {
   if (rows <= 0) return;
@@ -1577,9 +1626,10 @@ void hy4_gate_mul(bf16* o, const bf16* g, size_t n, hipStream_t st) {
   UH_CHECK_LAUNCH();
 }
 
-void hy4_ring_store(const bf16* rows, bf16* ring, int s0, int n, hipStream_t st) {
+void hy4_ring_store(const bf16* rows, bf16* ring, int s0, int n, hipStream_t st, bf16* bak) {
   if (n <= 0) return;
-  ring_store_kernel<<<grid1d(size_t(std::min(n, kHy4Window)) * R), 256, 0, st>>>(rows, ring, s0, n);
+  if (bak && n > kHy4Window) throw std::runtime_error("hy4_ring_store: a backup of more rows than the ring");
+  ring_store_kernel<<<grid1d(size_t(std::min(n, kHy4Window)) * R), 256, 0, st>>>(rows, ring, s0, n, bak);
   UH_CHECK_LAUNCH();
 }
 
@@ -1794,7 +1844,7 @@ void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tile
 
 bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
                    const uint8_t* const* w_tab, const void* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
-                   const int* ntiles_dev, const void* w_direct, int step_rows) {
+                   const int* ntiles_dev, const void* w_direct, int step_rows, const bf16* addend) {
   static const bool off = std::getenv("UNHOLY_HY4_NO_WMMA_GEMV") != nullptr;  // A/B checks
   static const bool apu_off = std::getenv("UNHOLY_HY4_NO_WMMA_GEMV_APU") != nullptr;
   if (off || ntiles <= 0 || K % 128 || N % 32) return false;
@@ -1804,9 +1854,12 @@ bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tile
   if (!device_gfx12() && apu_off) return false;
   const dim3 grid(unsigned(N / 32), unsigned(ntiles));
   const auto* wd = static_cast<const uint8_t*>(w_direct);
-  if (fmt == 0) wmma_gemv_kernel<0><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N);
-  else if (fmt == 1) wmma_gemv_kernel<1><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N);
-  else wmma_gemv_kernel<2><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N);
+  if (fmt == 0)
+    wmma_gemv_kernel<0><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, addend);
+  else if (fmt == 1)
+    wmma_gemv_kernel<1><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, addend);
+  else
+    wmma_gemv_kernel<2><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, addend);
   UH_CHECK_LAUNCH();
   return true;
 }
@@ -1821,7 +1874,8 @@ template <int CK>
 __global__ __launch_bounds__(256) void heads_gemv_kernel(const bf16* __restrict__ A, int lda, int a_head, int K,
                                                          const bf16* __restrict__ W, bf16* __restrict__ C, int ldc,
                                                          int c_head, int N, int rows, const bf16* __restrict__ gate,
-                                                         int ldg, int g_head, int tail) {
+                                                         int ldg, int g_head, int tail, const int32_t* pos,
+                                                         const int32_t* pos3, InvFreq fr) {
 #if defined(UH_GFX12)
   __shared__ float red[8][2][256];
   const int hd = blockIdx.y, r0 = blockIdx.z * 16, nr = min(16, rows - r0);
@@ -1876,26 +1930,39 @@ __global__ __launch_bounds__(256) void heads_gemv_kernel(const bf16* __restrict_
       C[row * ldc + size_t(hd) * c_head + col] = v;
     }
   }
-  if (tail > 0 && blockIdx.x == 0)
-    for (int i = t; i < nr * tail; i += 256) {
-      const size_t row = size_t(r0 + i / tail);
-      const int d = i % tail;
-      C[row * ldc + size_t(hd) * c_head + N + d] = A[row * lda + size_t(hd) * a_head + K + d];
-    }
+  if (tail > 0 && blockIdx.x == 0) {
+    if (pos)  // the tail as rope pairs (tail == 64)
+      for (int i = t; i < nr * 32; i += 256) {
+        const int row = r0 + i / 32, pr = i % 32;
+        rope_pair(A + size_t(row) * lda + size_t(hd) * a_head + K + 2 * pr,
+                  C + size_t(row) * ldc + size_t(hd) * c_head + N + 2 * pr, row, pr, pos, pos3, fr);
+      }
+    else
+      for (int i = t; i < nr * tail; i += 256) {
+        const size_t row = size_t(r0 + i / tail);
+        const int d = i % tail;
+        C[row * ldc + size_t(hd) * c_head + N + d] = A[row * lda + size_t(hd) * a_head + K + d];
+      }
+  }
 #endif
 }
 
 }  // namespace
 
 bool hy4_heads_gemv(const bf16* a, int lda, int a_head, int K, const bf16* w, int heads, bf16* c, int ldc, int c_head,
-                    int N, int rows, hipStream_t st, const bf16* gate, int ldg, int g_head, int tail) {
+                    int N, int rows, hipStream_t st, const bf16* gate, int ldg, int g_head, int tail,
+                    const int32_t* rope_pos, const int32_t* rope_pos3, float rope_theta) {
   static const bool off = std::getenv("UNHOLY_HY4_NO_HEADS_GEMV") != nullptr;  // A/B checks
   if (off || rows <= 0 || heads <= 0 || N % 32 || !device_gfx12()) return false;
+  if (rope_pos && tail != 64) throw std::runtime_error("hy4_heads_gemv: a rope tail is 64 wide");
   const dim3 grid(unsigned(N / 32), unsigned(heads), unsigned((rows + 15) / 16));
+  const InvFreq fr = rope_pos ? inv_freq(rope_theta) : InvFreq{};
   if (K % 64 == 0 && K / 64 >= 8)
-    heads_gemv_kernel<64><<<grid, 256, 0, st>>>(a, lda, a_head, K, w, c, ldc, c_head, N, rows, gate, ldg, g_head, tail);
+    heads_gemv_kernel<64><<<grid, 256, 0, st>>>(a, lda, a_head, K, w, c, ldc, c_head, N, rows, gate, ldg, g_head, tail,
+                                                rope_pos, rope_pos3, fr);
   else if (K % 32 == 0)
-    heads_gemv_kernel<32><<<grid, 256, 0, st>>>(a, lda, a_head, K, w, c, ldc, c_head, N, rows, gate, ldg, g_head, tail);
+    heads_gemv_kernel<32><<<grid, 256, 0, st>>>(a, lda, a_head, K, w, c, ldc, c_head, N, rows, gate, ldg, g_head, tail,
+                                                rope_pos, rope_pos3, fr);
   else
     return false;
   UH_CHECK_LAUNCH();

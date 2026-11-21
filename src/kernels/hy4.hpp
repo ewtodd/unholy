@@ -47,6 +47,11 @@ void hy4_hc_head(const bf16* x, const float* fn, const float* scale, const float
 // i % 3 == 1 and i < 30, the w plane when i % 3 == 2 and i < 30, else t (interleaved sections [12, 10, 10]).
 void hy4_rope(bf16* x, int ld, int rows, int heads, int hstride, int off, const int32_t* pos, float theta,
               hipStream_t st, const int32_t* pos3 = nullptr);
+// The fused q_a / kv_a output qkv [T][ld] (q part nq wide, then the key row nkv = nl + 64): qr [T][nq] = rmsnorm_hf(q
+// part, q_norm), kv [T][nkv] = rmsnorm_hf(latent nl, kv_norm) then the rope part through hy4_rope (theta, pos/pos3).
+void hy4_qkv_post(const bf16* qkv, int ld, int nq, const bf16* q_norm, bf16* qr, int nl, const bf16* kv_norm,
+                  bf16* kv, int nkv, int T, float eps, const int32_t* pos, const int32_t* pos3, float theta,
+                  hipStream_t st);
 // M-RoPE positions of the pooled indexer groups: the chunk's rows [n][3] (row q - s0 for slot q), and the planes of
 // the first slot of the group the chunk starts in (when that slot is before the chunk).
 struct Hy4GroupRope {
@@ -90,7 +95,8 @@ void hy4_pack_q(const bf16* qa, const bf16* q, bf16* out, int T, int H, hipStrea
 // o = bf16(o * bf16(sigmoid(g))) elementwise (the attention output gate).
 void hy4_gate_mul(bf16* o, const bf16* g, size_t n, hipStream_t st);
 // A window layer's ring takes the chunk's last <= 512 rows (positions s0 .. s0 + n - 1), after its attention.
-void hy4_ring_store(const bf16* rows, bf16* ring, int s0, int n, hipStream_t st);
+// bak (optional, n <= the window): the ring rows the store replaces, first (hy4_ring_backup's layout).
+void hy4_ring_store(const bf16* rows, bf16* ring, int s0, int n, hipStream_t st, bf16* bak = nullptr);
 // A sparse layer's rows [n][576] of positions s0 .. into the slot's pages.
 void hy4_page_store(const bf16* rows, bf16* pages, const int32_t* table, int s0, int n, hipStream_t st);
 
@@ -210,10 +216,12 @@ void hy4_swiglu_clamp2(const bf16* g, const bf16* u, bf16* h, int rows, int I, f
 // c[r][hd * c_head + n] = sum_k a[r][hd * a_head + k] . w[hd][n][k] for hd < heads, n < N (N % 32 == 0, K % 32 == 0),
 // rows in groups of 16 (a row's result never depends on the step's size). Optionally times bf16(sigmoid(gate[r][hd *
 // g_head + n])) after the bf16 rounding (hy4_gate_mul), and a's inputs [K, K + tail) of each head copied to c's
-// columns [N, N + tail) (the absorbed query: nope through w_ukT, the rope part as is).
+// columns [N, N + tail) (the absorbed query: nope through w_ukT, the rope part), with rope_pos through hy4_rope's
+// rotation (tail 64, row r at rope_pos[r] / rope_pos3, theta rope_theta) on the way.
 bool hy4_heads_gemv(const bf16* a, int lda, int a_head, int K, const bf16* w, int heads, bf16* c, int ldc, int c_head,
                     int N, int rows, hipStream_t st, const bf16* gate = nullptr, int ldg = 0, int g_head = 0,
-                    int tail = 0);
+                    int tail = 0, const int32_t* rope_pos = nullptr, const int32_t* rope_pos3 = nullptr,
+                    float rope_theta = 0.0f);
 // The same products for tiles of <= kHy4GemvRows rows (decode): a wave per 4 output columns, K split over its lanes in
 // 16-input chunks (K % 512 == 0); each weight dequantized to bf16(w * s) as above, fp32 sums. ldi: the rows' stride.
 constexpr int kHy4GemvRows = 8;
@@ -238,9 +246,11 @@ void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tile
 // half-waves; 16 experts x 6 rows fp8 263 -> 149 us, NVFP4 173 -> 108; ~5% slower than the GEMV at 1 row) at any row
 // count, so a row's result never depends on the step's size (step_rows: unused). Returns false, doing nothing,
 // where it does not apply (K % 128, N % 32): the caller runs the GEMV.
+// addend (optional, laid out as out): out = bf16(bf16(sum) + addend), hy4_add's rounding.
 bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
                    const uint8_t* const* w_tab, const void* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
-                   const int* ntiles_dev = nullptr, const void* w_direct = nullptr, int step_rows = 1);
+                   const int* ntiles_dev = nullptr, const void* w_direct = nullptr, int step_rows = 1,
+                   const bf16* addend = nullptr);
 // GGUF NVFP4 blocks of an [N][K] matrix -> codes [N][K / 2], scales [N][K / 16].
 void hy4_nvfp4_split(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales, hipStream_t st);
 // Tiles of one matrix (expert 0) over `rows` rows: ceil(rows / tile_rows) tiles of <= tile_rows rows, on the stream.

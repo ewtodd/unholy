@@ -55,30 +55,40 @@ void set_dense_tiles(const Hy4Scratch& s, int rows, hipStream_t st) {
   set_dense_tiles_at(s.at<k::Exl3Tile>(kBufDenseTiles), rows, st, &s.dense_tile_rows);
 }
 
-void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int rows, hipStream_t st) {
+// addend (optional, laid out as out): out = bf16(out + addend) (hy4_add), in the GEMV's epilogue when it runs.
+void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int rows, hipStream_t st,
+            const bf16* addend = nullptr) {
   if (rows <= 0) return;
+  const auto add_after = [&] {
+    if (!addend) return;
+    if (ldo != l.out) throw std::runtime_error("hy4: a linear's addend needs packed rows");
+    k::hy4_add(out, addend, out, size_t(rows) * l.out, st);
+  };
   if (l.fp8()) {
     if (rows != g_tiles.rows) throw std::runtime_error("hy4: fp8 linear outside its forward's rows");
     const auto* tw = l.tab.as<const uint8_t* const>();
     const auto* ts = reinterpret_cast<const uint16_t* const*>(tw + 1);
     if (rows <= kHy4GemvTokens) {  // the cards: the few-row WMMA kernel (memory-bound at any row count); else GEMV
       const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
-      if (!k::hy4_wmma_gemv(0, x, ldx, l.in, g_tiles.t8, n8, tw, reinterpret_cast<const void* const*>(ts), out, ldo,
-                            l.out, st))
-        k::hy4_fp8_grouped_gemv(x, ldx, l.in, g_tiles.t8, n8, tw, ts, out, ldo, l.out, st);
+      if (k::hy4_wmma_gemv(0, x, ldx, l.in, g_tiles.t8, n8, tw, reinterpret_cast<const void* const*>(ts), out, ldo,
+                           l.out, st, nullptr, nullptr, 1, addend))
+        return;
+      k::hy4_fp8_grouped_gemv(x, ldx, l.in, g_tiles.t8, n8, tw, ts, out, ldo, l.out, st);
     } else {
       if (ldx != l.in) throw std::runtime_error("hy4: fp8 GEMM rows must be packed");
       k::hy4_fp8_grouped_gemm(x, l.in, g_tiles.t64, (rows + k::kHy4TileRows - 1) / k::kHy4TileRows, tw, ts, out, ldo,
                               l.out, st);
     }
+    add_after();
     return;
   }
   if (rows <= kHy4GemvTokens && rows == g_tiles.rows &&
       k::hy4_wmma_gemv(2, x, ldx, l.in, g_tiles.t8, (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows, nullptr, nullptr,
-                       out, ldo, l.out, st, nullptr, l.w.ptr))
+                       out, ldo, l.out, st, nullptr, l.w.ptr, 1, addend))
     return;
   if (gemv_ok(l, rows)) k::gemv_bf16(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
   else k::gemm_bf16_wmma(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
+  add_after();
 }
 
 void linear_f32(const Hy4Linear& l, const bf16* x, int ldx, float* out, int ldo, int rows, hipStream_t st) {
@@ -93,15 +103,17 @@ void norm(bf16* x, int ld, const DevTensor& w, int rows, int dim, float eps, hip
 
 // ---- attention ----------------------------------------------------------------------------------------------------
 
-// The absorbed query qp [T][H][576] = [q_nope . w_ukT | q_rope] (qn, qa: the GEMM path's scratch), and the value-up
+// The absorbed query qp [T][H][576] = [q_nope . w_ukT | rope(q_rope)] (qn, qa: the GEMM path's scratch; q's rope
+// part is rotated in place there), and the value-up
 // o [T][H][v_dim] = ol . w_uv gated by bf16(sigmoid(g)): few-row steps by the per-head GEMV (fused), others by the
 // grouped GEMM and the elementwise kernels.
-void absorb_q(const Hy4Config& c, const bf16* w_ukT, const bf16* q, bf16* qn, bf16* qa, bf16* qp, int T, int H,
-              hipStream_t st) {
+void absorb_q(const Hy4Config& c, const bf16* w_ukT, bf16* q, bf16* qn, bf16* qa, bf16* qp, int T, int H,
+              const int32_t* pos, const int32_t* pos3, float theta, hipStream_t st) {
   constexpr int R = k::kHy4Row;
-  if (T <= kHy4GemvTokens &&
-      k::hy4_heads_gemv(q, H * 256, 256, c.nope, w_ukT, H, qp, H * R, R, c.kv_lora, T, st, nullptr, 0, 0, R - c.kv_lora))
-    return;
+  if (T <= kHy4GemvTokens && k::hy4_heads_gemv(q, H * 256, 256, c.nope, w_ukT, H, qp, H * R, R, c.kv_lora, T, st,
+                                               nullptr, 0, 0, R - c.kv_lora, pos, pos3, theta))
+    return;  // q's rope pairs rotated on their way into qp
+  k::hy4_rope(q, H * 256, T, H, 256, c.nope, pos, theta, st, pos3);
   k::hy4_split_q(q, qn, T, H, st);
   k::gemm_grouped_bf16_wmma(qn, w_ukT, qa, T, H, c.kv_lora, c.nope, st);
   k::hy4_pack_q(qa, q, qp, T, H, st);
@@ -120,21 +132,27 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
   const int T = b.T, D = c.dim, H = c.heads(w.layer), R = k::kHy4Row;
   const float theta = c.theta(w.layer);
   bf16* qr = s.at<bf16>(kBufQr);
-  linear(w.q_a, hn, D, qr, c.q_lora, T, st);
-  norm(qr, c.q_lora, w.q_a_norm, T, c.q_lora, c.eps, st);
+  bf16* kv = s.at<bf16>(kBufKv);
+  if (w.qkv_a) {  // one linear, one kernel for both norms and the key row's rope
+    bf16* qkv = s.at<bf16>(kBufQn);  // free until absorb_q's GEMM path
+    linear(w.qkv_a, hn, D, qkv, w.qkv_a.out, T, st);
+    k::hy4_qkv_post(qkv, w.qkv_a.out, c.q_lora, w.q_a_norm.p<bf16>(), qr, c.kv_lora, w.kv_a_norm.p<bf16>(), kv, R, T,
+                    c.eps, b.pos, b.pos3, theta, st);
+  } else {
+    linear(w.q_a, hn, D, qr, c.q_lora, T, st);
+    norm(qr, c.q_lora, w.q_a_norm, T, c.q_lora, c.eps, st);
+    linear(w.kv_a, hn, D, kv, R, T, st);
+    norm(kv, R, w.kv_a_norm, T, c.kv_lora, c.eps, st);
+    k::hy4_rope(kv, R, T, 1, R, c.kv_lora, b.pos, theta, st, b.pos3);
+  }
   bf16* q = s.at<bf16>(kBufQ);
   linear(w.q_b, qr, c.q_lora, q, H * 256, T, st);
-  k::hy4_rope(q, H * 256, T, H, 256, c.nope, b.pos, theta, st, b.pos3);
-  bf16* kv = s.at<bf16>(kBufKv);
-  linear(w.kv_a, hn, D, kv, R, T, st);
-  norm(kv, R, w.kv_a_norm, T, c.kv_lora, c.eps, st);
-  k::hy4_rope(kv, R, T, 1, R, c.kv_lora, b.pos, theta, st, b.pos3);
   bf16* g = s.at<bf16>(kBufG);
   linear(w.gate, hn, D, g, H * 256, T, st);
   bf16* qn = s.at<bf16>(kBufQn);
   bf16* qa = s.at<bf16>(kBufQa);
   bf16* qp = s.at<bf16>(kBufQp);
-  absorb_q(c, w.w_ukT.p<bf16>(), q, qn, qa, qp, T, H, st);
+  absorb_q(c, w.w_ukT.p<bf16>(), q, qn, qa, qp, T, H, b.pos, b.pos3, theta, st);
   bf16* ol = s.at<bf16>(kBufOl);
   const float scale = 1.0f / std::sqrt(float(c.nope + c.rope));
   float* ws = s.at<float>(kBufAttnSplit);  // few-query attention: keys split over workgroups
@@ -211,11 +229,12 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
       const k::Hy4Keys keys{nullptr, nullptr, ring, kv + size_t(ch.t0) * R, ch.s0};
       k::hy4_mla_attn(qp + size_t(ch.t0) * H * R, H, keys, nullptr, 0, c.window, b.pos + ch.t0, w.sinks.p<float>(),
                       ol + size_t(ch.t0) * H * c.kv_lora, ch.n, scale, st, nullptr, ws, ws_bytes);
-      if (ch.verify) {  // the ring rows the chunk overwrites, for restoring them after rejected drafts
+      bf16* bak = nullptr;  // a verify chunk: the ring rows it overwrites, for restoring them after rejected drafts
+      if (ch.verify) {
         if (ch.n > kHy4MaxVerify) throw std::runtime_error("hy4: verify chunk longer than the backups");
-        k::hy4_ring_backup(ring, cache.ring_bak.as<bf16>() + size_t(ch.slot) * kHy4MaxVerify * R, ch.s0, ch.n, st);
+        bak = cache.ring_bak.as<bf16>() + size_t(ch.slot) * kHy4MaxVerify * R;
       }
-      k::hy4_ring_store(kv + size_t(ch.t0) * R, ring, ch.s0, ch.n, st);
+      k::hy4_ring_store(kv + size_t(ch.t0) * R, ring, ch.s0, ch.n, st, bak);
     }
   }
   bf16* o = s.at<bf16>(kBufO);
@@ -308,9 +327,14 @@ void moe(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, cons
   bf16* su = s.at<bf16>(kBufShU);
   bf16* sh = s.at<bf16>(kBufShH);
   bf16* shared = s.at<bf16>(kBufShared);
-  linear(w.sh_gate, hn, D, sg, I, T, st);
-  linear(w.sh_up, hn, D, su, I, T, st);
-  k::hy4_swiglu(sg, su, I, sh, T, I, st);
+  if (w.sh_gu) {  // gate then up in one [T][2 I] (kBufShG has room for both)
+    linear(w.sh_gu, hn, D, sg, 2 * I, T, st);
+    k::hy4_swiglu(sg, sg + I, 2 * I, sh, T, I, st);
+  } else {
+    linear(w.sh_gate, hn, D, sg, I, T, st);
+    linear(w.sh_up, hn, D, su, I, T, st);
+    k::hy4_swiglu(sg, su, I, sh, T, I, st);
+  }
   linear(w.sh_down, sh, I, shared, D, T, st);
   bf16* msum = s.at<bf16>(kBufMsum);
   if (any_remote) {
@@ -320,9 +344,8 @@ void moe(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, cons
   } else {
     k::hy4_moe_sum(pout, pidx, nullptr, nullptr, nullptr, msum, T, K, Lt, st);
   }
-  bf16* routed = s.at<bf16>(kBufRouted);
-  linear(w.post_expert, msum, Lt, routed, D, T, st);
-  k::hy4_add(routed, shared, out, size_t(T) * D, st);  // normed (combine_norm) by the layer's / next layer's hc kernel
+  // routed + shared, normed (combine_norm) by the layer's / the next layer's hc kernel
+  linear(w.post_expert, msum, Lt, out, D, T, st, shared);
 }
 
 void engram(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, uint16_t* x, const Hy4Batch& b,
@@ -624,14 +647,13 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
     k::rmsnorm_hf(qr, c.q_lora, W.q_a_norm.p<bf16>(), qr, c.q_lora, N, c.q_lora, c.eps, st);
     bf16* q = bb(dQ);
     linear(W.q_b, qr, c.q_lora, q, H * 256, N, st);
-    k::hy4_rope(q, H * 256, N, H, 256, c.nope, dpos, c.theta_sparse, st);
     bf16* kv = bb(dKv);
     linear(W.kv_a, a, D, kv, RW, N, st);
     k::rmsnorm_hf(kv, RW, W.kv_a_norm.p<bf16>(), kv, RW, N, c.kv_lora, c.eps, st);
     k::hy4_rope(kv, RW, N, 1, RW, c.kv_lora, dpos, c.theta_sparse, st);
     bf16* g = bb(dG);
     linear(W.gate, a, D, g, H * 256, N, st);
-    absorb_q(c, W.w_ukT.p<bf16>(), q, bb(dQn), bb(dQa), bb(dQp), N, H, st);
+    absorb_q(c, W.w_ukT.p<bf16>(), q, bb(dQn), bb(dQa), bb(dQp), N, H, dpos, nullptr, c.theta_sparse, st);
     k::hy4_dfly_lists(reinterpret_cast<const int32_t* const*>(static_cast<uint64_t*>(buf(dHistP)) + size_t(L) * R),
                       reinterpret_cast<const int32_t* const*>(static_cast<uint64_t*>(buf(dCntP)) + size_t(L) * R),
                       ib(dAnchor), ib(dLists), ib(dCounts), R, kDflyW, st);

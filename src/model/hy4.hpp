@@ -94,6 +94,9 @@ struct Hy4LayerWeights {
   DevTensor post_mlp_norm;
   // MoE
   Hy4Linear router, pre_expert, post_expert, sh_gate, sh_up, sh_down;
+  // bf16 linears of one input stored as one matrix (the parts above are views of it), when the checkpoint allows:
+  // q_a then kv_a; the shared expert's gate then up.
+  Hy4Linear qkv_a, sh_gu;
   DevTensor router_bias, combine_norm;
   rt::DeviceBuffer experts;   // this device's routed experts: fp8 [gate_up codes, scales, down codes, scales], or
                               // MXFP4 (mx) [w1 codes, scales, w3 codes, scales, w2 codes, scales], tile-major repacked

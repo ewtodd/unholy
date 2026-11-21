@@ -237,6 +237,27 @@ struct LoadCtx {
   }
 };
 
+// Two loaded bf16 linears of one input as one [a.out + b.out][in] matrix (a's rows, then b's) into ab; a and b
+// become views of it. False (nothing done) if they don't fit.
+bool fuse_rows(LoadCtx& lc, Hy4Linear& a, Hy4Linear& b, Hy4Linear& ab, hipStream_t st) {
+  if (!a.w || !b.w || a.fp8() || b.fp8() || a.in != b.in || (a.out + b.out) % 32) return false;
+  ab.out = a.out + b.out;
+  ab.in = a.in;
+  ab.w = lc.alloc(size_t(ab.out) * ab.in * 2, DType::BF16, {ab.out, ab.in});
+  const size_t na = size_t(a.out) * a.in * 2, nb = size_t(b.out) * b.in * 2;
+  rt::DeviceGuard g(lc.dev);
+  UH_CHECK(hipMemcpyAsync(ab.w.ptr, a.w.ptr, na, hipMemcpyDeviceToDevice, st));
+  UH_CHECK(hipMemcpyAsync(static_cast<uint8_t*>(ab.w.ptr) + na, b.w.ptr, nb, hipMemcpyDeviceToDevice, st));
+  UH_CHECK(hipStreamSynchronize(st));
+  const auto view = [](DevTensor& t, void* at) {
+    t.buf = rt::DeviceBuffer();
+    t.ptr = at;
+  };
+  view(a.w, ab.w.ptr);
+  view(b.w, static_cast<uint8_t*>(ab.w.ptr) + na);
+  return true;
+}
+
 // kv_b [H (dn + dv)][r] -> uk_t [H][r][dn] and uv [H][dv][r].
 __global__ void split_kv_b_kernel(const uint16_t* kvb, uint16_t* uk_t, uint16_t* uv, int H, int dn, int dv, int r) {
   const size_t n = size_t(H) * (dn + dv) * r;
@@ -555,6 +576,10 @@ Hy4LayerWeights load_hy4_layer(const Checkpoint& ck, const Hy4Config& c, int lay
                                             r);
     UH_CHECK_LAUNCH();
     UH_CHECK(hipStreamSynchronize(st));
+  }
+  if (opt.load_dense) {
+    fuse_rows(lc, w.q_a, w.kv_a, w.qkv_a, st);
+    if (!w.dense) fuse_rows(lc, w.sh_gate, w.sh_up, w.sh_gu, st);
   }
   return w;
 }
@@ -1010,7 +1035,7 @@ std::vector<size_t> scratch_sizes(const Hy4Config& c, int max_tokens, int max_se
       T * Lt * 2,                         // routed sum
       T * D * 2,                          // routed out
       T * D * 2,                          // shared out
-      T * I * 2, T * I * 2, T * I * 2,    // shared gate, up, h
+      T * 2 * I * 2, T * I * 2, T * I * 2,  // shared gate (or gate and up, [T][2 I]), up, h
       E * 4, E * 4, E * 4,                // MoE count, off, fill
       2 * sizeof(k::MoePlan),
       (max_tiles + E + 1) * sizeof(k::Exl3Tile),
