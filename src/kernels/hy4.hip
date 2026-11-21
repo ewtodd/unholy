@@ -7,6 +7,7 @@
 // P V. The keys are bf16 rows (no fp8 latent), read through the block table (sparse layers) or from the window ring
 // and the chunk's own rows (window layers).
 #include "kernels/hy4.hpp"
+#include "kernels/moe_dispatch.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1257,6 +1258,36 @@ __global__ __launch_bounds__(256) void fp8_gemv_kernel(const bf16* __restrict__ 
   }
 }
 
+// wmma_gemv_kernel's store: the sums over the 8 waves (red [wave][column group][row * 16 + column]) through the
+// epilogue (Hy4GemvEpilogue) into C.
+__device__ __forceinline__ void gemv_store(const float (*red)[2][256], const Exl3Tile& tile, int rows, int c0,
+                                           bf16* __restrict__ C, int ldc, const Hy4GemvEpilogue& ep) {
+  const int t = threadIdx.x, r = t >> 4, cc = t & 15;
+  if (r >= rows) return;
+  const size_t row = size_t(tile.row0 + r);
+  float sum[2];
+#pragma unroll
+  for (int g = 0; g < 2; ++g) {
+    sum[g] = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) sum[g] += red[w][g][t];
+  }
+  if (ep.dual) {  // hy4_swiglu_clamp on the bf16 gate and up
+    const float gv = fminf(bf16_to_f32(f32_to_bf16(sum[0])), ep.limit);
+    const float uv = fminf(fmaxf(bf16_to_f32(f32_to_bf16(sum[1])), -ep.limit), ep.limit);
+    C[row * ldc + c0 + cc] = f32_to_bf16(round_bf16(siluf(gv)) * uv);
+    return;
+  }
+#pragma unroll
+  for (int g = 0; g < 2; ++g) {
+    const size_t at = row * ldc + c0 + g * 16 + cc;
+    bf16 v = f32_to_bf16(sum[g]);
+    if (ep.addend) v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(ep.addend[at]));  // hy4_add's rounding
+    if (ep.row_scale) v = f32_to_bf16(bf16_to_f32(v) * ep.row_scale[row]);       // hy4_scale_rows'
+    C[at] = v;
+  }
+}
+
 // Lane l of a wave: B fragments for columns c0 + (l & 15) and c0 + 16 + (l & 15), A for row (l & 15) of the tile.
 // K goes in chunks of 128 (one fp8 scale block), dealt to the 8 waves in turn; in a chunk at k0 the lane's half
 // h = l >> 4 takes inputs k0 + 64 h .. + 63, contiguous (a column's two halves read a whole 128-byte line of fp8),
@@ -1266,7 +1297,7 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
                                                         const Exl3Tile* tiles, int ntiles, const int* ntiles_dev,
                                                         const uint8_t* const* w_tab, const void* const* s_tab,
                                                         const uint8_t* w_direct, bf16* __restrict__ C, int ldc, int N,
-                                                        const bf16* __restrict__ addend) {
+                                                        Hy4GemvEpilogue ep) {
 #if defined(UH_GFX12)
   __shared__ float red[8][2][256];
   const int nt = ntiles_dev ? *ntiles_dev : ntiles;
@@ -1276,7 +1307,12 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
   const void* Sv = s_tab ? s_tab[tile.expert] : nullptr;
   if (!W || tile.rows <= 0) return;
   const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, l16 = lane & 15;
-  const int c0 = blockIdx.x * 32;
+  const int c0 = blockIdx.x * (ep.dual ? 16 : 32);
+  // column group g's weights and column (dual: g 0 the gate, g 1 the up projection of the same 16 columns)
+  const uint8_t* const W2 = ep.dual && ep.w_tab2 ? ep.w_tab2[tile.expert] : W;
+  const void* const S2 = ep.dual && ep.s_tab2 ? ep.s_tab2[tile.expert] : Sv;
+  const int up_off = ep.dual && !ep.w_tab2 ? ep.up_rows : 0;
+  const auto wcol = [&](int g) { return ep.dual ? c0 + l16 + (g ? up_off : 0) : c0 + g * 16 + l16; };
   const int rows = min(tile.rows, 16);
   const bool aok = l16 < rows;
   const bf16* Ar = A + size_t(tile.row0 + (aok ? l16 : 0)) * ldi;
@@ -1301,14 +1337,16 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
     }
 #pragma unroll
     for (int g = 0; g < 2; ++g) {
-      const int col = c0 + g * 16 + l16;
+      const int col = wcol(g);
+      const uint8_t* Wg = g ? W2 : W;
+      const void* Sg = g ? S2 : Sv;
       if constexpr (kFmt == 2) {
-        const uint16_t* Wr = reinterpret_cast<const uint16_t*>(W) + size_t(col) * K + kk;
+        const uint16_t* Wr = reinterpret_cast<const uint16_t*>(Wg) + size_t(col) * K + kk;
 #pragma unroll
         for (int j = 0; j < 8; ++j) acc[g] = UH_WMMA(a[j], *reinterpret_cast<const bf16x8_t*>(Wr + 8 * j), acc[g]);
       } else if constexpr (kFmt == 0) {
-        const uint8_t* Wr = W + size_t(col) * K + kk;
-        const float sc = bf16_to_f32(static_cast<const bf16*>(Sv)[size_t(col / 128) * (K / 128) + ch]);
+        const uint8_t* Wr = Wg + size_t(col) * K + kk;
+        const float sc = bf16_to_f32(static_cast<const bf16*>(Sg)[size_t(col / 128) * (K / 128) + ch]);
         uint4 wv[4];
 #pragma unroll
         for (int q = 0; q < 4; ++q) wv[q] = *reinterpret_cast<const uint4*>(Wr + 16 * q);
@@ -1325,8 +1363,8 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
           acc[g] = UH_WMMA(a[2 * q + 1], b1, acc[g]);
         }
       } else {  // NVFP4: per 16 inputs 8 bytes (byte j's low nibble input j, its high one input j + 8) and a scale
-        const uint8_t* Wr = W + size_t(col) * (K / 2) + kk / 2;
-        const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Sv) + size_t(col) * (K / 16) + kk / 16);
+        const uint8_t* Wr = Wg + size_t(col) * (K / 2) + kk / 2;
+        const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Sg) + size_t(col) * (K / 16) + kk / 16);
         uint4 wv[2];
         wv[0] = *reinterpret_cast<const uint4*>(Wr);
         wv[1] = *reinterpret_cast<const uint4*>(Wr + 16);
@@ -1352,18 +1390,7 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
 #pragma unroll
     for (int e = 0; e < 8; ++e) red[wave][g][(h * 8 + e) * 16 + l16] = acc[g][e];
   __syncthreads();
-  const int t = threadIdx.x, r = t >> 4, cc = t & 15;
-  if (r < rows)
-#pragma unroll
-    for (int g = 0; g < 2; ++g) {
-      float sum = 0.0f;
-#pragma unroll
-      for (int w = 0; w < 8; ++w) sum += red[w][g][t];
-      const size_t at = size_t(tile.row0 + r) * ldc + c0 + g * 16 + cc;
-      bf16 v = f32_to_bf16(sum);
-      if (addend) v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(addend[at]));  // hy4_add's rounding
-      C[at] = v;
-    }
+  gemv_store(red, tile, rows, c0, C, ldc, ep);
 #elif defined(UH_GFX11)
   // gfx11 (the APU): a WMMA operand is all 16 inputs of a k step in both half-waves. Each lane decodes only its own
   // 64 inputs of a chunk (k0 + 64 h ..); WMMA step j takes inputs k0 + 8 j .. + 7 (half 0's) and k0 + 64 + 8 j ..
@@ -1378,7 +1405,12 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
   const void* Sv = s_tab ? s_tab[tile.expert] : nullptr;
   if (!W || tile.rows <= 0) return;
   const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, l16 = lane & 15;
-  const int c0 = blockIdx.x * 32;
+  const int c0 = blockIdx.x * (ep.dual ? 16 : 32);
+  // column group g's weights and column (dual: g 0 the gate, g 1 the up projection of the same 16 columns)
+  const uint8_t* const W2 = ep.dual && ep.w_tab2 ? ep.w_tab2[tile.expert] : W;
+  const void* const S2 = ep.dual && ep.s_tab2 ? ep.s_tab2[tile.expert] : Sv;
+  const int up_off = ep.dual && !ep.w_tab2 ? ep.up_rows : 0;
+  const auto wcol = [&](int g) { return ep.dual ? c0 + l16 + (g ? up_off : 0) : c0 + g * 16 + l16; };
   const int rows = min(tile.rows, 16);
   const bool aok = l16 < rows;
   const bf16* Ar = A + size_t(tile.row0 + (aok ? l16 : 0)) * ldi;
@@ -1413,18 +1445,20 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
     }
 #pragma unroll
     for (int g = 0; g < 2; ++g) {
-      const int col = c0 + g * 16 + l16;
+      const int col = wcol(g);
+      const uint8_t* Wg = g ? W2 : W;
+      const void* Sg = g ? S2 : Sv;
       uint32_t b[8][4];  // this lane's 64 inputs as bf16 pairs, step j's 8 in b[j]
       if constexpr (kFmt == 2) {
-        const uint16_t* Wr = reinterpret_cast<const uint16_t*>(W) + size_t(col) * K + kk;
+        const uint16_t* Wr = reinterpret_cast<const uint16_t*>(Wg) + size_t(col) * K + kk;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
           const uint4 v = *reinterpret_cast<const uint4*>(Wr + 8 * j);
           b[j][0] = v.x, b[j][1] = v.y, b[j][2] = v.z, b[j][3] = v.w;
         }
       } else if constexpr (kFmt == 0) {
-        const uint8_t* Wr = W + size_t(col) * K + kk;
-        const float sc = bf16_to_f32(static_cast<const bf16*>(Sv)[size_t(col / 128) * (K / 128) + ch]);
+        const uint8_t* Wr = Wg + size_t(col) * K + kk;
+        const float sc = bf16_to_f32(static_cast<const bf16*>(Sg)[size_t(col / 128) * (K / 128) + ch]);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const uint4 wv = *reinterpret_cast<const uint4*>(Wr + 16 * q);
@@ -1436,8 +1470,8 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
           for (int i = 0; i < 4; ++i) b[2 * q][i] = pack(f[2 * i], f[2 * i + 1]), b[2 * q + 1][i] = pack(f[8 + 2 * i], f[9 + 2 * i]);
         }
       } else {
-        const uint8_t* Wr = W + size_t(col) * (K / 2) + kk / 2;
-        const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Sv) + size_t(col) * (K / 16) + kk / 16);
+        const uint8_t* Wr = Wg + size_t(col) * (K / 2) + kk / 2;
+        const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(Sg) + size_t(col) * (K / 16) + kk / 16);
         const uint4 w0 = *reinterpret_cast<const uint4*>(Wr), w1 = *reinterpret_cast<const uint4*>(Wr + 16);
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
@@ -1461,18 +1495,7 @@ __global__ __launch_bounds__(256) void wmma_gemv_kernel(const bf16* __restrict__
 #pragma unroll
     for (int e = 0; e < 8; ++e) red[wave][g][(2 * e + h) * 16 + l16] = acc[g][e];
   __syncthreads();
-  const int t = threadIdx.x, r = t >> 4, cc = t & 15;
-  if (r < rows)
-#pragma unroll
-    for (int g = 0; g < 2; ++g) {
-      float sum = 0.0f;
-#pragma unroll
-      for (int w = 0; w < 8; ++w) sum += red[w][g][t];
-      const size_t at = size_t(tile.row0 + r) * ldc + c0 + g * 16 + cc;
-      bf16 v = f32_to_bf16(sum);
-      if (addend) v = f32_to_bf16(bf16_to_f32(v) + bf16_to_f32(addend[at]));  // hy4_add's rounding
-      C[at] = v;
-    }
+  gemv_store(red, tile, rows, c0, C, ldc, ep);
 #endif
 }
 
@@ -1844,22 +1867,25 @@ void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tile
 
 bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
                    const uint8_t* const* w_tab, const void* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
-                   const int* ntiles_dev, const void* w_direct, int step_rows, const bf16* addend) {
+                   const int* ntiles_dev, const void* w_direct, int step_rows, const Hy4GemvEpilogue* epilogue) {
   static const bool off = std::getenv("UNHOLY_HY4_NO_WMMA_GEMV") != nullptr;  // A/B checks
   static const bool apu_off = std::getenv("UNHOLY_HY4_NO_WMMA_GEMV_APU") != nullptr;
-  if (off || ntiles <= 0 || K % 128 || N % 32) return false;
+  static const bool fuse_off = std::getenv("UNHOLY_HY4_NO_GEMV_EPILOGUE") != nullptr;  // the separate kernels instead
+  const Hy4GemvEpilogue ep = epilogue ? *epilogue : Hy4GemvEpilogue{};
+  if (fuse_off && (ep.dual || ep.row_scale)) return false;
+  if (off || ntiles <= 0 || K % 128 || N % (ep.dual ? 16 : 32)) return false;
   // gfx11 (the APU, the half-exchange variant) at any row count too, though the GEMV is ~5% faster on 1-row steps: a
   // row's result then never depends on the step's size, so decoding with drafts stays bit-identical to without.
   (void)step_rows;
   if (!device_gfx12() && apu_off) return false;
-  const dim3 grid(unsigned(N / 32), unsigned(ntiles));
+  const dim3 grid(unsigned(N / (ep.dual ? 16 : 32)), unsigned(ntiles));
   const auto* wd = static_cast<const uint8_t*>(w_direct);
   if (fmt == 0)
-    wmma_gemv_kernel<0><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, addend);
+    wmma_gemv_kernel<0><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, ep);
   else if (fmt == 1)
-    wmma_gemv_kernel<1><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, addend);
+    wmma_gemv_kernel<1><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, ep);
   else
-    wmma_gemv_kernel<2><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, addend);
+    wmma_gemv_kernel<2><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N, ep);
   UH_CHECK_LAUNCH();
   return true;
 }
@@ -1967,6 +1993,24 @@ bool hy4_heads_gemv(const bf16* a, int lda, int a_head, int K, const bf16* w, in
     return false;
   UH_CHECK_LAUNCH();
   return true;
+}
+
+namespace {
+__global__ void plan_stats_kernel(const MoePlan* plan, unsigned long long* stats) {
+  const MoePlan p = *plan;
+  stats[8 + min(p.P / 8, 63)] += 1;  // calls by rows (pairs / 8)
+  if (p.P > 48) return;  // decode-sized steps only (<= 6 rows of 8 experts)
+  stats[0] += 1;
+  stats[1] += unsigned(p.n_local_tiles);
+  stats[2] += unsigned(p.n_remote_tiles);
+  stats[3] += unsigned(p.remote0);
+  stats[4] += unsigned(p.P - p.remote0);
+}
+}  // namespace
+
+void hy4_plan_stats(const MoePlan* plan, unsigned long long* stats, hipStream_t st) {
+  plan_stats_kernel<<<1, 1, 0, st>>>(plan, stats);
+  UH_CHECK_LAUNCH();
 }
 
 void hy4_nvfp4_split(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales, hipStream_t st) {

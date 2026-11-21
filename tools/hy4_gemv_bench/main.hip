@@ -6,9 +6,12 @@
 // E experts (distinct weights, as a layer's cold experts on the APU: D = 2), R rows each (1: decode, up to 6: a
 // DFly2 verify step), timed over N calls: the weight bytes streamed per second. The first tile's outputs are checked
 // against a host reference (the kernel's dequantization: bf16(e4m3 * scale) for FP8, e2m1 * scale for NVFP4).
+// BENCH_WMMA=1: the few-row WMMA kernel; BENCH_GEMM=1: the 64-row tile GEMM; BENCH_GAP_US=G: calls timed one by one
+// with the device idle G us between them.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -134,12 +137,25 @@ int main(int argc, char** argv) {
     };
   }
   static const bool wmma = std::getenv("BENCH_WMMA") != nullptr;  // the few-row WMMA kernel instead
+  // BENCH_SPARE_TILES=S (with BENCH_WMMA): launched for E + S tiles with the count E on the device, as a step launches
+  // its worst case.
+  const int spare = std::getenv("BENCH_SPARE_TILES") ? std::atoi(std::getenv("BENCH_SPARE_TILES")) : 0;
+  void* dcount = nullptr;
+  if (spare > 0) {
+    std::vector<k::Exl3Tile> all(tiles);
+    all.resize(size_t(E + spare), k::Exl3Tile{0, 0, 0});
+    UH_CHECK(hipFree(dtiles));
+    UH_CHECK(hipMalloc(&dtiles, all.size() * sizeof(k::Exl3Tile)));
+    UH_CHECK(hipMemcpy(dtiles, all.data(), all.size() * sizeof(k::Exl3Tile), hipMemcpyHostToDevice));
+    UH_CHECK(hipMalloc(&dcount, 4));
+    UH_CHECK(hipMemcpy(dcount, &E, 4, hipMemcpyHostToDevice));
+  }
   if (wmma) {
     const auto gemv_call = call;
     call = [&, gemv_call] {
-      if (!k::hy4_wmma_gemv(nv ? 1 : 0, static_cast<uint16_t*>(dx), K, K, static_cast<k::Exl3Tile*>(dtiles), E,
+      if (!k::hy4_wmma_gemv(nv ? 1 : 0, static_cast<uint16_t*>(dx), K, K, static_cast<k::Exl3Tile*>(dtiles), E + spare,
                             static_cast<const uint8_t* const*>(dwt), static_cast<const void* const*>(dst),
-                            static_cast<uint16_t*>(dy), N, N, st))
+                            static_cast<uint16_t*>(dy), N, N, st, static_cast<const int*>(dcount)))
         gemv_call();
     };
   }
@@ -153,7 +169,26 @@ int main(int argc, char** argv) {
   UH_CHECK(hipEventSynchronize(b));
   float ms = 0;
   UH_CHECK(hipEventElapsedTime(&ms, a, b));
-  const double us = double(ms) * 1e3 / iters, gbs = double(E) * double(wbytes + sbytes) / (us * 1e-6) / 1e9;
+  double us = double(ms) * 1e3 / iters;
+  // BENCH_GAP_US=G: each call timed alone, the device idle G us in between (a served step's bursts between waits).
+  if (const char* gap = std::getenv("BENCH_GAP_US")) {
+    const int g = std::atoi(gap);
+    double tot = 0;
+    for (int i = 0; i < iters; ++i) {
+      UH_CHECK(hipEventRecord(a, st));
+      call();
+      UH_CHECK(hipEventRecord(b, st));
+      UH_CHECK(hipEventSynchronize(b));
+      float m1 = 0;
+      UH_CHECK(hipEventElapsedTime(&m1, a, b));
+      tot += m1;
+      const auto t0 = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(g)) {
+      }
+    }
+    us = tot * 1e3 / iters;
+  }
+  const double gbs = double(E) * double(wbytes + sbytes) / (us * 1e-6) / 1e9;
   // Check the first tile against the host.
   std::vector<uint16_t> y(size_t(R) * N);
   UH_CHECK(hipMemcpy(y.data(), dy, y.size() * 2, hipMemcpyDeviceToHost));

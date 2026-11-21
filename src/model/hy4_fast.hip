@@ -70,8 +70,10 @@ void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int 
     const auto* ts = reinterpret_cast<const uint16_t* const*>(tw + 1);
     if (rows <= kHy4GemvTokens) {  // the cards: the few-row WMMA kernel (memory-bound at any row count); else GEMV
       const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
+      k::Hy4GemvEpilogue ep;
+      ep.addend = addend;
       if (k::hy4_wmma_gemv(0, x, ldx, l.in, g_tiles.t8, n8, tw, reinterpret_cast<const void* const*>(ts), out, ldo,
-                           l.out, st, nullptr, nullptr, 1, addend))
+                           l.out, st, nullptr, nullptr, 1, &ep))
         return;
       k::hy4_fp8_grouped_gemv(x, ldx, l.in, g_tiles.t8, n8, tw, ts, out, ldo, l.out, st);
     } else {
@@ -82,9 +84,11 @@ void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int 
     add_after();
     return;
   }
+  k::Hy4GemvEpilogue ep;
+  ep.addend = addend;
   if (rows <= kHy4GemvTokens && rows == g_tiles.rows &&
       k::hy4_wmma_gemv(2, x, ldx, l.in, g_tiles.t8, (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows, nullptr, nullptr,
-                       out, ldo, l.out, st, nullptr, l.w.ptr, 1, addend))
+                       out, ldo, l.out, st, nullptr, l.w.ptr, 1, &ep))
     return;
   if (gemv_ok(l, rows)) k::gemv_bf16(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
   else k::gemm_bf16_wmma(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
@@ -391,6 +395,22 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
         k::hy4_nvfp4_grouped_gemm(x, K, tiles, max_tiles, w.mx_tab(m3, 0, E), w.mx_tab(m3, 1, E), y, N, N, st,
                                   ntiles_dev);
     };
+    if (gemv) {  // gate and up in one launch (the SwiGLU in its epilogue), the routing weight in down's
+      k::Hy4GemvEpilogue gu_ep;
+      gu_ep.dual = true;
+      gu_ep.w_tab2 = w.mx_tab(1, 0, E);
+      gu_ep.s_tab2 = reinterpret_cast<const void* const*>(w.mx_tab(1, 1, E));
+      gu_ep.limit = c.swiglu_limit;
+      k::Hy4GemvEpilogue dn_ep;
+      dn_ep.row_scale = rw;
+      if (k::hy4_wmma_gemv(1, xa, Lt, Lt, tiles, max_tiles, w.mx_tab(0, 0, E),
+                           reinterpret_cast<const void* const*>(w.mx_tab(0, 1, E)), eh, I, I, st, ntiles_dev, nullptr,
+                           P / c.n_active, &gu_ep) &&
+          k::hy4_wmma_gemv(1, eh, I, I, tiles, max_tiles, w.mx_tab(2, 0, E),
+                           reinterpret_cast<const void* const*>(w.mx_tab(2, 1, E)), out, Lt, Lt, st, ntiles_dev,
+                           nullptr, P / c.n_active, &dn_ep))
+        return;
+    }
     lin(xa, Lt, 0, g, I);
     lin(xa, Lt, 1, u, I);
     k::hy4_swiglu_clamp2(g, u, eh, P, I, c.swiglu_limit, st);
@@ -399,6 +419,19 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
     return;
   }
   if (!w.mx && P / c.n_active <= kHy4GemvTokens) {  // decode-sized: 8-row tiles, WMMA on the cards, else the GEMV
+    {  // gate and up (one matrix, up from row I) in one launch with the SwiGLU, the routing weight in down's epilogue
+      k::Hy4GemvEpilogue gu_ep;
+      gu_ep.dual = true;
+      gu_ep.up_rows = I;
+      gu_ep.limit = c.swiglu_limit;
+      k::Hy4GemvEpilogue dn_ep;
+      dn_ep.row_scale = rw;
+      if (k::hy4_wmma_gemv(0, xa, Lt, Lt, tiles, max_tiles, w.gu_w(), reinterpret_cast<const void* const*>(w.gu_s(E)),
+                           eh, I, I, st, ntiles_dev, nullptr, P / c.n_active, &gu_ep) &&
+          k::hy4_wmma_gemv(0, eh, I, I, tiles, max_tiles, w.dn_w(E), reinterpret_cast<const void* const*>(w.dn_s(E)),
+                           out, Lt, Lt, st, ntiles_dev, nullptr, P / c.n_active, &dn_ep))
+        return;
+    }
     if (!k::hy4_wmma_gemv(0, xa, Lt, Lt, tiles, max_tiles, w.gu_w(), reinterpret_cast<const void* const*>(w.gu_s(E)),
                           gu, 2 * I, 2 * I, st, ntiles_dev, nullptr, P / c.n_active))
       k::hy4_fp8_grouped_gemv(xa, Lt, Lt, tiles, max_tiles, w.gu_w(), w.gu_s(E), gu, 2 * I, 2 * I, st, ntiles_dev);

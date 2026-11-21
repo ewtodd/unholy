@@ -66,6 +66,19 @@ Hy4ApuExperts::Hy4ApuExperts(const model::Hy4Config& c, int dev, size_t capacity
 
 Hy4ApuExperts::~Hy4ApuExperts() {
   rt::DeviceGuard g(dev_);
+  if (st_) (void)hipStreamSynchronize(st_);
+  if (stats_ && stats_[0])
+    std::fprintf(stderr, "hy4 APU experts: %llu layer calls; per call %.2f local tiles, %.2f remote tiles, %.2f local "
+                 "pairs, %.2f remote pairs\n", stats_[0], double(stats_[1]) / double(stats_[0]),
+                 double(stats_[2]) / double(stats_[0]), double(stats_[3]) / double(stats_[0]),
+                 double(stats_[4]) / double(stats_[0]));
+  if (stats_) {
+    std::fprintf(stderr, "hy4 APU experts: layer calls by rows:");
+    for (int r = 0; r < 64; ++r)
+      if (stats_[8 + r]) std::fprintf(stderr, " %d:%llu", r, stats_[8 + r]);
+    std::fprintf(stderr, "\n");
+    (void)hipHostFree(stats_);
+  }
   if (st_) (void)hipStreamDestroy(st_);
   for (void* p : {static_cast<void*>(in_host), static_cast<void*>(out_host), static_cast<void*>(w_host),
                   static_cast<void*>(e_host), static_cast<void*>(plan_host), static_cast<void*>(tiles_host),
@@ -102,6 +115,15 @@ void Hy4ApuExperts::enqueue(int layer, hipStream_t card_st, int P) {
                          eh_.as<uint16_t>(), pout, st_, &plan_dev_->remote0, nullptr);
   k::glm_remote_partial(pout, u2p_dev_, &plan_dev_->n_remote_tokens, reinterpret_cast<float*>(out_dev_),
                         c_.n_active, Lt, P / c_.n_active, st_);
+  static const bool stats = std::getenv("UNHOLY_HY4_REMOTE_STATS") != nullptr;
+  if (stats) {
+    if (!stats_) {
+      UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&stats_), 72 * sizeof(unsigned long long),
+                             hipHostMallocPortable | hipHostMallocMapped));
+      std::memset(stats_, 0, 72 * sizeof(unsigned long long));
+    }
+    k::hy4_plan_stats(plan_dev_, stats_, st_);
+  }
   UH_CHECK(hipStreamWriteValue32(st_, done_flag_, seq_, 0));
 }
 
@@ -139,6 +161,11 @@ Plan make_hy4_plan(const Hy4PlanInput& in) {
     if (acc + b / 2 > total / 2) break;
     pl.layer_card[size_t(L)] = 0;
     acc += b;
+  }
+  if (const char* e = std::getenv("UNHOLY_HY4_CARD1_FIRST")) {  // experiments: card 1's first layer
+    const int first = std::atoi(e);
+    if (first < 1 || first >= c.n_layers) throw std::runtime_error("UNHOLY_HY4_CARD1_FIRST: out of range");
+    for (int L = 0; L < c.n_layers; ++L) pl.layer_card[size_t(L)] = L < first ? 0 : 1;
   }
   for (int L = 0; L < c.n_layers; ++L) {
     const int kc = pl.layer_card[size_t(L)];

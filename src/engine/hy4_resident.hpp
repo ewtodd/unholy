@@ -70,6 +70,7 @@ class Hy4ApuExperts final : public model::RemoteExperts {
   uint32_t* req_flag_ = nullptr;
   uint32_t* done_flag_ = nullptr;
   uint32_t seq_ = 0;
+  unsigned long long* stats_ = nullptr;  // UNHOLY_HY4_REMOTE_STATS: kernels::hy4_plan_stats' sums (pinned)
 };
 
 struct Hy4PlanInput {

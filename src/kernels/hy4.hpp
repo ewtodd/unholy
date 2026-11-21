@@ -246,11 +246,30 @@ void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tile
 // half-waves; 16 experts x 6 rows fp8 263 -> 149 us, NVFP4 173 -> 108; ~5% slower than the GEMV at 1 row) at any row
 // count, so a row's result never depends on the step's size (step_rows: unused). Returns false, doing nothing,
 // where it does not apply (K % 128, N % 32): the caller runs the GEMV.
-// addend (optional, laid out as out): out = bf16(bf16(sum) + addend), hy4_add's rounding.
+// What hy4_wmma_gemv does with its sums (all optional):
+// - addend (laid out as out): out = bf16(bf16(sum) + addend), hy4_add's rounding;
+// - row_scale: out = bf16(bf16(sum) * row_scale[row]) (hy4_scale_rows: a routed pair's weight);
+// - dual: the gate and the up projection in one launch, out [rows][N] = the clamped SwiGLU of the two (as
+//   hy4_swiglu_clamp / _clamp2 on their bf16 values, limit): the up weights from w_tab2 / s_tab2 (NVFP4's separate
+//   tensors), or the same matrix's rows + up_rows (fp8's gate_up). N % 16 == 0.
+struct Hy4GemvEpilogue {
+  const bf16* addend = nullptr;
+  const float* row_scale = nullptr;
+  bool dual = false;
+  const uint8_t* const* w_tab2 = nullptr;
+  const void* const* s_tab2 = nullptr;
+  int up_rows = 0;
+  float limit = 0.0f;
+};
 bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
                    const uint8_t* const* w_tab, const void* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
                    const int* ntiles_dev = nullptr, const void* w_direct = nullptr, int step_rows = 1,
-                   const bf16* addend = nullptr);
+                   const Hy4GemvEpilogue* ep = nullptr);
+struct MoePlan;
+// Debugging (UNHOLY_HY4_REMOTE_STATS): for plans of <= 48 pairs (decode-sized steps), stats[0..4] += 1, the plan's
+// local tiles, remote tiles, local pairs, remote pairs, and stats[8 + rows] += 1 for any plan (stats[72]; one thread;
+// host-visible, read when the stream is idle).
+void hy4_plan_stats(const MoePlan* plan, unsigned long long* stats, hipStream_t st);
 // GGUF NVFP4 blocks of an [N][K] matrix -> codes [N][K / 2], scales [N][K / 16].
 void hy4_nvfp4_split(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales, hipStream_t st);
 // Tiles of one matrix (expert 0) over `rows` rows: ceil(rows / tile_rows) tiles of <= tile_rows rows, on the stream.
