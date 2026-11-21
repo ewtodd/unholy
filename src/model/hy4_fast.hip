@@ -93,6 +93,28 @@ void norm(bf16* x, int ld, const DevTensor& w, int rows, int dim, float eps, hip
 
 // ---- attention ----------------------------------------------------------------------------------------------------
 
+// The absorbed query qp [T][H][576] = [q_nope . w_ukT | q_rope] (qn, qa: the GEMM path's scratch), and the value-up
+// o [T][H][v_dim] = ol . w_uv gated by bf16(sigmoid(g)): few-row steps by the per-head GEMV (fused), others by the
+// grouped GEMM and the elementwise kernels.
+void absorb_q(const Hy4Config& c, const bf16* w_ukT, const bf16* q, bf16* qn, bf16* qa, bf16* qp, int T, int H,
+              hipStream_t st) {
+  constexpr int R = k::kHy4Row;
+  if (T <= kHy4GemvTokens &&
+      k::hy4_heads_gemv(q, H * 256, 256, c.nope, w_ukT, H, qp, H * R, R, c.kv_lora, T, st, nullptr, 0, 0, R - c.kv_lora))
+    return;
+  k::hy4_split_q(q, qn, T, H, st);
+  k::gemm_grouped_bf16_wmma(qn, w_ukT, qa, T, H, c.kv_lora, c.nope, st);
+  k::hy4_pack_q(qa, q, qp, T, H, st);
+}
+
+void value_up(const Hy4Config& c, const bf16* w_uv, const bf16* ol, const bf16* g, bf16* o, int T, int H,
+              hipStream_t st) {
+  const int L = c.kv_lora, V = c.v_dim;
+  if (T <= kHy4GemvTokens && k::hy4_heads_gemv(ol, H * L, L, L, w_uv, H, o, H * V, V, V, T, st, g, H * V, V)) return;
+  k::gemm_grouped_bf16_wmma(ol, w_uv, o, T, H, V, L, st);
+  k::hy4_gate_mul(o, g, size_t(T) * H * V, st);
+}
+
 void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, const Hy4Scratch& s, const bf16* hn,
                bf16* out, const Hy4Batch& b, hipStream_t st) {
   const int T = b.T, D = c.dim, H = c.heads(w.layer), R = k::kHy4Row;
@@ -112,9 +134,7 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
   bf16* qn = s.at<bf16>(kBufQn);
   bf16* qa = s.at<bf16>(kBufQa);
   bf16* qp = s.at<bf16>(kBufQp);
-  k::hy4_split_q(q, qn, T, H, st);
-  k::gemm_grouped_bf16_wmma(qn, w.w_ukT.p<bf16>(), qa, T, H, c.kv_lora, c.nope, st);
-  k::hy4_pack_q(qa, q, qp, T, H, st);
+  absorb_q(c, w.w_ukT.p<bf16>(), q, qn, qa, qp, T, H, st);
   bf16* ol = s.at<bf16>(kBufOl);
   const float scale = 1.0f / std::sqrt(float(c.nope + c.rope));
   float* ws = s.at<float>(kBufAttnSplit);  // few-query attention: keys split over workgroups
@@ -199,10 +219,8 @@ void attention(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, co
     }
   }
   bf16* o = s.at<bf16>(kBufO);
-  k::gemm_grouped_bf16_wmma(ol, w.w_uv.p<bf16>(), o, T, H, c.v_dim, c.kv_lora, st);
-  k::hy4_gate_mul(o, g, size_t(T) * H * c.v_dim, st);
-  linear(w.o, o, H * c.v_dim, out, D, T, st);
-  norm(out, D, w.post_proj_norm, T, D, c.eps, st);
+  value_up(c, w.w_uv.p<bf16>(), ol, g, o, T, H, st);
+  linear(w.o, o, H * c.v_dim, out, D, T, st);  // normed (post_proj_norm) by the layer's hc kernel
 }
 
 // ---- MLP / MoE ----------------------------------------------------------------------------------------------------
@@ -217,7 +235,6 @@ void dense_mlp(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s
   linear(w.up_p, hn, D, u, I, T, st);
   k::hy4_swiglu(g, u, I, h, T, I, st);
   linear(w.down_p, h, I, out, D, T, st);
-  norm(out, D, w.post_mlp_norm, T, D, c.eps, st);
 }
 
 int cap_tiles(const Hy4Config& c, int T, int tile_rows) { return T * c.n_active / tile_rows + c.n_experts + 1; }
@@ -305,8 +322,7 @@ void moe(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, cons
   }
   bf16* routed = s.at<bf16>(kBufRouted);
   linear(w.post_expert, msum, Lt, routed, D, T, st);
-  k::hy4_add(routed, shared, out, size_t(T) * D, st);
-  norm(out, D, w.combine_norm, T, D, c.eps, st);
+  k::hy4_add(routed, shared, out, size_t(T) * D, st);  // normed (combine_norm) by the layer's / next layer's hc kernel
 }
 
 void engram(const Hy4Config& c, const Hy4LayerWeights& w, const Hy4Scratch& s, uint16_t* x, const Hy4Batch& b,
@@ -398,7 +414,8 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
 }
 
 void hy4_layer_forward(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, const Hy4Scratch& s,
-                       uint16_t* x, const Hy4Batch& b, hipStream_t st, RemoteExperts* remote) {
+                       uint16_t* x, const Hy4Batch& b, hipStream_t st, RemoteExperts* remote,
+                       const Hy4LayerWeights* pending, bool defer) {
   const int T = b.T, D = c.dim;
   if (T > s.max_tokens) throw std::runtime_error("hy4_layer_forward: batch larger than the scratch");
   if (T <= 0) return;
@@ -407,18 +424,29 @@ void hy4_layer_forward(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& c
   bf16* out = s.at<bf16>(kBufOut);
   float* post = s.at<float>(kBufPost);
   set_dense_tiles(s, T, st);
-  if (w.engram >= 0) engram(c, w, s, x, b, st);
+  if (w.engram >= 0) {
+    if (pending) throw std::logic_error("hy4_layer_forward: an Engram layer after a deferred one");
+    engram(c, w, s, x, b, st);
+  }
   // UNHOLY_HY4_ENGRAM_ONLY (debugging, tools/ref/hy4_oracle/engram_check.py): the layer stops after the Engram add.
   static const bool engram_only = std::getenv("UNHOLY_HY4_ENGRAM_ONLY") != nullptr;
   if (engram_only) return;
-  k::hy4_ihc_pre(x, w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), h, post, T, c.hc,
-                 D, c.eps, c.hc_eps, c.hc_mag, st, w.input_norm.p<bf16>(), hn);
+  void* ws = s.get(size_t(kBufHcWs));
+  // Each sublayer boundary is one kernel: the previous output's norm and stream add, then the next mix and its norm.
+  const auto ffn_norm = [](const Hy4LayerWeights& l) -> const DevTensor& {
+    return l.dense ? l.post_mlp_norm : l.combine_norm;
+  };
+  k::hy4_ihc_fused(pending ? out : nullptr, pending ? ffn_norm(*pending).p<bf16>() : nullptr, post, x,
+                   w.hc_attn_fn.p<float>(), w.hc_attn_scale.p<float>(), w.hc_attn_base.p<float>(), h, post, T, c.hc,
+                   D, c.eps, c.hc_eps, c.hc_mag, w.input_norm.p<bf16>(), hn, ws, s.max_tokens, st);
   attention(c, w, cache, s, hn, out, b, st);
-  k::hy4_ihc_post(out, x, post, T, c.hc, D, st);
-  k::hy4_ihc_pre(x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(), w.hc_ffn_base.p<float>(), h, post, T, c.hc, D,
-                 c.eps, c.hc_eps, c.hc_mag, st, w.post_norm.p<bf16>(), hn);
+  k::hy4_ihc_fused(out, w.post_proj_norm.p<bf16>(), post, x, w.hc_ffn_fn.p<float>(), w.hc_ffn_scale.p<float>(),
+                   w.hc_ffn_base.p<float>(), h, post, T, c.hc, D, c.eps, c.hc_eps, c.hc_mag, w.post_norm.p<bf16>(),
+                   hn, ws, s.max_tokens, st);
   if (w.dense) dense_mlp(c, w, s, hn, out, T, st);
   else moe(c, w, s, hn, out, T, st, remote);
+  if (defer) return;
+  norm(out, D, ffn_norm(w), T, D, c.eps, st);
   k::hy4_ihc_post(out, x, post, T, c.hc, D, st);
 }
 
@@ -448,7 +476,8 @@ namespace {
 enum DflyBuf : int {
   dIds, dPos, dAnchor, dHistP, dCntP, dLists, dCounts, dX, dResid, dA, dAtt, dMlp, dQr, dQ, dQn, dQa, dQp, dKv, dG,
   dOl, dO, dMg, dMu, dMh, dEin, dE, dHrow, dH, dCat, dF, dRowSel, dHIdx, dHid, dEmb, dHn, dEn, dCat2, dCg, dCu, dCh,
-  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dArgmaxWs, dHid5, dCand, dTopkWs, dLse, dTokTmp, dConfTmp, dBufs
+  dCorr, dLogits, dConf, dTiles, dBonus, dAttnWs, dArgmaxWs, dHid5, dCand, dTopkWs, dLse, dTokTmp, dConfTmp, dPickWs,
+  dBufs
 };
 constexpr int kDflyW = 2048 + 8;  // a row's key list: the history (<= 2048), then the block's rows (<= 6)
 // The head chain's shortlist: the uncorrected rows' top K tokens, among which the corrected logits pick.
@@ -471,7 +500,7 @@ std::vector<size_t> dfly_sizes(const Hy4Config& c, int Rm) {
       // the shortlisted head: the uncorrected rows, their top-K, top-k work, log-sum-exp, argmax outputs
       kHy4DraftTokens * R * D * 2, kHy4DraftTokens * R * size_t(kDraftShortlist) * 4,
       k::glm_topk_cand_bytes(kHy4DraftTokens * Rm, c.vocab, kDraftShortlist), kHy4DraftTokens * R * 4,
-      kHy4DraftTokens * R * 4, kHy4DraftTokens * R * 4};
+      kHy4DraftTokens * R * 4, kHy4DraftTokens * R * 4, k::hy4_draft_pick_bytes(Rm, kDraftShortlist)};
   if (z.size() != size_t(dBufs)) throw std::logic_error("dfly scratch: buffer list out of date");
   return z;
 }
@@ -511,6 +540,7 @@ Hy4DflyScratch make_hy4_dfly_scratch(const Hy4Config& c, int dev, int max_reqs) 
   s.max_reqs = max_reqs;
   rt::DeviceGuard g(dev);
   for (size_t z : dfly_sizes(c, max_reqs)) s.bufs.emplace_back(dev, std::max<size_t>(z, 16));
+  UH_CHECK(hipMemset(s.bufs[size_t(dPickWs)].data(), 0, s.bufs[size_t(dPickWs)].size()));  // its counters
   UH_CHECK(hipHostMalloc(reinterpret_cast<void**>(&s.host), host_words(max_reqs) * 4, hipHostMallocPortable));
   return s;
 }
@@ -601,9 +631,7 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
     k::hy4_rope(kv, RW, N, 1, RW, c.kv_lora, dpos, c.theta_sparse, st);
     bf16* g = bb(dG);
     linear(W.gate, a, D, g, H * 256, N, st);
-    k::hy4_split_q(q, bb(dQn), N, H, st);
-    k::gemm_grouped_bf16_wmma(bb(dQn), W.w_ukT.p<bf16>(), bb(dQa), N, H, c.kv_lora, c.nope, st);
-    k::hy4_pack_q(bb(dQa), q, bb(dQp), N, H, st);
+    absorb_q(c, W.w_ukT.p<bf16>(), q, bb(dQn), bb(dQa), bb(dQp), N, H, st);
     k::hy4_dfly_lists(reinterpret_cast<const int32_t* const*>(static_cast<uint64_t*>(buf(dHistP)) + size_t(L) * R),
                       reinterpret_cast<const int32_t* const*>(static_cast<uint64_t*>(buf(dCntP)) + size_t(L) * R),
                       ib(dAnchor), ib(dLists), ib(dCounts), R, kDflyW, st);
@@ -617,8 +645,7 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
                       st, ib(dCounts) + r * kHy4DraftRows, static_cast<float*>(buf(dAttnWs)),
                       s.bufs[size_t(dAttnWs)].size());
     }
-    k::gemm_grouped_bf16_wmma(bb(dOl), W.w_uv.p<bf16>(), bb(dO), N, H, c.v_dim, c.kv_lora, st);
-    k::hy4_gate_mul(bb(dO), g, size_t(N) * H * c.v_dim, st);
+    value_up(c, W.w_uv.p<bf16>(), bb(dOl), g, bb(dO), N, H, st);
     linear(W.o, bb(dO), H * c.v_dim, att, D, N, st);
     k::rmsnorm_hf(att, D, W.post_proj_norm.p<bf16>(), att, D, N, D, c.eps, st);
     k::hy4_add(att, resid, x, size_t(N) * D, st);
@@ -662,7 +689,8 @@ void hy4_dfly_draft(const Hy4Config& c, const Hy4DflyWeights& w, const Hy4HeadWe
       linear(w.cd, bb(dCh), D, bb(dHn), D, R, st);  // the correction (delta) of each request's row
       k::hy4_draft_pick(base + size_t(t) * R * V, static_cast<float*>(buf(dLse)) + t * R,
                         ib(dCand) + size_t(t) * R * kDraftShortlist, kDraftShortlist, head.head.w.p<bf16>(), bb(dHn),
-                        R, V, D, tokens + t * R, static_cast<float*>(buf(dConf)) + t * R, st);
+                        R, V, D, tokens + t * R, static_cast<float*>(buf(dConf)) + t * R, buf(dPickWs), s.max_reqs,
+                        st);
       prev = tokens + t * R;
     }
   }

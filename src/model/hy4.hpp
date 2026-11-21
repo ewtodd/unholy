@@ -232,6 +232,7 @@ enum Hy4Buf : int {
   kBufEngRows, kBufEngKv,                                                                    // Engram
   kBufDenseTiles,                                                                            // fp8 linears
   kBufAttnSplit,                                                                             // few-query attention
+  kBufHcWs,                                                                                  // hy4_ihc_fused
   kHy4ScratchBufs
 };
 constexpr int kHy4IdxBlock = 64;  // queries per index-score pass
@@ -252,8 +253,12 @@ size_t hy4_scratch_bytes(const Hy4Config& c, int max_tokens, int max_seq);
 void hy4_embed(const Hy4Config& c, const Hy4HeadWeights& h, const int32_t* ids, uint16_t* x, int T, hipStream_t st);
 // One layer for the whole batch; x [T][hc][dim] updated in place. Routed experts this device does not hold run
 // through `remote` (required if any are missing).
+// defer: the layer's last step (its FFN output normed and added to the streams) is left to the next layer's first
+// kernel, which then gets this layer as `pending` (on the same scratch, with no Engram lookup in between: the next
+// layer must not have one). Until then x lacks this layer's FFN output.
 void hy4_layer_forward(const Hy4Config& c, const Hy4LayerWeights& w, Hy4Cache& cache, const Hy4Scratch& s,
-                       uint16_t* x, const Hy4Batch& b, hipStream_t st, RemoteExperts* remote = nullptr);
+                       uint16_t* x, const Hy4Batch& b, hipStream_t st, RemoteExperts* remote = nullptr,
+                       const Hy4LayerWeights* pending = nullptr, bool defer = false);
 // x [T][hc][dim] -> logits f32 [T][vocab] (hyper-head, norm, the fp32 LM head).
 // hn_out (optional): the normed rows the LM head reads [T][dim] (DFly2's target hidden states).
 void hy4_head_forward(const Hy4Config& c, const Hy4HeadWeights& h, const Hy4Scratch& s, const uint16_t* x, int T,

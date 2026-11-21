@@ -22,6 +22,16 @@ using bf16 = uint16_t;
 void hy4_ihc_pre(const bf16* x, const float* fn, const float* scale, const float* base, bf16* y, float* post, int T,
                  int hc, int dim, float eps, float hc_eps, float mag, hipStream_t st, const bf16* norm_w = nullptr,
                  bf16* hn = nullptr);
+// One kernel for a sublayer boundary: with out (the previous sublayer's output [T][dim], not yet normed) first
+// out = rmsnorm_hf(out, out_norm) added to the streams as hy4_ihc_post with post_in, then hy4_ihc_pre with the given
+// mix weights into y, post_out (may be post_in) and, with norm_w, hn. The mix's sums are taken over 512-wide slices
+// in parallel (a few blocks per token instead of one), so they round slightly differently from hy4_ihc_pre's. ws:
+// hy4_ihc_ws_bytes(ws_rows, hc, dim) for up to ws_rows rows, zeroed once (its counters reset themselves). hc 4,
+// dim % 512 == 0.
+void hy4_ihc_fused(const bf16* out, const bf16* out_norm, const float* post_in, bf16* x, const float* fn,
+                   const float* scale, const float* base, bf16* y, float* post_out, int T, int hc, int dim, float eps,
+                   float hc_eps, float mag, const bf16* norm_w, bf16* hn, void* ws, int ws_rows, hipStream_t st);
+size_t hy4_ihc_ws_bytes(int max_rows, int hc, int dim);
 // x[t][i] = bf16(post[t][i] * out[t] + x[t][i]) in fp32.
 void hy4_ihc_post(const bf16* out, bf16* x, const float* post, int T, int hc, int dim, hipStream_t st);
 // HYV4FlashHyperHead: mix = (fn . flat) * rsqrt(mean(flat^2) + eps) ([hc]); pre = sigmoid(mix * scale + base) + eps;
@@ -164,9 +174,12 @@ void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* 
 // DFly2's shortlisted head step, per request r (one block): the logits base[r] (the LM head of the uncorrected
 // hidden row, fp32 [R][V], log-sum-exp lse[r]) corrected by head . delta[r] for the K candidates cand[r] (the base's
 // top K): the best candidate (ties: lower id) into tok[r], and conf[r] its probability with the candidates' mass
-// moved to their corrected logits. head bf16 [V][D], delta bf16 [R][D].
+// moved to their corrected logits. head bf16 [V][D], delta bf16 [R][D]. ws: hy4_draft_pick_bytes(ws_rows, K) for
+// up to ws_rows rows, zeroed once (its counters reset themselves).
 void hy4_draft_pick(const float* base, const float* lse, const int32_t* cand, int K, const bf16* head,
-                    const bf16* delta, int R, int V, int D, int32_t* tok, float* conf, hipStream_t st);
+                    const bf16* delta, int R, int V, int D, int32_t* tok, float* conf, void* ws, int ws_rows,
+                    hipStream_t st);
+inline size_t hy4_draft_pick_bytes(int R, int K) { return size_t(R) * (K + 1) * 4; }
 // x = bf16(x + bf16(g * f)) per row (DFly2's slot-0 fusion: x embed row, g the fusion gate [dim], f eh_proj's output).
 void hy4_gated_add(bf16* x, int ldx, const bf16* g, const bf16* f, int rows, int dim, hipStream_t st);
 // out [rows][2 dim] = [a, b] (two normalized rows side by side).
@@ -193,6 +206,14 @@ void hy4_fp8_to_mxfp4(const uint8_t* w, const bf16* s, int kb, int row0, int N, 
 // h = bf16(bf16(silu(min(g, lim))) * clamp(u, +-lim)) from separate gate / up rows [rows][I].
 void hy4_swiglu_clamp2(const bf16* g, const bf16* u, bf16* h, int rows, int I, float limit, hipStream_t st);
 
+// Per-head few-row bf16 GEMV (gfx12; false elsewhere, or when the shape doesn't fit, or UNHOLY_HY4_NO_HEADS_GEMV):
+// c[r][hd * c_head + n] = sum_k a[r][hd * a_head + k] . w[hd][n][k] for hd < heads, n < N (N % 32 == 0, K % 32 == 0),
+// rows in groups of 16 (a row's result never depends on the step's size). Optionally times bf16(sigmoid(gate[r][hd *
+// g_head + n])) after the bf16 rounding (hy4_gate_mul), and a's inputs [K, K + tail) of each head copied to c's
+// columns [N, N + tail) (the absorbed query: nope through w_ukT, the rope part as is).
+bool hy4_heads_gemv(const bf16* a, int lda, int a_head, int K, const bf16* w, int heads, bf16* c, int ldc, int c_head,
+                    int N, int rows, hipStream_t st, const bf16* gate = nullptr, int ldg = 0, int g_head = 0,
+                    int tail = 0);
 // The same products for tiles of <= kHy4GemvRows rows (decode): a wave per 4 output columns, K split over its lanes in
 // 16-input chunks (K % 512 == 0); each weight dequantized to bf16(w * s) as above, fp32 sums. ldi: the rows' stride.
 constexpr int kHy4GemvRows = 8;

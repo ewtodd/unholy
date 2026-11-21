@@ -1021,6 +1021,7 @@ std::vector<size_t> scratch_sizes(const Hy4Config& c, int max_tokens, int max_se
       T * 5 * D * 4,                      // Engram projections (fp32)
       (T / k::kHy4GemvRows + T / k::kHy4TileRows + 4) * sizeof(k::Exl3Tile),  // fp8 linears' tiles (8-row, 64-row)
       k::hy4_attn_split_bytes(std::max(c.heads_sparse, c.heads_window)),       // split attention partials
+      k::hy4_ihc_ws_bytes(max_tokens, c.hc, c.dim),                             // hc mix partials, counters
   };
   if (sizes.size() != size_t(kHy4ScratchBufs)) throw std::logic_error("hy4 scratch: buffer list out of date");
   return sizes;

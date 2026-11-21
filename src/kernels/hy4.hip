@@ -97,6 +97,106 @@ __global__ void ihc_post_kernel(const bf16* out, bf16* x, const float* post, int
   }
 }
 
+// hy4_ihc_fused: grid (S = hc * dim / kHcSlice, T), 256 threads. Block (s, t) first, with `out`, adds the previous
+// sublayer's output to its slice of token t's streams (rmsnorm_hf of the out row, its scale recomputed by every
+// block in rmsnorm_hf's order, then ihc_post), then writes its slice's sum of squares and 2 hc mix dots to ws; the
+// token's last block to arrive (counter, reset by it) adds the slices in order and finishes as ihc_pre does.
+constexpr int kHcSlice = 512;
+
+__global__ __launch_bounds__(kHcThreads) void ihc_fused_kernel(const bf16* out, const bf16* out_norm,
+                                                               const float* post_in, bf16* x, const float* fn,
+                                                               const float* scale, const float* base, bf16* y,
+                                                               float* post_out, int hc, int dim, float eps,
+                                                               float hc_eps, float mag, const bf16* norm_w, bf16* hn,
+                                                               float* ws, uint32_t* count) {
+  constexpr int NV = 1 + kMaxMix;  // sum of squares, 2 hc == 8 dots
+  __shared__ float red[32];
+  __shared__ float wred[kHcThreads / 32][NV];
+  __shared__ float tot[NV];
+  __shared__ float sy[4096];
+  __shared__ bool last;
+  const int t = blockIdx.y, sl = blockIdx.x, S = gridDim.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int width = hc * dim, i0 = sl * kHcSlice, stream = i0 / dim, d0 = i0 % dim;
+  bf16* xt = x + size_t(t) * width;
+  float rs_out = 0.0f, pin = 0.0f;
+  if (out) {
+    const bf16* orow = out + size_t(t) * dim;
+    float ss = 0.0f;
+    for (int i = tid; i < dim; i += kHcThreads) {
+      const float v = bf16_to_f32(orow[i]);
+      ss += v * v;
+    }
+    ss = block_sum(ss, red);
+    rs_out = rsqrtf(ss / float(dim) + eps);
+    pin = post_in[size_t(t) * hc + stream];
+  }
+  float v9[NV];
+#pragma unroll
+  for (int j = 0; j < NV; ++j) v9[j] = 0.0f;
+  for (int k = tid; k < kHcSlice; k += kHcThreads) {
+    const int fi = i0 + k;
+    float v;
+    if (out) {
+      const int d = d0 + k;
+      const float on = bf16_to_f32(f32_to_bf16(bf16_to_f32(out_norm[d]) * round_bf16(bf16_to_f32(out[size_t(t) * dim + d]) * rs_out)));
+      const bf16 nx = f32_to_bf16(pin * on + bf16_to_f32(xt[fi]));
+      xt[fi] = nx;
+      v = bf16_to_f32(nx);
+    } else {
+      v = bf16_to_f32(xt[fi]);
+    }
+    v9[0] = fmaf(v, v, v9[0]);
+#pragma unroll
+    for (int j = 0; j < kMaxMix; ++j) v9[1 + j] = fmaf(fn[size_t(j) * width + fi], v, v9[1 + j]);
+  }
+#pragma unroll
+  for (int j = 0; j < NV; ++j) v9[j] = warp_sum(v9[j]);
+  if (lane == 0)
+#pragma unroll
+    for (int j = 0; j < NV; ++j) wred[warp][j] = v9[j];
+  __syncthreads();
+  if (tid < NV) {
+    float a = 0.0f;
+    for (int w = 0; w < kHcThreads / 32; ++w) a += wred[w][tid];
+    ws[(size_t(t) * S + sl) * NV + tid] = a;
+  }
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) last = atomicAdd(&count[t], 1u) == unsigned(S - 1);
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  if (tid < NV) {
+    float a = 0.0f;
+    for (int s2 = 0; s2 < S; ++s2) a += __builtin_nontemporal_load(&ws[(size_t(t) * S + s2) * NV + tid]);
+    tot[tid] = a;
+  }
+  if (tid == 0) count[t] = 0;
+  __syncthreads();
+  const float rs = rsqrtf(tot[0] / float(width) + eps);
+  float pre[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    pre[i] = sigmoidf(tot[1 + i] * rs * scale[0] + base[i]) + hc_eps;
+    if (tid == 0) post_out[size_t(t) * hc + i] = mag * sigmoidf(tot[5 + i] * rs * scale[1] + base[4 + i]) + hc_eps;
+  }
+  float ss = 0.0f;
+  for (int d = tid; d < dim; d += kHcThreads) {
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc += pre[i] * bf16_to_f32(xt[size_t(i) * dim + d]);
+    const bf16 vb = f32_to_bf16(acc);
+    y[size_t(t) * dim + d] = vb;
+    const float fv = bf16_to_f32(vb);
+    sy[d] = fv;
+    ss = fmaf(fv, fv, ss);
+  }
+  if (!norm_w) return;
+  const float rs2 = rsqrtf(block_sum(ss, red) / float(dim) + eps);
+  for (int d = tid; d < dim; d += kHcThreads)
+    hn[size_t(t) * dim + d] = f32_to_bf16(bf16_to_f32(norm_w[d]) * round_bf16(sy[d] * rs2));
+}
+
 __global__ __launch_bounds__(kHcThreads) void hc_head_kernel(const bf16* x, const float* fn, const float* scale,
                                                              const float* base, bf16* y, int hc, int dim, float eps,
                                                              float hc_eps) {
@@ -773,31 +873,44 @@ __global__ void argmax_combine_kernel(const float* ws, int S, int32_t* tok, floa
   if (lse) lse[r] = mx + logf(tot);
 }
 
-// One block of 256 threads per request: each warp scores K / 8 candidates (lanes stride the hidden dimension).
+// Grid (K / 8, R), 256 threads: each warp scores one candidate (uint4 loads of its head row and the delta) into
+// ws [R][K]; the row's last block to finish (counter ws_count[r], reset by it) picks.
 __global__ __launch_bounds__(256) void draft_pick_kernel(const float* base, const float* lse, const int32_t* cand,
                                                          int K, const bf16* head, const bf16* delta, int V, int D,
-                                                         int32_t* tok, float* conf) {
-  extern __shared__ float sm[];  // delta [D], then corrected logits [K]
-  float* sd = sm;
-  float* sl = sm + D;
+                                                         int32_t* tok, float* conf, float* ws, uint32_t* ws_count) {
   __shared__ float rv[8], rs0[8], rs1[8];
   __shared__ int ri[8];
-  const int r = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  for (int d = tid; d < D; d += 256) sd[d] = bf16_to_f32(delta[size_t(r) * D + d]);
-  __syncthreads();
+  __shared__ bool last;
+  const int r = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int32_t* cr = cand + size_t(r) * K;
   const float* br = base + size_t(r) * V;
-  for (int c = warp; c < K; c += 8) {
-    const int id = cr[c];
+  float* sl = ws + size_t(r) * K;
+  {
+    const int c = blockIdx.x * 8 + warp;
+    const int id = c < K ? cr[c] : -1;
     float s = 0.0f;
     if (id >= 0) {
-      const bf16* hr = head + size_t(id) * D;
-      for (int d = lane; d < D; d += 32) s = fmaf(bf16_to_f32(hr[d]), sd[d], s);
+      const uint4* hr = reinterpret_cast<const uint4*>(head + size_t(id) * D);
+      const uint4* dr = reinterpret_cast<const uint4*>(delta + size_t(r) * D);
+      for (int i = lane; i < D / 8; i += 32) {
+        const uint4 h = hr[i], d = dr[i];
+        const uint32_t hw[4] = {h.x, h.y, h.z, h.w}, dw[4] = {d.x, d.y, d.z, d.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          s = fmaf(__uint_as_float(hw[j] << 16), __uint_as_float(dw[j] << 16), s);
+          s = fmaf(__uint_as_float(hw[j] & 0xffff0000u), __uint_as_float(dw[j] & 0xffff0000u), s);
+        }
+      }
     }
     s = warp_sum(s);
-    if (lane == 0) sl[c] = id >= 0 ? br[id] + s : -INFINITY;
+    if (lane == 0 && c < K) sl[c] = id >= 0 ? br[id] + s : -INFINITY;
   }
+  __threadfence();
   __syncthreads();
+  if (tid == 0) last = atomicAdd(&ws_count[r], 1u) == gridDim.x - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
   // best candidate, and the mass: 1 - sum exp(base_c - lse) + sum exp(l_c - lse)
   const float L = lse[r];
   float bv = -INFINITY, s0 = 0.0f, s1 = 0.0f;
@@ -805,7 +918,7 @@ __global__ __launch_bounds__(256) void draft_pick_kernel(const float* base, cons
   for (int c = tid; c < K; c += 256) {
     const int id = cr[c];
     if (id < 0) continue;
-    const float l = sl[c];
+    const float l = __builtin_nontemporal_load(&sl[c]);
     if (l > bv || (l == bv && id < bi)) bv = l, bi = id;
     s0 += expf(br[id] - L);
     s1 += expf(l - L);
@@ -829,6 +942,7 @@ __global__ __launch_bounds__(256) void draft_pick_kernel(const float* base, cons
     }
     tok[r] = i;
     conf[r] = expf(v - L) / fmaxf(1.0f - a + b, 1e-30f);
+    ws_count[r] = 0;
   }
 }
 
@@ -1380,6 +1494,24 @@ void hy4_ihc_pre(const bf16* x, const float* fn, const float* scale, const float
   UH_CHECK_LAUNCH();
 }
 
+size_t hy4_ihc_ws_bytes(int max_rows, int hc, int dim) {
+  return size_t(max_rows) * (size_t(hc) * dim / kHcSlice * (1 + kMaxMix) + 1) * 4;
+}
+
+void hy4_ihc_fused(const bf16* out, const bf16* out_norm, const float* post_in, bf16* x, const float* fn,
+                   const float* scale, const float* base, bf16* y, float* post_out, int T, int hc, int dim, float eps,
+                   float hc_eps, float mag, const bf16* norm_w, bf16* hn, void* ws, int ws_rows, hipStream_t st) {
+  if (T <= 0) return;
+  if (hc != 4 || dim > 4096 || dim % kHcSlice) throw std::runtime_error("hy4_ihc_fused: hc 4, dim <= 4096, dim % 512");
+  if (T > ws_rows) throw std::runtime_error("hy4_ihc_fused: more rows than the workspace");
+  const int S = hc * dim / kHcSlice;
+  auto* count = static_cast<uint32_t*>(ws);  // at a fixed place: every call's counters start at 0
+  auto* part = reinterpret_cast<float*>(count + ws_rows);
+  ihc_fused_kernel<<<dim3(unsigned(S), unsigned(T)), kHcThreads, 0, st>>>(
+      out, out_norm, post_in, x, fn, scale, base, y, post_out, hc, dim, eps, hc_eps, mag, norm_w, hn, part, count);
+  UH_CHECK_LAUNCH();
+}
+
 void hy4_ihc_post(const bf16* out, bf16* x, const float* post, int T, int hc, int dim, hipStream_t st) {
   if (T <= 0) return;
   ihc_post_kernel<<<grid1d(size_t(T) * hc * dim), 256, 0, st>>>(out, x, post, T, hc, dim);
@@ -1570,9 +1702,15 @@ void hy4_argmax_conf(const float* logits, int rows, int V, int32_t* tok, float* 
 }
 
 void hy4_draft_pick(const float* base, const float* lse, const int32_t* cand, int K, const bf16* head,
-                    const bf16* delta, int R, int V, int D, int32_t* tok, float* conf, hipStream_t st) {
+                    const bf16* delta, int R, int V, int D, int32_t* tok, float* conf, void* ws, int ws_rows,
+                    hipStream_t st) {
   if (R <= 0) return;
-  draft_pick_kernel<<<R, 256, size_t(D + K) * 4, st>>>(base, lse, cand, K, head, delta, V, D, tok, conf);
+  if (D % 8) throw std::runtime_error("hy4_draft_pick: dim % 8");
+  if (R > ws_rows) throw std::runtime_error("hy4_draft_pick: more rows than the workspace");
+  auto* count = static_cast<uint32_t*>(ws);  // at a fixed place: every call's counters start at 0
+  auto* scores = reinterpret_cast<float*>(count + ws_rows);
+  draft_pick_kernel<<<dim3(unsigned((K + 7) / 8), unsigned(R)), 256, 0, st>>>(base, lse, cand, K, head, delta, V, D,
+                                                                               tok, conf, scores, count);
   UH_CHECK_LAUNCH();
 }
 
@@ -1669,6 +1807,97 @@ bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tile
   if (fmt == 0) wmma_gemv_kernel<0><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N);
   else if (fmt == 1) wmma_gemv_kernel<1><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N);
   else wmma_gemv_kernel<2><<<grid, 256, 0, st>>>(xa, ldi, K, tiles, ntiles, ntiles_dev, w_tab, s_tab, wd, out, ldo, N);
+  UH_CHECK_LAUNCH();
+  return true;
+}
+
+namespace {
+
+// Per-head few-row bf16 GEMV (gfx12): grid (N / 32, heads, row groups of 16), 256 threads. A block takes 32 output
+// columns of head blockIdx.y; its 8 waves take K in chunks of CK, in turn (lane half h: inputs k0 + h CK / 2 ..,
+// contiguous, CK / 16 WMMA steps, A and B permuted alike), reduced in LDS. Epilogue: bf16, then optionally times
+// bf16(sigmoid(gate)) as hy4_gate_mul; the block of column 0 also copies inputs [K, K + tail) to columns [N, N + tail).
+template <int CK>
+__global__ __launch_bounds__(256) void heads_gemv_kernel(const bf16* __restrict__ A, int lda, int a_head, int K,
+                                                         const bf16* __restrict__ W, bf16* __restrict__ C, int ldc,
+                                                         int c_head, int N, int rows, const bf16* __restrict__ gate,
+                                                         int ldg, int g_head, int tail) {
+#if defined(UH_GFX12)
+  __shared__ float red[8][2][256];
+  const int hd = blockIdx.y, r0 = blockIdx.z * 16, nr = min(16, rows - r0);
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, h = lane >> 4, l16 = lane & 15;
+  const int c0 = blockIdx.x * 32;
+  const bool aok = l16 < nr;
+  const bf16* Ar = A + size_t(r0 + (aok ? l16 : 0)) * lda + size_t(hd) * a_head;
+  const uint16_t* Wh = reinterpret_cast<const uint16_t*>(W) + size_t(hd) * N * K;
+  constexpr int S = CK / 16;
+  float8_t acc[2];
+#pragma unroll
+  for (int g = 0; g < 2; ++g)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) acc[g][e] = 0.0f;
+  for (int ch = wave; ch < K / CK; ch += 8) {
+    const int kk = ch * CK + h * (CK / 2);
+    bf16x8_t a[S];
+#pragma unroll
+    for (int j = 0; j < S; ++j) {
+      if (aok) a[j] = *reinterpret_cast<const bf16x8_t*>(Ar + kk + 8 * j);
+      else
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a[j][i] = __bf16(0.0f);
+    }
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      const uint16_t* Wr = Wh + size_t(c0 + g * 16 + l16) * K + kk;
+      bf16x8_t b[S];
+#pragma unroll
+      for (int j = 0; j < S; ++j) b[j] = *reinterpret_cast<const bf16x8_t*>(Wr + 8 * j);
+#pragma unroll
+      for (int j = 0; j < S; ++j) acc[g] = UH_WMMA(a[j], b[j], acc[g]);
+    }
+  }
+#pragma unroll
+  for (int g = 0; g < 2; ++g)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) red[wave][g][(h * 8 + e) * 16 + l16] = acc[g][e];
+  __syncthreads();
+  const int t = threadIdx.x, r = t >> 4, cc = t & 15;
+  if (r < nr) {
+    const size_t row = size_t(r0 + r);
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int w = 0; w < 8; ++w) sum += red[w][g][t];
+      const int col = c0 + g * 16 + cc;
+      bf16 v = f32_to_bf16(sum);
+      if (gate)
+        v = f32_to_bf16(bf16_to_f32(v) * round_bf16(sigmoidf(bf16_to_f32(gate[row * ldg + size_t(hd) * g_head + col]))));
+      C[row * ldc + size_t(hd) * c_head + col] = v;
+    }
+  }
+  if (tail > 0 && blockIdx.x == 0)
+    for (int i = t; i < nr * tail; i += 256) {
+      const size_t row = size_t(r0 + i / tail);
+      const int d = i % tail;
+      C[row * ldc + size_t(hd) * c_head + N + d] = A[row * lda + size_t(hd) * a_head + K + d];
+    }
+#endif
+}
+
+}  // namespace
+
+bool hy4_heads_gemv(const bf16* a, int lda, int a_head, int K, const bf16* w, int heads, bf16* c, int ldc, int c_head,
+                    int N, int rows, hipStream_t st, const bf16* gate, int ldg, int g_head, int tail) {
+  static const bool off = std::getenv("UNHOLY_HY4_NO_HEADS_GEMV") != nullptr;  // A/B checks
+  if (off || rows <= 0 || heads <= 0 || N % 32 || !device_gfx12()) return false;
+  const dim3 grid(unsigned(N / 32), unsigned(heads), unsigned((rows + 15) / 16));
+  if (K % 64 == 0 && K / 64 >= 8)
+    heads_gemv_kernel<64><<<grid, 256, 0, st>>>(a, lda, a_head, K, w, c, ldc, c_head, N, rows, gate, ldg, g_head, tail);
+  else if (K % 32 == 0)
+    heads_gemv_kernel<32><<<grid, 256, 0, st>>>(a, lda, a_head, K, w, c, ldc, c_head, N, rows, gate, ldg, g_head, tail);
+  else
+    return false;
   UH_CHECK_LAUNCH();
   return true;
 }

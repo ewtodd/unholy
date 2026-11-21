@@ -120,6 +120,19 @@ int main(int argc, char** argv) {
                               static_cast<const uint8_t* const*>(dwt), static_cast<const uint16_t* const*>(dst),
                               static_cast<uint16_t*>(dy), N, N, st);
   };
+  static const bool gemm = std::getenv("BENCH_GEMM") != nullptr;  // the 64-row tile GEMM (prefill) instead
+  if (gemm) {
+    call = [&] {
+      if (nv)
+        k::hy4_nvfp4_grouped_gemm(static_cast<uint16_t*>(dx), K, static_cast<k::Exl3Tile*>(dtiles), E,
+                                  static_cast<const uint8_t* const*>(dwt), static_cast<const uint8_t* const*>(dst),
+                                  static_cast<uint16_t*>(dy), N, N, st);
+      else
+        k::hy4_fp8_grouped_gemm(static_cast<uint16_t*>(dx), K, static_cast<k::Exl3Tile*>(dtiles), E,
+                                static_cast<const uint8_t* const*>(dwt), static_cast<const uint16_t* const*>(dst),
+                                static_cast<uint16_t*>(dy), N, N, st);
+    };
+  }
   static const bool wmma = std::getenv("BENCH_WMMA") != nullptr;  // the few-row WMMA kernel instead
   if (wmma) {
     const auto gemv_call = call;
@@ -164,7 +177,8 @@ int main(int argc, char** argv) {
       }
       worst = std::max(worst, std::fabs(double(bf16_f(y[size_t(r) * N + n])) - acc) / std::max(mag, 1e-30));
     }
-  std::printf("device %d %s, %d experts x %d rows: %.1f us per call, %.1f GB/s of weights; first tile vs host: "
-              "max error %.2e of the sum of |products|\n", dev, fmt.c_str(), E, R, us, gbs, worst);
+  const double tflops = 2.0 * N * K * double(E) * R / (us * 1e-6) / 1e12;
+  std::printf("device %d %s, %d experts x %d rows: %.1f us per call, %.1f GB/s of weights, %.1f TFLOPS; first tile vs "
+              "host: max error %.2e of the sum of |products|\n", dev, fmt.c_str(), E, R, us, gbs, tflops, worst);
   return worst < 1e-2 ? 0 : 1;
 }

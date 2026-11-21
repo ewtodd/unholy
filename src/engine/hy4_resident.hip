@@ -646,8 +646,15 @@ uint64_t Hy4ResidentModel::submit(const StepInput& in) {
       UH_CHECK(hipEventRecord(f.consumed, cd.st));
     }
     state_copies(kc, in.restore, false);
-    for (size_t i = 0; i < cd.w.size(); ++i)
-      model::hy4_layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.x.as<uint16_t>(), b, cd.st, chan_[kc].get());
+    // Each layer's last stream add goes into the next one's first kernel (not across the cards, nor into an Engram
+    // layer, which reads the streams first).
+    bool deferred = false;
+    for (size_t i = 0; i < cd.w.size(); ++i) {
+      const bool defer = i + 1 < cd.w.size() && cd.w[i + 1].engram < 0;
+      model::hy4_layer_forward(c_, cd.w[i], cd.cache[i], cd.scratch, cd.x.as<uint16_t>(), b, cd.st, chan_[kc].get(),
+                               deferred ? &cd.w[i - 1] : nullptr, defer);
+      deferred = defer;
+    }
     if (kc == 0) {
       UH_CHECK(hipStreamWaitEvent(cd.st, f.consumed, 0));
       k::copy_kernel(f.x_host, cd.x.data(), size_t(T) * row * 2, cd.st);
