@@ -61,9 +61,11 @@ void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int 
     if (rows != g_tiles.rows) throw std::runtime_error("hy4: fp8 linear outside its forward's rows");
     const auto* tw = l.tab.as<const uint8_t* const>();
     const auto* ts = reinterpret_cast<const uint16_t* const*>(tw + 1);
-    if (rows <= kHy4GemvTokens) {
-      k::hy4_fp8_grouped_gemv(x, ldx, l.in, g_tiles.t8, (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows, tw, ts, out,
-                              ldo, l.out, st);
+    if (rows <= kHy4GemvTokens) {  // the cards: the few-row WMMA kernel (memory-bound at any row count); else GEMV
+      const int n8 = (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows;
+      if (!k::hy4_wmma_gemv(0, x, ldx, l.in, g_tiles.t8, n8, tw, reinterpret_cast<const void* const*>(ts), out, ldo,
+                            l.out, st))
+        k::hy4_fp8_grouped_gemv(x, ldx, l.in, g_tiles.t8, n8, tw, ts, out, ldo, l.out, st);
     } else {
       if (ldx != l.in) throw std::runtime_error("hy4: fp8 GEMM rows must be packed");
       k::hy4_fp8_grouped_gemm(x, l.in, g_tiles.t64, (rows + k::kHy4TileRows - 1) / k::kHy4TileRows, tw, ts, out, ldo,
@@ -71,6 +73,10 @@ void linear(const Hy4Linear& l, const bf16* x, int ldx, bf16* out, int ldo, int 
     }
     return;
   }
+  if (rows <= kHy4GemvTokens && rows == g_tiles.rows &&
+      k::hy4_wmma_gemv(2, x, ldx, l.in, g_tiles.t8, (rows + k::kHy4GemvRows - 1) / k::kHy4GemvRows, nullptr, nullptr,
+                       out, ldo, l.out, st, nullptr, l.w.ptr))
+    return;
   if (gemv_ok(l, rows)) k::gemv_bf16(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
   else k::gemm_bf16_wmma(x, ldx, l.w.p<bf16>(), out, ldo, rows, l.out, l.in, st);
 }
@@ -335,6 +341,10 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
     uint16_t* g = gu;
     uint16_t* u = gu + size_t(P) * I;
     const auto lin = [&](const uint16_t* x, int K, int m3, uint16_t* y, int N) {
+      if (gemv && k::hy4_wmma_gemv(1, x, K, K, tiles, max_tiles, w.mx_tab(m3, 0, E),
+                                   reinterpret_cast<const void* const*>(w.mx_tab(m3, 1, E)), y, N, N, st, ntiles_dev,
+                                   nullptr, P / c.n_active))
+        return;  // the cards (the APU keeps the GEMV)
       if (gemv)
         k::hy4_nvfp4_grouped_gemv(x, K, K, tiles, max_tiles, w.mx_tab(m3, 0, E), w.mx_tab(m3, 1, E), y, N, N, st,
                                   ntiles_dev);
@@ -349,10 +359,14 @@ void hy4_experts_dev(const Hy4Config& c, const Hy4LayerWeights& w, const uint16_
     k::hy4_scale_rows(out, rw, P, Lt, st, row0_dev, row1_dev);
     return;
   }
-  if (!w.mx && P / c.n_active <= kHy4GemvTokens) {  // decode-sized: the fp8 GEMVs on 8-row tiles
-    k::hy4_fp8_grouped_gemv(xa, Lt, Lt, tiles, max_tiles, w.gu_w(), w.gu_s(E), gu, 2 * I, 2 * I, st, ntiles_dev);
+  if (!w.mx && P / c.n_active <= kHy4GemvTokens) {  // decode-sized: 8-row tiles, WMMA on the cards, else the GEMV
+    if (!k::hy4_wmma_gemv(0, xa, Lt, Lt, tiles, max_tiles, w.gu_w(), reinterpret_cast<const void* const*>(w.gu_s(E)),
+                          gu, 2 * I, 2 * I, st, ntiles_dev, nullptr, P / c.n_active))
+      k::hy4_fp8_grouped_gemv(xa, Lt, Lt, tiles, max_tiles, w.gu_w(), w.gu_s(E), gu, 2 * I, 2 * I, st, ntiles_dev);
     k::hy4_swiglu_clamp(gu, eh, P, I, c.swiglu_limit, st);
-    k::hy4_fp8_grouped_gemv(eh, I, I, tiles, max_tiles, w.dn_w(E), w.dn_s(E), out, Lt, Lt, st, ntiles_dev);
+    if (!k::hy4_wmma_gemv(0, eh, I, I, tiles, max_tiles, w.dn_w(E), reinterpret_cast<const void* const*>(w.dn_s(E)),
+                          out, Lt, Lt, st, ntiles_dev, nullptr, P / c.n_active))
+      k::hy4_fp8_grouped_gemv(eh, I, I, tiles, max_tiles, w.dn_w(E), w.dn_s(E), out, Lt, Lt, st, ntiles_dev);
     k::hy4_scale_rows(out, rw, P, Lt, st, row0_dev, row1_dev);
     return;
   }

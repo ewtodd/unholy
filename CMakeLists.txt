@@ -173,6 +173,8 @@ target_link_libraries(unholy_engine PUBLIC unholy_ref unholy_glm unholy_hy4)
 add_executable(unholy-resident-test tools/resident_test/main.hip)
 target_link_libraries(unholy-resident-test PRIVATE unholy_engine)
 
+add_executable(unholy-hy4-dense-bench tools/hy4_dense_bench/main.hip)
+target_link_libraries(unholy-hy4-dense-bench PRIVATE unholy_hy4)
 add_executable(unholy-hy4-gemv-bench tools/hy4_gemv_bench/main.hip)
 target_link_libraries(unholy-hy4-gemv-bench PRIVATE unholy_hy4)
 add_executable(unholy-hy4-engram-bench tools/hy4_engram_bench/main.cpp)

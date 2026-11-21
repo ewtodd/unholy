@@ -201,6 +201,18 @@ void hy4_nvfp4_grouped_gemm(const bf16* xa, int K, const Exl3Tile* tiles, int nt
 void hy4_nvfp4_grouped_gemv(const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
                             const uint8_t* const* w_tab, const uint8_t* const* s_tab, bf16* out, int ldo, int N,
                             hipStream_t st, const int* ntiles_dev = nullptr);
+// Few-row GEMV on WMMA (gfx12): tiles of up to 16 rows, a block per 32 output columns, its 8 waves splitting K and
+// summed in LDS; each weight is dequantized once for all the tile's rows (the GEMVs above re-read the rows per 4
+// columns: at 6 rows they run at ~55-60% of their 1-row bandwidth). fmt 0: e4m3 [N][K] with bf16 [N / 128][K / 128]
+// scales, bf16(w * s) as the GEMV; 1: NVFP4 as hy4_nvfp4_grouped_gemv; 2: bf16 [N][K]. w_tab / s_tab per expert as
+// the grouped GEMVs (w_tab null: w_direct for every tile, no scales). fp32 accumulation in WMMA order (not the
+// GEMV's: results differ from it at the rounding level). gfx12 and gfx11 (the APU: operands exchanged between
+// half-waves; 16 experts x 6 rows fp8 263 -> 149 us, NVFP4 173 -> 108; ~5% slower than the GEMV at 1 row) at any row
+// count, so a row's result never depends on the step's size (step_rows: unused). Returns false, doing nothing,
+// where it does not apply (K % 128, N % 32): the caller runs the GEMV.
+bool hy4_wmma_gemv(int fmt, const bf16* xa, int ldi, int K, const Exl3Tile* tiles, int ntiles,
+                   const uint8_t* const* w_tab, const void* const* s_tab, bf16* out, int ldo, int N, hipStream_t st,
+                   const int* ntiles_dev = nullptr, const void* w_direct = nullptr, int step_rows = 1);
 // GGUF NVFP4 blocks of an [N][K] matrix -> codes [N][K / 2], scales [N][K / 16].
 void hy4_nvfp4_split(const uint8_t* blocks, int N, int K, uint8_t* codes, uint8_t* scales, hipStream_t st);
 // Tiles of one matrix (expert 0) over `rows` rows: ceil(rows / tile_rows) tiles of <= tile_rows rows, on the stream.

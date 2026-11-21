@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -108,7 +110,7 @@ int main(int argc, char** argv) {
   UH_CHECK(hipMemcpy(dtiles, tiles.data(), tiles.size() * sizeof(k::Exl3Tile), hipMemcpyHostToDevice));
   hipStream_t st;
   UH_CHECK(hipStreamCreate(&st));
-  const auto call = [&] {
+  std::function<void()> call = [&] {
     if (nv)
       k::hy4_nvfp4_grouped_gemv(static_cast<uint16_t*>(dx), K, K, static_cast<k::Exl3Tile*>(dtiles), E,
                                 static_cast<const uint8_t* const*>(dwt), static_cast<const uint8_t* const*>(dst),
@@ -118,6 +120,16 @@ int main(int argc, char** argv) {
                               static_cast<const uint8_t* const*>(dwt), static_cast<const uint16_t* const*>(dst),
                               static_cast<uint16_t*>(dy), N, N, st);
   };
+  static const bool wmma = std::getenv("BENCH_WMMA") != nullptr;  // the few-row WMMA kernel instead
+  if (wmma) {
+    const auto gemv_call = call;
+    call = [&, gemv_call] {
+      if (!k::hy4_wmma_gemv(nv ? 1 : 0, static_cast<uint16_t*>(dx), K, K, static_cast<k::Exl3Tile*>(dtiles), E,
+                            static_cast<const uint8_t* const*>(dwt), static_cast<const void* const*>(dst),
+                            static_cast<uint16_t*>(dy), N, N, st))
+        gemv_call();
+    };
+  }
   for (int i = 0; i < 5; ++i) call();
   hipEvent_t a, b;
   UH_CHECK(hipEventCreate(&a));
